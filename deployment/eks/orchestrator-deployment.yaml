@@ -1,0 +1,119 @@
+# Orchestrator deployment — fans out to ARTF containers via Kubernetes Services.
+# Exposed via AWS ALB Ingress Controller.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: artf
+  labels:
+    app: artf
+    component: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: artf
+      component: orchestrator
+  template:
+    metadata:
+      labels:
+        app: artf
+        component: orchestrator
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator
+          image: __REGISTRY__/__STACK_NAME__-orchestrator:__IMAGE_TAG__
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: DLRM_URL
+              value: "http://dlrm-bid-shader:8081"
+            - name: WIDEDEEP_URL
+              value: "http://widedeep-segment-activator:8081"
+            - name: NCF_URL
+              value: "http://ncf-deal-manager:8081"
+            - name: METRICS_URL
+              value: "http://metrics-enricher:8081"
+            - name: LOADTEST_TABLE
+              value: "__STACK_NAME__-loadtest-history"
+            - name: EKS_CLUSTER_NAME
+              value: "__STACK_NAME__-triton"
+            - name: GPU_NODEGROUP_NAME
+              value: "gpu-inference"
+            - name: AWS_DEFAULT_REGION
+              value: "__REGION__"
+            - name: COGNITO_USER_POOL_ID
+              value: "__COGNITO_USER_POOL_ID__"
+            - name: COGNITO_REGION
+              value: "__REGION__"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: artf
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+  selector:
+    app: artf
+    component: orchestrator
+
+---
+# HPA for orchestrator — scale on CPU utilization
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orchestrator-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orchestrator
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

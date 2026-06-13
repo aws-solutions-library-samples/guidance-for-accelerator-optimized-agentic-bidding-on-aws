@@ -1,0 +1,72 @@
+# EKS cluster configuration for Accelerator-optimized Agentic Bidding with Triton Inference Server.
+# Uses g5.xlarge instances (1x NVIDIA A10G GPU, 4 vCPU, 16 GiB) for cost-effective
+# GPU inference of recommendation models (DLRM, Wide & Deep, NCF).
+#
+# For production with larger models, upgrade to:
+#   g5.2xlarge (1x A10G, 8 vCPU, 32 GiB) or
+#   p4d.24xlarge (8x A100, 96 vCPU, 1152 GiB) for multi-model serving
+#
+# Usage:
+#   eksctl create cluster -f triton/eks/cluster-config.yaml
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  # __STACK_NAME__ is replaced by deploy-eks.sh at deploy time
+  name: __STACK_NAME__-triton
+  region: __REGION__
+  version: "1.31"
+
+managedNodeGroups:
+  # GPU node group for Triton Inference Server
+  - name: gpu-inference
+    instanceType: g5.xlarge
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 5
+    volumeSize: 100
+    labels:
+      nvidia.com/gpu: "present"
+      role: inference
+    tags:
+      Project: __STACK_NAME__
+      ManagedBy: deploy-script
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+        cloudWatch: true
+
+  # CPU node group for orchestrator, ALB ingress controller, monitoring
+  - name: cpu-services
+    instanceType: c5.xlarge
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 4
+    volumeSize: 50
+    labels:
+      role: services
+    tags:
+      Project: __STACK_NAME__
+      ManagedBy: deploy-script
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+        cloudWatch: true
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: vpc-cni
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+  - name: coredns
+  - name: kube-proxy
+
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator

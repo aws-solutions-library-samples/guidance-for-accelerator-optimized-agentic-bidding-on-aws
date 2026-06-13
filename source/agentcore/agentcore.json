@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "name": "NvidiaArtfRecommenders",
+      "language": "Python",
+      "framework": "Custom",
+      "type": "create",
+      "codeLocation": "agentcore",
+      "entrypoint": "artf_mcp_server.py",
+      "build": "Container",
+      "protocol": "MCP",
+      "networkMode": "PUBLIC",
+      "memory": "none"
+    }
+  ]
+}

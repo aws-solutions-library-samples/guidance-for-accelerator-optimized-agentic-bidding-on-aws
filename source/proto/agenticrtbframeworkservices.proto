@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package com.iabtechlab.bidstream.mutation.services.v1;
+
+import "agenticrtbframework.proto";
+
+service RTBExtensionPoint {
+  // GetMutations returns RTBResponse containing mutations to be applied at the predetermined auction lifecycle event
+  rpc GetMutations (com.iabtechlab.bidstream.mutation.v1.RTBRequest) returns (com.iabtechlab.bidstream.mutation.v1.RTBResponse);
+}

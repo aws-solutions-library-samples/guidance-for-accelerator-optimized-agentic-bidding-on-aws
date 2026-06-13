@@ -1,0 +1,1 @@
+"""NCF ACTIVATE_DEALS / SUPPRESS_DEALS container."""

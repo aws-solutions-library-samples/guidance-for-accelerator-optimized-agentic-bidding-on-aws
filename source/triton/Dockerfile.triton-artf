@@ -1,0 +1,55 @@
+# ARTF container that calls NVIDIA Triton Inference Server for model inference.
+# This container handles ARTF protocol (gRPC + MCP + Health) and delegates
+# the actual neural network inference to a Triton sidecar via tritonclient.
+#
+# No PyTorch dependency — inference runs on Triton's ONNX Runtime backend
+# with GPU acceleration via CUDA Execution Provider.
+#
+# Usage:
+#   docker build --build-arg CONTAINER=containers/dlrm_bid_shader \
+#     -f triton/Dockerfile.triton-artf -t dlrm-bid-shader-triton .
+
+FROM python:3.12-slim AS base
+
+ARG CONTAINER
+ARG AGENT_NAME=artf-nvidia-triton-agent
+ARG VERSION=0.2.0
+
+LABEL agent-manifest="{ \
+  \"name\": \"${AGENT_NAME}\", \
+  \"version\": \"${VERSION}\", \
+  \"vendor\": \"NVIDIA\", \
+  \"inference\": \"triton\", \
+  \"resources\": {\"cpu\": \"500m\", \"memory\": \"512Mi\"}, \
+  \"intents\": [\"ACTIVATE_SEGMENTS\",\"ACTIVATE_DEALS\",\"SUPPRESS_DEALS\",\"BID_SHADE\",\"ADD_METRICS\"], \
+  \"health\": { \
+    \"livenessProbe\": {\"httpGet\": {\"path\": \"/health/live\", \"port\": 8080}}, \
+    \"readinessProbe\": {\"httpGet\": {\"path\": \"/health/ready\", \"port\": 8080}} \
+  } \
+}"
+
+# Install tritonclient (the real NVIDIA dependency) + ARTF server deps
+# No torch needed — Triton handles inference
+RUN pip install --no-cache-dir \
+    tritonclient[http] \
+    numpy \
+    fastapi uvicorn[standard] starlette httpx pydantic \
+    grpcio protobuf
+
+WORKDIR /app
+COPY shared/ /app/shared/
+COPY ${CONTAINER}/ /app/container/
+
+RUN adduser --disabled-password --no-create-home appuser
+USER appuser
+
+# gRPC + MCP + Health
+EXPOSE 50051 8081 8080
+
+# TRITON_URL is set by the EKS pod spec to point to the Triton sidecar
+ENV TRITON_URL=localhost:8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')" || exit 1
+
+CMD ["python", "-m", "container.app"]

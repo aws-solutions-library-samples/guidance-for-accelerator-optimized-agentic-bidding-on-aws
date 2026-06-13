@@ -1,0 +1,63 @@
+# DLRM Bid Shader — NVIDIA Triton Inference Server configuration
+# Architecture: NVIDIA DeepLearningExamples DLRM with dot-product interaction
+# Backend: ONNX Runtime (CPU or GPU via CUDA EP)
+#
+# Inputs:
+#   dense_features: [batch, 4] float32 — bidfloor, hour, age_norm, has_video
+#   sparse_user:    [batch]    int64   — hashed user ID (0..999)
+#   sparse_domain:  [batch]    int64   — hashed site domain (0..999)
+#   sparse_device:  [batch]    int64   — hashed device UA (0..999)
+#
+# Output:
+#   ctr_prediction: [batch]    float32 — predicted click-through rate
+
+name: "dlrm_bid_shader"
+backend: "onnxruntime"
+max_batch_size: 64
+
+input [
+  {
+    name: "dense_features"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  },
+  {
+    name: "sparse_user"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_domain"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_device"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "ctr_prediction"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]

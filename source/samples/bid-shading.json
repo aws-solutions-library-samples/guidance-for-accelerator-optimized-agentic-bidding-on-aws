@@ -1,0 +1,47 @@
+{
+  "id": "sample-bidshade-001",
+  "tmax": 100,
+  "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+  "originator": {"type": "TYPE_DSP", "id": "dsp-nike-001"},
+  "applicable_intents": ["BID_SHADE"],
+  "bid_request": {
+    "id": "auction-789",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 728, "h": 90},
+        "bidfloor": 2.00
+      }
+    ],
+    "site": {
+      "id": "site-espn",
+      "domain": "espn.com",
+      "cat": ["IAB17"]
+    },
+    "user": {
+      "id": "user-alex",
+      "yob": 1992,
+      "gender": "M"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (iPhone 15; CPU iPhone OS 17_0)",
+      "geo": {"country": "USA", "region": "IL"}
+    }
+  },
+  "bid_response": {
+    "id": "auction-789",
+    "seatbid": [
+      {
+        "seat": "dsp-001",
+        "bid": [
+          {
+            "id": "bid-nike-abc",
+            "impid": "imp-1",
+            "price": 7.50,
+            "adomain": ["nike.com"]
+          }
+        ]
+      }
+    ]
+  }
+}

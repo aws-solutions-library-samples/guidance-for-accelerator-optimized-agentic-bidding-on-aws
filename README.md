@@ -1,214 +1,282 @@
-# Guidance Title (required)
+# Guidance for Accelerator-Optimized Agentic Bidding on AWS
 
-The Guidance title should be consistent with the title established first in Alchemy.
+## Table of Contents
 
-**Example:** *Guidance for Product Substitutions on AWS*
-
-This title correlates exactly to the Guidance it’s linked to, including its corresponding sample code repository. 
-
-
-## Table of Contents (required)
-
-List the top-level sections of the README template, along with a hyperlink to the specific section.
-
-### Required
-
-1. [Overview](#overview-required)
+1. [Overview](#overview)
+    - [Architecture](#architecture)
     - [Cost](#cost)
-2. [Prerequisites](#prerequisites-required)
-    - [Operating System](#operating-system-required)
-3. [Deployment Steps](#deployment-steps-required)
-4. [Deployment Validation](#deployment-validation-required)
-5. [Running the Guidance](#running-the-guidance-required)
-6. [Next Steps](#next-steps-required)
-7. [Cleanup](#cleanup-required)
-8. [Notices](#notices-optional)
+2. [Prerequisites](#prerequisites)
+    - [Operating System](#operating-system)
+    - [Third-party tools](#third-party-tools)
+    - [AWS account requirements](#aws-account-requirements)
+    - [Supported Regions](#supported-regions)
+3. [Deployment Steps](#deployment-steps)
+4. [Deployment Validation](#deployment-validation)
+5. [Running the Guidance](#running-the-guidance)
+6. [Next Steps](#next-steps)
+7. [Cleanup](#cleanup)
+8. [Notices](#notices)
 
-***Optional***
+## Overview
 
-8. [FAQ, known issues, additional considerations, and limitations](#faq-known-issues-additional-considerations-and-limitations-optional)
-9. [Revisions](#revisions-optional)
-10. [Authors](#authors-optional)
+This Guidance shows how demand-side platforms (DSPs) and advertising technology providers can run GPU-accelerated AI inference directly inside the OpenRTB programmatic bidding pipeline, following the IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 specification.
 
-## Overview (required)
+ARTF defines agent-driven containers that receive an OpenRTB bid request, analyze it, and propose typed *mutations* to the bidstream — adjusting bid prices, activating audience segments, managing private marketplace deals, or adding quality metrics. The host platform applies approved mutations atomically before the auction continues. This Guidance replaces rule-based bidding heuristics with real-time neural network inference served on the GPU, so bidding decisions stay within OpenRTB timeout budgets.
 
-1. Provide a brief overview explaining the what, why, or how of your Guidance. You can answer any one of the following to help you write this:
+The solution provides four ARTF-compliant containers backed by NVIDIA deep learning recommender models served on NVIDIA Triton Inference Server, an orchestration layer for parallel fan-out, and AI agent integration through Amazon Bedrock AgentCore with Model Context Protocol (MCP) support:
 
-    - **Why did you build this Guidance?**
-    - **What problem does this Guidance solve?**
+- **DLRM Bid Shader** (`BID_SHADE`) — predicts click-through rate (CTR) and computes an optimal shaded bid price.
+- **Wide & Deep Segment Activator** (`ACTIVATE_SEGMENTS`) — scores user-segment affinities and activates high-value segments.
+- **NCF Deal Manager** (`ACTIVATE_DEALS` / `SUPPRESS_DEALS`) — predicts user-deal relevance and activates or suppresses private marketplace deals.
+- **Metrics Enricher** (`ADD_METRICS`) — a rule-based container that adds viewability and brand-safety scores, demonstrating that the ARTF container model can mix neural and deterministic logic in one pipeline.
 
-2. Include the architecture diagram image, as well as the steps explaining the high-level overview and flow of the architecture. 
-    - To add a screenshot, create an ‘assets/images’ folder in your repository and upload your screenshot to it. Then, using the relative file path, add it to your README. 
+Three of the four containers (DLRM, Wide & Deep, NCF) run inference against ONNX models hosted on NVIDIA Triton Inference Server using ONNX Runtime and the CUDA Execution Provider on NVIDIA A10G GPUs (`g5.xlarge`). The orchestrator (a Starlette application exposing gRPC as the primary protocol plus MCP and REST) fans each `RTBRequest` out to all four containers in parallel, merges the resulting mutations, and returns a single `RTBResponse`. A React testing frontend (served from Amazon S3 through Amazon CloudFront, authenticated by Amazon Cognito) lets builders submit sample payloads, inspect mutations, and exercise the MCP interface. Test run history is persisted in Amazon DynamoDB.
 
-### Cost ( required )
+### How it works
 
-This section is for a high-level cost estimate. Think of a likely straightforward scenario with reasonable assumptions based on the problem the Guidance is trying to solve. Provide an in-depth cost breakdown table in this section below ( you should use AWS Pricing Calculator to generate cost breakdown ).
+1. **Bid request ingestion** — An OpenRTB bid request arrives through Amazon CloudFront and is routed to the orchestrator.
+2. **Orchestration** — The orchestrator receives the request and fans it out in parallel to the four ARTF containers.
+3. **GPU-accelerated inference** — The DLRM, Wide & Deep, and NCF containers extract features, invoke their assigned model on Triton via `tritonclient.http`, and receive predictions from the GPU. The Metrics Enricher applies rule-based logic on CPU.
+4. **Mutation generation** — Each container translates its result into typed ARTF mutations.
+5. **Response assembly** — The orchestrator merges all mutations into a single `RTBResponse`.
+6. **Mutation application** — The DSP host platform applies the approved mutations to the bidstream before the auction continues.
 
-Start this section with the following boilerplate text:
+### Architecture
 
-_You are responsible for the cost of the AWS services used while running this Guidance. As of <month> <year>, the cost for running this Guidance with the default settings in the <Default AWS Region (Most likely will be US East (N. Virginia)) > is approximately $<n.nn> per month for processing ( <nnnnn> records )._
+![Architecture](assets/images/architecture.svg)
 
-Replace this amount with the approximate cost for running your Guidance in the default Region. This estimate should be per month and for processing/serving resonable number of requests/entities.
+A detailed component-by-component description of the architecture is available at [assets/images/architecture.md](assets/images/architecture.md).
 
-Suggest you keep this boilerplate text:
-_We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance._
+The primary deployment path provisions an Amazon EKS cluster:
 
-### Sample Cost Table ( required )
+- **CPU node group (`c5.xlarge`)** runs the orchestrator behind a Network Load Balancer.
+- **GPU node group (`g5.xlarge`, NVIDIA A10G)** runs NVIDIA Triton Inference Server (`nvcr.io/nvidia/tritonserver:24.08-py3`) serving three ONNX models — `dlrm_bid_shader`, `widedeep_segment_activator`, and `ncf_deal_manager` — loaded from Amazon S3, co-located with the four ARTF containers.
+- **Amazon CloudFront + Amazon S3** serve the React frontend; **Amazon Cognito** authenticates users; the orchestrator verifies Cognito-issued JWTs.
+- **Amazon Bedrock AgentCore** optionally hosts an MCP runtime (ARM64 microVM) that exposes the `extend_rtb` tool for AI agent integration.
 
-**Note : Once you have created a sample cost table using AWS Pricing Calculator, copy the cost breakdown to below table and upload a PDF of the cost estimation on BuilderSpace. Do not add the link to the pricing calculator in the ReadMe.**
+An ECS Fargate path is also provided as an explicit alternative for CPU-only demos without GPU infrastructure (see [Deployment Steps](#deployment-steps)).
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month.
+### Cost
 
-| AWS service  | Dimensions | Cost [USD] |
-| ----------- | ------------ | ------------ |
-| Amazon API Gateway | 1,000,000 REST API calls per month  | $ 3.50month |
-| Amazon Cognito | 1,000 active users per month without advanced security feature | $ 0.00 |
+You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,080 per month** assuming a single-GPU demo configuration with the GPU node group running on a daytime-only schedule.
 
-## Prerequisites (required)
+We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
-### Operating System (required)
+#### Sample cost table
 
-- Talk about the base Operating System (OS) and environment that can be used to run or deploy this Guidance, such as *Mac, Linux, or Windows*. Include all installable packages or modules required for the deployment. 
-- By default, assume Amazon Linux 2/Amazon Linux 2023 AMI as the base environment. All packages that are not available by default in AMI must be listed out.  Include the specific version number of the package or module.
+The following table provides a sample, illustrative cost breakdown for deploying this Guidance with the default demo parameters in the US East (N. Virginia) Region for one month. Figures are example estimates only; actual costs depend on traffic, instance hours, and data transfer. The GPU node group is the dominant cost — this estimate assumes the included scheduled shutdown keeps it running roughly 12 hours per business day (~260 hours/month) rather than 24/7.
 
-**Example:**
-“These deployment instructions are optimized to best work on **<Amazon Linux 2 AMI>**.  Deployment in another OS may require additional steps.”
+| AWS service | Dimensions | Cost [USD/month] |
+| ----------- | ---------- | ---------------- |
+| Amazon EKS | 1 cluster control plane, 730 hrs @ $0.10/hr | $73 |
+| Amazon EC2 (GPU) | 1 × g5.xlarge (NVIDIA A10G), ~260 hrs/month with scheduled shutdown @ ~$1.006/hr | $262 |
+| Amazon EC2 (CPU) | 2 × c5.xlarge, 730 hrs each @ $0.17/hr | $248 |
+| Amazon S3 | ~1 GB model + frontend storage and requests | $1 |
+| Amazon CloudFront | Low-traffic demo, < 10 GB egress | $2 |
+| Amazon Cognito | < 1,000 monthly active users | $0 |
+| Amazon DynamoDB | On-demand, low read/write volume for test history | $1 |
+| Amazon Bedrock AgentCore | Optional MCP runtime, intermittent invocation | $5 |
+| **Total (example estimate)** | | **~$592** |
 
-- Include install commands for packages, if applicable.
+> The headline ~$1,080/month figure reflects running the GPU node 24/7 plus headroom; enabling the included scheduled GPU shutdown brings a typical demo month closer to the ~$592 shown above. For a short demo, deploy, validate, and tear down immediately — a 2-hour session costs only a few dollars.
 
+## Prerequisites
 
-### Third-party tools (If applicable)
+### Operating System
 
-*List any installable third-party tools required for deployment.*
+These deployment instructions are optimized to best work on **macOS** or a **Linux** workstation (for example Amazon Linux 2023 or Ubuntu). Deployment on Windows may require additional steps (for example, running the deployment scripts inside WSL2). The deployment scripts are POSIX shell and Python and assume a Unix-like environment.
 
+### Third-party tools
 
-### AWS account requirements (If applicable)
+Install the following before running the deployment, with the listed minimum versions:
 
-*List out pre-requisites required on the AWS account if applicable, this includes enabling AWS regions, requiring ACM certificate.*
+- **AWS CLI v2** with valid credentials configured (`aws configure`)
+- **Docker** with **buildx** (required for ARM64 cross-compilation of the AgentCore bundle)
+- **Python 3.11+** with `boto3`, `torch`, `onnx`, and `onnxscript` (used to export PyTorch models to ONNX)
+- **jq** (JSON processor)
+- **eksctl** (EKS cluster management)
+- **kubectl** (Kubernetes CLI)
 
-**Example:** “This deployment requires you have public ACM certificate available in your AWS account”
+```bash
+# AWS CLI v2
+aws --version
 
-**Example resources:**
-- ACM certificate 
-- DNS record
-- S3 bucket
-- VPC
-- IAM role with specific permissions
-- Enabling a Region or service etc.
+# Docker with buildx
+docker buildx version
 
+# Python 3.11+ with export/deploy dependencies
+pip install boto3 torch onnx onnxscript
 
-### aws cdk bootstrap (if sample code has aws-cdk)
+# jq, eksctl, kubectl (macOS via Homebrew shown; see each tool's docs for Linux)
+brew install jq eksctl kubectl
+```
 
-<If using aws-cdk, include steps for account bootstrap for new cdk users.>
+The deployment script checks for all of these at startup and fails with a clear message if any are missing.
 
-**Example blurb:** “This Guidance uses aws-cdk. If you are using aws-cdk for first time, please perform the below bootstrapping....”
+### AWS account requirements
 
-### Service limits  (if applicable)
+This deployment requires:
 
-<Talk about any critical service limits that affect the regular functioning of the Guidance. If the Guidance requires service limit increase, include the service name, limit name and link to the service quotas page.>
+- An AWS account with permissions to create Amazon EKS clusters, Amazon EC2 instances (including `g5` GPU instances), Amazon S3 buckets, Amazon ECR repositories, Amazon CloudFront distributions, Amazon Cognito user pools, Amazon DynamoDB tables, and AWS IAM roles.
+- **NVIDIA NGC registry access** to pull the NVIDIA Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`).
+- **NVIDIA GPU service quota** for at least one `g5.xlarge` (NVIDIA A10G) instance in your target Region. In `us-east-1`, confirm the *Running On-Demand G and VT instances* quota is large enough before deploying. If not, request an increase through the [Service Quotas console](https://console.aws.amazon.com/servicequotas/).
 
-### Supported Regions (if applicable)
+### Supported Regions
 
-<If the Guidance is built for specific AWS Regions, or if the services used in the Guidance do not support all Regions, please specify the Region this Guidance is best suited for>
+This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVIDIA A10G (`g5` family) instances, including:
 
+- US East (N. Virginia): `us-east-1` (default)
+- US West (Oregon): `us-west-2`
+- Europe (Ireland): `eu-west-1`
+- Europe (Frankfurt): `eu-central-1`
+- Asia Pacific (Tokyo): `ap-northeast-1`
+- Asia Pacific (Sydney): `ap-southeast-2`
 
-## Deployment Steps (required)
+## Deployment Steps
 
-Deployment steps must be numbered, comprehensive, and usable to customers at any level of AWS expertise. The steps must include the precise commands to run, and describe the action it performs.
+1. Clone the repository:
 
-* All steps must be numbered.
-* If the step requires manual actions from the AWS console, include a screenshot if possible.
-* The steps must start with the following command to clone the repo. ```git clone xxxxxxx```
-* If applicable, provide instructions to create the Python virtual environment, and installing the packages using ```requirement.txt```.
-* If applicable, provide instructions to capture the deployed resource ARN or ID using the CLI command (recommended), or console action.
+   ```bash
+   git clone https://github.com/aws-solutions-library-samples/guidance-for-accelerator-optimized-agentic-bidding-on-aws.git
+   ```
 
- 
-**Example:**
+2. Change into the repository directory:
 
-1. Clone the repo using command ```git clone xxxxxxxxxx```
-2. cd to the repo folder ```cd <repo-name>```
-3. Install packages in requirements using command ```pip install requirement.txt```
-4. Edit content of **file-name** and replace **s3-bucket** with the bucket name in your account.
-5. Run this command to deploy the stack ```cdk deploy``` 
-6. Capture the domain name created by running this CLI command ```aws apigateway ............```
+   ```bash
+   cd guidance-for-accelerator-optimized-agentic-bidding-on-aws
+   ```
 
+3. Confirm your AWS credentials and target Region:
 
+   ```bash
+   aws sts get-caller-identity
+   export AWS_REGION=us-east-1
+   ```
 
-## Deployment Validation  (required)
+4. Authenticate to the NVIDIA NGC registry so Docker can pull the Triton image, then deploy the full solution on the **primary EKS path** using the deployment entry-point script:
 
-<Provide steps to validate a successful deployment, such as terminal output, verifying that the resource is created, status of the CloudFormation template, etc.>
+   ```bash
+   cd deployment
+   ./deploy.sh
+   ```
 
+   `deploy.sh` provisions the entire EKS stack end to end:
 
-**Examples:**
+   | Step | Action |
+   |------|--------|
+   | 1 | Create Amazon ECR repositories |
+   | 2 | Export PyTorch models to ONNX (`../source/triton/export_models.py`) |
+   | 3 | Upload the ONNX model repository to Amazon S3 |
+   | 4 | Build and push container images (AMD64 for EKS, ARM64 for AgentCore) |
+   | 5 | Create the Amazon EKS cluster (`g5.xlarge` GPU + `c5.xlarge` CPU node groups) |
+   | 6 | Install the NVIDIA Kubernetes Device Plugin |
+   | 7 | Configure IAM Roles for Service Accounts (IRSA) for Triton S3 access |
+   | 8 | Apply the Kubernetes manifests in `deployment/eks/` (Triton, ARTF containers, orchestrator, HPA) |
+   | 9 | Deploy the frontend (Amazon S3 + Amazon CloudFront) and Amazon Cognito user pool |
+   | 10 | Register the Amazon Bedrock AgentCore MCP runtime |
 
-* Open CloudFormation console and verify the status of the template with the name starting with xxxxxx.
-* If deployment is successful, you should see an active database instance with the name starting with <xxxxx> in        the RDS console.
-*  Run the following CLI command to validate the deployment: ```aws cloudformation describe xxxxxxxxxxxxx```
+   Useful options:
 
+   ```bash
+   ./deploy.sh --prefix v1                    # namespaced resources (v1-*)
+   ./deploy.sh --prefix prod --skip-agentcore # EKS + frontend only
+   ./deploy.sh --skip-images                  # reuse existing images
+   ./deploy.sh --skip-cluster                 # reuse an existing EKS cluster
+   AWS_REGION=us-west-2 ./deploy.sh           # deploy to a different Region
+   ```
 
+   During deployment you will be prompted (or must set via the `DEMO_USER_PASSWORD` environment variable) for the initial password of the admin-created demo user. The frontend has no self-signup; users are created by an administrator. Choose a strong password and keep it private — it is never printed by the scripts and must not be committed.
 
-## Running the Guidance (required)
+5. **(Alternative) ECS Fargate path.** For a CPU-only demo without provisioning GPU infrastructure, deploy the alternative ECS Fargate stack instead of `deploy.sh`. This path runs the containers with inline CPU inference behind an Application Load Balancer:
 
-<Provide instructions to run the Guidance with the sample data or input provided, and interpret the output received.> 
+   ```bash
+   cd deployment
+   python scripts/deploy_ecs.py
+   ```
 
-This section should include:
+   The ECS Fargate path is intended for rapid demos and does not provide GPU-accelerated Triton inference. The EKS path (`deploy.sh`) remains the primary, production-oriented deployment.
 
-* Guidance inputs
-* Commands to run
-* Expected output (provide screenshot if possible)
-* Output description
+## Deployment Validation
 
+After `deploy.sh` completes, validate the deployment:
 
+1. Confirm the EKS cluster is reachable and nodes are ready:
 
-## Next Steps (required)
+   ```bash
+   kubectl get nodes
+   ```
 
-Provide suggestions and recommendations about how customers can modify the parameters and the components of the Guidance to further enhance it according to their requirements.
+   You should see at least one GPU node (labeled `role: inference`) and the CPU nodes in `Ready` state.
 
+2. Confirm all workloads are running:
 
-## Cleanup (required)
+   ```bash
+   kubectl get pods
+   ```
 
-- Include detailed instructions, commands, and console actions to delete the deployed Guidance.
-- If the Guidance requires manual deletion of resources, such as the content of an S3 bucket, please specify.
+   The Triton server pod, the four ARTF container pods, and the orchestrator pod should all report `Running` with ready containers. Triton may take a few minutes to reach `Ready` while it loads the ONNX models from S3 (startup probes allow for this).
 
+3. Confirm the orchestrator health endpoints respond:
 
+   ```bash
+   kubectl port-forward deploy/orchestrator 8000:8000 &
+   curl -s localhost:8000/health/ready
+   ```
 
-## FAQ, known issues, additional considerations, and limitations (optional)
+4. Confirm the frontend distribution is deployed. The deployment output prints the CloudFront domain; open `https://<CLOUDFRONT_DOMAIN>/` in a browser and confirm the login screen loads.
 
+**Security note:** The frontend is served through Amazon CloudFront using Origin Access Control (OAC) over a private Amazon S3 bucket — the bucket is not publicly readable. All orchestrator API calls require a valid Amazon Cognito JWT: the orchestrator verifies the RS256 signature, issuer, and expiry against the Cognito JWKS on every non-health endpoint. There are no open or unauthenticated application endpoints.
 
-**Known issues (optional)**
+## Running the Guidance
 
-<If there are common known issues, or errors that can occur during the Guidance deployment, describe the issue and resolution steps here>
+1. Open the frontend at `https://<CLOUDFRONT_DOMAIN>/` and sign in with the admin-created demo user and the password set at deploy time. On first login you may be prompted to set a new password (the Cognito `newPasswordRequired` challenge).
 
+2. On the **REST Orchestrator** tab, load one of the bundled OpenRTB sample payloads, optionally edit the JSON, and submit it. Sample payloads are available at:
+   - `source/samples/` — `banner-basic.json`, `bid-shading.json`, `video-deals.json`
+   - `source/frontend-react/public/samples/` — the same payloads served to the browser
 
-**Additional considerations (if applicable)**
+   Expected behavior:
 
-<Include considerations the customer must know while using the Guidance, such as anti-patterns, or billing considerations.>
+   | Sample | What it exercises | Expected mutations |
+   |--------|-------------------|--------------------|
+   | `banner-basic.json` | 300×250 banner on a sports site | `ACTIVATE_SEGMENTS`, `ADD_METRICS` |
+   | `bid-shading.json` | DSP bid above floor on a 728×90 banner | `BID_SHADE` (shaded bid price) |
+   | `video-deals.json` | Video pre-roll with private marketplace deals | `ACTIVATE_DEALS` / `SUPPRESS_DEALS`, `ADD_METRICS` |
 
-**Examples:**
+   The bid shader computes its shaded price from the model output as `min(original_bid, predicted_CTR × $12.0 × 0.65)`, floored at the publisher's `bidfloor` — where `EST_CONVERSION_VALUE = $12.0` and `SHADE_FACTOR = 0.65` (see `source/containers/dlrm_bid_shader/app.py`).
 
-- “This Guidance creates a public AWS bucket required for the use-case.”
-- “This Guidance created an Amazon SageMaker notebook that is billed per hour irrespective of usage.”
-- “This Guidance creates unauthenticated public API endpoints.”
+3. On the **MCP Extension Point** tab, initialize an MCP session and call the `extend_rtb` tool via JSON-RPC to exercise the same containers through the interface AI agents use.
 
+4. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
 
-Provide a link to the *GitHub issues page* for users to provide feedback.
+## Next Steps
 
+You can adapt this Guidance to your own bidding pipeline:
 
-**Example:** *“For any feedback, questions, or suggestions, please use the issues tab under this repo.”*
+- **Bring your own models.** Export your proprietary bidding models to ONNX using `source/triton/export_models.py` as a reference, upload them to the Triton model repository in S3 following the `model_name/version/model.onnx` convention with a `config.pbtxt`, and point the relevant container at the new model name.
+- **Add or swap ARTF containers.** Implement additional ARTF intent logic using the four containers under `source/containers/` as reference implementations, then register them with the orchestrator fan-out.
+- **Scale for production traffic.** The included Horizontal Pod Autoscalers and Cluster Autoscaler scale the orchestrator and Triton pods (and their nodes) with load. For higher QPS, increase node-group capacity in `deployment/eks/cluster-config.yaml` and adjust the HPA targets in `deployment/eks/triton-hpa.yaml`. Consider EC2 Spot Instances or Savings Plans for the GPU node group, and NVIDIA TensorRT optimization of the ONNX models to reduce GPU requirements.
+- **Connect to a live DSP.** Route OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream.
 
-## Revisions (optional)
+## Cleanup
 
-Document all notable changes to this project.
+Tear down all deployed resources using the destroy flag on the deployment script:
 
-Consider formatting this section based on Keep a Changelog, and adhering to Semantic Versioning.
+```bash
+cd deployment
+./deploy.sh --destroy
+```
 
-## Notices ( required )
+To tear down a specific namespaced stack, include the same prefix used at deploy time:
 
-Include below mandatory legal disclaimer for Guidance
+```bash
+./deploy.sh --destroy --prefix v1
+```
 
-*Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided “as is” without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.*
+This removes the EKS cluster (including GPU and CPU node groups), the Kubernetes workloads, the CloudFront distribution, the S3 buckets, the Cognito user pool, and the AgentCore runtime.
 
+**Note:** Amazon ECR repositories are retained by design so cached images are not lost between deployments. If you no longer need them, delete the ECR repositories manually from the Amazon ECR console or with the AWS CLI. Also confirm the S3 model and frontend buckets are emptied and removed if you want to stop all associated storage charges.
 
-## Authors (optional)
+## Notices
 
-Name of code contributors
+*Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.*

@@ -1,0 +1,45 @@
+{
+  "id": "sample-video-deals-001",
+  "tmax": 150,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_EXCHANGE", "id": "exchange-video-001"},
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "SUPPRESS_DEALS", "ADJUST_DEAL_FLOOR", "ADD_METRICS"],
+  "bid_request": {
+    "id": "auction-456",
+    "imp": [
+      {
+        "id": "imp-1",
+        "video": {
+          "mimes": ["video/mp4"],
+          "minduration": 15,
+          "maxduration": 30,
+          "w": 640,
+          "h": 480
+        },
+        "bidfloor": 8.00,
+        "pmp": {
+          "private_auction": true,
+          "deals": [
+            {"id": "deal-premium-video", "bidfloor": 10.00, "at": 1},
+            {"id": "deal-standard-video", "bidfloor": 5.00, "at": 2},
+            {"id": "deal-remnant", "bidfloor": 0.50, "at": 2}
+          ]
+        }
+      }
+    ],
+    "site": {
+      "id": "site-789",
+      "domain": "streaming.example.com",
+      "cat": ["IAB1"]
+    },
+    "user": {
+      "id": "user-456",
+      "yob": 1985,
+      "gender": "F"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      "geo": {"country": "USA", "region": "NY"}
+    }
+  }
+}

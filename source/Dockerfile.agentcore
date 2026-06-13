@@ -1,0 +1,49 @@
+# Dockerfile.agentcore — ARM64 container for Bedrock AgentCore MCP runtime.
+#
+# AgentCore requirements:
+#   - ARM64 architecture
+#   - /ping on :8080 returning {"status": "Healthy"}
+#   - MCP JSON-RPC on :8000 at /mcp
+#   - Non-root user
+#
+# This image bundles all four ARTF containers in-process (ARTF_MODE=local)
+# so the entire recommender pipeline runs inside a single AgentCore microVM.
+
+FROM --platform=linux/arm64 python:3.12-slim
+
+LABEL agent-manifest="{ \
+  \"name\": \"nvidia-artf-recommenders\", \
+  \"version\": \"0.1.0\", \
+  \"vendor\": \"NVIDIA-ARTF\", \
+  \"resources\": {\"cpu\": \"2000m\", \"memory\": \"2048Mi\"}, \
+  \"intents\": [\"ACTIVATE_SEGMENTS\",\"ACTIVATE_DEALS\",\"SUPPRESS_DEALS\",\"BID_SHADE\",\"ADD_METRICS\"], \
+  \"health\": { \
+    \"livenessProbe\": {\"httpGet\": {\"path\": \"/ping\", \"port\": 8080}}, \
+    \"readinessProbe\": {\"httpGet\": {\"path\": \"/ping\", \"port\": 8080}} \
+  } \
+}"
+
+RUN pip install --no-cache-dir \
+    starlette uvicorn[standard] httpx pydantic \
+    torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+WORKDIR /app
+
+# Copy all source
+COPY shared/ /app/shared/
+COPY containers/ /app/containers/
+COPY agentcore/ /app/agentcore/
+
+ENV ARTF_MODE=local
+ENV PYTHONUNBUFFERED=1
+
+RUN adduser --disabled-password --no-create-home appuser
+USER appuser
+
+# AgentCore MCP port + health port
+EXPOSE 8000 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')" || exit 1
+
+CMD ["python", "agentcore/artf_mcp_server.py"]
