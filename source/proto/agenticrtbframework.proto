@@ -1,37 +1,55 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+//
+// Agentic RTB Framework (ARTF) bidstream mutation messages.
+//
+// This file is an independent definition of the message contract described by
+// the public IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 specification
+// (https://iabtechlab.com/standards/artf/). It is authored from the published
+// specification for interoperability and is NOT derived from, nor a copy of,
+// the AGPL-licensed ARTF reference implementation. Field names, tags, and types
+// are reproduced only to the extent required for on-the-wire compatibility with
+// conforming ARTF hosts.
+//
+// The imported OpenRTB definitions (com.iabtechlab.openrtb.v2) are distributed
+// separately under the Apache License 2.0 and retain their own copyright header.
+
 edition = "2023";
 
 package com.iabtechlab.bidstream.mutation.v1;
 
-// Import OpenRTB definitions for BidRequest and BidResponse
 import "com/iabtechlab/openrtb/v2.6/openrtb.proto";
 
-// ------------------- Messages -------------------
+// ------------------------------------------------------------------------
+// Request / response envelope exchanged with an ARTF extension point.
+// ------------------------------------------------------------------------
 
+// Payload an exchange sends to an extension point at a given auction stage.
 message RTBRequest {
-  // As per Programmatic Auction Definition IAB TL doc/spec
+  // Auction lifecycle stage at which mutations are being solicited.
   Lifecycle lifecycle = 1;
 
-  // ID of the extension point request, assigned by the exchange, and unique for the
-  // exchange's subsequent tracking of the responses. The exchange may use
-  // different values for different recipients.
+  // Exchange-assigned identifier used to correlate this request with its
+  // response. Need not be unique across recipients.
   string id = 2;
 
-  // Maximum time in milliseconds the exchange allows for mutations to be received including latency to avoid timeout
+  // Upper bound, in milliseconds, the exchange will wait for mutations
+  // (including network latency) before treating the call as timed out.
   int32 tmax = 3;
 
-  // Bid request
+  // The OpenRTB bid request under consideration.
   com.iabtechlab.openrtb.v2.BidRequest bid_request = 4;
 
-  // Bid response
+  // The OpenRTB bid response under consideration, when applicable.
   com.iabtechlab.openrtb.v2.BidResponse bid_response = 5;
 
-  // Business entity that created and owns the enclosed BidRequest or BidResponse
+  // The entity that owns the enclosed bid request or bid response.
   Originator originator = 6;
 
-  // List of intents the server is eligibible to send back
+  // Intents the responder is permitted to return for this request.
   repeated Intent applicable_intents = 7;
 
-  // Extension fields
+  // Reserved extension envelope.
   Ext ext = 99;
 
   message Ext {
@@ -39,28 +57,30 @@ message RTBRequest {
   }
 }
 
+// Auction lifecycle stages at which an extension point may be invoked.
 enum Lifecycle {
-  // Placeholder to Define Programmatic Auction Definition Stages
   LIFECYCLE_UNSPECIFIED = 0;
 
+  // Invoked against a publisher-originated bid request.
   LIFECYCLE_PUBLISHER_BID_REQUEST = 1;
 
+  // Invoked against a DSP-originated bid response.
   LIFECYCLE_DSP_BID_RESPONSE = 2;
-
-  // More to be added
 }
 
+// Set of mutations returned by an extension point for a given request.
 message RTBResponse {
-  // ID of the extension point request to which this is a response.
+  // Echoes RTBRequest.id so the exchange can correlate the response.
   string id = 1;
 
-  // List of mutations suggesting changes to be applied
+  // Proposed changes for the exchange to apply.
   repeated Mutation mutations = 2;
 
-  // Metadata about the response
+  // Optional descriptive metadata about how the response was produced.
   Metadata metadata = 3;
 }
 
+// The business entity responsible for the enclosed request/response.
 message Originator {
   enum Type {
     TYPE_UNSPECIFIED = 0;
@@ -74,131 +94,138 @@ message Originator {
   string id = 2;
 }
 
+// ------------------------------------------------------------------------
+// Mutations.
+// ------------------------------------------------------------------------
+
+// A single proposed change to the bidstream.
 message Mutation {
-  // The purpose of the mutation
+  // What the mutation is intended to accomplish.
   Intent intent = 1;
 
-  // Defines the operation to perform (e.g. add, remove, replace) on the target data at the given path
+  // How the change is applied to the target (add / remove / replace).
   Operation op = 2;
 
-  // The semantic business domain of where the operation will be applied
+  // Business-domain location the operation targets.
   string path = 3;
 
-  // The structure of value depends on the specified intent.
-  // Reserve 100+ for intent-specific payloads
+  // Intent-specific payload. Tags at 100+ are reserved per payload type.
   oneof value {
-    // List of string Identifiers
+    // A list of opaque string identifiers (segments, deals, content IDs).
     IDsPayload ids = 100;
 
-    // Adjust properties of a specific deal
+    // Adjustments to a specific deal's economics.
     AdjustDealPayload adjust_deal = 101;
 
-    // Adjust the bid price
+    // Adjustment to a bid price.
     AdjustBidPayload adjust_bid = 102;
 
-    // Metrics or telemetry data
+    // Quality or telemetry metrics to attach.
     MetricsPayload metrics = 103;
 
-    // Content data
+    // Content data to attach.
     DataPayload content_data = 104;
   }
 
-  // Reserved for experimental/test payloads
+  // Reserved for experimental or test payloads.
   reserved 1000 to 1999;
 }
 
+// The kind of change an operation performs on the target data.
 enum Operation {
   OPERATION_UNSPECIFIED = 0;
   OPERATION_ADD = 1;
   OPERATION_REMOVE = 2;
   OPERATION_REPLACE = 3;
-
-  // More operations can be added in the future
 }
 
+// The purpose of a mutation. Determines which oneof payload is expected.
 enum Intent {
   INTENT_UNSPECIFIED = 0;
 
-  // Activate user segments by their external segment IDs
+  // Activate audience segments by external segment ID.
   ACTIVATE_SEGMENTS = 1;
 
-  // Activate deals by their external deal IDs
+  // Activate deals by external deal ID.
   ACTIVATE_DEALS = 2;
 
-  // Suppress deals by their external deal IDs
+  // Suppress deals by external deal ID.
   SUPPRESS_DEALS = 3;
 
-  // Adjust the bid floor of a specific deal
+  // Adjust the bid floor of a specific deal.
   ADJUST_DEAL_FLOOR = 4;
 
-  // Adjust the deal margin of a specific deal
+  // Adjust the margin of a specific deal.
   ADJUST_DEAL_MARGIN = 5;
 
-  // Adjust the bid price of a specific bid
+  // Shade (adjust) the price of a specific bid.
   BID_SHADE = 6;
 
-  // Add metrics to an impression
+  // Attach metrics to an impression.
   ADD_METRICS = 7;
 
-  // Add extended content IDs
+  // Attach extended content identifiers.
   ADD_CIDS = 8;
 
-  // More intents can be added in the future
-
-  // Reserved for experimental/test intents
+  // Reserved for experimental or test intents.
   reserved 1000 to 1999;
 }
 
+// Descriptive metadata about the responder and the model used, if any.
 message Metadata {
-  // Version of the data provider API
+  // Version of the responder's API.
   string api_version = 1;
 
-  // The model version utilized by the container or API to compute the mutation if applicable
+  // Version of the model used to compute the mutation, when applicable.
   string model_version = 2;
-
-  // More metadata fields can be added in the future
 }
 
+// ------------------------------------------------------------------------
+// Mutation payloads.
+// ------------------------------------------------------------------------
+
+// A list of identifiers; the meaning is determined by the mutation's intent.
 message IDsPayload {
-  // List of IDs. Context of the ID is determined by the intent
   repeated string id = 1;
 }
 
+// Adjustments to the economics of a deal.
 message AdjustDealPayload {
-  // Suggested bid floor for the deal
+  // Suggested bid floor for the deal.
   double bidfloor = 1;
 
-  // Suggested margin for the deal
+  // Suggested margin for the deal.
   Margin margin = 2;
 }
 
+// A margin value and how it should be interpreted.
 message Margin {
-  // The adjusted margin value
+  // The margin amount.
   double value = 1;
 
-  // The type of margin adjustment
   enum CalculationType {
-    // Absolute margin adjustment
+    // Absolute adjustment expressed as CPM.
     CPM = 0;
 
-    // Relative margin adjustment (percentage)
+    // Relative adjustment expressed as a percentage.
     PERCENT = 1;
   }
 
   CalculationType calculation_type = 2;
 }
 
+// An adjusted bid price.
 message AdjustBidPayload {
-  // The adjusted bid price
   double price = 1;
 }
 
+// Metrics to add, reusing the OpenRTB impression Metric type
+// (nested under BidRequest.Imp in the OpenRTB schema).
 message MetricsPayload {
-  // List of metrics to add
-  repeated com.iabtechlab.openrtb.v2.BidRequest.Metric metric = 1;
+  repeated com.iabtechlab.openrtb.v2.BidRequest.Imp.Metric metric = 1;
 }
 
+// Content data to add, reusing the OpenRTB Data type.
 message DataPayload {
-  // List of data to add
   repeated com.iabtechlab.openrtb.v2.BidRequest.Data data = 1;
 }
