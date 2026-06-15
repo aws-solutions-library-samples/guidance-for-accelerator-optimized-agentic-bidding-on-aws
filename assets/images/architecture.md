@@ -24,6 +24,16 @@ Triton serves **three ONNX models** (DLRM, Wide & Deep, NCF) on a single NVIDIA
 **A10G GPU** (`g5.xlarge`) using ONNX Runtime with the CUDA Execution Provider. The
 metrics enricher is rule-based and needs no GPU model.
 
+> **Note on the models.** These three models are *reference architectures* following
+> the published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) and NVIDIA Merlin
+> (Wide & Deep) designs. They are defined in `source/triton/export_models.py` and
+> exported to ONNX with **randomly initialized (seeded) weights** — they are **not
+> pretrained or production-trained**. They exist to demonstrate the GPU inference path
+> and the ARTF container/Triton integration; train the architectures on your own data
+> (or supply your own ONNX models) before relying on their predictions. The Triton
+> Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine
+> upstream NVIDIA NGC container.
+
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
 Amazon Cognito JWT, and **fans out in parallel** to the four containers over gRPC
 (primary ARTF protocol) with an MCP/REST path for AI-agent and tool interoperability.
