@@ -27,9 +27,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-}"
-RUNTIME_NAME="$(echo "${STACK_PREFIX:+${STACK_PREFIX}_}nvidia_artf_recommenders_mcp" | tr '-' '_')"
-ECR_REPO_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}nvidia-artf-recommenders-agentcore"
-ROLE_NAME="NvidiaArtfAgentCoreRole-$(python3 -c "import hashlib; print(hashlib.sha256('${RUNTIME_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 DESTROY=0
@@ -50,6 +47,10 @@ for arg in "$@"; do
 done
 unset _PREV_ARG
 
+# Resource names derive from STACK_PREFIX, which may have been set by --prefix above.
+RUNTIME_NAME="$(echo "${STACK_PREFIX:+${STACK_PREFIX}_}nvidia_artf_recommenders_mcp" | tr '-' '_')"
+ECR_REPO_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}nvidia-artf-recommenders-agentcore"
+
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[deploy][warn]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[deploy][fail]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -66,6 +67,8 @@ ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account"
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 IMAGE_URI="${REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
+# ROLE_NAME depends on ACCOUNT_ID (resolved just above) and RUNTIME_NAME.
+ROLE_NAME="NvidiaArtfAgentCoreRole-$(python3 -c "import hashlib; print(hashlib.sha256('${RUNTIME_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
 
 log "Account=${ACCOUNT_ID}  Region=${AWS_REGION}  Image=${IMAGE_URI}"
 

@@ -17,6 +17,8 @@ metadata:
   name: __STACK_NAME__-triton
   region: __REGION__
   version: "1.31"
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
 
 managedNodeGroups:
   # GPU node group for Triton Inference Server

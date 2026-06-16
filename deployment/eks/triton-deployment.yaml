@@ -18,6 +18,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: triton-inference-server
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
   labels:
     app: triton
     component: inference

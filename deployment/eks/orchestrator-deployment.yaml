@@ -6,6 +6,8 @@ kind: Deployment
 metadata:
   name: orchestrator
   namespace: artf
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
   labels:
     app: artf
     component: orchestrator
