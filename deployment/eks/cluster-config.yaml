@@ -22,9 +22,9 @@ managedNodeGroups:
   # GPU node group for Triton Inference Server
   - name: gpu-inference
     instanceType: g5.xlarge
-    desiredCapacity: 2
+    desiredCapacity: 1
     minSize: 1
-    maxSize: 5
+    maxSize: __MAX_GPUS__
     volumeSize: 100
     labels:
       nvidia.com/gpu: "present"

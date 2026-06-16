@@ -21,6 +21,7 @@
 #   ./deploy.sh --ui-only                      # redeploy frontend only (fast)
 #   ./deploy.sh --skip-cluster                 # reuse existing EKS cluster
 #   ./deploy.sh --export-only                  # just export ONNX models, no deploy
+#   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
 #   ./deploy.sh --destroy                      # tear down the entire stack
 #   AWS_REGION=us-west-2 ./deploy.sh           # different region
 #
@@ -45,6 +46,7 @@ SKIP_IMAGES=0
 UI_ONLY=0
 SKIP_CLUSTER=0
 EXPORT_ONLY=0
+MAX_GPUS="${MAX_GPUS:-3}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 for arg in "$@"; do
   case "${arg}" in
@@ -56,16 +58,26 @@ for arg in "$@"; do
     --export-only)      EXPORT_ONLY=1 ;;
     --prefix=*)         STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)           ;; # value comes in next arg, handled below
-    -h|--help)          sed -n '2,20p' "$0"; exit 0 ;;
+    --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}" ;;
+    --maxGPUs)          ;; # value comes in next arg, handled below
+    -h|--help)          sed -n '2,24p' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
         STACK_PREFIX="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--maxGPUs" ]]; then
+        MAX_GPUS="${arg}"
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
 unset _PREV_ARG
+
+# Validate --maxGPUs: must be a positive integer (it caps the GPU node group's maxSize)
+if ! [[ "${MAX_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+  printf '\033[0;31m[fail]\033[0m %s\n' "--maxGPUs must be a positive integer (got '${MAX_GPUS}')" >&2
+  exit 1
+fi
 
 # Apply prefix to stack name AFTER arg parsing
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
@@ -344,9 +356,11 @@ if [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
     log "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
   else
     log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
+    log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
     CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
     sed -e "s/__STACK_NAME__/${STACK_NAME}/g" \
         -e "s/__REGION__/${AWS_REGION}/g" \
+        -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
         "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${CLUSTER_CONFIG}"
     eksctl create cluster -f "${CLUSTER_CONFIG}"
   fi
