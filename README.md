@@ -184,8 +184,11 @@ This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVI
    ./deploy.sh --prefix prod --skip-agentcore # EKS + frontend only
    ./deploy.sh --skip-images                  # reuse existing images
    ./deploy.sh --skip-cluster                 # reuse an existing EKS cluster
+   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size (default 3)
    AWS_REGION=us-west-2 ./deploy.sh           # deploy to a different Region
    ```
+
+   The GPU node group starts at a single `g5.xlarge` (desired capacity 1) and can scale out to `--maxGPUs` nodes (default 3) under load.
 
    During deployment you will be prompted (or must set via the `DEMO_USER_PASSWORD` environment variable) for the initial password of the admin-created demo user. The frontend has no self-signup; users are created by an administrator. Choose a strong password and keep it private — it is never printed by the scripts and must not be committed.
 
@@ -260,7 +263,7 @@ You can adapt this Guidance to your own bidding pipeline:
   2. **Align the feature contract.** A real model's input schema will differ from the small synthetic tensors used here (e.g., DLRM's `dense_features [4]` + three sparse inputs over a vocabulary of 1000). Update each container's feature-engineering in `source/containers/<name>/app.py` so the tensors it builds match the trained model's expected inputs, and update the corresponding `config.pbtxt` I/O (`name`, `dims`, `data_type`) to match the new ONNX signature. Plan for recsys-specific concerns: large sparse embedding tables, a hashing/collision strategy for high-cardinality IDs, train/serve feature skew, and periodic retraining as your catalog drifts.
   3. **Export and serve.** Produce the new `model.onnx`, place it under `source/triton/model_repository/<model_name>/<version>/model.onnx` with its `config.pbtxt`, and re-run `deployment/deploy.sh` (or `./deploy.sh --export-only` to regenerate models only). Triton loads from the S3 model repository at startup. Point the relevant container at the new model name. The integration plumbing is model-agnostic — swapping in a trained model is a config-and-upload step; the training and feature alignment above are where the real effort lives.
 - **Add or swap ARTF containers.** Implement additional ARTF intent logic using the four containers under `source/containers/` as reference implementations, then register them with the orchestrator fan-out.
-- **Scale for production traffic.** The included Horizontal Pod Autoscalers and Cluster Autoscaler scale the orchestrator and Triton pods (and their nodes) with load. For higher QPS, increase node-group capacity in `deployment/eks/cluster-config.yaml` and adjust the HPA targets in `deployment/eks/triton-hpa.yaml`. Consider EC2 Spot Instances or Savings Plans for the GPU node group, and NVIDIA TensorRT optimization of compatible ONNX models to improve inference efficiency.
+- **Scale for production traffic.** The included Horizontal Pod Autoscalers and Cluster Autoscaler scale the orchestrator and Triton pods (and their nodes) with load. The GPU node group defaults to a single node and scales out to `--maxGPUs` (default 3); raise that ceiling at deploy time (e.g. `./deploy.sh --maxGPUs 5`) or edit `deployment/eks/cluster-config.yaml`, and adjust the HPA targets in `deployment/eks/triton-hpa.yaml`. Consider EC2 Spot Instances or Savings Plans for the GPU node group, and NVIDIA TensorRT optimization of compatible ONNX models to improve inference efficiency.
 - **Connect to a live DSP.** Route OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream.
 
 ## Cleanup
@@ -272,15 +275,28 @@ cd deployment
 ./deploy.sh --destroy
 ```
 
+The script prompts for confirmation before deleting anything — type `destroy` when asked to proceed.
+
 To tear down a specific namespaced stack, include the same prefix used at deploy time:
 
 ```bash
 ./deploy.sh --destroy --prefix v1
 ```
 
-This removes the EKS cluster (including GPU and CPU node groups), the Kubernetes workloads, the CloudFront distribution, the S3 buckets, the Cognito user pool, and the AgentCore runtime.
+`--destroy` removes, in order:
 
-**Note:** Amazon ECR repositories are retained by design so cached images are not lost between deployments. If you no longer need them, delete the ECR repositories manually from the Amazon ECR console or with the AWS CLI. Also confirm the S3 model and frontend buckets are emptied and removed if you want to stop all associated storage charges.
+- **Kubernetes workloads** — the manifests under `deployment/eks/` and the `artf` namespace.
+- **The Amazon EKS cluster** (GPU and CPU node groups, and their Auto Scaling groups including the scheduled GPU shutdown action) via `eksctl delete cluster`. Because eksctl enables CloudFormation termination protection on the stacks it creates, the script first disables it on each `eksctl-<cluster>-*` stack.
+- **Amazon S3 Triton model bucket** (`--force` empties it first).
+- **Amazon DynamoDB** load-test history table.
+- **Amazon CloudFront distribution + frontend S3 bucket** (via `deploy_frontend.py`).
+- **Amazon Bedrock AgentCore** MCP runtime.
+- **Amazon Cognito** user pool.
+- **AWS IAM** customer-managed policies (Triton S3, DynamoDB load-test, EKS GPU scaling) and the AgentCore execution role.
+
+**Required permission for teardown:** disabling termination protection needs `cloudformation:UpdateTerminationProtection`. If your session denies that action (for example, a restricted Isengard/SSO session policy), the script logs a warning and the EKS stacks will not delete — re-run `--destroy` from a session that allows the action.
+
+**Retained by design:** Amazon ECR repositories are kept so cached images survive between deployments. Delete them manually from the Amazon ECR console or CLI if no longer needed. If you want to stop all storage charges, also confirm the S3 model and frontend buckets are fully emptied and removed.
 
 ## Notices
 
