@@ -21,8 +21,19 @@ calls **NVIDIA Triton Inference Server** for GPU-accelerated inference:
 | Metrics enricher (`metrics_enricher`) | `ADD_METRICS` | Rule-based (no Triton) |
 
 Triton serves **three ONNX models** (DLRM, Wide & Deep, NCF) on a single NVIDIA
-**A10G GPU** (`g5.xlarge`) using ONNX Runtime with the CUDA Execution Provider. The
-metrics enricher is rule-based and needs no GPU model.
+**A10G GPU** (`g5.xlarge`) using ONNX Runtime with the CUDA Execution Provider; for
+higher throughput, the more powerful Amazon EC2 **G7e** instances are an
+alternative. The metrics enricher is rule-based and needs no GPU model.
+
+> **Note on the models.** These three models are *reference architectures* following
+> the published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) and NVIDIA Merlin
+> (Wide & Deep) designs. They are defined in `source/triton/export_models.py` and
+> exported to ONNX with **randomly initialized (seeded) weights** — they are **not
+> pretrained or production-trained**. They exist to demonstrate the GPU inference path
+> and the ARTF container/Triton integration; train the architectures on your own data
+> (or supply your own ONNX models) before relying on their predictions. The Triton
+> Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine
+> upstream NVIDIA NGC container.
 
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
 Amazon Cognito JWT, and **fans out in parallel** to the four containers over gRPC
@@ -52,7 +63,7 @@ graph TB
         NLB["Network Load Balancer"]
         ORCH["Orchestrator (Starlette)<br/>JWT verify + parallel fan-out<br/>gRPC primary · MCP/REST"]
 
-        subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G"]
+        subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G (or Amazon EC2 G7e)"]
             TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + CUDA EP<br/>3 models on GPU"]
             DLRM_C["DLRM bid shader<br/>BID_SHADE"]
             WD_C["Wide & Deep segment activator<br/>ACTIVATE_SEGMENTS"]
@@ -111,7 +122,7 @@ graph TB
 5. The DLRM, Wide & Deep, and NCF containers call **Triton** via `tritonclient` for
    GPU inference; the metrics enricher returns rule-based mutations.
 6. **Triton** loads the three ONNX models from the **S3 model repository** at startup
-   and runs inference on the A10G GPU.
+   and runs inference on the A10G GPU (or the more powerful Amazon EC2 G7e).
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
    it through the NLB and CloudFront to the caller.
 
@@ -123,7 +134,7 @@ runtime.
 
 - **Primary — Amazon EKS** via `deployment/deploy.sh`: provisions ECR repositories,
   exports and uploads ONNX models to S3, builds and pushes images, creates/reuses the
-  EKS cluster (GPU `g5.xlarge` + CPU `c5.xlarge` node groups), installs the NVIDIA
+  EKS cluster (GPU `g5.xlarge` — or the more powerful Amazon EC2 G7e — + CPU `c5.xlarge` node groups), installs the NVIDIA
   device plugin, applies the manifests under `deployment/eks/`, and deploys the
   frontend (S3 + CloudFront + Cognito).
 - **Alternative — Amazon ECS Fargate** via `deployment/scripts/deploy_ecs.py`: an

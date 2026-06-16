@@ -93,7 +93,7 @@
 
   <!-- GPU region + Triton -->
   <rect x="48" y="540" width="624" height="118" rx="10" fill="#f3f8e8" stroke="#5a8f00" stroke-width="1.3" stroke-dasharray="6 4"/>
-  <text x="64" y="560" font-size="12" font-weight="bold" fill="#5a8f00">GPU node — g5.xlarge · NVIDIA A10G</text>
+  <text x="64" y="560" font-size="12" font-weight="bold" fill="#5a8f00">GPU node — g5.xlarge · NVIDIA A10G (alt: Amazon EC2 G7e (Blackwell))</text>
 
   <rect x="160" y="572" width="400" height="70" rx="9" fill="#e3f0c4" stroke="#5a8f00" stroke-width="2"/>
   <text x="360" y="598" text-anchor="middle" font-size="14" font-weight="bold" fill="#2f4d00">NVIDIA Triton Inference Server</text>
