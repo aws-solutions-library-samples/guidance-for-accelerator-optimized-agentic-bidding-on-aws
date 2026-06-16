@@ -116,6 +116,19 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   kubectl delete namespace artf --ignore-not-found 2>/dev/null || true
 
   log "Deleting EKS cluster ${CLUSTER_NAME}..."
+  # Disable termination protection on eksctl-managed stacks first, in case
+  # the cluster was deployed before Step 5.5 existed (eksctl enables it by
+  # default). Requires cloudformation:UpdateTerminationProtection.
+  for stack in $(aws cloudformation list-stacks \
+      --region "${AWS_REGION}" \
+      --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE \
+      --query "StackSummaries[?starts_with(StackName, 'eksctl-${CLUSTER_NAME}-')].StackName" \
+      --output text 2>/dev/null); do
+    aws cloudformation update-termination-protection \
+      --stack-name "${stack}" --no-enable-termination-protection \
+      --region "${AWS_REGION}" >/dev/null 2>&1 \
+      || warn "  Could not disable termination protection on ${stack} (need cloudformation:UpdateTerminationProtection)"
+  done
   eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null || true
 
   log "Deleting Triton model bucket..."
@@ -339,6 +352,39 @@ if [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
   fi
 else
   warn "Skipping EKS cluster creation (--skip-cluster)"
+fi
+
+# =========================================================================
+# Step 5.5: Disable termination protection on eksctl-managed stacks
+# =========================================================================
+# eksctl enables CloudFormation termination protection on the cluster,
+# nodegroup, and addon stacks it creates, and the ClusterConfig schema
+# (deployment/eks/cluster-config.yaml) exposes no option to opt out. We
+# disable it here so a later `./deploy.sh --destroy` (or `eksctl delete
+# cluster`) is not blocked at teardown. This requires the deploying
+# principal to hold cloudformation:UpdateTerminationProtection; if that
+# action is denied (e.g. by a restrictive session policy), teardown will
+# need a session that allows it.
+log "Step 5.5: Disabling termination protection on eksctl-managed stacks"
+EKSCTL_STACKS="$(aws cloudformation list-stacks \
+  --region "${AWS_REGION}" \
+  --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE \
+  --query "StackSummaries[?starts_with(StackName, 'eksctl-${CLUSTER_NAME}-')].StackName" \
+  --output text 2>/dev/null || echo '')"
+if [[ -z "${EKSCTL_STACKS}" ]]; then
+  warn "  No eksctl-managed stacks found for ${CLUSTER_NAME} (skipping)"
+else
+  for stack in ${EKSCTL_STACKS}; do
+    if aws cloudformation update-termination-protection \
+         --stack-name "${stack}" \
+         --no-enable-termination-protection \
+         --region "${AWS_REGION}" >/dev/null 2>&1; then
+      log "  Termination protection disabled: ${stack}"
+    else
+      warn "  Could not disable termination protection on ${stack}"
+      warn "    (missing cloudformation:UpdateTerminationProtection? teardown will need a session that allows it)"
+    fi
+  done
 fi
 
 aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"

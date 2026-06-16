@@ -1,0 +1,131 @@
+# Part 2 — Closed-Loop Learning
+# Simplifies the Part 1 real-time path into a single block and adds the two
+# feedback loops: a batch retraining loop and an agentic parameter-tuning loop,
+# plus governed zero-downtime deployment. SageMaker is intentionally not shown;
+# the training step is represented as generic GPU retraining.
+
+direction: down
+
+title: |md
+  # Accelerator-Optimized Agentic Bidding — Part 2: Closed-Loop Learning
+| {
+  near: top-center
+  style.font-size: 28
+  style.bold: true
+}
+
+exchange: "Ad Exchange / DSP\nOpenRTB bidstream" {
+  shape: cloud
+  style.fill: "#EFE9FB"
+  style.stroke: "#8C4FFF"
+}
+
+aws: "AWS Cloud" {
+  style.stroke: "#232F3E"
+  style.font-size: 20
+  style.bold: true
+  grid-columns: 2
+
+  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 4 ARTF containers" {
+    style.fill: "#FDEBD0"
+    style.stroke: "#ED7100"
+    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n3 ONNX models" {
+      style.fill: "#76b900"
+      style.stroke: "#5a8c00"
+      style.font-color: "#000000"
+    }
+  }
+
+  params: "Parameter Store (DynamoDB)\nshade_factor · conversion_value" {
+    shape: cylinder
+    style.fill: "#F7D9F9"
+    style.stroke: "#C925D1"
+  }
+
+  feedback: "Feedback Data Pipeline" {
+    style.stroke: "#8C4FFF"
+    style.font-size: 20
+    direction: right
+    kds: "Kinesis Data Stream\nBid Outcomes"
+    kdf: "Kinesis Data Firehose\nBuffer + partition"
+    s3raw: "Amazon S3\nRaw Outcomes (Parquet)" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    glue: "AWS Glue ETL\nFeature Engineering"
+    s3train: "Amazon S3\nTraining Data" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    kds -> kdf -> s3raw -> glue -> s3train
+  }
+
+  retrain: "Batch Retraining Loop (GPU)" {
+    style.stroke: "#76b900"
+    direction: down
+    style.font-size: 20
+    nemo: "NVIDIA NeMo-RL\nRL policy optimization" {
+      style.fill: "#76b900"
+      style.stroke: "#5a8c00"
+      style.font-color: "#000000"
+    }
+    registry: "Model Registry\nVersioned artifacts + lineage" {
+      shape: cylinder
+    }
+    nemo -> registry: "register new version"
+  }
+
+  agents: "Amazon Bedrock AgentCore Runtimes" {
+    style.stroke: "#ED7100"
+    gov: "Model Governance Agent\nA/B test + approval gate"
+    bsa: "Bid Shading Strategy Agent\ntunes pricing parameters"
+  }
+
+  deploy: "Zero-Downtime Deployment" {
+    style.stroke: "#76b900"
+    direction: down
+    nim: "NVIDIA NIM\nTensorRT optimization" {
+      style.fill: "#76b900"
+      style.stroke: "#5a8c00"
+      style.font-color: "#000000"
+    }
+    canary: "Canary Deployer\nProgressive rollout"
+    nim -> canary: "optimized model"
+  }
+
+  events: "Amazon EventBridge\nRule + Scheduler" {
+    style.fill: "#FBD7E8"
+    style.stroke: "#E7157B"
+  }
+
+  cw: "Amazon CloudWatch\nMetrics" {
+    style.fill: "#FBD7E8"
+    style.stroke: "#E7157B"
+  }
+}
+
+exchange -> aws.rtb: "OpenRTB BidRequest"
+aws.rtb -> exchange: "RTBResponse (mutations)"
+
+# Feedback collection
+aws.rtb -> aws.feedback.kds: "bid outcomes (win/loss, price, CTR)"
+
+# Batch retraining
+aws.feedback.s3train -> aws.retrain.nemo: "labeled training data"
+aws.retrain.registry -> aws.events: "new version registered"
+
+# Governance + deployment
+aws.events -> aws.agents.gov: "invoke (rule)"
+aws.agents.gov -> aws.deploy.nim: "approved"
+aws.deploy.canary -> aws.rtb.triton: "canary → promote"
+
+# Agentic parameter-tuning loop
+aws.rtb -> aws.cw: "metrics"
+aws.events -> aws.agents.bsa: "invoke (every 5 min)"
+aws.cw -> aws.agents.bsa: "win rate, cost, revenue"
+aws.agents.bsa -> aws.params: "update params"
+aws.params -> aws.rtb: "read at inference" {
+  style.stroke-dash: 4
+}

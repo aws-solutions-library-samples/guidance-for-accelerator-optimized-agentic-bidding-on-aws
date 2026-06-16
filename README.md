@@ -30,7 +30,7 @@ The solution provides four ARTF-compliant containers backed by industry-standard
 - **NCF Deal Manager** (`ACTIVATE_DEALS` / `SUPPRESS_DEALS`) — predicts user-deal relevance and activates or suppresses private marketplace deals.
 - **Metrics Enricher** (`ADD_METRICS`) — a rule-based container that adds viewability and brand-safety scores, demonstrating that the ARTF container model can mix neural and deterministic logic in one pipeline.
 
-Three of the four containers (DLRM, Wide & Deep, NCF) run inference against ONNX models hosted on NVIDIA Triton Inference Server using ONNX Runtime and the CUDA Execution Provider on NVIDIA A10G GPUs (`g5.xlarge`). The orchestrator (a Starlette application exposing gRPC as the primary protocol plus MCP and REST) fans each `RTBRequest` out to all four containers in parallel, merges the resulting mutations, and returns a single `RTBResponse`. A React testing frontend (served from Amazon S3 through Amazon CloudFront, authenticated by Amazon Cognito) lets builders submit sample payloads, inspect mutations, and exercise the MCP interface. Test run history is persisted in Amazon DynamoDB.
+Three of the four containers (DLRM, Wide & Deep, NCF) run inference against ONNX models hosted on NVIDIA Triton Inference Server using ONNX Runtime and the CUDA Execution Provider on NVIDIA A10G GPUs (`g5.xlarge`); for higher throughput, the more powerful Amazon EC2 G7e instances — accelerated by NVIDIA RTX PRO 6000 Blackwell Server Edition GPUs — are an alternative. The orchestrator (a Starlette application exposing gRPC as the primary protocol plus MCP and REST) fans each `RTBRequest` out to all four containers in parallel, merges the resulting mutations, and returns a single `RTBResponse`. A React testing frontend (served from Amazon S3 through Amazon CloudFront, authenticated by Amazon Cognito) lets builders submit sample payloads, inspect mutations, and exercise the MCP interface. Test run history is persisted in Amazon DynamoDB.
 
 > **Note on the models.** The bundled DLRM, Wide & Deep, and NCF implementations are industry-standard deep learning recommender model examples served through NVIDIA Triton Inference Server; they use seeded random weights to exercise the GPU-accelerated inference path but do not make meaningful predictions. The fourth container is a CPU/rule-based Metrics Enricher. The models are defined in `source/triton/export_models.py` and exported to ONNX with **randomly initialized (seeded) weights** — they are **not pretrained or production-trained models**, and their predictions are not meaningful until you train the architectures on your own data (or substitute your own ONNX models — see [Next Steps](#next-steps)). The NVIDIA Triton Inference Server image itself (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine upstream NVIDIA NGC container.
 
@@ -52,7 +52,7 @@ A detailed component-by-component description of the architecture is available a
 The primary deployment path provisions an Amazon EKS cluster:
 
 - **CPU node group (`c5.xlarge`)** runs the orchestrator behind a Network Load Balancer.
-- **GPU node group (`g5.xlarge`, NVIDIA A10G)** runs NVIDIA Triton Inference Server (`nvcr.io/nvidia/tritonserver:24.08-py3`) serving three ONNX models — `dlrm_bid_shader`, `widedeep_segment_activator`, and `ncf_deal_manager` — loaded from Amazon S3, co-located with the four ARTF containers.
+- **GPU node group (`g5.xlarge`, NVIDIA A10G)** runs NVIDIA Triton Inference Server (`nvcr.io/nvidia/tritonserver:24.08-py3`) serving three ONNX models — `dlrm_bid_shader`, `widedeep_segment_activator`, and `ncf_deal_manager` — loaded from Amazon S3, co-located with the four ARTF containers. For higher throughput, the more powerful Amazon EC2 G7e instances are an alternative to the A10G `g5.xlarge`.
 - **Amazon CloudFront + Amazon S3** serve the React frontend; **Amazon Cognito** authenticates users; the orchestrator verifies Cognito-issued JWTs.
 - **Amazon Bedrock AgentCore** optionally hosts an MCP runtime (ARM64 microVM) that exposes the `extend_rtb` tool for AI agent integration.
 
@@ -60,7 +60,7 @@ An ECS Fargate path is also provided as an explicit alternative for CPU-only dem
 
 ### Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,080 per month** assuming a single-GPU demo configuration with the GPU node group running on a daytime-only schedule.
+You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$592 per month** for a single-GPU demo using the included daytime-only GPU schedule, rising to about **$1,080 per month** if the GPU node runs 24/7.
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
@@ -80,7 +80,7 @@ The following table provides a sample, illustrative cost breakdown for deploying
 | Amazon Bedrock AgentCore | Optional MCP runtime, intermittent invocation | $5 |
 | **Total (example estimate)** | | **~$592** |
 
-> The headline ~$1,080/month figure reflects running the GPU node 24/7 plus headroom; enabling the included scheduled GPU shutdown brings a typical demo month closer to the ~$592 shown above. For a short demo, deploy, validate, and tear down immediately — a 2-hour session costs only a few dollars.
+> The ~$1,080/month figure reflects running the GPU node 24/7 plus headroom; enabling the included scheduled GPU shutdown brings a typical demo month closer to the ~$592 shown above. For a short demo, deploy, validate, and tear down immediately — a 2-hour session costs only a few dollars. The A10G `g5.xlarge` line item can be substituted with the more powerful Amazon EC2 G7e instances, which deliver higher performance at higher cost.
 
 ## Prerequisites
 
@@ -121,11 +121,11 @@ This deployment requires:
 
 - An AWS account with permissions to create Amazon EKS clusters, Amazon EC2 instances (including `g5` GPU instances), Amazon S3 buckets, Amazon ECR repositories, Amazon CloudFront distributions, Amazon Cognito user pools, Amazon DynamoDB tables, and AWS IAM roles.
 - **NVIDIA NGC registry access** to pull the NVIDIA Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`).
-- **NVIDIA GPU service quota** for at least one `g5.xlarge` (NVIDIA A10G) instance in your target Region. In `us-east-1`, confirm the *Running On-Demand G and VT instances* quota is large enough before deploying. If not, request an increase through the [Service Quotas console](https://console.aws.amazon.com/servicequotas/).
+- **NVIDIA GPU service quota** for at least one `g5.xlarge` (NVIDIA A10G) instance in your target Region — a more powerful alternative is the Amazon EC2 G7e instance family. In `us-east-1`, confirm the *Running On-Demand G and VT instances* quota is large enough before deploying. If not, request an increase through the [Service Quotas console](https://console.aws.amazon.com/servicequotas/).
 
 ### Supported Regions
 
-This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVIDIA A10G (`g5` family) instances, including:
+This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVIDIA A10G (`g5` family) instances — or the more powerful Amazon EC2 G7e instances, where available — including:
 
 - US East (N. Virginia): `us-east-1` (default)
 - US West (Oregon): `us-west-2`
@@ -170,7 +170,7 @@ This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVI
    | 2 | Export PyTorch models to ONNX (`../source/triton/export_models.py`) |
    | 3 | Upload the ONNX model repository to Amazon S3 |
    | 4 | Build and push container images (AMD64 for EKS, ARM64 for AgentCore) |
-   | 5 | Create the Amazon EKS cluster (`g5.xlarge` GPU + `c5.xlarge` CPU node groups) |
+   | 5 | Create the Amazon EKS cluster (`g5.xlarge` GPU — or the more powerful Amazon EC2 G7e — + `c5.xlarge` CPU node groups) |
    | 6 | Install the NVIDIA Kubernetes Device Plugin |
    | 7 | Configure IAM Roles for Service Accounts (IRSA) for Triton S3 access |
    | 8 | Apply the Kubernetes manifests in `deployment/eks/` (Triton, ARTF containers, orchestrator, HPA) |
