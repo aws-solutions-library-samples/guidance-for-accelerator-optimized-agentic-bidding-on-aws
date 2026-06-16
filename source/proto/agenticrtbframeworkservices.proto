@@ -1,13 +1,11 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: MIT-0
-//
-// Agentic RTB Framework (ARTF) extension point service.
-//
-// This file is an independent definition of the gRPC service described by the
-// public IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 specification
-// (https://iabtechlab.com/standards/artf/). It is authored from the published
-// specification for interoperability and is NOT derived from, nor a copy of,
-// the AGPL-licensed ARTF reference implementation.
+// IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 - Protocol Buffers schema.
+// Title:   IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 schema
+// Author:  IAB Tech Lab (Interactive Advertising Bureau Technology Laboratory)
+// Source:  https://github.com/IABTechLab/agentic-realtime-framework
+// License: Creative Commons Attribution 3.0 (CC BY 3.0)
+//          https://creativecommons.org/licenses/by/3.0/
+// Redistributed unmodified as part of the ARTF Specification (CC BY 3.0).
+// See source/proto/THIRD_PARTY_LICENSES.md for full attribution.
 
 syntax = "proto3";
 
@@ -15,9 +13,7 @@ package com.iabtechlab.bidstream.mutation.services.v1;
 
 import "agenticrtbframework.proto";
 
-// The extension point an exchange calls to obtain bidstream mutations.
 service RTBExtensionPoint {
-  // Returns the mutations to apply for the given auction lifecycle event.
-  rpc GetMutations (com.iabtechlab.bidstream.mutation.v1.RTBRequest)
-      returns (com.iabtechlab.bidstream.mutation.v1.RTBResponse);
+  // GetMutations returns RTBResponse containing mutations to be applied at the predetermined auction lifecycle event
+  rpc GetMutations (com.iabtechlab.bidstream.mutation.v1.RTBRequest) returns (com.iabtechlab.bidstream.mutation.v1.RTBResponse);
 }
