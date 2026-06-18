@@ -1,0 +1,88 @@
+# Part 1 — Real-Time Agentic Bidding (live integration path)
+# Shows how the solution is invoked in a live environment: an ad exchange / DSP
+# calls the ARTF extension point directly over the bidstream. The React test
+# console and its Cognito/CloudFront auth path are intentionally omitted.
+
+direction: right
+
+# Increase font sizes everywhere for readability
+**.style.font-size: 22
+(** -> **)[*].style.font-size: 18
+
+title: |md
+  # Accelerator-Optimized Agentic Bidding
+| {
+  near: top-center
+  style.font-size: 24
+  style.bold: true
+}
+
+exchange: "Ad Exchange / DSP\nOpenRTB bidstream" {
+  shape: cloud
+  style.fill: "#EFE9FB"
+  style.stroke: "#8C4FFF"
+  style.font-size: 24
+}
+
+aws: "AWS Cloud" {
+  style.stroke: "#232F3E"
+  style.font-size: 26
+  style.bold: true
+
+  orch: "Orchestrator\nAmazon EKS · Starlette\ngRPC fan-out (+ MCP/REST)" {
+    shape: hexagon
+    style.fill: "#FDEBD0"
+    style.stroke: "#ED7100"
+    style.font-size: 22
+  }
+
+  containers: "ARTF Containers (Amazon EKS)" {
+    style.stroke: "#ED7100"
+    style.font-size: 24
+    grid-columns: 2
+    dlrm: "DLRM Bid Shader\nBID_SHADE"
+    wd: "Wide & Deep Segment Activator\nACTIVATE_SEGMENTS"
+    ncf: "NCF Deal Manager\nACTIVATE_DEALS / SUPPRESS_DEALS"
+    metrics: "Metrics Enricher\nADD_METRICS (rule-based, CPU)"
+  }
+
+  triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nONNX Runtime + CUDA EP · 3 models" {
+    style.fill: "#76b900"
+    style.stroke: "#5a8c00"
+    style.font-color: "#000000"
+    style.font-size: 22
+  }
+
+  models: "Amazon S3\nModel Repository (ONNX)" {
+    shape: cylinder
+    style.fill: "#E4F2DD"
+    style.stroke: "#3F8624"
+    style.font-size: 22
+  }
+
+  agentcore: "Amazon Bedrock AgentCore\nMCP Runtime — extend_rtb (optional)" {
+    style.fill: "#FDEBD0"
+    style.stroke: "#ED7100"
+    style.font-size: 22
+  }
+}
+
+exchange -> aws.orch: "OpenRTB BidRequest"
+aws.orch -> exchange: "RTBResponse (mutations)"
+
+aws.orch -> aws.containers.dlrm: "parallel fan-out"
+aws.orch -> aws.containers.wd
+aws.orch -> aws.containers.ncf
+aws.orch -> aws.containers.metrics
+
+aws.containers.dlrm -> aws.triton: "tritonclient"
+aws.containers.wd -> aws.triton
+aws.containers.ncf -> aws.triton
+
+aws.triton -> aws.models: "load models at startup" {
+  style.stroke-dash: 4
+}
+
+aws.agentcore -> aws.orch: "extend_rtb (MCP)" {
+  style.stroke-dash: 4
+}

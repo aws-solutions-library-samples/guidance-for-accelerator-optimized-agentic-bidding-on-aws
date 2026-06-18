@@ -1,0 +1,150 @@
+services:
+  # -----------------------------------------------------------------------
+  # ARTF Orchestrator — fans out to containers via gRPC and HTTP
+  # -----------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: orchestrator
+        AGENT_NAME: artf-orchestrator
+    ports:
+      - "8080:8000"   # REST API for the frontend
+    environment:
+      DLRM_GRPC: dlrm:50051
+      DLRM_MCP: http://dlrm:8081
+      WIDEDEEP_GRPC: widedeep:50051
+      WIDEDEEP_MCP: http://widedeep:8081
+      NCF_GRPC: ncf:50051
+      NCF_MCP: http://ncf:8081
+      METRICS_GRPC: metrics:50051
+      METRICS_MCP: http://metrics:8081
+    depends_on:
+      dlrm:
+        condition: service_healthy
+      widedeep:
+        condition: service_healthy
+      ncf:
+        condition: service_healthy
+      metrics:
+        condition: service_healthy
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # DLRM Bid Shader — BID_SHADE intent
+  # Ports: gRPC 50051, MCP 8081, Health 8080
+  # -----------------------------------------------------------------------
+  dlrm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/dlrm_bid_shader
+        AGENT_NAME: dlrm-bid-shader
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50061:50051"  # gRPC exposed to host
+      - "8091:8081"    # MCP exposed to host
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # Wide & Deep Segment Activator — ACTIVATE_SEGMENTS intent
+  # -----------------------------------------------------------------------
+  widedeep:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/widedeep_segment_activator
+        AGENT_NAME: widedeep-segment-activator
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50062:50051"
+      - "8092:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # NCF Deal Manager — ACTIVATE_DEALS / SUPPRESS_DEALS intents
+  # -----------------------------------------------------------------------
+  ncf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/ncf_deal_manager
+        AGENT_NAME: ncf-deal-manager
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50063:50051"
+      - "8093:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # Metrics Enricher — ADD_METRICS intent
+  # -----------------------------------------------------------------------
+  metrics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/metrics_enricher
+        AGENT_NAME: metrics-enricher
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50064:50051"
+      - "8094:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+networks:
+  artf:
+    driver: bridge

@@ -1,0 +1,43 @@
+{
+  "id": "sample-banner-001",
+  "tmax": 100,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-example-001"},
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "ADD_METRICS"],
+  "bid_request": {
+    "id": "auction-123",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 300, "h": 250, "pos": 1},
+        "bidfloor": 1.50,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-456",
+      "domain": "espn.com",
+      "cat": ["IAB17"],
+      "page": "https://espn.com/nba/article"
+    },
+    "user": {
+      "id": "user-789",
+      "yob": 1990,
+      "gender": "M",
+      "data": [
+        {
+          "id": "data-provider-1",
+          "name": "Example DMP",
+          "segment": [
+            {"id": "seg-sports", "name": "Sports Enthusiast"}
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)",
+      "ip": "192.168.1.1",
+      "geo": {"country": "USA", "region": "IL"}
+    }
+  }
+}

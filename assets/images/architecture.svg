@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="800" viewBox="0 0 1060 800"
+     font-family="Helvetica, Arial, sans-serif" role="img"
+     aria-label="Architecture: OpenRTB request flows through CloudFront, S3 and Cognito to an orchestrator that fans out over gRPC/MCP to four containers, three of which call NVIDIA Triton on a GPU; an optional Bedrock AgentCore MCP runtime calls the orchestrator.">
+  <title>Guidance for Accelerator-Optimized Agentic Bidding on AWS — Architecture</title>
+
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#37475a"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#5a8f00"/>
+    </marker>
+    <marker id="arrowDash" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8a6d3b"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1060" height="800" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="530" y="34" text-anchor="middle" font-size="21" font-weight="bold" fill="#16191f">
+    Accelerator-Optimized Agentic Bidding on AWS
+  </text>
+  <text x="530" y="56" text-anchor="middle" font-size="13" fill="#5f6b7a">
+    GPU-accelerated real-time OpenRTB bidstream mutations
+  </text>
+
+  <!-- ===== End user ===== -->
+  <rect x="450" y="78" width="160" height="46" rx="8" fill="#eef2f7" stroke="#37475a" stroke-width="1.5"/>
+  <text x="530" y="100" text-anchor="middle" font-size="13" font-weight="bold" fill="#16191f">Browser /</text>
+  <text x="530" y="116" text-anchor="middle" font-size="13" font-weight="bold" fill="#16191f">MCP client</text>
+
+  <!-- ===== Frontend & Auth band ===== -->
+  <rect x="70" y="150" width="600" height="96" rx="10" fill="none" stroke="#c9a227" stroke-width="1.3" stroke-dasharray="6 4"/>
+  <text x="84" y="170" font-size="12" font-weight="bold" fill="#8a6d3b">AWS Edge, Frontend &amp; Auth</text>
+
+  <!-- S3 frontend -->
+  <rect x="92" y="180" width="168" height="54" rx="8" fill="#fff3d6" stroke="#c9a227" stroke-width="1.5"/>
+  <text x="176" y="202" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#16191f">Amazon S3</text>
+  <text x="176" y="219" text-anchor="middle" font-size="11.5" fill="#5f6b7a">React static frontend</text>
+
+  <!-- CloudFront -->
+  <rect x="278" y="180" width="168" height="54" rx="8" fill="#fff3d6" stroke="#c9a227" stroke-width="1.5"/>
+  <text x="362" y="202" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#16191f">Amazon CloudFront</text>
+  <text x="362" y="219" text-anchor="middle" font-size="11.5" fill="#5f6b7a">HTTPS + /api/* proxy</text>
+
+  <!-- Cognito -->
+  <rect x="464" y="180" width="184" height="54" rx="8" fill="#f6ddc7" stroke="#b5651d" stroke-width="1.5"/>
+  <text x="556" y="202" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#16191f">Amazon Cognito</text>
+  <text x="556" y="219" text-anchor="middle" font-size="11.5" fill="#5f6b7a">User Pool · SRP / JWT</text>
+
+  <!-- ===== Orchestrator ===== -->
+  <rect x="360" y="288" width="340" height="66" rx="9" fill="#e7ecf3" stroke="#37475a" stroke-width="2"/>
+  <text x="530" y="312" text-anchor="middle" font-size="14" font-weight="bold" fill="#16191f">Orchestrator (Starlette)</text>
+  <text x="530" y="330" text-anchor="middle" font-size="11.5" fill="#5f6b7a">JWT verify · parallel fan-out</text>
+  <text x="530" y="346" text-anchor="middle" font-size="11.5" fill="#5f6b7a">gRPC primary · MCP / REST</text>
+
+  <!-- Network Load Balancer label on path -->
+  <text x="312" y="276" text-anchor="middle" font-size="10.5" fill="#5f6b7a">via Network Load Balancer</text>
+
+  <!-- ===== AgentCore (right) ===== -->
+  <rect x="788" y="288" width="220" height="66" rx="9" fill="#fff3d6" stroke="#c9a227" stroke-width="1.5"/>
+  <text x="898" y="310" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#16191f">Bedrock AgentCore</text>
+  <text x="898" y="327" text-anchor="middle" font-size="11.5" fill="#5f6b7a">MCP runtime (optional)</text>
+  <text x="898" y="343" text-anchor="middle" font-size="11.5" fill="#5f6b7a">extend_rtb tool</text>
+
+  <!-- ===== EKS / containers band ===== -->
+  <rect x="32" y="398" width="850" height="312" rx="12" fill="none" stroke="#37475a" stroke-width="1.3" stroke-dasharray="6 4"/>
+  <text x="48" y="418" font-size="12" font-weight="bold" fill="#37475a">Amazon EKS (primary) — Amazon ECS Fargate (alternative)</text>
+
+  <!-- four containers -->
+  <rect x="48" y="430" width="196" height="72" rx="8" fill="#dcfce0" stroke="#16a34a" stroke-width="1.6"/>
+  <text x="146" y="454" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#14532d">DLRM bid shader</text>
+  <text x="146" y="472" text-anchor="middle" font-size="11" fill="#3f6b4a">dlrm_bid_shader</text>
+  <text x="146" y="490" text-anchor="middle" font-size="11" font-weight="bold" fill="#16a34a">BID_SHADE</text>
+
+  <rect x="262" y="430" width="196" height="72" rx="8" fill="#e0e3fb" stroke="#6366f1" stroke-width="1.6"/>
+  <text x="360" y="454" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#312e81">Wide &amp; Deep activator</text>
+  <text x="360" y="472" text-anchor="middle" font-size="11" fill="#4b4f8a">widedeep_segment_activator</text>
+  <text x="360" y="490" text-anchor="middle" font-size="11" font-weight="bold" fill="#6366f1">ACTIVATE_SEGMENTS</text>
+
+  <rect x="476" y="430" width="196" height="72" rx="8" fill="#fcecd2" stroke="#d97706" stroke-width="1.6"/>
+  <text x="574" y="454" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#7c3f06">NCF deal manager</text>
+  <text x="574" y="472" text-anchor="middle" font-size="11" fill="#8a5a22">ncf_deal_manager</text>
+  <text x="574" y="490" text-anchor="middle" font-size="11" font-weight="bold" fill="#d97706">ACTIVATE / SUPPRESS_DEALS</text>
+
+  <rect x="686" y="430" width="180" height="72" rx="8" fill="#d6eef5" stroke="#0891b2" stroke-width="1.6"/>
+  <text x="776" y="454" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#0b4a5c">Metrics enricher</text>
+  <text x="776" y="472" text-anchor="middle" font-size="11" fill="#2a6c7e">rule-based (no GPU)</text>
+  <text x="776" y="490" text-anchor="middle" font-size="11" font-weight="bold" fill="#0891b2">ADD_METRICS</text>
+
+  <!-- GPU region + Triton -->
+  <rect x="48" y="540" width="624" height="118" rx="10" fill="#f3f8e8" stroke="#5a8f00" stroke-width="1.3" stroke-dasharray="6 4"/>
+  <text x="64" y="560" font-size="12" font-weight="bold" fill="#5a8f00">GPU node — g5.xlarge · NVIDIA A10G (alt: Amazon EC2 G7e (Blackwell))</text>
+
+  <rect x="160" y="572" width="400" height="70" rx="9" fill="#e3f0c4" stroke="#5a8f00" stroke-width="2"/>
+  <text x="360" y="598" text-anchor="middle" font-size="14" font-weight="bold" fill="#2f4d00">NVIDIA Triton Inference Server</text>
+  <text x="360" y="616" text-anchor="middle" font-size="11.5" fill="#4a6b1a">ONNX Runtime + CUDA EP</text>
+  <text x="360" y="632" text-anchor="middle" font-size="11.5" fill="#4a6b1a">3 ONNX models on GPU</text>
+
+  <!-- ===== S3 model repository ===== -->
+  <rect x="360" y="724" width="340" height="56" rx="8" fill="#fff3d6" stroke="#c9a227" stroke-width="1.5"/>
+  <text x="530" y="746" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#16191f">Amazon S3 — model repository</text>
+  <text x="530" y="763" text-anchor="middle" font-size="11" fill="#5f6b7a">dlrm · widedeep · ncf (model.onnx)</text>
+
+  <!-- ===================== ARROWS ===================== -->
+  <!-- Browser <-> Cognito (auth) -->
+  <path d="M510,108 C470,128 510,150 535,178" fill="none" stroke="#b5651d" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="430" y="150" text-anchor="middle" font-size="10.5" fill="#b5651d">SRP auth / JWT</text>
+
+  <!-- Browser -> CloudFront (HTTPS + Bearer, OpenRTB request) -->
+  <path d="M470,112 C420,128 380,150 362,178" fill="none" stroke="#37475a" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="300" y="120" text-anchor="middle" font-size="10.5" fill="#37475a">OpenRTB request</text>
+  <text x="300" y="134" text-anchor="middle" font-size="10.5" fill="#37475a">HTTPS + Bearer</text>
+
+  <!-- CloudFront -> S3 frontend (GET /*) -->
+  <path d="M278,210 L262,210" fill="none" stroke="#37475a" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="270" y="248" text-anchor="middle" font-size="10" fill="#5f6b7a">GET /*</text>
+
+  <!-- CloudFront -> Orchestrator (POST /api/*) -->
+  <path d="M362,234 C362,260 420,272 460,288" fill="none" stroke="#37475a" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="408" y="262" text-anchor="middle" font-size="10.5" fill="#37475a">POST /api/*</text>
+
+  <!-- Orchestrator -> Cognito (verify JWT via JWKS) -->
+  <path d="M600,300 C660,272 640,250 580,236" fill="none" stroke="#b5651d" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#arrowDash)"/>
+  <text x="648" y="262" text-anchor="middle" font-size="10" fill="#b5651d">verify JWT (JWKS)</text>
+
+  <!-- AgentCore -> Orchestrator (extend_rtb) -->
+  <path d="M788,322 L700,322" fill="none" stroke="#8a6d3b" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrowDash)"/>
+  <text x="744" y="314" text-anchor="middle" font-size="10" fill="#8a6d3b">extend_rtb</text>
+
+  <!-- Orchestrator -> four containers (fan-out gRPC/MCP) -->
+  <path d="M430,354 C320,378 200,400 146,430" fill="none" stroke="#37475a" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <path d="M480,354 C440,378 400,404 360,430" fill="none" stroke="#37475a" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <path d="M580,354 C600,378 580,404 574,430" fill="none" stroke="#37475a" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <path d="M630,354 C720,378 760,404 776,430" fill="none" stroke="#37475a" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="250" y="392" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#37475a">parallel fan-out — gRPC / MCP</text>
+
+  <!-- model containers -> Triton (tritonclient) -->
+  <path d="M146,502 C146,535 220,556 250,572" fill="none" stroke="#5a8f00" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
+  <path d="M360,502 L360,572" fill="none" stroke="#5a8f00" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
+  <path d="M574,502 C574,535 500,556 470,572" fill="none" stroke="#5a8f00" stroke-width="1.6" marker-end="url(#arrowGreen)"/>
+  <text x="430" y="528" text-anchor="middle" font-size="10" fill="#5a8f00">tritonclient (GPU inference)</text>
+
+  <!-- Triton -> S3 model repo (load models at startup) -->
+  <path d="M420,642 C440,680 480,706 510,724" fill="none" stroke="#5a8f00" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrowGreen)"/>
+  <text x="560" y="690" text-anchor="middle" font-size="10" fill="#5a8f00">load ONNX models at startup</text>
+
+  <!-- legend -->
+  <text x="900" y="700" text-anchor="middle" font-size="10.5" fill="#5f6b7a">Four containers · no ISV partners</text>
+  <text x="900" y="716" text-anchor="middle" font-size="10.5" fill="#5f6b7a">Three ONNX models on Triton/GPU</text>
+</svg>

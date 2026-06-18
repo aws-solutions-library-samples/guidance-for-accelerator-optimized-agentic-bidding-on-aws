@@ -1,0 +1,47 @@
+# Wide & Deep Segment Activator — NVIDIA Triton Inference Server configuration
+# Architecture: NVIDIA Merlin WideAndDeepModel (Cheng et al. 2016)
+# Backend: ONNX Runtime (CPU or GPU via CUDA EP)
+#
+# Inputs:
+#   wide_features: [batch, 8] float32 — crossed feature interactions
+#   deep_features: [batch, 6] float32 — dense user/site/device features
+#
+# Output:
+#   segment_scores: [batch, 15] float32 — activation scores per candidate segment
+
+name: "widedeep_segment_activator"
+backend: "onnxruntime"
+max_batch_size: 64
+
+input [
+  {
+    name: "wide_features"
+    data_type: TYPE_FP32
+    dims: [ 8 ]
+  },
+  {
+    name: "deep_features"
+    data_type: TYPE_FP32
+    dims: [ 6 ]
+  }
+]
+
+output [
+  {
+    name: "segment_scores"
+    data_type: TYPE_FP32
+    dims: [ 15 ]
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]

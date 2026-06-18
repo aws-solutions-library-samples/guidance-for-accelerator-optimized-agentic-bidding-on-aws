@@ -1,0 +1,79 @@
+# HPA for Triton Inference Server — scale on GPU utilization and queue depth.
+#
+# Uses custom Prometheus metrics scraped from Triton's /metrics endpoint.
+# The queue_compute_ratio metric represents the ratio of time requests spend
+# waiting in the inference queue vs. actual compute time.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: triton-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: triton-inference-server
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    # Scale on GPU utilization
+    - type: Resource
+      resource:
+        name: nvidia.com/gpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    # Scale on CPU as a proxy when custom metrics aren't available
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# PodMonitor for Prometheus to scrape Triton metrics
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: triton-metrics
+  labels:
+    app: triton
+spec:
+  selector:
+    matchLabels:
+      app: triton
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+
+---
+# PrometheusRule for custom Triton metrics
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: triton-metrics-rules
+  labels:
+    app: triton
+spec:
+  groups:
+    - name: triton.rules
+      rules:
+        # Queue-to-compute ratio — high values mean Triton is overloaded
+        - record: triton:queue_compute_ratio
+          expr: |
+            rate(nv_inference_queue_duration_us_sum[1m])
+            /
+            (rate(nv_inference_compute_infer_duration_us_sum[1m]) + 1)
+        # Inference throughput (requests per second)
+        - record: triton:inference_rps
+          expr: |
+            sum(rate(nv_inference_request_success[1m])) by (model)
+        # Average inference latency (milliseconds)
+        - record: triton:inference_latency_ms
+          expr: |
+            rate(nv_inference_compute_infer_duration_us_sum[1m])
+            /
+            (rate(nv_inference_request_success[1m]) + 1)
+            / 1000

@@ -1,0 +1,124 @@
+# NVIDIA Triton Inference Server deployment for ARTF recommendation models.
+#
+# Serves 3 ONNX models (DLRM, Wide & Deep, NCF) from an S3 model repository
+# with dynamic batching and GPU acceleration via CUDA Execution Provider.
+#
+# The Triton server exposes:
+#   - HTTP inference API on port 8000
+#   - gRPC inference API on port 8001
+#   - Prometheus metrics on port 8002
+#
+# Model repository is loaded from S3 at startup:
+#   s3://<bucket>/triton-models/
+#     dlrm_bid_shader/config.pbtxt + 1/model.onnx
+#     widedeep_segment_activator/config.pbtxt + 1/model.onnx
+#     ncf_deal_manager/config.pbtxt + 1/model.onnx
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-inference-server
+  labels:
+    app: triton
+    component: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triton
+  template:
+    metadata:
+      labels:
+        app: triton
+        component: inference
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        nvidia.com/gpu: "present"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: triton
+          # NVIDIA NGC Triton Inference Server — the real NVIDIA container
+          image: nvcr.io/nvidia/tritonserver:24.08-py3
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 8002
+              name: metrics
+          args:
+            - tritonserver
+            - --model-repository=s3://__MODEL_BUCKET__/triton-models/
+            - --log-verbose=0
+            - --strict-model-config=true
+            - --exit-on-error=false
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "__REGION__"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          startupProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 10
+      serviceAccountName: triton-sa
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-inference-server
+  labels:
+    app: triton
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+    - port: 8002
+      targetPort: 8002
+      name: metrics
+  selector:
+    app: triton
+
+---
+# ServiceAccount with IRSA for S3 model repository access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: triton-sa
+  annotations:
+    # __TRITON_ROLE_ARN__ is replaced by deploy-eks.sh
+    eks.amazonaws.com/role-arn: "__TRITON_ROLE_ARN__"

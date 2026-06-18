@@ -1,0 +1,61 @@
+{
+  "id": "sample-isv-ecosystem-001",
+  "tmax": 100,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_EXCHANGE", "id": "exchange-ecosystem-demo-001"},
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "BID_SHADE", "ADD_METRICS", "ADD_CIDS"],
+  "bid_request": {
+    "id": "auction-eco-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 970, "h": 250, "pos": 1},
+        "bidfloor": 4.00,
+        "bidfloorcur": "USD",
+        "pmp": {
+          "private_auction": true,
+          "deals": [
+            {"id": "deal-premium-auto", "bidfloor": 6.00, "at": 1},
+            {"id": "deal-standard-auto", "bidfloor": 3.50, "at": 2}
+          ]
+        }
+      },
+      {
+        "id": "imp-2",
+        "banner": {"w": 300, "h": 600, "pos": 2},
+        "bidfloor": 3.00,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-cnn",
+      "domain": "cnn.com",
+      "cat": ["IAB12", "IAB12-2", "IAB17"],
+      "page": "https://cnn.com/2024/sports/nfl-playoffs"
+    },
+    "user": {
+      "id": "user-eco-303",
+      "yob": 1982,
+      "gender": "M",
+      "data": [
+        {
+          "id": "data-provider-nielsen",
+          "name": "Nielsen Segments",
+          "segment": [
+            {"id": "seg-auto", "name": "Auto Intender - Luxury"},
+            {"id": "seg-sports", "name": "Sports Enthusiast - NFL"}
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+      "ip": "192.0.2.157",
+      "ifa": "AEBE52E7-03EE-455A-B3C4-E57283966239",
+      "geo": {"country": "USA", "region": "TX", "city": "Austin", "zip": "78701"},
+      "devicetype": 4,
+      "os": "Android",
+      "osv": "14"
+    }
+  }
+}
