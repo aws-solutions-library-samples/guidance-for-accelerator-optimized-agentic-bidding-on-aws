@@ -155,12 +155,14 @@ This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVI
    export AWS_REGION=us-east-1
    ```
 
-4. Authenticate to the NVIDIA NGC registry so Docker can pull the Triton image, then deploy the full solution on the **primary EKS path** using the deployment entry-point script:
+4. Authenticate to the NVIDIA NGC registry so Docker can pull the Triton image, then deploy the full solution on the **primary EKS path** using the deployment entry-point script. Pass `--prefix <prefix>` to namespace every resource (stack, cluster, buckets, IAM, CloudFront, AgentCore) so multiple environments can coexist in one account/Region:
 
    ```bash
    cd deployment
-   ./deploy.sh
+   ./deploy.sh --prefix stg
    ```
+
+   With `--prefix stg`, resources are named `stg-nvidia-artf-recommenders-*`. Omit the flag to deploy with the default (unprefixed) stack name.
 
    `deploy.sh` provisions the entire EKS stack end to end:
 
