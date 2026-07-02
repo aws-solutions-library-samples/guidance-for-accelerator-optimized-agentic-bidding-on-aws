@@ -1,5 +1,7 @@
 # Guidance for Accelerator-Optimized Agentic Bidding on AWS
 
+> 📄 **Full guidance document:** See [GUIDANCE.md](GUIDANCE.md) for the complete published guidance including architecture details, model specifications, scaling scenarios, cost estimation, and Well-Architected analysis.
+
 ## Table of Contents
 
 1. [Overview](#overview)
@@ -238,23 +240,42 @@ After `deploy.sh` completes, validate the deployment:
 
 1. Open the frontend at `https://<CLOUDFRONT_DOMAIN>/` and sign in with the admin-created demo user — the username and password shown in the **Demo Login** section of the deployment summary. On first login you may be prompted to set a new password (the Cognito `newPasswordRequired` challenge).
 
-2. On the **REST Orchestrator** tab, load one of the bundled OpenRTB sample payloads, optionally edit the JSON, and submit it. Sample payloads are available at:
-   - `source/samples/` — `banner-basic.json`, `bid-shading.json`, `video-deals.json`
-   - `source/frontend-react/public/samples/` — the same payloads served to the browser
+2. **Before running scenarios, confirm the containers are available.** Click the **Containers** link in the navigation to open the Container Health panel. The GPU node group is scaled to zero when idle to save costs, so you may need to start it:
 
-   Expected behavior:
+   - **GPUs stopped** — If GPU Inference shows as stopped and containers show as *unreachable*, click **Start GPUs**. Starting takes approximately 3–5 minutes.
 
-   | Sample | What it exercises | Expected mutations |
-   |--------|-------------------|--------------------|
-   | `banner-basic.json` | 300×250 banner on a sports site | `ACTIVATE_SEGMENTS`, `ADD_METRICS` |
-   | `bid-shading.json` | DSP bid above floor on a 728×90 banner | `BID_SHADE` (shaded bid price) |
-   | `video-deals.json` | Video pre-roll with private marketplace deals | `ACTIVATE_DEALS` / `SUPPRESS_DEALS`, `ADD_METRICS` |
+     <img src="assets/images/containers-starting.png" alt="Containers starting" height="300">
 
-   The bid shader computes its shaded price from the model output as `min(original_bid, predicted_CTR × $12.0 × 0.65)`, floored at the publisher's `bidfloor` — where `EST_CONVERSION_VALUE = $12.0` and `SHADE_FACTOR = 0.65` (see `source/containers/dlrm_bid_shader/app.py`).
+   - **GPUs running, all containers ready** — Once the GPU node group is running and Triton has loaded all models, each container will show a green **ready** badge. Click **Refresh** to update the status.
 
-3. On the **MCP Extension Point** tab, initialize an MCP session and call the `extend_rtb` tool via JSON-RPC to exercise the same containers through the interface AI agents use.
+     <img src="assets/images/containers-ready.png" alt="Containers ready" height="300">
 
-4. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
+   Wait until all four containers (dlrm-bid-shader, widedeep-segment-activator, ncf-deal-manager, metrics-enricher) and the Triton Inference Server show **ready** before proceeding.
+
+3. Click on one of the pre-built **Scenarios** to run it through the pipeline. Each scenario card shows which ARTF intents (containers) it exercises:
+
+   <img src="assets/images/scenarios-ui.png" alt="Scenarios UI" height="400">
+
+   | Scenario | What it exercises | Containers triggered |
+   |----------|-------------------|---------------------|
+   | **Banner Ad — Segment Activation** | ESPN sports page with a 300×250 banner | `ACTIVATE_SEGMENTS`, `ADD_METRICS` |
+   | **Bid Shading — DLRM Price Optimization** | Nike DSP bid response at $7.50; DLRM predicts CTR and shades the bid | `BID_SHADE` |
+   | **Video + PMP Deals — NCF Scoring** | Video impression with 3 private marketplace deals | `ACTIVATE_DEALS`, `SUPPRESS_DEALS`, `ADD_METRICS` |
+   | **Full Pipeline — All 4 Containers** | CNN sports page triggering segments, deals, bid shading, and metrics | `ACTIVATE_SEGMENTS`, `ACTIVATE_DEALS`, `BID_SHADE`, `ADD_METRICS` |
+
+   Clicking a scenario submits the corresponding OpenRTB payload to the orchestrator and displays the results:
+
+   <img src="assets/images/scenario-result.png" alt="Scenario result — Banner Ad" height="350">
+
+   - **Right panel (Request + Mutations Applied)** — The full OpenRTB request with all accepted mutations merged in, showing the final mutated state that would be passed downstream in a live bidstream.
+   - **Center (latency breakdown)** — A per-container timing waterfall showing how long each ARTF agent took to produce its mutations. The containers run in parallel; the orchestrator overhead is the fan-out/merge cost. The **"Network (round-trip)"** segment represents the CloudFront CDN and internet hop between the browser and the EKS cluster — this latency is an artifact of the testing UI and would not be present in a production integration where the caller is co-located with the orchestrator (for example, an SSP exchange calling the orchestrator directly over a VPC or RTB Fabric link).
+   - **Bottom (Mutations)** — The individual mutations proposed by each container, showing the intent, operation, JSON path, and payload for each bidstream modification.
+
+   The bid shader computes its shaded price as `min(original_bid, predicted_CTR × conversion_value × shade_factor)`, floored at the publisher's `bidfloor`.
+
+4. On the **MCP Extension Point** tab, initialize an MCP session and call the `extend_rtb` tool via JSON-RPC to exercise the same containers through the interface AI agents use.
+
+5. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
 
 ## Next Steps
 
