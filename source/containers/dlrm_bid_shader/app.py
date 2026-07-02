@@ -15,9 +15,11 @@ Server via tritonclient.http.  Otherwise, PyTorch runs inline (CPU).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -25,6 +27,8 @@ from shared.artf_types import (
     AdjustBidPayload, Intent, Metadata, Mutation, Operation,
     RTBRequest, RTBResponse, intent_applicable,
 )
+
+logger = logging.getLogger(__name__)
 
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 
@@ -34,6 +38,53 @@ NUM_SPARSE = 3
 VOCAB_SIZE = 1000
 SHADE_FACTOR = 0.65
 EST_CONVERSION_VALUE = 12.0
+
+# ---------------------------------------------------------------------------
+# Parameter Cache — lazy initialization controlled by PARAMETER_STORE_TABLE
+# ---------------------------------------------------------------------------
+
+_parameter_cache: Optional["ParameterCache"] = None  # noqa: F821
+_parameter_cache_initialized: bool = False
+
+
+def _get_parameter_cache():
+    """Lazily initialize the ParameterCache if PARAMETER_STORE_TABLE is set.
+
+    Returns the cache instance or None if the env var is not configured
+    (backward-compatible: falls back to module-level constants).
+    """
+    global _parameter_cache, _parameter_cache_initialized
+
+    if _parameter_cache_initialized:
+        return _parameter_cache
+
+    table_name = os.environ.get("PARAMETER_STORE_TABLE")
+    if table_name:
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        from shared.parameter_cache import ParameterCache
+
+        _parameter_cache = ParameterCache(
+            table_name=table_name,
+            region=region,
+            ttl_seconds=float(os.environ.get("PARAMETER_CACHE_TTL", "60")),
+            model_type="dlrm_bid_shader",
+        )
+        logger.info(
+            "ParameterCache initialized: table=%s region=%s",
+            table_name,
+            region,
+        )
+    else:
+        _parameter_cache = None
+        logger.info(
+            "PARAMETER_STORE_TABLE not set — using static defaults "
+            "(shade_factor=%s, conversion_value=%s)",
+            SHADE_FACTOR,
+            EST_CONVERSION_VALUE,
+        )
+
+    _parameter_cache_initialized = True
+    return _parameter_cache
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +222,22 @@ def mutate(req: RTBRequest) -> RTBResponse:
     if not bid_response:
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
-    # Read model parameter overrides from the request (frontend sliders)
+    # Read model parameter overrides from the request (frontend sliders take priority)
     params = req.model_params or {}
-    shade_factor = params.get('shade_factor', SHADE_FACTOR)
-    conversion_value = params.get('conversion_value', EST_CONVERSION_VALUE)
+
+    # Determine shade_factor: frontend override > cache > static default
+    if 'shade_factor' in params:
+        shade_factor = params['shade_factor']
+    else:
+        cache = _get_parameter_cache()
+        shade_factor = cache.get_shade_factor() if cache else SHADE_FACTOR
+
+    # Determine conversion_value: frontend override > cache > static default
+    if 'conversion_value' in params:
+        conversion_value = params['conversion_value']
+    else:
+        cache = _get_parameter_cache()
+        conversion_value = cache.get_conversion_value() if cache else EST_CONVERSION_VALUE
 
     predicted_ctr = _predict_ctr_from_request(req.bid_request)
 

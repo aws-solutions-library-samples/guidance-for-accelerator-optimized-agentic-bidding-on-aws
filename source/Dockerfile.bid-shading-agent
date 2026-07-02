@@ -1,0 +1,30 @@
+# Bid Shading Strategy Agent — AgentCore HTTP Runtime
+# ====================================================
+#
+# Runs as a Bedrock AgentCore HTTP-protocol runtime in a Firecracker microVM.
+# Invoked by EventBridge Scheduler (every 5 min) and by the orchestrator
+# for the Adaptive Bidding UI.
+#
+# AgentCore contract:
+#   - POST :8000 → invocation handler (reads CloudWatch, writes DynamoDB)
+#   - GET  :8080/ping → {"status": "Healthy"}
+#
+# Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
+
+FROM --platform=linux/arm64 python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY agents/bid_shading/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Copy source — handler needs shared/ and agents/bid_shading/
+COPY shared/ /app/shared/
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/bid_shading/ /app/agents/bid_shading/
+
+# AgentCore runs the container as an HTTP server on port 8080
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "agents.bid_shading.handler"]

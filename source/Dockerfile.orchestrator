@@ -1,0 +1,54 @@
+# Dedicated Dockerfile for the ARTF Orchestrator.
+#
+# Unlike the shared container Dockerfile (which copies a single container dir to
+# /app/container and runs `container.app`), the orchestrator is written with
+# absolute package imports (`orchestrator.*`, `shared.*`, `agents.*`,
+# `closed_loop_demo.*`). This image therefore lays the source out at /app so
+# those packages resolve, and runs `python -m orchestrator.app`.
+#
+# Build context must be the repo's `source/` directory so all packages are
+# available:
+#   docker buildx build -f source/Dockerfile.orchestrator -t orchestrator source
+#
+# Exposes the REST API on :8000 (health at /health/live, /health/ready).
+
+FROM python:3.12-slim AS base
+
+ARG AGENT_NAME=artf-orchestrator
+ARG VERSION=0.1.0
+
+LABEL agent-manifest="{ \
+  \"name\": \"${AGENT_NAME}\", \
+  \"version\": \"${VERSION}\", \
+  \"vendor\": \"NVIDIA\", \
+  \"component\": \"orchestrator\" \
+}"
+
+# Runtime dependencies:
+# - Starlette/uvicorn/httpx/grpc/pydantic: orchestrator serving + fan-out
+# - boto3: CloudWatch / DynamoDB / SageMaker / EKS calls (Part 1 + Part 2)
+# - python-jose: Cognito JWT verification
+# The Part 2 A/B evaluator implements its own statistics (no scipy/numpy needed).
+RUN pip install --no-cache-dir \
+    fastapi "uvicorn[standard]" starlette httpx pydantic \
+    grpcio protobuf boto3 \
+    "python-jose[cryptography]==3.3.0"
+
+WORKDIR /app
+
+# Absolute-import packages the orchestrator depends on, laid out at /app so
+# `python -m orchestrator.app` resolves every import.
+COPY shared/ /app/shared/
+COPY agents/ /app/agents/
+COPY closed_loop_demo/ /app/closed_loop_demo/
+COPY orchestrator/ /app/orchestrator/
+
+RUN adduser --disabled-password --no-create-home appuser
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')" || exit 1
+
+CMD ["python", "-m", "orchestrator.app"]

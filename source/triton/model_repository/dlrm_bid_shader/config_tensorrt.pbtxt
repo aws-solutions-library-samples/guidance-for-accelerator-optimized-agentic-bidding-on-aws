@@ -1,0 +1,109 @@
+# DLRM Bid Shader — NVIDIA Triton Inference Server configuration
+# Architecture: NVIDIA DeepLearningExamples DLRM with dot-product interaction
+# Backend: NVIDIA TensorRT (compiled from ONNX via Triton's TRT backend)
+#
+# TensorRT provides:
+#   - Layer fusion (Conv+BN+ReLU collapsed into single kernel)
+#   - FP16 mixed-precision inference (2x throughput on Ampere+ GPUs)
+#   - Kernel auto-tuning for the target GPU at model load time
+#
+# Triton automatically compiles the ONNX model to a TensorRT engine at first
+# load if no pre-compiled .plan file is present. Subsequent loads use the
+# cached engine. Set TRITON_TENSORRT_CACHE_PATH in the deployment to persist
+# compiled engines across restarts.
+#
+# To use this config instead of the onnxruntime config, rename this file to
+# config.pbtxt and place the ONNX model as model.onnx in the version directory.
+# Triton's TRT backend accepts ONNX directly and compiles at load time.
+#
+# Inputs:
+#   dense_features: [batch, 4] float32 — bidfloor, hour, age_norm, has_video
+#   sparse_user:    [batch]    int64   — hashed user ID (0..999)
+#   sparse_domain:  [batch]    int64   — hashed site domain (0..999)
+#   sparse_device:  [batch]    int64   — hashed device UA (0..999)
+#
+# Output:
+#   ctr_prediction: [batch]    float32 — predicted click-through rate
+
+name: "dlrm_bid_shader"
+backend: "tensorrt"
+max_batch_size: 64
+
+input [
+  {
+    name: "dense_features"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  },
+  {
+    name: "sparse_user"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_domain"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_device"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "ctr_prediction"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32, 64 ]
+  max_queue_delay_microseconds: 200
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]
+
+# TensorRT optimization parameters
+optimization {
+  input_pinned_memory { enable: true }
+  output_pinned_memory { enable: true }
+
+  # Mixed-precision: FP16 on compute, FP32 on I/O
+  # Provides ~2x throughput on NVIDIA A10G (Ampere) and A100 GPUs
+  execution_accelerators {
+    gpu_execution_accelerator : [
+      {
+        name: "tensorrt"
+        parameters {
+          key: "precision_mode"
+          value: "FP16"
+        }
+        parameters {
+          key: "max_workspace_size_bytes"
+          value: "1073741824"
+        }
+        parameters {
+          key: "trt_engine_cache_enable"
+          value: "1"
+        }
+        parameters {
+          key: "trt_engine_cache_path"
+          value: "/tmp/trt_engines"
+        }
+      }
+    ]
+  }
+}

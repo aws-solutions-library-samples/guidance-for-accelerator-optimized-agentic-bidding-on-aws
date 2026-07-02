@@ -1,0 +1,187 @@
+"""Feedback integration — emits BidOutcomeEvents from the orchestrator bid path.
+
+Provides a single public function ``emit_bid_outcome()`` that constructs a
+BidOutcomeEvent from the RTBRequest/RTBResponse and fires it to Kinesis via
+``asyncio.create_task`` (fire-and-forget, non-blocking, < 1 ms overhead).
+
+The FeedbackCollector instance is lazily initialized as a module-level
+singleton controlled by environment variables:
+
+- ``FEEDBACK_STREAM_NAME`` — Kinesis stream name. If unset, emission is
+  disabled and ``emit_bid_outcome()`` is a no-op.
+- ``FEEDBACK_STREAM_REGION`` — AWS region (falls back to
+  ``AWS_REGION`` → ``AWS_DEFAULT_REGION`` → ``us-east-1``).
+
+Requirements: 1.1, 1.2, 1.6
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from shared.artf_types import RTBRequest, RTBResponse
+from shared.feedback_collector import FeedbackCollector
+from shared.feedback_models import BidOutcomeEvent
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Lazy singleton FeedbackCollector
+# ---------------------------------------------------------------------------
+
+_FEEDBACK_STREAM_NAME: Optional[str] = os.environ.get("FEEDBACK_STREAM_NAME")
+_FEEDBACK_REGION: str = os.environ.get(
+    "FEEDBACK_STREAM_REGION",
+    os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")),
+)
+
+_feedback_collector: Optional[FeedbackCollector] = None
+
+if _FEEDBACK_STREAM_NAME:
+    _feedback_collector = FeedbackCollector(
+        stream_name=_FEEDBACK_STREAM_NAME,
+        region=_FEEDBACK_REGION,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def emit_bid_outcome(req: RTBRequest, resp: RTBResponse, start_time: float) -> None:
+    """Fire-and-forget: build and emit a BidOutcomeEvent via asyncio.create_task.
+
+    Emits exactly one event per served bid. The ``asyncio.create_task`` call
+    itself adds < 1 ms and never blocks the bid response path.
+
+    This function NEVER raises — any error is logged and swallowed to ensure
+    the bid response is never impacted.
+
+    Parameters
+    ----------
+    req : RTBRequest
+        The inbound bid request.
+    resp : RTBResponse
+        The assembled response with mutations.
+    start_time : float
+        The ``time.monotonic()`` value captured at the start of request
+        processing (retained for future latency telemetry; not used for
+        the event timestamp which uses wall-clock ``time.time()``).
+    """
+    if _feedback_collector is None:
+        return
+
+    try:
+        event = _build_bid_outcome_event(req, resp, start_time)
+        asyncio.create_task(_feedback_collector.emit(event))
+    except Exception:
+        # Never impact the bid response path
+        logger.warning("Failed to emit bid outcome event", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Event construction
+# ---------------------------------------------------------------------------
+
+
+def _build_bid_outcome_event(
+    req: RTBRequest, resp: RTBResponse, start_time: float
+) -> BidOutcomeEvent:
+    """Construct a BidOutcomeEvent from the RTBRequest/RTBResponse data.
+
+    Extracts available context from the bid_request and model_params.
+    Fields that arrive later (won, impression, click, conversion) default
+    to False — they are updated asynchronously via downstream signals.
+
+    ``start_time`` is ignored for the timestamp field (we use wall-clock
+    time.time() instead) but retained in the signature for future use.
+    """
+    bid_request = req.bid_request or {}
+    imp_list = bid_request.get("imp", [{}])
+    first_imp = imp_list[0] if imp_list else {}
+    bid_floor = first_imp.get("bidfloor", 0.0)
+
+    # Extract model parameters used (from ext.model_params if available)
+    model_params = req.model_params or {}
+    shade_factor_used = float(model_params.get("shade_factor", 0.65))
+    conversion_value_estimate_used = float(
+        model_params.get("conversion_value", 5.0)
+    )
+
+    # Compute original_price from mutations: look for BID_SHADE adjust_bid mutations
+    original_price = bid_floor
+    shaded_price = bid_floor
+    for mutation in resp.mutations:
+        if mutation.adjust_bid and mutation.adjust_bid.price:
+            shaded_price = mutation.adjust_bid.price
+            # Original is the unshaded price (shaded_price / shade_factor)
+            if shade_factor_used > 0:
+                original_price = shaded_price / shade_factor_used
+            else:
+                original_price = shaded_price
+            break
+
+    # Ensure price ordering: original_price >= shaded_price >= bid_floor
+    original_price = max(original_price, shaded_price)
+    shaded_price = max(shaded_price, bid_floor)
+    original_price = max(original_price, bid_floor)
+
+    # Extract user identity info for hashing
+    user_data = bid_request.get("user", {})
+    user_id_raw = (
+        user_data.get("id", "") or user_data.get("buyeruid", "") or ""
+    )
+    user_id_hash = (
+        hashlib.sha256(user_id_raw.encode()).hexdigest()[:16]
+        if user_id_raw
+        else "unknown"
+    )
+
+    # Extract context features
+    site = bid_request.get("site", {})
+    site_domain = site.get("domain", "unknown")
+    device = bid_request.get("device", {})
+    device_type = device.get("devicetype", "unknown")
+    if isinstance(device_type, int):
+        device_type = str(device_type)
+
+    # Compute hour_of_day from current time
+    hour_of_day = datetime.now(timezone.utc).hour
+
+    # Generate a proper UUID request_id
+    request_id = req.id
+    # Ensure it's in UUID format for the BidOutcomeEvent validation
+    try:
+        uuid.UUID(request_id)
+    except (ValueError, AttributeError):
+        # If the original request id is not a UUID, create a deterministic one from it
+        request_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(request_id)))
+
+    return BidOutcomeEvent(
+        request_id=request_id,
+        timestamp=time.time(),
+        model_version="orchestrator-v1",
+        original_price=original_price,
+        shaded_price=shaded_price,
+        bid_floor=bid_floor,
+        won=False,
+        price_paid=None,
+        impression=False,
+        click=False,
+        conversion=False,
+        conversion_value=None,
+        user_id_hash=user_id_hash,
+        site_domain=site_domain,
+        device_type=device_type,
+        hour_of_day=hour_of_day,
+        shade_factor_used=shade_factor_used,
+        conversion_value_estimate_used=conversion_value_estimate_used,
+    )

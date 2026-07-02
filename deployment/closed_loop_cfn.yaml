@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Closed-Loop Learning System - DynamoDB tables (Parameter Store + Audit Trail),
+  DAX cluster for low-latency parameter reads, SageMaker Model Package Groups,
+  and SNS training alerts topic. All stores encrypted with KMS at rest.
+  Requirements: 3.1, 5.2, 9.1, 11.1, 12.1, 12.2, 12.3
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
+
+  KMSKeyArn:
+    Type: String
+    Description: >-
+      ARN of the KMS key (from feedback pipeline stack) for encrypting DynamoDB tables at rest.
+
+  AlertEmailEndpoint:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional email address for SNS training failure alerts.
+      If empty, no subscription is created (add manually after deployment).
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # 1. DynamoDB Tables - Parameter Store and Audit Trail
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 1a. ParameterStoreTable
+  #
+  # Stores current bidding parameters (shade_factor, conversion_value) per model.
+  # Fronted by DAX for sub-5ms reads at inference time.
+  # Uses optimistic concurrency (version attribute) for conflict resolution.
+  # KMS encryption at rest (Req 12.3).
+  # ---------------------------------------------------------------------------
+  ParameterStoreTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-parameter-store'
+        - 'parameter-store'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_type
+          AttributeType: S
+        - AttributeName: parameter_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_type
+          KeyType: HASH
+        - AttributeName: parameter_name
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # 1b. AuditTrailTable
+  #
+  # Append-only record of every parameter change, model promotion, and rejection.
+  # Partition key: model_type; Sort key: timestamp_version (ISO timestamp + version).
+  # No TTL - records are never deleted (Req 10.2).
+  # KMS encryption at rest (Req 12.3).
+  # ---------------------------------------------------------------------------
+  AuditTrailTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-audit-trail'
+        - 'audit-trail'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_type
+          AttributeType: S
+        - AttributeName: timestamp_version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_type
+          KeyType: HASH
+        - AttributeName: timestamp_version
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ===========================================================================
+  # 3. SageMaker Model Package Groups - one per model type
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 3a. DLRM Bid Shader Model Package Group
+  # ---------------------------------------------------------------------------
+  DLRMBidShaderModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-dlrm-bid-shader'
+        - 'artf-dlrm-bid-shader'
+      ModelPackageGroupDescription: >-
+        Model versions for the DLRM Bid Shader - trained via NeMo-RL on bid outcomes.
+        Each version goes through A/B testing via the Governance Agent before promotion.
+
+  # ---------------------------------------------------------------------------
+  # 3b. NCF Deal Manager Model Package Group
+  # ---------------------------------------------------------------------------
+  NCFDealManagerModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-ncf-deal-manager'
+        - 'artf-ncf-deal-manager'
+      ModelPackageGroupDescription: >-
+        Model versions for the NCF Deal Manager - trained on deal activation outcomes.
+        Governed by the Model Governance Agent with A/B testing and guardrail checks.
+
+  # ---------------------------------------------------------------------------
+  # 3c. Wide&Deep Segment Activator Model Package Group
+  # ---------------------------------------------------------------------------
+  WideDeepSegmentActivatorModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-widedeep-segment-activator'
+        - 'artf-widedeep-segment-activator'
+      ModelPackageGroupDescription: >-
+        Model versions for the Wide&Deep Segment Activator - trained on segment
+        activation performance. Subject to governance A/B testing before promotion.
+
+  # ===========================================================================
+  # 4. SNS Topic - Training Alerts
+  # ===========================================================================
+
+  TrainingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-training-alerts'
+        - 'training-alerts'
+      DisplayName: ARTF Training Pipeline Alerts
+      KmsMasterKeyId: !Ref KMSKeyArn
+
+  TrainingAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref TrainingAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSameAccountPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sns:Publish'
+            Resource: !Ref TrainingAlertsTopic
+          - Sid: DenyNonTLSAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref TrainingAlertsTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  TrainingAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref TrainingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailEndpoint
+
+  # ---------------------------------------------------------------------------
+  # 4. User Feature Store Table (DynamoDB)
+  #
+  # Online feature store for real-time user feature serving in the bid path.
+  # Partition key: user_id (hashed). Populated by a Glue ETL materialization
+  # job that aggregates bid outcomes into per-user feature vectors.
+  #
+  # Features per user:
+  #   - bid_count_7d: total bids in last 7 days
+  #   - win_rate_7d: win rate over last 7 days
+  #   - avg_ctr_7d: average CTR
+  #   - avg_spend_7d: average spend per bid
+  #   - top_domain_hash: most-frequently-bid domain (hashed)
+  #   - device_preference: dominant device type
+  #   - last_updated: epoch timestamp of last materialization
+  #
+  # TTL enabled (feature_expiry_epoch) so stale features auto-expire after 14 days.
+  # DAX-compatible: ConsistentRead=false on all lookups.
+  # ---------------------------------------------------------------------------
+  UserFeatureTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-user-features'
+        - 'user-features'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: feature_expiry_epoch
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ParameterStoreTableArn:
+    Description: ARN of the DynamoDB Parameter Store table
+    Value: !GetAtt ParameterStoreTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-ParameterStoreTableArn'
+        - 'ParameterStoreTableArn'
+
+  ParameterStoreTableName:
+    Description: Name of the DynamoDB Parameter Store table
+    Value: !Ref ParameterStoreTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-ParameterStoreTableName'
+        - 'ParameterStoreTableName'
+
+  AuditTrailTableArn:
+    Description: ARN of the DynamoDB Audit Trail table
+    Value: !GetAtt AuditTrailTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-AuditTrailTableArn'
+        - 'AuditTrailTableArn'
+
+  AuditTrailTableName:
+    Description: Name of the DynamoDB Audit Trail table
+    Value: !Ref AuditTrailTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-AuditTrailTableName'
+        - 'AuditTrailTableName'
+
+  TrainingAlertsTopicArn:
+    Description: ARN of the SNS topic for training failure alerts
+    Value: !Ref TrainingAlertsTopic
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingAlertsTopicArn'
+        - 'TrainingAlertsTopicArn'
+
+  DLRMModelPackageGroupName:
+    Description: SageMaker Model Package Group for DLRM Bid Shader
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-dlrm-bid-shader'
+      - 'artf-dlrm-bid-shader'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DLRMModelPackageGroupName'
+        - 'DLRMModelPackageGroupName'
+
+  NCFModelPackageGroupName:
+    Description: SageMaker Model Package Group for NCF Deal Manager
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-ncf-deal-manager'
+      - 'artf-ncf-deal-manager'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-NCFModelPackageGroupName'
+        - 'NCFModelPackageGroupName'
+
+  WideDeepModelPackageGroupName:
+    Description: SageMaker Model Package Group for Wide&Deep Segment Activator
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-widedeep-segment-activator'
+      - 'artf-widedeep-segment-activator'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-WideDeepModelPackageGroupName'
+        - 'WideDeepModelPackageGroupName'
+
+  UserFeatureTableArn:
+    Description: ARN of the DynamoDB User Feature Store table
+    Value: !GetAtt UserFeatureTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-UserFeatureTableArn'
+        - 'UserFeatureTableArn'
+
+  UserFeatureTableName:
+    Description: Name of the DynamoDB User Feature Store table
+    Value: !Ref UserFeatureTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-UserFeatureTableName'
+        - 'UserFeatureTableName'

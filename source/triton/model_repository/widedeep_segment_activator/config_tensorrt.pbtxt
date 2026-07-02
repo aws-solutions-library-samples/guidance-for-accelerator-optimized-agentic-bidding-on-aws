@@ -1,0 +1,71 @@
+# Wide & Deep Segment Activator — NVIDIA Triton with TensorRT backend
+# Architecture: Wide & Deep Learning (Google, 2016) — NVIDIA DeepLearningExamples variant
+# Backend: NVIDIA TensorRT (compiled from ONNX)
+#
+# See dlrm_bid_shader/config_tensorrt.pbtxt for TensorRT optimization rationale.
+
+name: "widedeep_segment_activator"
+backend: "tensorrt"
+max_batch_size: 64
+
+input [
+  {
+    name: "wide_features"
+    data_type: TYPE_FP32
+    dims: [ 8 ]
+  },
+  {
+    name: "deep_features"
+    data_type: TYPE_FP32
+    dims: [ 6 ]
+  }
+]
+
+output [
+  {
+    name: "segment_scores"
+    data_type: TYPE_FP32
+    dims: [ 5 ]
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32, 64 ]
+  max_queue_delay_microseconds: 200
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]
+
+optimization {
+  input_pinned_memory { enable: true }
+  output_pinned_memory { enable: true }
+
+  execution_accelerators {
+    gpu_execution_accelerator : [
+      {
+        name: "tensorrt"
+        parameters {
+          key: "precision_mode"
+          value: "FP16"
+        }
+        parameters {
+          key: "max_workspace_size_bytes"
+          value: "1073741824"
+        }
+        parameters {
+          key: "trt_engine_cache_enable"
+          value: "1"
+        }
+        parameters {
+          key: "trt_engine_cache_path"
+          value: "/tmp/trt_engines"
+        }
+      }
+    ]
+  }
+}

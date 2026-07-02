@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import grpc
 import httpx
@@ -29,6 +32,14 @@ from starlette.routing import Route
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.artf_types import ContainerInvocationModel, Metadata, Mutation, RTBRequest, RTBResponse  # noqa: E402
+from shared.feedback_collector import FeedbackCollector  # noqa: E402
+from shared.signal_associator import SignalAssociator  # noqa: E402
+from orchestrator.signal_receiver import receive_signal as _receive_signal_handler  # noqa: E402
+from orchestrator.feedback_integration import emit_bid_outcome  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
 
 # ---------------------------------------------------------------------------
 # Container registry
@@ -72,6 +83,9 @@ def _filter_containers(applicable_intents: list[str] | None) -> list[dict]:
         return CONTAINERS
     requested = set(applicable_intents)
     return [c for c in CONTAINERS if c["intents"] & requested]
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +295,9 @@ async def get_mutations(request: Request) -> JSONResponse:
     if fabric_link_id:
         resp_dict["metadata"]["rtb_fabric_link_id"] = fabric_link_id
 
+    # Emit bid outcome event (fire-and-forget, non-blocking)
+    emit_bid_outcome(req, resp, start)
+
     return JSONResponse(resp_dict)
 
 
@@ -476,7 +493,6 @@ async def mcp_proxy(request: Request) -> JSONResponse:
 
     # For initialize and tools/list, respond directly (orchestrator acts as MCP server)
     if method == "initialize":
-        import uuid
         session_id = str(uuid.uuid4())
         return JSONResponse(
             {"jsonrpc": "2.0", "id": body.get("id"), "result": {
@@ -549,6 +565,9 @@ async def mcp_proxy(request: Request) -> JSONResponse:
                     containers=all_invocations,
                 ),
             )
+            # Emit bid outcome event (fire-and-forget, non-blocking)
+            emit_bid_outcome(req, resp, start)
+
             return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {
                 "content": [{"type": "text", "text": json.dumps(resp.model_dump())}],
             }}, headers={"Mcp-Session-Id": request.headers.get("mcp-session-id", "")})
@@ -629,14 +648,103 @@ async def gpu_stop(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ---------------------------------------------------------------------------
+# Signal Associator (downstream signal → bid association)
+# ---------------------------------------------------------------------------
+
+_KINESIS_STREAM = os.environ.get("FEEDBACK_KINESIS_STREAM", "artf-bid-outcomes")
+_SIGNAL_ASSOCIATOR: SignalAssociator | None = None
+
+
+def _get_signal_associator() -> SignalAssociator:
+    """Lazy-initialize the signal associator singleton."""
+    global _SIGNAL_ASSOCIATOR
+    if _SIGNAL_ASSOCIATOR is None:
+        collector = FeedbackCollector(
+            stream_name=_KINESIS_STREAM,
+            region=_AWS_REGION,
+        )
+        _SIGNAL_ASSOCIATOR = SignalAssociator(feedback_collector=collector)
+    return _SIGNAL_ASSOCIATOR
+
+
+async def receive_signal(request: Request) -> JSONResponse:
+    """POST /v1/signals — receive a downstream signal and associate it with an originating bid.
+
+    Delegates to the signal_receiver module which validates the payload,
+    emits a SignalEvent to Kinesis for ETL joining, and passes the signal
+    to the in-memory SignalAssociator for immediate enrichment.
+
+    Requirements: 1.4
+    """
+    associator = _get_signal_associator()
+    return await _receive_signal_handler(
+        request=request,
+        signal_associator=associator,
+        feedback_collector=_feedback_collector,
+    )
+
+
 try:
     from orchestrator.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest  # noqa: E402
 except ImportError:
     from container.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest  # noqa: E402
 
+# Closed-loop demo API (Part 2 visualization + controllable synthetic input).
+# Imported defensively: it depends on the closed_loop_demo + agents packages,
+# which must be present in the image. If they are not, the closed-loop routes
+# are simply not registered — the rest of the orchestrator is unaffected.
+_CLOSED_LOOP_AVAILABLE = False
+try:
+    try:
+        from orchestrator.closed_loop_api import (  # noqa: E402
+            list_scenarios_handler as cl_scenarios,
+            generate_handler as cl_generate,
+            parameters_handler as cl_parameters,
+            audit_handler as cl_audit,
+            models_handler as cl_models,
+            metrics_handler as cl_metrics,
+            schedule_status_handler as cl_schedule_status,
+            schedule_toggle_handler as cl_schedule_toggle,
+        )
+    except ImportError:
+        from closed_loop_api import (  # noqa: E402
+            list_scenarios_handler as cl_scenarios,
+            generate_handler as cl_generate,
+            parameters_handler as cl_parameters,
+            audit_handler as cl_audit,
+            models_handler as cl_models,
+            metrics_handler as cl_metrics,
+            schedule_status_handler as cl_schedule_status,
+            schedule_toggle_handler as cl_schedule_toggle,
+        )
+    _CLOSED_LOOP_AVAILABLE = True
+except Exception as _cl_exc:  # pragma: no cover - depends on image contents
+    logging.getLogger(__name__).warning(
+        "Closed-loop demo API unavailable (routes disabled): %s", _cl_exc
+    )
+
+
+def _closed_loop_routes(prefix: str) -> list:
+    """Build the closed-loop routes under a given prefix ('' or '/api')."""
+    if not _CLOSED_LOOP_AVAILABLE:
+        return []
+    return [
+        Route(f"{prefix}/v1/closed-loop/scenarios", cl_scenarios, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/generate", cl_generate, methods=["POST"]),
+        Route(f"{prefix}/v1/closed-loop/parameters", cl_parameters, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/audit", cl_audit, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/models", cl_models, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/metrics", cl_metrics, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/schedule", cl_schedule_status, methods=["GET"]),
+        Route(f"{prefix}/v1/closed-loop/schedule", cl_schedule_toggle, methods=["POST"]),
+    ]
+
+
 routes = [
     Route("/v1/mutations", get_mutations, methods=["POST"]),
     Route("/v1/containers", list_containers),
+    Route("/v1/signals", receive_signal, methods=["POST"]),
     Route("/v1/gpu/status", gpu_status),
     Route("/v1/gpu/start", gpu_start, methods=["POST"]),
     Route("/v1/gpu/stop", gpu_stop, methods=["POST"]),
@@ -651,6 +759,7 @@ routes = [
     # CloudFront proxies /api/* from the frontend
     Route("/api/v1/mutations", get_mutations, methods=["POST"]),
     Route("/api/v1/containers", list_containers),
+    Route("/api/v1/signals", receive_signal, methods=["POST"]),
     Route("/api/v1/gpu/status", gpu_status),
     Route("/api/v1/gpu/start", gpu_start, methods=["POST"]),
     Route("/api/v1/gpu/stop", gpu_stop, methods=["POST"]),
@@ -667,6 +776,10 @@ routes = [
     Route("/fabric/mcp", mcp_proxy, methods=["POST", "GET", "DELETE", "OPTIONS"]),
     Route("/fabric/health/ready", health),
 ]
+
+# Closed-loop demo routes on both the direct ('/v1/...') and CloudFront ('/api/v1/...') prefixes.
+routes += _closed_loop_routes("")
+routes += _closed_loop_routes("/api")
 
 app = Starlette(routes=routes)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])

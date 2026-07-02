@@ -60,6 +60,15 @@ spec:
               value: "__COGNITO_USER_POOL_ID__"
             - name: COGNITO_REGION
               value: "__REGION__"
+            # Part 2 closed-loop demo API — DynamoDB tables created by
+            # deploy_closed_loop.sh (closed_loop_cfn.yaml). Names match the
+            # unprefixed stack defaults; override if a stack prefix is used.
+            - name: PARAMETER_STORE_TABLE
+              value: "parameter-store"
+            - name: AUDIT_TRAIL_TABLE
+              value: "audit-trail"
+            - name: BID_SHADING_RUNTIME_ARN
+              value: "__BID_SHADING_RUNTIME_ARN__"
           resources:
             requests:
               cpu: "500m"

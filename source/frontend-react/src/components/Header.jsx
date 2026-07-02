@@ -2,7 +2,7 @@ import NvidiaLogo from "../logos/Nvidia_logo.svg";
 import { isAuthConfigured, signOut, getCurrentUserEmail } from "../auth";
 import { useState, useEffect } from "react";
 
-export default function Header({ loading, error, onContainersClick }) {
+export default function Header({ loading, error, onContainersClick, view, onViewChange }) {
   const statusClass = error ? "err" : loading ? "warn" : "ok";
   const statusLabel = error ? "Error" : loading ? "Processing…" : "Connected";
   const [userEmail, setUserEmail] = useState(null);
@@ -30,6 +30,20 @@ export default function Header({ loading, error, onContainersClick }) {
         <button className="btn btn-secondary" onClick={onContainersClick}>
           Containers
         </button>
+        <nav className="header-nav">
+          <button
+            className={`header-nav-link${view === "scenarios" ? " active" : ""}`}
+            onClick={() => onViewChange("scenarios")}
+          >
+            Scenarios
+          </button>
+          <button
+            className={`header-nav-link${view === "tuning" ? " active" : ""}`}
+            onClick={() => onViewChange("tuning")}
+          >
+            Adaptive Bidding
+          </button>
+        </nav>
         {userEmail && (
           <div className="header-auth">
             <span className="auth-user">{userEmail}</span>

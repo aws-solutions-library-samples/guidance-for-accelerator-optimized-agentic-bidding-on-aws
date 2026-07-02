@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "name": "BidShadingStrategyAgent",
+      "language": "Python",
+      "framework": "Custom",
+      "type": "create",
+      "codeLocation": "agents/bid_shading",
+      "entrypoint": "handler.py",
+      "build": "Container",
+      "protocol": "HTTP",
+      "networkMode": "PUBLIC",
+      "memory": "none"
+    }
+  ]
+}

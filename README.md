@@ -275,6 +275,122 @@ After `deploy.sh` completes, validate the deployment:
 
 4. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
 
+## Part 2: Closed-Loop Learning & Adaptive Bidding
+
+Part 2 extends the core inference pipeline with a full closed-loop learning system: the models observe bid outcomes, an AI agent adapts bidding parameters in real time, and a governance pipeline retrains and promotes model versions — all orchestrated through AWS and NVIDIA infrastructure.
+
+### Additional Components
+
+| Component | Purpose | AWS Service |
+|-----------|---------|-------------|
+| **Bid Shading Strategy Agent** | Reads market signals (CloudWatch), computes parameter adjustments, writes to DynamoDB | Amazon Bedrock AgentCore (Firecracker microVM) |
+| **Model Governance Agent** | Runs A/B evaluation (Welch's t-test + SPRT), promotes/rejects challenger models | Amazon Bedrock AgentCore |
+| **NeMo-RL Training Pipeline** | Two-phase retraining: supervised + reinforcement learning with bid outcome rewards | Amazon SageMaker + NVIDIA NeMo Framework |
+| **DynamoDB Parameter Store** | Online feature store for bidding parameters (shade_factor, conversion_value) with sub-5ms reads | Amazon DynamoDB (+ optional DAX) |
+| **DynamoDB User Feature Table** | Per-user feature vectors (win_rate, CTR, spend) materialized from bid outcomes with TTL-based expiry | Amazon DynamoDB |
+| **Glue Feature ETL** | Transforms raw bid outcomes into labeled training datasets + materializes user features into DynamoDB | AWS Glue (Spark) |
+| **EventBridge Scheduler** | Invokes the Bid Shading Agent every 5 minutes and triggers retraining on a 6-hour cadence | Amazon EventBridge Scheduler |
+| **SageMaker Model Registry** | Versioned model packages with approval workflow (governance agent promotes/rejects) | Amazon SageMaker Model Registry |
+| **TensorRT Optimization** | FP16 mixed-precision inference with engine caching for 2x throughput on NVIDIA Ampere+ GPUs | NVIDIA TensorRT (via Triton backend) |
+
+### Architecture (Closed-Loop)
+
+```
+Bid Outcomes (CloudWatch) ──► Glue ETL ──► S3 Training Data
+                                              │
+                                              ▼
+                              SageMaker Training (NeMo-RL + NVIDIA NeMo Framework)
+                                              │
+                                              ▼
+                              Model Registry (versioned ONNX artifacts)
+                                              │
+                                              ▼
+                              Governance Agent (A/B test: promote / reject / extend)
+                                              │
+                               ┌──────────────┴──────────────┐
+                               ▼                              ▼
+                       Triton (hot-swap model)        Reject (keep incumbent)
+                               │
+                               ▼
+CloudWatch Metrics ──► Bid Shading Agent (AgentCore) ──► DynamoDB Parameters
+                                                              │
+                                                              ▼
+                                                    ARTF Containers (read at bid time)
+```
+
+### Deployment
+
+Part 2 is deployed via a single flag added to the main deployment:
+
+```bash
+cd deployment
+./deploy.sh --prefix dv --with-retraining
+```
+
+This runs the full Part 1 stack (EKS + Triton + frontend) and then automatically deploys the closed-loop infrastructure:
+
+- Builds and pushes the NeMo-RL training container (`nvcr.io/nvidia/nemo:24.07` base) to ECR
+- Creates DynamoDB tables (parameter-store, audit-trail, user-features) with KMS encryption
+- Creates SageMaker Model Package Groups for each model type
+- Deploys Glue ETL jobs (feature engineering + user feature materialization)
+- Creates EventBridge schedules for the Bid Shading Agent (every 5 min) and retraining (every 6h)
+- Deploys AgentCore runtimes for the Bid Shading and Governance agents
+
+To deploy Part 2 separately on an existing Part 1 stack:
+
+```bash
+cd deployment
+./deploy_closed_loop.sh --prefix dv
+```
+
+### Disabling Expensive Components
+
+The scheduled components (agent invocations, retraining jobs) run on fixed cadences and incur ongoing costs. Disable them without tearing down infrastructure:
+
+```bash
+# Disable scheduled retraining via the API
+curl -X POST https://<CLOUDFRONT_DOMAIN>/api/v1/closed-loop/schedule \
+  -H "Authorization: Bearer <TOKEN>" \
+  -d '{"enabled": false}'
+
+# Re-enable when needed
+curl -X POST https://<CLOUDFRONT_DOMAIN>/api/v1/closed-loop/schedule \
+  -H "Authorization: Bearer <TOKEN>" \
+  -d '{"enabled": true}'
+```
+
+The UI also exposes this toggle on the **Adaptive Bidding** page.
+
+### TensorRT Optimization
+
+To enable TensorRT (FP16) instead of ONNX Runtime for inference:
+
+```bash
+# For each model, swap the config before deploying
+cd source/triton/model_repository/dlrm_bid_shader
+cp config.pbtxt config_onnxruntime.pbtxt      # backup
+cp config_tensorrt.pbtxt config.pbtxt          # activate TensorRT
+```
+
+TensorRT compiles the ONNX model to an optimized engine at first Triton load (~2–5 min). Subsequent loads use the cached engine. FP16 provides ~2x throughput on NVIDIA A10G (Ampere) and higher GPUs.
+
+### Cost (Part 2 additional)
+
+The following costs are **in addition to** the Part 1 base (~$592/month):
+
+| AWS Service | Dimensions | Cost [USD/month] |
+|-------------|-----------|------------------|
+| Amazon DynamoDB | 3 tables (parameter-store, audit-trail, user-features), on-demand | ~$5 |
+| Amazon DynamoDB DAX (optional) | 1 × dax.t3.small cluster | ~$36 |
+| Amazon Bedrock AgentCore | Bid Shading Agent: ~8,640 invocations/month (5-min cadence) | ~$15 |
+| Amazon Bedrock AgentCore | Governance Agent: triggered on model registration | ~$2 |
+| Amazon SageMaker Training | 1 × ml.g5.xlarge, ~4 retraining jobs/day × 15 min each | ~$60 |
+| AWS Glue | 10 DPU-hours/day for feature engineering + materialization | ~$44 |
+| Amazon EventBridge Scheduler | 2 schedules, negligible | <$1 |
+| **Part 2 total (estimate)** | | **~$125–160** |
+
+> With both Part 1 and Part 2 running (daytime GPU schedule), expect approximately **$720–750/month**. Disable the EventBridge schedules and Glue jobs to drop Part 2 costs to near-zero (only DynamoDB storage remains). DAX is optional — only needed if you require sub-millisecond parameter reads at very high request rates.
+
 ## Next Steps
 
 You can adapt this Guidance to your own bidding pipeline:

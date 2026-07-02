@@ -18,6 +18,8 @@
 #   ./deploy.sh                                # full deploy
 #   ./deploy.sh --prefix v1                    # resources named v1-nvidia-artf-*
 #   ./deploy.sh --prefix prod --skip-agentcore # combine flags
+#   ./deploy.sh --with-retraining              # include NeMo-RL training, Model Registry, Glue ETL
+#   ./deploy.sh --prefix dv --with-retraining  # full stack with retraining
 #   ./deploy.sh --ui-only                      # redeploy frontend only (fast)
 #   ./deploy.sh --skip-cluster                 # reuse existing EKS cluster
 #   ./deploy.sh --export-only                  # just export ONNX models, no deploy
@@ -46,6 +48,8 @@ SKIP_IMAGES=0
 UI_ONLY=0
 SKIP_CLUSTER=0
 EXPORT_ONLY=0
+WITH_RETRAINING=0
+START_AT=1
 MAX_GPUS="${MAX_GPUS:-3}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 for arg in "$@"; do
@@ -53,25 +57,35 @@ for arg in "$@"; do
     --destroy)          DESTROY=1 ;;
     --skip-agentcore)   SKIP_AGENTCORE=1 ;;
     --skip-images)      SKIP_IMAGES=1 ;;
+    --start-at=*)       START_AT="${arg#--start-at=}" ;;
     --ui-only)          UI_ONLY=1 ;;
     --skip-cluster)     SKIP_CLUSTER=1 ;;
     --export-only)      EXPORT_ONLY=1 ;;
+    --with-retraining)  WITH_RETRAINING=1 ;;
     --prefix=*)         STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)           ;; # value comes in next arg, handled below
     --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}" ;;
     --maxGPUs)          ;; # value comes in next arg, handled below
+    --start-at)         ;; # value comes in next arg, handled below
     -h|--help)          sed -n '2,24p' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
         STACK_PREFIX="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--maxGPUs" ]]; then
         MAX_GPUS="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--start-at" ]]; then
+        START_AT="${arg}"
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
 unset _PREV_ARG
+
+# --start-at: skip earlier steps by setting SKIP flags
+# Steps: 1-3=models/ECR, 4=images, 5-7=cluster/NVIDIA/IAM, 8=manifests, 9=frontend, 10=agentcore, 11=closed-loop
+if [[ "${START_AT}" -gt 4 ]]; then SKIP_IMAGES=1; fi
+if [[ "${START_AT}" -gt 7 ]]; then SKIP_CLUSTER=1; fi
 
 # Validate --maxGPUs: must be a positive integer (it caps the GPU node group's maxSize)
 if ! [[ "${MAX_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -93,16 +107,39 @@ fail() { printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # Preflight
 # =========================================================================
 log "Preflight checks"
-for bin in aws docker python3 jq eksctl kubectl; do
+for bin in aws docker jq eksctl kubectl; do
   command -v "${bin}" >/dev/null 2>&1 || fail "missing: ${bin}"
 done
+
+# Resolve Python 3 binary (prefer python3, fall back to python if it's 3.x)
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON="python3"
+elif command -v python >/dev/null 2>&1 && python -c "import sys; assert sys.version_info >= (3, 11)" 2>/dev/null; then
+  PYTHON="python"
+else
+  fail "missing: python3 (>= 3.11)"
+fi
+log "Using Python: $(${PYTHON} --version) ($(command -v ${PYTHON}))"
+
+# Ensure required Python packages are available (install if missing)
+REQUIRED_PY_PACKAGES="torch onnx onnxscript boto3"
+MISSING_PY_PACKAGES=""
+for pkg in ${REQUIRED_PY_PACKAGES}; do
+  if ! ${PYTHON} -c "import ${pkg}" 2>/dev/null; then
+    MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${pkg}"
+  fi
+done
+if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
+  log "Installing missing Python packages:${MISSING_PY_PACKAGES}"
+  ${PYTHON} -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"
+fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account"
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 # Deterministic UID for resource naming
-STACK_UID="$(python3 -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
+STACK_UID="$(${PYTHON} -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
 
 CLUSTER_NAME="${STACK_NAME}-triton"
 MODEL_BUCKET="${STACK_NAME}-triton-models-${STACK_UID}"
@@ -150,14 +187,14 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   aws dynamodb delete-table --table-name "${LOADTEST_TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
 
   log "Deleting CloudFront + S3 frontend..."
-  python3 "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
 
   log "Deleting AgentCore runtime..."
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
-  python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" || true
 
   log "Deleting Cognito User Pool..."
-  python3 "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
 
   log "Deleting IAM policies..."
   TRITON_POLICY_NAME="${STACK_NAME}-triton-s3-policy-${STACK_UID}"
@@ -166,8 +203,10 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   DYNAMO_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DYNAMO_POLICY_NAME}"
   EKS_SCALE_POLICY_NAME="${STACK_NAME}-eks-gpu-scale-${STACK_UID}"
   EKS_SCALE_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${EKS_SCALE_POLICY_NAME}"
+  CLOSED_LOOP_POLICY_NAME="${STACK_NAME}-closed-loop-${STACK_UID}"
+  CLOSED_LOOP_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLOSED_LOOP_POLICY_NAME}"
 
-  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}"; do
+  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}" "${CLOSED_LOOP_POLICY_ARN}"; do
     # Detach from all entities before deletion
     for ENTITY in $(aws iam list-entities-for-policy --policy-arn "${POLICY_ARN}" --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
       aws iam detach-role-policy --role-name "${ENTITY}" --policy-arn "${POLICY_ARN}" 2>/dev/null || true
@@ -188,6 +227,24 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   log "Deleting IRSA service account IAM role..."
   eksctl delete iamserviceaccount --name triton-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+
+  # --- Part 2 closed-loop resources (if deployed) ---
+  log "Deleting Part 2 closed-loop stacks (if present)..."
+  for CL_STACK in "${STACK_PREFIX:+${STACK_PREFIX}-}agentcore-security" "${STACK_PREFIX:+${STACK_PREFIX}-}closed-loop-core" "${STACK_PREFIX:+${STACK_PREFIX}-}glue-etl" "${STACK_PREFIX:+${STACK_PREFIX}-}feedback-pipeline"; do
+    if aws cloudformation describe-stacks --stack-name "${CL_STACK}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+      log "  Deleting ${CL_STACK}..."
+      aws cloudformation delete-stack --stack-name "${CL_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+    fi
+  done
+
+  log "Deleting Bid Shading AgentCore runtime..."
+  BID_SHADING_ID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'BidShadingStrategy')].agentRuntimeId | [0]" \
+    --output text 2>/dev/null || echo 'None')"
+  if [[ -n "${BID_SHADING_ID}" && "${BID_SHADING_ID}" != "None" ]]; then
+    aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${BID_SHADING_ID}" --region "${AWS_REGION}" 2>/dev/null || true
+    log "  Deleted runtime ${BID_SHADING_ID}"
+  fi
 
   log "Destroy complete."
   log ""
@@ -212,7 +269,7 @@ if [[ "${UI_ONLY}" -eq 1 ]]; then
   fi
 
   # Primary distribution: React UI
-  python3 "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -237,6 +294,7 @@ REPOS=(
   ${STACK_NAME}-agentcore
 )
 
+if [[ "${START_AT}" -le 1 ]]; then
 log "Step 1: Ensuring ECR repositories"
 aws ecr get-login-password --region "${AWS_REGION}" | \
   docker login --username AWS --password-stdin "${REGISTRY}"
@@ -268,7 +326,7 @@ fi
 # Step 2: Export PyTorch models to ONNX
 # =========================================================================
 log "Step 2: Exporting PyTorch models to ONNX for Triton"
-python3 "${SCRIPT_DIR}/../source/triton/export_models.py" \
+${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
   --output-dir "${SCRIPT_DIR}/../source/triton/model_repository"
 
 if [[ "${EXPORT_ONLY}" -eq 1 ]]; then
@@ -287,6 +345,7 @@ aws s3 sync "${SCRIPT_DIR}/../source/triton/model_repository/" \
   "s3://${MODEL_BUCKET}/triton-models/" \
   --delete --region "${AWS_REGION}"
 log "  Models uploaded to s3://${MODEL_BUCKET}/triton-models/"
+fi # START_AT <= 1 (steps 1-3)
 
 # =========================================================================
 # Step 4: Build and push container images
@@ -313,24 +372,28 @@ if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
     docker push "${IMAGE}"
   done
 
-  # Metrics enricher (rule-based) + orchestrator (standard Dockerfile, no Triton needed)
-  for entry in \
-    "containers/metrics_enricher:${STACK_NAME}-metrics-enricher:metrics-enricher" \
-    "orchestrator:${STACK_NAME}-orchestrator:orchestrator"; do
-    CONTAINER_PATH="${entry%%:*}"
-    REMAINDER="${entry#*:}"
-    REPO_NAME="${REMAINDER%%:*}"
-    AGENT_NAME="${REMAINDER##*:}"
-    IMAGE="${REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
-    log "  Building ${REPO_NAME} (amd64)"
-    docker buildx build \
-      --platform linux/amd64 \
-      --build-arg CONTAINER="${CONTAINER_PATH}" \
-      --build-arg AGENT_NAME="${AGENT_NAME}" \
-      -f "${SCRIPT_DIR}/../source/Dockerfile" \
-      -t "${IMAGE}" --load "${SCRIPT_DIR}/../source"
-    docker push "${IMAGE}"
-  done
+  # Metrics enricher (rule-based, shared container Dockerfile — no Triton needed)
+  METRICS_IMAGE="${REGISTRY}/${STACK_NAME}-metrics-enricher:${IMAGE_TAG}"
+  log "  Building ${STACK_NAME}-metrics-enricher (amd64)"
+  docker buildx build \
+    --platform linux/amd64 \
+    --build-arg CONTAINER="containers/metrics_enricher" \
+    --build-arg AGENT_NAME="metrics-enricher" \
+    -f "${SCRIPT_DIR}/../source/Dockerfile" \
+    -t "${METRICS_IMAGE}" --load "${SCRIPT_DIR}/../source"
+  docker push "${METRICS_IMAGE}"
+
+  # Orchestrator (dedicated Dockerfile — packages shared/, agents/, and
+  # closed_loop_demo/ alongside orchestrator/ so the Part 1 + Part 2 REST API,
+  # including the closed-loop endpoints, resolve their absolute imports).
+  ORCH_IMAGE="${REGISTRY}/${STACK_NAME}-orchestrator:${IMAGE_TAG}"
+  log "  Building ${STACK_NAME}-orchestrator (amd64)"
+  docker buildx build \
+    --platform linux/amd64 \
+    --build-arg AGENT_NAME="artf-orchestrator" \
+    -f "${SCRIPT_DIR}/../source/Dockerfile.orchestrator" \
+    -t "${ORCH_IMAGE}" --load "${SCRIPT_DIR}/../source"
+  docker push "${ORCH_IMAGE}"
 
   # AgentCore container (ARM64)
   if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
@@ -351,18 +414,64 @@ fi
 # =========================================================================
 # Step 5: Create or reuse EKS cluster
 # =========================================================================
+# Render the eksctl ClusterConfig and run `eksctl create cluster`.
+create_eks_cluster() {
+  log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
+  local CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
+  sed -e "s/__STACK_NAME__/${STACK_NAME}/g" \
+      -e "s/__REGION__/${AWS_REGION}/g" \
+      -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
+      "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${CLUSTER_CONFIG}"
+  eksctl create cluster -f "${CLUSTER_CONFIG}"
+}
+
 if [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
   if eksctl get cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
     log "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
   else
-    log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
-    log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
-    CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
-    sed -e "s/__STACK_NAME__/${STACK_NAME}/g" \
-        -e "s/__REGION__/${AWS_REGION}/g" \
-        -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
-        "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${CLUSTER_CONFIG}"
-    eksctl create cluster -f "${CLUSTER_CONFIG}"
+    # `eksctl get cluster` found no active cluster, but a previous
+    # `eksctl create cluster` may have left an orphaned CloudFormation stack
+    # (e.g. ROLLBACK_COMPLETE / CREATE_FAILED after a mid-create failure). In
+    # that state a fresh create fails with:
+    #   AlreadyExistsException: Stack [eksctl-<cluster>-cluster] already exists
+    # eksctl base cluster stacks cannot be updated in place, so recovery is:
+    # reuse it if it's healthy, otherwise delete the failed stack and recreate.
+    CLUSTER_STACK="eksctl-${CLUSTER_NAME}-cluster"
+    STACK_STATUS="$(aws cloudformation describe-stacks \
+      --stack-name "${CLUSTER_STACK}" \
+      --region "${AWS_REGION}" \
+      --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
+
+    if [[ -z "${STACK_STATUS}" ]]; then
+      log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
+      create_eks_cluster
+    else
+      warn "Step 5: Found existing eksctl stack ${CLUSTER_STACK} (status: ${STACK_STATUS})"
+      case "${STACK_STATUS}" in
+        CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE)
+          # Stack is healthy but `eksctl get cluster` didn't list it — reuse it
+          # (kubeconfig is refreshed below in Step 5.5). No create needed.
+          log "  Stack is healthy; reusing existing cluster"
+          ;;
+        *_IN_PROGRESS)
+          fail "  Stack ${CLUSTER_STACK} is ${STACK_STATUS}; wait for it to settle, then re-run"
+          ;;
+        ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED|UPDATE_ROLLBACK_FAILED)
+          warn "  Stack is in a failed state; deleting the orphaned cluster before recreating"
+          # Prefer eksctl (cleans up all associated stacks); fall back to a raw
+          # CFN delete if eksctl can't (the cluster resource may never have existed).
+          eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null \
+            || aws cloudformation delete-stack --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}"
+          aws cloudformation wait stack-delete-complete \
+            --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+          log "  Orphaned stack deleted; creating fresh cluster ${CLUSTER_NAME} (15-20 min)"
+          create_eks_cluster
+          ;;
+        *)
+          fail "  Stack ${CLUSTER_STACK} in unexpected state ${STACK_STATUS}; resolve manually then re-run"
+          ;;
+      esac
+    fi
   fi
 else
   warn "Skipping EKS cluster creation (--skip-cluster)"
@@ -499,13 +608,52 @@ if [[ -n "${SERVICES_NG_ROLE}" && "${SERVICES_NG_ROLE}" != "None" ]]; then
 fi
 
 # =========================================================================
+# Step 7.7: Closed-loop (Part 2) permissions for the orchestrator
+# =========================================================================
+# The orchestrator exposes the Part 2 closed-loop demo API, which:
+#   - emits synthetic input metrics and reads market metrics (CloudWatch)
+#   - reads/writes the DynamoDB Parameter Store + Audit Trail (KMS-encrypted)
+#   - lists/describes SageMaker model package versions
+# These stores are created by deploy_closed_loop.sh; the policy is scoped by
+# name/ARN patterns so it is valid whether or not a stack prefix is used.
+log "Step 7.7: Ensuring closed-loop (Part 2) access for orchestrator"
+CLOSED_LOOP_POLICY_NAME="${STACK_NAME}-closed-loop-${STACK_UID}"
+CLOSED_LOOP_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLOSED_LOOP_POLICY_NAME}"
+CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
+{\"Sid\":\"EmitBidOutcomeMetrics\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:PutMetricData\"],\"Resource\":\"*\",\"Condition\":{\"StringLike\":{\"cloudwatch:namespace\":[\"ARTF/*\"]}}},\
+{\"Sid\":\"ReadMetrics\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:GetMetricData\",\"cloudwatch:GetMetricStatistics\"],\"Resource\":\"*\"},\
+{\"Sid\":\"ParameterStoreAndAudit\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:BatchGetItem\",\"dynamodb:DescribeTable\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]},\
+{\"Sid\":\"InvokeAgentRuntime\",\"Effect\":\"Allow\",\"Action\":[\"bedrock-agentcore:InvokeAgentRuntime\"],\"Resource\":[\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*\",\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*/*\"]},\
+{\"Sid\":\"SchedulerToggle\",\"Effect\":\"Allow\",\"Action\":[\"scheduler:GetSchedule\",\"scheduler:UpdateSchedule\"],\"Resource\":[\"arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/default/*\"]},\
+{\"Sid\":\"ModelRegistryRead\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListModelPackages\",\"sagemaker:DescribeModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package-group/*artf-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
+{\"Sid\":\"KmsForDynamoDb\",\"Effect\":\"Allow\",\"Action\":[\"kms:Decrypt\",\"kms:GenerateDataKey\",\"kms:DescribeKey\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":[\"dynamodb.${AWS_REGION}.amazonaws.com\"]}}}\
+]}"
+
+if aws iam get-policy --policy-arn "${CLOSED_LOOP_POLICY_ARN}" >/dev/null 2>&1; then
+  aws iam create-policy-version \
+    --policy-arn "${CLOSED_LOOP_POLICY_ARN}" \
+    --policy-document "${CLOSED_LOOP_POLICY_DOC}" \
+    --set-as-default 2>/dev/null || true
+else
+  aws iam create-policy \
+    --policy-name "${CLOSED_LOOP_POLICY_NAME}" \
+    --policy-document "${CLOSED_LOOP_POLICY_DOC}" >/dev/null
+fi
+
+if [[ -n "${SERVICES_NG_ROLE}" && "${SERVICES_NG_ROLE}" != "None" ]]; then
+  aws iam attach-role-policy --role-name "${SERVICES_NG_ROLE}" --policy-arn "${CLOSED_LOOP_POLICY_ARN}" 2>/dev/null || true
+  log "  Attached closed-loop policy to node role: ${SERVICES_NG_ROLE}"
+fi
+
+# =========================================================================
 # Step 8: Apply Kubernetes manifests (idempotent — kubectl apply)
 # =========================================================================
+if [[ "${START_AT}" -le 8 ]]; then
 log "Step 8: Applying Kubernetes manifests"
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
 log "  Provisioning Cognito User Pool (needed for orchestrator auth)..."
-python3 "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
   --action deploy \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
@@ -519,6 +667,63 @@ log "  Cognito Pool: ${COGNITO_USER_POOL_ID}  Client: ${COGNITO_CLIENT_ID}"
 if [[ -z "${COGNITO_USER_POOL_ID}" ]]; then
   warn "Cognito pool ID is empty — orchestrator auth will be DISABLED until patched!"
 fi
+
+# --- Create Cognito Identity Pool (gives browser AWS SDK credentials) ---
+IDENTITY_POOL_NAME="${STACK_NAME}-identity-pool"
+IDENTITY_POOL_ID=""
+# Check if it already exists
+IDENTITY_POOL_ID="$(aws cognito-identity list-identity-pools --max-results 60 --region "${AWS_REGION}" \
+  --query "IdentityPools[?IdentityPoolName=='${IDENTITY_POOL_NAME}'].IdentityPoolId | [0]" \
+  --output text 2>/dev/null || echo '')"
+
+if [[ -z "${IDENTITY_POOL_ID}" || "${IDENTITY_POOL_ID}" == "None" ]]; then
+  log "  Creating Cognito Identity Pool: ${IDENTITY_POOL_NAME}"
+  IDENTITY_POOL_ID="$(aws cognito-identity create-identity-pool \
+    --identity-pool-name "${IDENTITY_POOL_NAME}" \
+    --no-allow-unauthenticated-identities \
+    --cognito-identity-providers \
+      "ProviderName=cognito-idp.${AWS_REGION}.amazonaws.com/${COGNITO_USER_POOL_ID},ClientId=${COGNITO_CLIENT_ID},ServerSideTokenCheck=false" \
+    --region "${AWS_REGION}" \
+    --query 'IdentityPoolId' --output text)"
+  log "  Created Identity Pool: ${IDENTITY_POOL_ID}"
+
+  # Create the authenticated IAM role
+  ID_POOL_AUTH_ROLE_NAME="${STACK_NAME}-cognito-auth-${STACK_UID}"
+  log "  Creating authenticated role: ${ID_POOL_AUTH_ROLE_NAME}"
+  aws iam create-role --role-name "${ID_POOL_AUTH_ROLE_NAME}" \
+    --assume-role-policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"cognito-identity.amazonaws.com\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\"cognito-identity.amazonaws.com:aud\":\"${IDENTITY_POOL_ID}\"},\"ForAnyValue:StringLike\":{\"cognito-identity.amazonaws.com:amr\":\"authenticated\"}}}]}" \
+    --description "Authenticated role for ${STACK_NAME} frontend users" >/dev/null 2>&1 || true
+
+  # Grant InvokeAgentRuntime permission
+  aws iam put-role-policy --role-name "${ID_POOL_AUTH_ROLE_NAME}" \
+    --policy-name AllowAgentCoreInvoke \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"bedrock-agentcore:InvokeAgentRuntime\"],\"Resource\":[\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*\"]}]}"
+
+  # Attach role to identity pool
+  ID_POOL_AUTH_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ID_POOL_AUTH_ROLE_NAME}"
+  aws cognito-identity set-identity-pool-roles \
+    --identity-pool-id "${IDENTITY_POOL_ID}" \
+    --roles "authenticated=${ID_POOL_AUTH_ROLE_ARN}" \
+    --region "${AWS_REGION}"
+  log "  Identity Pool roles configured"
+else
+  log "  Identity Pool already exists: ${IDENTITY_POOL_ID}"
+fi
+
+# Resolve AgentCore runtime ARN for the bid shading agent.
+# First check if a runtime named *bid*shading* or *BidShading* exists.
+# Allow override via env var for pre-deployed runtimes.
+if [[ -z "${BID_SHADING_RUNTIME_ARN:-}" ]]; then
+  BID_SHADING_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'BidShading')].agentRuntimeArn | [0]" \
+    --output text 2>/dev/null || echo '')"
+  if [[ -z "${BID_SHADING_RUNTIME_ARN}" || "${BID_SHADING_RUNTIME_ARN}" == "None" ]]; then
+    BID_SHADING_RUNTIME_ARN=""
+    warn "No Bid Shading AgentCore runtime found. Deploy it with: ./deploy.sh --with-retraining"
+    warn "The Adaptive Bidding page will show an error until the runtime is deployed and BID_SHADING_RUNTIME_ARN is set."
+  fi
+fi
+log "  Bid Shading AgentCore ARN: ${BID_SHADING_RUNTIME_ARN:-<not deployed>}"
 
 # All workloads (Triton, agent containers, orchestrator) deploy into the
 # `default` namespace, matching the triton-sa IRSA service account. Keeping
@@ -554,6 +759,7 @@ for manifest in triton-deployment.yaml artf-containers-deployment.yaml orchestra
       -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
       -e "s|__TRITON_ROLE_ARN__|${TRITON_ROLE_ARN}|g" \
       -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
+      -e "s|__BID_SHADING_RUNTIME_ARN__|${BID_SHADING_RUNTIME_ARN:-}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
   kubectl apply -f "${PROCESSED}"
 done
@@ -564,6 +770,14 @@ kubectl rollout status deployment/triton-inference-server --timeout=300s || \
 
 log "  Waiting for orchestrator..."
 kubectl rollout status deployment/orchestrator --timeout=120s || true
+
+# Patch the orchestrator with the Bid Shading runtime ARN if available.
+# This runs on every deploy so re-deploys pick up the correct ARN even if
+# it was empty during manifest apply (e.g., runtime created after manifests).
+if [[ -n "${BID_SHADING_RUNTIME_ARN}" && "${BID_SHADING_RUNTIME_ARN}" != "None" ]]; then
+  kubectl set env deployment/orchestrator "BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}" 2>/dev/null || true
+  log "  Orchestrator patched with BID_SHADING_RUNTIME_ARN"
+fi
 
 # Wait for the LoadBalancer to get an external hostname
 log "  Waiting for orchestrator LoadBalancer endpoint..."
@@ -620,9 +834,12 @@ else
   warn "Could not find GPU ASG — skipping scheduled shutdown setup"
 fi
 
+fi # START_AT <= 8
+
 # =========================================================================
 # Step 9: Deploy frontend to S3 + CloudFront (React UI)
 # =========================================================================
+if [[ "${START_AT}" -le 9 ]]; then
 log "Step 9: Deploying frontend"
 
 # Cognito was already provisioned in Step 8 (before manifest apply).
@@ -637,10 +854,12 @@ cat > "${REACT_ENV}" <<EOF
 VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
 VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
 VITE_COGNITO_REGION=${AWS_REGION}
+VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}
 EOF
 
 # React UI distribution
-python3 "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
   --action deploy \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
@@ -651,7 +870,7 @@ CF_DOMAIN="$(jq -r '.CloudFrontDomain // empty' "${PRIMARY_OUTPUTS}" 2>/dev/null
 
 # Update Cognito callback URLs now that we know the CF domain
 if [[ -n "${CF_DOMAIN}" && -n "${COGNITO_USER_POOL_ID}" ]]; then
-  python3 "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -676,7 +895,7 @@ if [[ -n "${COGNITO_USER_POOL_ID}" ]]; then
     # summary. The operator may instead supply one via DEMO_USER_PASSWORD.
     TEMP_PASS="${DEMO_USER_PASSWORD:-}"
     if [[ -z "${TEMP_PASS}" ]]; then
-      TEMP_PASS="$(python3 - <<'PY'
+      TEMP_PASS="$(${PYTHON} - <<'PY'
 import secrets
 import string
 
@@ -704,6 +923,8 @@ PY
   fi
 fi
 
+fi # START_AT <= 9
+
 # =========================================================================
 # Step 10: Deploy AgentCore MCP runtime
 # =========================================================================
@@ -720,12 +941,16 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     aws iam attach-role-policy --role-name "${ROLE_NAME}" --policy-arn "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
     aws iam attach-role-policy --role-name "${ROLE_NAME}" --policy-arn "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
     aws iam attach-role-policy --role-name "${ROLE_NAME}" --policy-arn "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+    # Bid Shading Agent needs CloudWatch metrics + DynamoDB for parameter store
+    aws iam put-role-policy --role-name "${ROLE_NAME}" \
+      --policy-name BidShadingAgentPermissions \
+      --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"CloudWatch\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:GetMetricData\",\"cloudwatch:GetMetricStatistics\",\"cloudwatch:PutMetricData\"],\"Resource\":\"*\"},{\"Sid\":\"DynamoDB\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:Query\",\"dynamodb:UpdateItem\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]}]}"
     sleep 10
   fi
 
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
   AC_IMAGE="${REGISTRY}/${STACK_NAME}-agentcore:${IMAGE_TAG}"
-  python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
     --action deploy \
     --runtime-name "${AC_RUNTIME_NAME}" \
     --role-arn "${ROLE_ARN}" \
@@ -733,6 +958,70 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     --region "${AWS_REGION}"
 else
   warn "Skipping AgentCore deployment (--skip-agentcore)"
+fi
+
+# =========================================================================
+# Step 11 (optional): Deploy closed-loop retraining infrastructure
+# =========================================================================
+if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
+  log ""
+  log "Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)"
+  log ""
+
+  # Resolve VPC, subnets, and node role from the EKS cluster for the closed-loop stack
+  CL_VPC_ID="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+    --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null || echo '')"
+  CL_SUBNET_IDS="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+    --query 'cluster.resourcesVpcConfig.subnetIds' --output text 2>/dev/null | tr '\t' ',' || echo '')"
+  # EKS_NODE_ROLE must be the full ARN (used in KMS key policies)
+  CL_NODE_ROLE_ARN="$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name "cpu-services" --region "${AWS_REGION}" \
+    --query 'nodegroup.nodeRole' --output text 2>/dev/null || echo '')"
+
+  # Pass through the prefix and skip flags
+  CLOSED_LOOP_ARGS=""
+  if [[ -n "${STACK_PREFIX}" ]]; then
+    CLOSED_LOOP_ARGS="--prefix ${STACK_PREFIX}"
+  fi
+  if [[ "${SKIP_AGENTCORE}" -eq 1 ]]; then
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --skip-agentcore"
+  fi
+
+  VPC_ID="${CL_VPC_ID}" \
+  SUBNET_IDS="${CL_SUBNET_IDS}" \
+  EKS_NODE_ROLE="${CL_NODE_ROLE_ARN}" \
+  "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} || {
+    warn "Closed-loop deployment returned non-zero. Check output above for errors."
+    warn "The core EKS deployment succeeded — retraining infra may need manual intervention."
+  }
+
+  # Resolve the actual runtime ARN (deploy_closed_loop.sh exports it, but subshell won't propagate)
+  BID_SHADING_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'BidShadingStrategy')].agentRuntimeArn | [0]" \
+    --output text 2>/dev/null || echo '')"
+  if [[ -n "${BID_SHADING_RUNTIME_ARN}" && "${BID_SHADING_RUNTIME_ARN}" != "None" ]]; then
+    log "  BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}"
+
+    # Re-deploy frontend with the runtime ARN now available
+    log "  Re-deploying frontend with AgentCore runtime ARN..."
+    cat > "${REACT_ENV}" <<EOF
+VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
+VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
+VITE_COGNITO_REGION=${AWS_REGION}
+VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}
+EOF
+    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+      --action deploy \
+      --stack-name "${STACK_NAME}" \
+      --region "${AWS_REGION}" 2>/dev/null || warn "Frontend re-deploy failed"
+  fi
+
+  log "  Closed-loop retraining infrastructure deployed."
+else
+  log ""
+  log "  Skipping closed-loop retraining (pass --with-retraining to enable)."
+  log "  This includes: NeMo-RL training container, SageMaker Model Registry,"
+  log "  Glue ETL, EventBridge scheduled retraining, and AgentCore agents."
 fi
 
 # =========================================================================

@@ -3,6 +3,7 @@ import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
 import RawPanel from "./components/RawPanel";
 import ContainersPanel from "./components/ContainersPanel";
+import ClosedLoopPanel from "./components/ClosedLoopPanel";
 import { LoadTestResults } from "./components/LoadTestPanel";
 import BidBubbleOverlay from "./components/BidBubbleOverlay";
 import DemoToggle from "./components/DemoToggle";
@@ -18,6 +19,7 @@ import {
 
 function AppContent() {
   const [showContainers, setShowContainers] = useState(false);
+  const [view, setView] = useState("scenarios");
   const [lastPayload, setLastPayload] = useState(null);
   const [loadTestState, setLoadTestState] = useState(null);
   const [demoActive, setDemoActive] = useState(false);
@@ -108,56 +110,64 @@ function AppContent() {
         loading={activeLoading}
         error={activeError}
         onContainersClick={() => setShowContainers(true)}
+        view={view}
+        onViewChange={setView}
       />
       <div className="app-layout">
-        <Sidebar
-          onResult={(r) => { }}
-          submit={handleSubmit}
-          onLoadTestChange={setLoadTestState}
-          demoActive={demoActive}
-        />
+        {view !== "tuning" && (
+          <Sidebar
+            onResult={(r) => { }}
+            submit={handleSubmit}
+            onLoadTestChange={setLoadTestState}
+            demoActive={demoActive}
+          />
+        )}
         <main className="app-main">
-          {/* Mode selector bar */}
-          <div className="mode-selector-bar">
-            <ModeSelector />
-          </div>
-          {/* Scenario timeline + Request JSON (shown only after a scenario is submitted) */}
-          {showScenarioView && !loadTestActive && (
-            <div className="main-top">
-              <div className="main-top-left">
-                <ComparisonLayout />
-                <div className="raw-panel raw-panel--single">
-                  <RawPanel
-                    result={activeResult}
-                    payload={lastPayload || activeResult?.submittedPayload}
-                    section="mutations"
-                  />
+          {view === "tuning" ? (
+            <ClosedLoopPanel />
+          ) : (
+            <>
+              {/* Mode selector bar */}
+              <div className="mode-selector-bar">
+                <ModeSelector />
+              </div>
+              {/* Scenario timeline + Request JSON (shown only after a scenario is submitted) */}
+              {showScenarioView && !loadTestActive && (
+                <div className="main-top">
+                  <div className="main-top-left">
+                    <ComparisonLayout />
+                    <div className="raw-panel raw-panel--single">
+                      <RawPanel
+                        result={activeResult}
+                        payload={lastPayload || activeResult?.submittedPayload}
+                        section="mutations"
+                      />
+                    </div>
+                  </div>
+                  <div className="main-top-right">
+                    <RawPanel
+                      result={activeResult}
+                      payload={lastPayload || activeResult?.submittedPayload}
+                      section="request"
+                    />
+                  </div>
                 </div>
-              </div>
-              <div className="main-top-right">
-                <RawPanel
-                  result={activeResult}
-                  payload={lastPayload || activeResult?.submittedPayload}
-                  section="request"
-                />
-              </div>
-            </div>
+              )}
+              {/* Load test results — always visible as the default view */}
+              <LoadTestResults
+                progress={loadTestState?.progress}
+                result={loadTestState?.result}
+                running={loadTestState?.running || false}
+                error={loadTestState?.error}
+              />
+
+              {/* Bid bubble overlay — scoped to main area width */}
+              <BidBubbleOverlay
+                running={loadTestState?.running}
+                progress={loadTestState?.progress}
+              />
+            </>
           )}
-          {/* Load test results — always visible as the default view */}
-          <LoadTestResults
-            progress={loadTestState?.progress}
-            result={loadTestState?.result}
-            running={loadTestState?.running || false}
-            error={loadTestState?.error}
-          />
-
-          {/* Bid bubble overlay — scoped to main area width */}
-          <BidBubbleOverlay
-            running={loadTestState?.running}
-            progress={loadTestState?.progress}
-          />
-
-
         </main>
       </div>
       {showContainers && <ContainersPanel onClose={() => setShowContainers(false)} />}

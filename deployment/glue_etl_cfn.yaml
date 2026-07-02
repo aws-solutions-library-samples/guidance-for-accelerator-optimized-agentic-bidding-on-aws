@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Glue ETL Job for feature engineering and labeling of bid outcome data.
+  De-duplicates by request_id, engineers features (ROI, shade_ratio, win_rate_bucket),
+  and produces labeled training datasets in S3.
+  Requirements: 2.2, 2.3, 2.4, 2.6
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
+
+  GlueScriptS3Path:
+    Type: String
+    Description: >-
+      S3 path to the Glue ETL script (e.g., s3://my-scripts-bucket/etl/glue_feature_engineering.py)
+
+  TrainingDataBucketName:
+    Type: String
+    Description: >-
+      Name of the S3 bucket where labeled training data will be written
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues:
+      - G.1X
+      - G.2X
+      - G.4X
+    Description: Glue worker type for the ETL job
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 100
+    Description: Number of Glue workers for the ETL job
+
+  ScheduleIntervalHours:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 24
+    Description: How often (in hours) the ETL job runs
+
+  WindowDurationHours:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 168
+    Description: Duration of the processing window in hours (matches schedule interval by default)
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket - labeled training data output
+  # ---------------------------------------------------------------------------
+  TrainingDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-training-data-${AWS::AccountId}-${AWS::Region}'
+        - !Sub 'training-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !ImportValue
+                Fn::If:
+                  - HasStackPrefix
+                  - !Sub '${StackPrefix}-FeedbackPipelineKMSKeyArn'
+                  - 'FeedbackPipelineKMSKeyArn'
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  TrainingDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrainingDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLSOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TrainingDataBucket.Arn
+              - !Sub '${TrainingDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Glue ETL Job
+  # ---------------------------------------------------------------------------
+  GlueETLJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-glue-etl-feature-engineering-role'
+        - 'glue-etl-feature-engineering-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: RawOutcomesReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !ImportValue
+                    Fn::If:
+                      - HasStackPrefix
+                      - !Sub '${StackPrefix}-RawOutcomesBucketArn'
+                      - 'RawOutcomesBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        Fn::If:
+                          - HasStackPrefix
+                          - !Sub '${StackPrefix}-RawOutcomesBucketArn'
+                          - 'RawOutcomesBucketArn'
+        - PolicyName: TrainingDataWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !GetAtt TrainingDataBucket.Arn
+                  - !Sub '${TrainingDataBucket.Arn}/*'
+        - PolicyName: GlueScriptReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${GlueScriptS3Path}'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !ImportValue
+                  Fn::If:
+                    - HasStackPrefix
+                    - !Sub '${StackPrefix}-FeedbackPipelineKMSKeyArn'
+                    - 'FeedbackPipelineKMSKeyArn'
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/feedback_pipeline'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/feedback_pipeline/raw_bid_outcomes'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+
+  # ---------------------------------------------------------------------------
+  # AWS Glue ETL Job
+  # ---------------------------------------------------------------------------
+  FeatureEngineeringJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-feature-engineering-etl'
+        - 'feature-engineering-etl'
+      Description: >-
+        ETL job that de-duplicates bid outcomes, engineers features (ROI, shade_ratio,
+        win_rate_bucket), applies labeling, validates no raw PII, and writes labeled
+        Parquet training datasets.
+      Role: !GetAtt GlueETLJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${GlueScriptS3Path}'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--database_name': feedback_pipeline
+        '--table_name': raw_bid_outcomes
+        '--output_path': !Sub 's3://${TrainingDataBucket}/training-data/'
+        '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp/'
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 120
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # ---------------------------------------------------------------------------
+  # Glue Trigger - scheduled execution (every N hours)
+  # ---------------------------------------------------------------------------
+  FeatureEngineeringSchedule:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-feature-engineering-schedule'
+        - 'feature-engineering-schedule'
+      Description: !Sub 'Triggers the feature engineering ETL job every ${ScheduleIntervalHours} hours'
+      Type: SCHEDULED
+      Schedule: !Sub 'cron(0 */${ScheduleIntervalHours} * * ? *)'
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref FeatureEngineeringJob
+          Arguments:
+            '--start_timestamp': !Sub '${ScheduleIntervalHours}h_ago_epoch_millis'
+            '--end_timestamp': 'now_epoch_millis'
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  GlueETLJobName:
+    Description: Name of the Glue ETL job for feature engineering
+    Value: !Ref FeatureEngineeringJob
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-FeatureEngineeringJobName'
+        - 'FeatureEngineeringJobName'
+
+  GlueETLJobRoleArn:
+    Description: ARN of the IAM role used by the Glue ETL job
+    Value: !GetAtt GlueETLJobRole.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-GlueETLJobRoleArn'
+        - 'GlueETLJobRoleArn'
+
+  TrainingDataBucketName:
+    Description: Name of the S3 bucket storing labeled training data
+    Value: !Ref TrainingDataBucket
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingDataBucketName'
+        - 'TrainingDataBucketName'
+
+  TrainingDataBucketArn:
+    Description: ARN of the training data S3 bucket
+    Value: !GetAtt TrainingDataBucket.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingDataBucketArn'
+        - 'TrainingDataBucketArn'

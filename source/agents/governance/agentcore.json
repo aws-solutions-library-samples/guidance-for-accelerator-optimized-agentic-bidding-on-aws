@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "name": "ModelGovernanceAgent",
+      "language": "Python",
+      "framework": "Custom",
+      "type": "create",
+      "codeLocation": "agents/governance",
+      "entrypoint": "handler.py",
+      "build": "Container",
+      "protocol": "HTTP",
+      "networkMode": "PUBLIC",
+      "memory": "none"
+    }
+  ]
+}

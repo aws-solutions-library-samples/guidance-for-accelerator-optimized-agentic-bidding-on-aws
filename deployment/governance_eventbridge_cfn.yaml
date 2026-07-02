@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EventBridge rules for Model Governance Agent and Bid Shading Agent AgentCore Runtimes.
+  - EventBridge rule on ModelPackageGroupChanged -> Governance Agent Runtime (AWS_IAM auth)
+  - EventBridge Scheduler for Bid Shading Agent (every 5 minutes)
+  - IAM roles with least-privilege for EventBridge to invoke AgentCore runtimes
+  - Resource-based policies restricted to specific EventBridge rule ARNs (no wildcard principals)
+  Requirements: 4.1, 11.1, 11.3, 11.6, 10.4
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: artf
+    Description: Prefix for resource names
+
+  GovernanceAgentRuntimeArn:
+    Type: String
+    Description: >-
+      ARN of the deployed Model Governance Agent AgentCore Runtime endpoint.
+      Format: arn:aws:bedrock-agentcore:<region>:<account>:agent-runtime/<id>
+
+  BidShadingAgentRuntimeArn:
+    Type: String
+    Description: >-
+      ARN of the deployed Bid Shading Strategy Agent AgentCore Runtime endpoint.
+      Format: arn:aws:bedrock-agentcore:<region>:<account>:agent-runtime/<id>
+
+  GovernanceAgentMaxLifetimeHours:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 8
+    Description: >-
+      Maximum session lifetime for the Governance Agent in hours.
+      Must be sufficient to cover a full A/B test window (up to 8h).
+
+  BidShadingScheduleRate:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: EventBridge Scheduler rate expression for the Bid Shading Agent
+
+  ManualOverrideRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the IAM role permitted to manually approve/reject models.
+      Must have governance:ApproveModel permission.
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rule: ModelPackageGroupChanged -> Governance Agent Runtime
+  # ---------------------------------------------------------------------------
+
+  GovernanceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${StackPrefix}-governance-model-registered'
+      Description: >-
+        Routes ModelPackageGroupChanged events from the training pipeline to
+        the Model Governance Agent AgentCore Runtime for validation.
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'artf.training-pipeline'
+        detail-type:
+          - 'ModelPackageGroupChanged'
+      Targets:
+        - Id: GovernanceAgentTarget
+          Arn: !Ref GovernanceAgentRuntimeArn
+          RoleArn: !GetAtt GovernanceEventRuleRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              modelType: '$.detail.ModelType'
+              modelPackageArn: '$.detail.ModelPackageArn'
+              modelPackageGroupName: '$.detail.ModelPackageGroupName'
+            InputTemplate: |
+              {
+                "detail": {
+                  "ModelType": <modelType>,
+                  "ModelPackageArn": <modelPackageArn>,
+                  "ModelPackageGroupName": <modelPackageGroupName>
+                },
+                "max_lifetime_hours": ${GovernanceAgentMaxLifetimeHours}
+              }
+
+  # IAM Role for EventBridge to invoke the Governance Agent Runtime (AWS_IAM auth)
+  GovernanceEventRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-eventbridge-invoke-governance'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${StackPrefix}-governance-model-registered'
+      Policies:
+        - PolicyName: InvokeGovernanceAgentRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:InvokeAgentRuntime'
+                Resource: !Ref GovernanceAgentRuntimeArn
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Scheduler: Bid Shading Agent (every 5 minutes)
+  # ---------------------------------------------------------------------------
+
+  BidShadingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${StackPrefix}-bid-shading-scheduler'
+      Description: >-
+        Invokes the Bid Shading Strategy Agent AgentCore Runtime every 5 minutes
+        to evaluate market conditions and adjust bidding parameters.
+      ScheduleExpression: !Ref BidShadingScheduleRate
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !Ref BidShadingAgentRuntimeArn
+        RoleArn: !GetAtt BidShadingSchedulerRole.Arn
+        Input: '{"source": "eventbridge-scheduler", "schedule": "rate(5 minutes)"}'
+
+  # IAM Role for EventBridge Scheduler to invoke the Bid Shading Agent Runtime
+  BidShadingSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-scheduler-invoke-bid-shading'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${StackPrefix}-bid-shading-scheduler'
+      Policies:
+        - PolicyName: InvokeBidShadingAgentRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:InvokeAgentRuntime'
+                Resource: !Ref BidShadingAgentRuntimeArn
+
+  # ---------------------------------------------------------------------------
+  # IAM Policy: Manual Override requires governance:ApproveModel permission
+  # ---------------------------------------------------------------------------
+
+  ManualOverridePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${StackPrefix}-governance-manual-override'
+      Description: >-
+        Grants the governance:ApproveModel permission required for manual
+        model promotion or rejection overrides. Attach to operator roles.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowManualModelApproval
+            Effect: Allow
+            Action:
+              - 'governance:ApproveModel'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:PrincipalTag/governance-role': 'approver'
+          - Sid: AllowSageMakerRegistryUpdate
+            Effect: Allow
+            Action:
+              - 'sagemaker:UpdateModelPackage'
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+
+  GovernanceEventRuleArn:
+    Description: ARN of the EventBridge rule that invokes the Governance Agent
+    Value: !GetAtt GovernanceEventRule.Arn
+    Export:
+      Name: !Sub '${StackPrefix}-governance-event-rule-arn'
+
+  GovernanceEventRuleRoleArn:
+    Description: ARN of the IAM role for EventBridge to invoke Governance Agent
+    Value: !GetAtt GovernanceEventRuleRole.Arn
+
+  BidShadingScheduleArn:
+    Description: ARN of the EventBridge Scheduler for the Bid Shading Agent
+    Value: !GetAtt BidShadingSchedule.Arn
+    Export:
+      Name: !Sub '${StackPrefix}-bid-shading-schedule-arn'
+
+  BidShadingSchedulerRoleArn:
+    Description: ARN of the IAM role for the Bid Shading Scheduler
+    Value: !GetAtt BidShadingSchedulerRole.Arn
+
+  ManualOverridePolicyArn:
+    Description: ARN of the managed policy for manual governance overrides
+    Value: !Ref ManualOverridePolicy
