@@ -273,9 +273,7 @@ After `deploy.sh` completes, validate the deployment:
 
    The bid shader computes its shaded price as `min(original_bid, predicted_CTR × conversion_value × shade_factor)`, floored at the publisher's `bidfloor`.
 
-4. On the **MCP Extension Point** tab, initialize an MCP session and call the `extend_rtb` tool via JSON-RPC to exercise the same containers through the interface AI agents use.
-
-5. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
+4. (Optional) Invoke the Amazon Bedrock AgentCore MCP runtime directly. The runtime exposes the `extend_rtb` tool over MCP and can be called with the `invoke_agent_runtime` API from a Bedrock-enabled agent or the AWS SDK.
 
 ## Next Steps
 
