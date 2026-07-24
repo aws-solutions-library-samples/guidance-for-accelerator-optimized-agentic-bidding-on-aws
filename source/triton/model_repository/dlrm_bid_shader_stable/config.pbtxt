@@ -1,0 +1,55 @@
+# DLRM Bid Shader — STABLE engine (TensorRT).
+# The live/promoted model version. Served behind the dlrm_bid_shader router.
+# model.plan is built from the exported ONNX by the Model Optimizer at deploy
+# time (base engine) and on each promotion (version swap). Batch profile 1..64.
+
+name: "dlrm_bid_shader_stable"
+platform: "tensorrt_plan"
+max_batch_size: 64
+
+input [
+  {
+    name: "dense_features"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  },
+  {
+    name: "sparse_user"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_domain"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_device"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "ctr_prediction"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]

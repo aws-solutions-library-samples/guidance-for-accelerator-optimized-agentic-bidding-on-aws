@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CodeBuild project for building ARTF Recommenders container images remotely.
+  Avoids local disk/resource requirements for large images (NeMo-RL ~20 GB).
+
+Parameters:
+  StackName:
+    Type: String
+    Description: The deployment stack name (e.g., "stg-nvidia-artf-recommenders")
+  NgcApiKeySecret:
+    Type: String
+    Default: ''
+    Description: >-
+      (Optional) Secrets Manager secret name or ARN containing the NVIDIA NGC
+      API key. Required for building the NeMo-RL training container. Create with:
+      aws secretsmanager create-secret --name artf-ngc-api-key --secret-string "YOUR_NGC_KEY"
+
+Conditions:
+  HasNgcSecret: !Not [!Equals [!Ref NgcApiKeySecret, '']]
+
+Resources:
+  # =========================================================================
+  # IAM Role for CodeBuild
+  # =========================================================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-codebuild-role'
+      Description: Execution role for ARTF container image builds in CodeBuild
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        # -----------------------------------------------------------------
+        # CloudWatch Logs — build output for both x86 and ARM projects
+        # -----------------------------------------------------------------
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackName}-image-builder'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackName}-image-builder:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackName}-arm-image-builder'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackName}-arm-image-builder:*'
+
+        # -----------------------------------------------------------------
+        # ECR — push/pull images, create repos if missing
+        # -----------------------------------------------------------------
+        - PolicyName: ECRPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # GetAuthorizationToken does not support resource-level constraints
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              # Push/pull/create for all project repos
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:TagResource
+                  - ecr:SetRepositoryPolicy
+                  - ecr:GetRepositoryPolicy
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}-*'
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/artf-nemo-rl-training'
+
+        # -----------------------------------------------------------------
+        # S3 — read source zip uploaded by remote_build.sh
+        # -----------------------------------------------------------------
+        - PolicyName: S3SourcePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${StackName}-codebuild-source-*'
+                  - !Sub 'arn:aws:s3:::${StackName}-codebuild-source-*/*'
+
+        # -----------------------------------------------------------------
+        # CodeBuild — report build status (required for batch builds, but
+        # also avoids spurious permission errors in build logs)
+        # -----------------------------------------------------------------
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${StackName}-*'
+
+        # -----------------------------------------------------------------
+        # Secrets Manager — NGC API key (conditional)
+        # -----------------------------------------------------------------
+        - !If
+          - HasNgcSecret
+          - PolicyName: NgcSecretAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource:
+                    - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${NgcApiKeySecret}*'
+          - !Ref AWS::NoValue
+
+  # =========================================================================
+  # CodeBuild Project — x86_64 builds (Triton, orchestrator, metrics, NeMo)
+  # =========================================================================
+  ImageBuilderProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackName}-image-builder'
+      Description: >-
+        Builds ARTF container images (amd64): Triton ARTF containers,
+        orchestrator, metrics enricher, and NeMo-RL training container.
+        Also cross-compiles ARM64 images via buildx.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 60
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Source is uploaded via start-build --source; buildspec is overridden"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        # 2XLARGE: 72 vCPUs, 144 GB RAM, 824 GB SSD — needed for NeMo (~20 GB)
+        ComputeType: BUILD_GENERAL1_2XLARGE
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: BUILD_TARGET
+            Value: all
+          - Name: IMAGE_TAG
+            Value: latest
+          - Name: NGC_API_KEY_SECRET
+            Value: !If [HasNgcSecret, !Ref NgcApiKeySecret, '']
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${StackName}-image-builder'
+
+  # =========================================================================
+  # CodeBuild Project — ARM64 builds (AgentCore, bid-shading-agent)
+  # =========================================================================
+  ArmImageBuilderProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackName}-arm-image-builder'
+      Description: >-
+        Builds ARM64 container images for AgentCore runtimes (bid-shading
+        agent, MCP runtime). Runs natively on Graviton for faster ARM builds.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 30
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Source is uploaded via start-build --source; buildspec is overridden"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: IMAGE_TAG
+            Value: latest
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${StackName}-image-builder'
+
+Outputs:
+  CodeBuildProjectName:
+    Description: Name of the x86_64 CodeBuild project
+    Value: !Ref ImageBuilderProject
+  ArmCodeBuildProjectName:
+    Description: Name of the ARM64 CodeBuild project
+    Value: !Ref ArmImageBuilderProject
+  CodeBuildRoleArn:
+    Description: ARN of the CodeBuild service role
+    Value: !GetAtt CodeBuildRole.Arn

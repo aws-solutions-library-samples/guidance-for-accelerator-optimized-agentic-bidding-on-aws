@@ -1,7 +1,7 @@
 {
   "agents": [
     {
-      "name": "ModelGovernanceAgent",
+      "name": "ModelPromotionGovernanceAgent",
       "language": "Python",
       "framework": "Custom",
       "type": "create",

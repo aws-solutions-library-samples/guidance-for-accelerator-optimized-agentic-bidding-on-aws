@@ -1,7 +1,7 @@
-"""Model Governance Agent: validation pipeline and promotion decisions.
+"""Model Promotion Governance Agent: validation pipeline and promotion decisions.
 
 Orchestrates model validation through a full pipeline:
-  NIM optimize → canary deploy → A/B test → promote/reject
+  Model Optimizer (TensorRT) → canary deploy → A/B test → promote/reject
 
 Promotion criteria:
 - Treatment primary metric > control primary metric
@@ -10,7 +10,7 @@ Promotion criteria:
 
 Rejection triggers:
 - Any guardrail breach → immediate reject + rollback
-- NIM optimization failure → reject with reason
+- Model optimization failure → reject with reason
 - Canary load failure → reject with reason
 - Max duration reached without significance → inconclusive + rollback
 
@@ -67,22 +67,22 @@ class GovernancePipelineError(Exception):
 # ---------------------------------------------------------------------------
 
 
-class ModelGovernanceAgent:
+class ModelPromotionGovernanceAgent:
     """Orchestrates model validation and promotion decisions.
 
     Deployed as an AgentCore Runtime. Invoked by EventBridge when a new
     model version is registered in SageMaker Model Registry. Each invocation
     runs the full validation pipeline:
-      NIM optimization → canary deploy → A/B test → promote/reject.
+      model optimization → canary deploy → A/B test → promote/reject.
 
     Uses AgentCore Identity (workload identity) to obtain credentials for:
     - SageMaker Model Registry (update model package status)
     - DynamoDB (audit trail writes)
     - CloudWatch (read A/B test metrics)
-    - Triton/NIM (deploy models)
+    - Triton + Model Optimizer (build engines, deploy canary/stable models)
 
     Args:
-        nim_optimizer: NIMOptimizer instance for model optimization.
+        model_optimizer: ModelOptimizer instance for model optimization.
         canary_deployer: CanaryDeployer instance for traffic management.
         ab_evaluator_factory: Callable that creates an ABEvaluator for a given ABTestConfig.
         guardrail_monitor: Object with `check(model_name)` method returning guardrail violations.
@@ -92,14 +92,14 @@ class ModelGovernanceAgent:
 
     def __init__(
         self,
-        nim_optimizer: Any,
+        model_optimizer: Any,
         canary_deployer: Any,
         ab_evaluator_factory: Callable[[ABTestConfig], ABEvaluator],
         guardrail_monitor: Any,
         model_registry_client: Any,
         audit_store: Any,
     ):
-        self._nim_optimizer = nim_optimizer
+        self._model_optimizer = model_optimizer
         self._canary_deployer = canary_deployer
         self._ab_evaluator_factory = ab_evaluator_factory
         self._guardrail_monitor = guardrail_monitor
@@ -118,7 +118,7 @@ class ModelGovernanceAgent:
         """Run the full validation pipeline for a new model version.
 
         Steps:
-        1. NIM optimize the artifact → get optimized URI
+        1. Optimize the artifact via the Model Optimizer (TensorRT) → optimized engine URI
         2. Deploy as canary (5% initial traffic) via canary_deployer
         3. Run A/B test: collect metrics, evaluate periodically
         4. Decision:
@@ -154,21 +154,21 @@ class ModelGovernanceAgent:
                 guardrail_metrics=["latency_p99", "error_rate"],
             )
 
-        # Step 1: NIM optimize
+        # Step 1: Model optimize (TensorRT engine build via the Model Optimizer service)
         try:
-            optimized_uri = await self._nim_optimizer.optimize(
+            optimized_uri = await self._model_optimizer.optimize(
                 model_artifact_uri=artifact_uri,
                 model_name=model_type,
             )
         except Exception as e:
-            reason = f"NIM optimization failed: {e}"
+            reason = f"Model optimization failed: {e}"
             logger.error(reason)
             decision = GovernanceDecision(
                 decision="reject",
                 reason=reason,
                 model_type=model_type,
                 version_arn=version_arn,
-                metrics={"stage": "nim_optimization", "error": str(e)},
+                metrics={"stage": "model_optimization", "error": str(e)},
             )
             await self._update_registry_status(version_arn, "Rejected", reason)
             await self._write_audit_record(
@@ -459,7 +459,7 @@ class ModelGovernanceAgent:
         """
         record = {
             "timestamp": time.time(),
-            "actor": "governance_agent",
+            "actor": "model_promotion_governance_agent",
             "model_type": model_type,
             "version_arn": version_arn,
             "decision": decision,

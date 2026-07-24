@@ -1,8 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  AgentCore Security, Identity, and Observability - Workload Identity IAM roles for
-  BidShadingStrategyAgent and ModelGovernanceAgent, EventBridge Rule/Scheduler for
-  invocation, and manual override role with governance:ApproveModel permission.
+  AgentCore Workload Identity IAM roles (execution roles) for the
+  AdaptiveBiddingStrategyAgent and ModelPromotionGovernanceAgent runtimes, plus the
+  manual override role with governance:ApproveModel permission.
+
+  This stack is deployed BEFORE the agent runtimes: the role trust policies are scoped
+  to the agent's runtime-name prefix (ArnLike), not a single runtime ARN, so the roles
+  do not depend on a runtime existing yet. The runtimes are then created with these role
+  ARNs, and the Scheduler/EventBridge invocation resources (which DO need the real
+  runtime ARNs) are deployed afterwards by governance_eventbridge_cfn.yaml.
   Requirements: 7.1, 10.4, 11.2, 11.3, 11.4, 11.5
 
 # =============================================================================
@@ -13,18 +19,6 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
-
-  BidShadingAgentRuntimeArn:
-    Type: String
-    Description: >-
-      ARN of the Bid Shading Strategy Agent AgentCore Runtime
-      (e.g., arn:aws:bedrock-agentcore:<region>:<account>:runtime/<id>)
-
-  GovernanceAgentRuntimeArn:
-    Type: String
-    Description: >-
-      ARN of the Model Governance Agent AgentCore Runtime
-      (e.g., arn:aws:bedrock-agentcore:<region>:<account>:runtime/<id>)
 
   ParameterStoreTableArn:
     Type: String
@@ -38,43 +32,43 @@ Parameters:
     Type: String
     Description: ARN of the KMS key (from feedback pipeline) used for DynamoDB/S3 encryption
 
+  ModelBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the S3 Triton model-repository bucket. The Model Promotion Governance
+      agent stages/promotes/rolls back canary engines and edits the router config
+      here (Option D). Leave empty to skip granting S3 access.
+
 Conditions:
   HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  HasModelBucket: !Not [!Equals [!Ref ModelBucketName, '']]
 
 # =============================================================================
 # Resources
 # =============================================================================
 Resources:
 
-  # ===========================================================================
-  # 1. Workload Identity IAM Roles
-  # ===========================================================================
-
   # ---------------------------------------------------------------------------
-  # 1a. BidShadingAgentRole
+  # 1a. AdaptiveBiddingAgentRole (reasoning agent execution role)
   #
-  # Trust policy: AgentCore service principal scoped to the specific runtime ARN.
-  # Permissions: DynamoDB (parameter store R/W, audit trail write), CloudWatch metrics.
-  # No SageMaker, no Triton admin - least privilege for parameter tuning only.
-  #
-  # Security notes:
-  # - Firecracker isolation: Each invocation runs in a fresh microVM with no
-  #   shared state between invocations. State is persisted only in DynamoDB.
-  # - Token Vault: Any OAuth tokens or API keys MUST be stored in AgentCore
-  #   Token Vault (not environment variables or hardcoded values).
-  # - AgentCore Observability: Distributed tracing is enabled in the agent
-  #   handler (handler.py) via AgentCore Observability SDK.
+  # Trust: AgentCore service principal, scoped by account + the agent's runtime-name
+  # prefix (ArnLike) so the role can be created before the runtime exists.
+  # Permissions: DynamoDB parameter store R/W, audit trail write, CloudWatch metrics,
+  # and Bedrock model invocation for the reasoning layer.
   # ---------------------------------------------------------------------------
-  BidShadingAgentRole:
+  AdaptiveBiddingAgentRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-bid-shading-agent-role'
-        - 'bid-shading-agent-role'
+      RoleName: !Join
+        - '-'
+        - - !If
+              - HasStackPrefix
+              - !Sub '${StackPrefix}-adaptive-bidding-agent-role'
+              - 'adaptive-bidding-agent-role'
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
       Description: >-
-        Workload Identity role for the Bid Shading Strategy Agent (AgentCore Runtime).
-        Grants access to DynamoDB parameter store, audit trail, and CloudWatch metrics.
+        Workload Identity role for the Adaptive Bidding Strategy Agent (AgentCore Runtime).
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -85,8 +79,8 @@ Resources:
             Condition:
               StringEquals:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
-              ArnEquals:
-                'aws:SourceArn': !Ref BidShadingAgentRuntimeArn
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/AdaptiveBiddingStrategyAgent-*'
       Policies:
         - PolicyName: DynamoDBParameterStoreAccess
           PolicyDocument:
@@ -115,20 +109,42 @@ Resources:
                 Action:
                   - dynamodb:PutItem
                 Resource: !Ref AuditTrailTableArn
-        - PolicyName: CloudWatchMetricsAccess
+        - PolicyName: CloudWatchGetMetricData
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - cloudwatch:GetMetricData
+                Resource: '*'
+        - PolicyName: CloudWatchPutMetricData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
                   - cloudwatch:PutMetricData
                 Resource: '*'
                 Condition:
                   StringEquals:
                     'cloudwatch:namespace':
-                      - 'ARTF/BidShading'
+                      - 'ARTF/BidOutcome'
                       - 'ARTF/AgentCore'
+        - PolicyName: BedrockModelInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  # Cross-region inference profiles (us./eu./apac.) route to multiple
+                  # regions, so the underlying foundation model must be allowed in all
+                  # regions (ARN region field wildcarded). The inference profile itself
+                  # is invoked in the deploy region.
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
         - PolicyName: KMSDecryptAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -139,29 +155,65 @@ Resources:
                   - kms:GenerateDataKey
                   - kms:DescribeKey
                 Resource: !Ref KMSKeyArn
+        # AgentCore pulls the runtime container image from ECR — required at
+        # CreateAgentRuntime validation time. GetAuthorizationToken has no
+        # resource scope; the layer/image reads are scoped to account repos.
+        - PolicyName: ECRImagePull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+        # CloudWatch Logs for the runtime's own log group.
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+        # X-Ray tracing emitted by the AgentCore runtime.
+        - PolicyName: XRayTraceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
 
   # ---------------------------------------------------------------------------
-  # 1b. GovernanceAgentRole
+  # 1b. ModelPromotionGovernanceAgentRole (reasoning agent execution role)
   #
-  # Trust policy: AgentCore service principal scoped to the specific runtime ARN.
-  # Permissions: SageMaker (model registry updates), DynamoDB (audit trail),
-  # CloudWatch metrics.
-  #
-  # NOTE on NIM/Triton access: Both NIM and Triton are accessed via HTTP within
-  # the EKS cluster (cluster-internal networking). Access is controlled by
-  # Kubernetes NetworkPolicies and security groups, NOT IAM. The agent reaches
-  # them via their internal Service DNS names over HTTPS.
+  # The Model Optimizer/Triton are reached over cluster-internal HTTP (internal NLBs
+  # + VPC network mode + security groups), not IAM. S3 model-repo access below is for
+  # canary staging/promotion/rollback + router config edits.
   # ---------------------------------------------------------------------------
-  GovernanceAgentRole:
+  ModelPromotionGovernanceAgentRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-governance-agent-role'
-        - 'governance-agent-role'
+      RoleName: !Join
+        - '-'
+        - - !If
+              - HasStackPrefix
+              - !Sub '${StackPrefix}-model-promotion-governance-agent-role'
+              - 'model-promotion-governance-agent-role'
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
       Description: >-
-        Workload Identity role for the Model Governance Agent (AgentCore Runtime).
-        Grants access to SageMaker Model Registry, DynamoDB audit trail, and CloudWatch.
+        Workload Identity role for the Model Promotion Governance Agent (AgentCore Runtime).
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -172,8 +224,8 @@ Resources:
             Condition:
               StringEquals:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
-              ArnEquals:
-                'aws:SourceArn': !Ref GovernanceAgentRuntimeArn
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/ModelPromotionGovernanceAgent-*'
       Policies:
         - PolicyName: SageMakerModelRegistryAccess
           PolicyDocument:
@@ -186,23 +238,35 @@ Resources:
                   - sagemaker:ListModelPackages
                   - sagemaker:DescribeModelPackageGroup
                 Resource:
-                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
-                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/*'
-        - PolicyName: DynamoDBAuditTrailWrite
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/*'
+        - PolicyName: DynamoDBAuditTrailAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
-                Resource: !Ref AuditTrailTableArn
-        - PolicyName: CloudWatchMetricsAccess
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref AuditTrailTableArn
+                  - !Sub '${AuditTrailTableArn}/index/*'
+        - PolicyName: CloudWatchGetMetricData
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - cloudwatch:GetMetricData
+                Resource: '*'
+        - PolicyName: CloudWatchPutMetricData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
                   - cloudwatch:PutMetricData
                 Resource: '*'
                 Condition:
@@ -211,6 +275,21 @@ Resources:
                       - 'ARTF/Governance'
                       - 'ARTF/ABTest'
                       - 'ARTF/AgentCore'
+        - PolicyName: BedrockModelInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  # Cross-region inference profiles (us./eu./apac.) route to multiple
+                  # regions, so the underlying foundation model must be allowed in all
+                  # regions (ARN region field wildcarded). The inference profile itself
+                  # is invoked in the deploy region.
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
         - PolicyName: KMSDecryptAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -221,42 +300,100 @@ Resources:
                   - kms:GenerateDataKey
                   - kms:DescribeKey
                 Resource: !Ref KMSKeyArn
-        # NOTE: NIM access is via HTTP to the NIM endpoint within the EKS cluster.
-        # Triton access is cluster-internal via Kubernetes Service DNS.
-        # Neither requires IAM permissions - they are secured via:
-        #   - VPC security groups restricting inbound to the AgentCore VPC endpoint
-        #   - Kubernetes NetworkPolicies limiting pod-to-pod communication
-        #   - mTLS between services where configured
+        # AgentCore pulls the runtime container image from ECR — required at
+        # CreateAgentRuntime validation time. GetAuthorizationToken has no
+        # resource scope; the layer/image reads are scoped to account repos.
+        - PolicyName: ECRImagePull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+        # CloudWatch Logs for the runtime's own log group.
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+        # X-Ray tracing emitted by the AgentCore runtime.
+        - PolicyName: XRayTraceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+        # Invoke the VPC HTTP proxy Lambda (vpc_proxy_cfn.yaml) — lets the PUBLIC
+        # runtime reach the cluster-internal Model Optimizer / Triton NLBs without
+        # itself being in VPC mode. Name-pattern scoped (prefix-agnostic).
+        - PolicyName: InvokeVpcProxy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*vpc-optimizer-proxy'
+        # S3 access to the Triton model repo — stage/promote/rollback canary
+        # engines and edit the router config.pbtxt (Option D). Only granted when a
+        # bucket name is provided. CopyObject is covered by Get(source)+Put(dest).
+        - !If
+          - HasModelBucket
+          - PolicyName: S3ModelRepoAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/*'
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}'
+          - !Ref 'AWS::NoValue'
 
   # ---------------------------------------------------------------------------
-  # 1c. ManualOverrideRole
-  #
-  # Custom IAM permission: governance:ApproveModel
-  # Only principals who can assume this role (via explicit IAM policy in their
-  # identity) may manually promote a model, bypassing the automated governance
-  # pipeline. The custom condition key ensures the action is auditable.
-  #
-  # This role is for MANUAL INTERVENTION ONLY. Automated promotions use the
-  # GovernanceAgentRole above. Any principal invoking manual override must
-  # have governance:ApproveModel in their IAM policy to assume this role.
+  # 1c. ManualOverrideRole — governance:ApproveModel gated manual promotion
   # ---------------------------------------------------------------------------
   ManualOverrideRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-governance-manual-override-role'
-        - 'governance-manual-override-role'
+      RoleName: !Join
+        - '-'
+        - - !If
+              - HasStackPrefix
+              - !Sub '${StackPrefix}-governance-manual-override-role'
+              - 'governance-manual-override-role'
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
       Description: >-
         Role for manual model promotion overrides. Requires the caller to have
         governance:ApproveModel permission in their identity-based policy.
-        Used for exceptional manual interventions only.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: 'sts:AssumeRole'
             Condition:
               StringEquals:
@@ -270,7 +407,7 @@ Resources:
                 Action:
                   - sagemaker:UpdateModelPackage
                 Resource:
-                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
         - PolicyName: DynamoDBAuditTrailWrite
           PolicyDocument:
             Version: '2012-10-17'
@@ -280,24 +417,19 @@ Resources:
                   - dynamodb:PutItem
                 Resource: !Ref AuditTrailTableArn
 
-  # ---------------------------------------------------------------------------
-  # IAM Policy: governance:ApproveModel
-  #
-  # This managed policy grants the custom permission to assume the manual
-  # override role. Attach it only to IAM users/roles that are authorized to
-  # perform manual model promotions.
-  # ---------------------------------------------------------------------------
   GovernanceApproveModelPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-governance-approve-model'
-        - 'governance-approve-model'
+      ManagedPolicyName: !Join
+        - '-'
+        - - !If
+              - HasStackPrefix
+              - !Sub '${StackPrefix}-governance-approve-model'
+              - 'governance-approve-model'
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
       Description: >-
         Grants governance:ApproveModel - the ability to assume the manual override role
-        and manually promote a model in the SageMaker Model Registry. Attach only to
-        authorized human operators.
+        and manually promote a model. Attach only to authorized human operators.
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -309,210 +441,27 @@ Resources:
               StringEquals:
                 'sts:ExternalId': 'governance-manual-override'
 
-  # ===========================================================================
-  # 2. EventBridge Rule - Governance Agent Invocation
-  #
-  # Triggers on ModelPackageGroupChanged from the SageMaker Model Registry.
-  # Uses AWS_IAM auth to invoke the AgentCore Runtime endpoint.
-  # The invocation role is restricted to THIS specific rule ARN only.
-  # ===========================================================================
-
-  # ===========================================================================
-  # 2. EventBridge Rule: Model Registration -> Governance Agent
-  #
-  # NOTE: EventBridge Rules (AWS::Events::Rule) do NOT support AgentCore as a
-  # direct target. The governance agent is invoked via the training pipeline
-  # code (which calls InvokeAgentRuntime after registering a model package).
-  # A future enhancement could use a Lambda intermediary or Step Functions.
-  # ===========================================================================
-
-  # ===========================================================================
-  # 3. EventBridge Scheduler - Bid Shading Agent Invocation (via Lambda)
-  #
-  # EventBridge Scheduler does NOT support bedrock-agentcore as a universal
-  # target. The documented pattern is: Scheduler -> Lambda -> InvokeAgentRuntime.
-  # ===========================================================================
-
-  BidShadingInvokerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-bid-shading-invoker'
-        - 'bid-shading-invoker'
-      Description: >-
-        Invokes the Bid Shading Strategy Agent AgentCore Runtime.
-        Triggered by EventBridge Scheduler every 5 minutes.
-      Runtime: python3.12
-      Handler: index.handler
-      Timeout: 60
-      MemorySize: 128
-      Role: !GetAtt BidShadingInvokerLambdaRole.Arn
-      Environment:
-        Variables:
-          AGENT_RUNTIME_ARN: !Ref BidShadingAgentRuntimeArn
-          AWS_REGION_NAME: !Ref 'AWS::Region'
-      Code:
-        ZipFile: |
-          import boto3
-          import json
-          import os
-          import time
-
-          def handler(event, context):
-              client = boto3.client('bedrock-agentcore',
-                  region_name=os.environ.get('AWS_REGION_NAME', 'us-east-1'))
-              arn = os.environ['AGENT_RUNTIME_ARN']
-              session_id = f"scheduler-{int(time.time() * 1000)}-{context.aws_request_id}"
-              response = client.invoke_agent_runtime(
-                  agentRuntimeArn=arn,
-                  runtimeSessionId=session_id,
-                  payload=json.dumps(event).encode('utf-8'),
-                  contentType='application/json',
-                  qualifier='DEFAULT',
-              )
-              body = response['response'].read()
-              return json.loads(body) if body else {'status': 'empty_response'}
-
-  BidShadingInvokerLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-bid-shading-invoker-role'
-        - 'bid-shading-invoker-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      Policies:
-        - PolicyName: InvokeAgentCore
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - bedrock-agentcore:InvokeAgentRuntime
-                Resource:
-                  - !Ref BidShadingAgentRuntimeArn
-                  - !Sub '${BidShadingAgentRuntimeArn}/*'
-
-  BidShadingSchedulerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-scheduler-invoke-bid-shading-agent'
-        - 'scheduler-invoke-bid-shading-agent'
-      Description: >-
-        EventBridge Scheduler execution role for invoking the Lambda that
-        triggers the Bid Shading Agent.
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: scheduler.amazonaws.com
-            Action: 'sts:AssumeRole'
-      Policies:
-        - PolicyName: InvokeLambda
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !GetAtt BidShadingInvokerFunction.Arn
-
-  BidShadingSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-bid-shading-agent-schedule'
-        - 'bid-shading-agent-schedule'
-      Description: >-
-        Invokes the Bid Shading Strategy Agent every 5 minutes via Lambda.
-      ScheduleExpression: 'rate(5 minutes)'
-      ScheduleExpressionTimezone: UTC
-      State: ENABLED
-      FlexibleTimeWindow:
-        Mode: 'OFF'
-      Target:
-        Arn: !GetAtt BidShadingInvokerFunction.Arn
-        RoleArn: !GetAtt BidShadingSchedulerRole.Arn
-        Input: '{"source": "eventbridge-scheduler", "action": "evaluate_and_adjust"}'
-
-# =============================================================================
-# Security Documentation (inline for operational reference)
-# =============================================================================
-#
-# Firecracker Isolation:
-#   Each AgentCore Runtime invocation runs in an isolated Firecracker microVM.
-#   There is NO shared memory, filesystem, or process space between invocations.
-#   All persistent state is stored in DynamoDB (parameter store, audit trail)
-#   or S3 (model artifacts). The microVM is destroyed after session termination.
-#
-# Token Vault:
-#   Any OAuth tokens, API keys, or secrets required by the agents MUST be stored
-#   in the AgentCore Token Vault. They are injected into the microVM at runtime
-#   and are NOT stored in environment variables, source code, or container images.
-#   Token Vault handles rotation and secure delivery to the microVM.
-#
-# AgentCore Observability:
-#   Both agents emit distributed traces via the AgentCore Observability SDK,
-#   which is integrated in their handler.py entrypoints. Traces include:
-#   - Invocation start/end timestamps
-#   - Downstream service call latency (DynamoDB, CloudWatch, SageMaker)
-#   - Decision outcomes (parameter changes, promotion/rejection)
-#   Traces are available in CloudWatch ServiceLens / X-Ray.
-#
-# No Cross-Invocation Shared State:
-#   Beyond what is explicitly persisted in DynamoDB or S3, agents have NO shared
-#   state between invocations. Each microVM starts fresh. The parameter store
-#   uses optimistic concurrency (version checks) to handle concurrent access.
-#
-# Resource-Based Policy Restrictions:
-#   - The EventBridge rule invoke role trusts ONLY events.amazonaws.com with a
-#     condition on the specific rule ARN.
-#   - The EventBridge Scheduler invoke role trusts ONLY scheduler.amazonaws.com
-#     with a condition on the specific scheduler ARN.
-#   - No wildcard principals (*) are used anywhere.
-#   - No Lambda functions with open resource-based policies exist in this stack.
-#
-# KMS Encryption:
-#   All DynamoDB access uses the shared KMS key from the feedback pipeline for
-#   encryption at rest. The agents have Decrypt/GenerateDataKey permissions
-#   scoped to that specific key ARN only.
-#
-# =============================================================================
-
 # =============================================================================
 # Outputs
 # =============================================================================
 Outputs:
-  BidShadingAgentRoleArn:
-    Description: ARN of the Workload Identity IAM role for the Bid Shading Agent
-    Value: !GetAtt BidShadingAgentRole.Arn
+  AdaptiveBiddingAgentRoleArn:
+    Description: Execution role ARN for the Adaptive Bidding Agent runtime
+    Value: !GetAtt AdaptiveBiddingAgentRole.Arn
     Export:
       Name: !If
         - HasStackPrefix
-        - !Sub '${StackPrefix}-BidShadingAgentRoleArn'
-        - 'BidShadingAgentRoleArn'
+        - !Sub '${StackPrefix}-AdaptiveBiddingAgentRoleArn'
+        - 'AdaptiveBiddingAgentRoleArn'
 
-  GovernanceAgentRoleArn:
-    Description: ARN of the Workload Identity IAM role for the Governance Agent
-    Value: !GetAtt GovernanceAgentRole.Arn
+  ModelPromotionGovernanceAgentRoleArn:
+    Description: Execution role ARN for the Model Promotion Governance Agent runtime
+    Value: !GetAtt ModelPromotionGovernanceAgentRole.Arn
     Export:
       Name: !If
         - HasStackPrefix
-        - !Sub '${StackPrefix}-GovernanceAgentRoleArn'
-        - 'GovernanceAgentRoleArn'
+        - !Sub '${StackPrefix}-ModelPromotionGovernanceAgentRoleArn'
+        - 'ModelPromotionGovernanceAgentRoleArn'
 
   ManualOverrideRoleArn:
     Description: ARN of the manual override role (requires governance:ApproveModel)
@@ -524,16 +473,5 @@ Outputs:
         - 'ManualOverrideRoleArn'
 
   GovernanceApproveModelPolicyArn:
-    Description: >-
-      ARN of the managed policy granting governance:ApproveModel permission.
-      Attach to IAM principals authorized for manual model promotion.
+    Description: ARN of the managed policy granting governance:ApproveModel
     Value: !Ref GovernanceApproveModelPolicy
-
-  BidShadingScheduleArn:
-    Description: ARN of the EventBridge Scheduler for the Bid Shading Agent (every 5 min)
-    Value: !GetAtt BidShadingSchedule.Arn
-    Export:
-      Name: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-BidShadingScheduleArn'
-        - 'BidShadingScheduleArn'

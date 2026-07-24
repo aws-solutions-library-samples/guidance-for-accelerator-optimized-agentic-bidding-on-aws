@@ -44,7 +44,7 @@ def _make_dynamodb_item(parameter_name: str, current_value: float) -> dict:
         "current_value": str(current_value),
         "previous_value": str(current_value - 0.02),
         "updated_at": "1718000000.0",
-        "updated_by": "bid_shading_agent",
+        "updated_by": "adaptive_bidding_agent",
         "version": 5,
         "min_value": str(PARAMETER_BOUNDS[parameter_name][0]),
         "max_value": str(PARAMETER_BOUNDS[parameter_name][1]),

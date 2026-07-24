@@ -61,14 +61,16 @@ spec:
             - name: COGNITO_REGION
               value: "__REGION__"
             # Part 2 closed-loop demo API — DynamoDB tables created by
-            # deploy_closed_loop.sh (closed_loop_cfn.yaml). Names match the
-            # unprefixed stack defaults; override if a stack prefix is used.
+            # deploy_closed_loop.sh (closed_loop_cfn.yaml). deploy.sh substitutes
+            # these with the stack-prefix-aware names (e.g. "dv2-parameter-store")
+            # so the orchestrator and the AgentCore agents read the SAME tables.
             - name: PARAMETER_STORE_TABLE
-              value: "parameter-store"
+              value: "__PARAMETER_STORE_TABLE__"
             - name: AUDIT_TRAIL_TABLE
-              value: "audit-trail"
-            - name: BID_SHADING_RUNTIME_ARN
-              value: "__BID_SHADING_RUNTIME_ARN__"
+              value: "__AUDIT_TRAIL_TABLE__"
+            # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
+            # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
+            # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.
           resources:
             requests:
               cpu: "500m"

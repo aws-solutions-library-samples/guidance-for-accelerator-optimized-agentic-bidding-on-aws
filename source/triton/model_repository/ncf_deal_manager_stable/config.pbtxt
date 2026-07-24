@@ -1,0 +1,43 @@
+# NCF Deal Manager — STABLE engine (TensorRT).
+# Served behind the ncf_deal_manager router. model.plan built by the Model
+# Optimizer at deploy + on promotion. Batch profile 1..128.
+
+name: "ncf_deal_manager_stable"
+platform: "tensorrt_plan"
+max_batch_size: 128
+
+input [
+  {
+    name: "user_ids"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "item_ids"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "relevance_scores"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 16, 32, 64 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]

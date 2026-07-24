@@ -3,8 +3,14 @@
 Exposes endpoints for the Part 2 closed-loop demo:
 
 - ``GET  /v1/closed-loop/scenarios``  — list controllable scenarios
-- ``POST /v1/closed-loop/generate``   — generate synthetic input for a scenario,
-   run the real decision path, and return the real decision + evidence
+- ``POST /v1/closed-loop/generate``   — emit synthetic input for a scenario to
+   CloudWatch and return the "before" context (agentic) or the real A/B decision
+   (governance). This endpoint does NOT invoke any agent runtime — the UI invokes
+   the Adaptive Bidding agent directly (browser-direct, SigV4). The orchestrator is
+   never in the agent-invocation path.
+- ``GET  /v1/closed-loop/sample-outcomes`` — a subset of individual synthetic
+   sample records for a scenario (bid-outcome records for agentic scenarios,
+   control/treatment A/B values for governance scenarios)
 - ``GET  /v1/closed-loop/parameters`` — current bidding parameters (real DynamoDB)
 - ``GET  /v1/closed-loop/audit``      — audit trail (real DynamoDB)
 - ``GET  /v1/closed-loop/models``     — model registry versions/status (real SageMaker)
@@ -23,6 +29,7 @@ Configuration (environment variables):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -137,13 +144,19 @@ async def list_scenarios_handler(request: Request) -> JSONResponse:
 
 
 async def generate_handler(request: Request) -> JSONResponse:
-    """POST — generate synthetic input for a scenario and run the real decision.
+    """POST — emit synthetic input for a scenario; return before-context or A/B decision.
 
     Body: ``{"scenario": "<key>"}``
 
-    Returns emit evidence (what was written to real CloudWatch) plus the real
-    decision (parameter updates for agentic scenarios, or the A/B recommendation
-    for governance scenarios).
+    For **agentic** scenarios: emits the synthetic market metrics to CloudWatch,
+    ensures the bidding parameters exist, and returns the "before" parameter
+    snapshot + emitted market_state under ``context``. It does NOT invoke the
+    agent — the UI invokes the Adaptive Bidding AgentCore runtime directly
+    (browser-direct, SigV4) and then reads the persisted "after" state via the
+    parameters endpoint.
+
+    For **governance** scenarios: returns the real A/B statistical decision
+    (``ABEvaluator``; pure computation, not an agent invocation) under ``decision``.
     """
     try:
         body = await request.json()
@@ -162,14 +175,19 @@ async def generate_handler(request: Request) -> JSONResponse:
     response: dict[str, Any] = {
         "scenario": scenario.summary(),
         "generated": [],
-        "decision": None,
+        "context": None,   # agentic: "before" snapshot + emitted market_state (no invocation)
+        "decision": None,  # governance: real A/B decision (pure ABEvaluator)
         "errors": [],
     }
 
     # Step 1: emit the synthetic input metrics to real CloudWatch (best-effort).
+    # Run in a worker thread: emit_for_scenario polls GetMetricData (blocking
+    # time.sleep, up to ~12s) to confirm the just-written datapoint is actually
+    # queryable before the UI invokes the agent — that polling must not block
+    # this async event loop.
     try:
         cw = _get_cloudwatch()
-        evidences = generator.emit_for_scenario(cw, scenario)
+        evidences = await asyncio.to_thread(generator.emit_for_scenario, cw, scenario)
         response["generated"] = [
             {
                 "namespace": e.namespace,
@@ -177,6 +195,8 @@ async def generate_handler(request: Request) -> JSONResponse:
                 "error": e.error,
                 "timestamp": e.timestamp,
                 "emitted": e.emitted,
+                "visible": e.visible,
+                "visible_wait_seconds": e.visible_wait_seconds,
             }
             for e in evidences
         ]
@@ -185,23 +205,62 @@ async def generate_handler(request: Request) -> JSONResponse:
         response["errors"].append(f"emit: {type(exc).__name__}: {exc}")
         cw = None
 
-    # Step 2: run the real decision path.
+    # Step 2: prepare context / run the pure statistical gate. NO agent invocation.
+    ready = False
     try:
         if scenario.loop == LOOP_AGENTIC:
             store = _get_parameter_store()
-            response["decision"] = await invoker.run_agentic_decision(
-                scenario, store, real_cloudwatch_client=cw
-            )
+            # Prepare-only: ensure params + snapshot "before" + echo emitted market_state.
+            # The UI invokes the Adaptive Bidding runtime directly (SigV4).
+            response["context"] = await invoker.prepare_agentic_context(scenario, store)
+            ready = True
         elif scenario.loop == LOOP_GOVERNANCE:
+            # Pure statistical A/B gate (not an agent invocation).
             response["decision"] = invoker.run_governance_decision(scenario)
+            ready = True
         else:
             response["errors"].append(f"unknown loop '{scenario.loop}'")
     except Exception as exc:
-        logger.exception("Decision failed for scenario %s", scenario_key)
-        response["errors"].append(f"decision: {type(exc).__name__}: {exc}")
+        logger.exception("Prepare failed for scenario %s", scenario_key)
+        response["errors"].append(f"prepare: {type(exc).__name__}: {exc}")
 
-    status = 200 if response["decision"] is not None else 502
+    status = 200 if ready else 502
     return JSONResponse(response, status_code=status)
+
+
+async def sample_outcomes_handler(request: Request) -> JSONResponse:
+    """GET — a subset of individual synthetic sample records for a scenario.
+
+    Query params: ``scenario`` (required), ``n`` (optional, default 10).
+
+    For agentic scenarios: illustrative individual bid-outcome records
+    (won/price_paid/impression/click/conversion) consistent with the scenario's
+    aggregate metrics. For governance scenarios: the first N control/treatment
+    values from the deterministic A/B sample lists actually fed to the real
+    ABEvaluator. Always deterministic and explicitly labelled as synthetic
+    sample input, never a fabricated result.
+    """
+    scenario_key = request.query_params.get("scenario")
+    if not scenario_key:
+        return JSONResponse({"error": "missing 'scenario' query parameter"}, status_code=400)
+
+    try:
+        n = int(request.query_params.get("n", "10"))
+    except ValueError:
+        n = 10
+
+    try:
+        scenario = get_scenario(scenario_key)
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+    return JSONResponse(
+        {
+            "scenario": scenario_key,
+            "loop": scenario.loop,
+            **scenario.sample_outcomes(n=n),
+        }
+    )
 
 
 async def parameters_handler(request: Request) -> JSONResponse:

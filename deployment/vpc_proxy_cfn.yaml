@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VPC proxy Lambda for the closed-loop Governance Agent. The Governance AgentCore
+  runtime runs in PUBLIC network mode and cannot reach cluster-internal endpoints
+  directly. This Lambda (attached to the cluster VPC) serves two roles:
+    1) For Triton calls it forwards http(s) to the internal Triton NLB
+       (agent -> lambda:InvokeFunction -> internal NLB).
+    2) For POST .../v1/optimize it launches an ON-DEMAND Kubernetes Job that runs
+       the Model Optimizer (TensorRT build) on a GPU node and exits — so no
+       optimizer pod holds a GPU at steady state. The engine is written to the
+       request's output_uri; the Lambda returns that URI (same shape the old
+       always-on optimizer service returned), so the Governance agent is unchanged.
+  Requirements: 5.1, 5.2, 12.4
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: artf
+    Description: Prefix for resource names.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Private subnet IDs (cluster VPC) to attach the proxy Lambda ENIs to. Any AZ
+      is fine — the AgentCore-supported-AZ restriction does not apply to Lambda.
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: >-
+      Security group IDs for the proxy Lambda ENIs. Use the EKS cluster security
+      group so the Lambda can reach the internal Triton NLB (:8000) and the EKS
+      API server.
+
+  ClusterName:
+    Type: String
+    Description: EKS cluster name — the Lambda calls eks:DescribeCluster + the K8s API to launch optimize Jobs.
+
+  OptimizerImage:
+    Type: String
+    Description: Full ECR image URI for the Model Optimizer (used by the on-demand optimize Job).
+
+  OptimizerServiceAccount:
+    Type: String
+    Default: model-optimizer-sa
+    Description: K8s ServiceAccount (IRSA) the optimize Job runs as (S3 rw on the model bucket).
+
+  JobNamespace:
+    Type: String
+    Default: default
+    Description: Namespace in which to launch on-demand optimize Jobs.
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+
+Resources:
+  ProxyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - !If [HasStackPrefix, !Sub '${StackPrefix}-vpc-proxy-role', 'vpc-proxy-role']
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # AWSLambdaVPCAccessExecutionRole grants ENI create/describe/delete + basic
+      # CloudWatch Logs — exactly what a VPC-attached Lambda needs.
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: describe-eks-cluster
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the cluster API endpoint + CA to talk to the K8s API. Scoped
+              # to this cluster. K8s-level authz (create Jobs) is granted separately
+              # via aws-auth / RBAC bound to this role (see deploy_closed_loop.sh).
+              - Effect: Allow
+                Action: 'eks:DescribeCluster'
+                Resource: !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+
+  ProxyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If [HasStackPrefix, !Sub '${StackPrefix}-vpc-optimizer-proxy', 'vpc-optimizer-proxy']
+      Description: >-
+        Forwards Triton http(s) from the PUBLIC Governance runtime to the internal
+        NLB, and launches on-demand K8s optimize Jobs for /v1/optimize.
+      Runtime: python3.12
+      # Optimize builds run as a K8s Job the Lambda waits on; GPU node cold-start +
+      # trtexec can take several minutes, so use the Lambda max timeout (15 min).
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt ProxyFunctionRole.Arn
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ClusterName
+          OPTIMIZER_IMAGE: !Ref OptimizerImage
+          OPTIMIZER_SA: !Ref OptimizerServiceAccount
+          JOB_NAMESPACE: !Ref JobNamespace
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import ssl
+          import time
+          import urllib.error
+          import urllib.request
+          import uuid
+
+          import boto3
+          from botocore.signers import RequestSigner
+
+          REGION = os.environ["AWS_REGION"]
+          CLUSTER_NAME = os.environ.get("CLUSTER_NAME", "")
+          OPTIMIZER_IMAGE = os.environ.get("OPTIMIZER_IMAGE", "")
+          OPTIMIZER_SA = os.environ.get("OPTIMIZER_SA", "model-optimizer-sa")
+          JOB_NAMESPACE = os.environ.get("JOB_NAMESPACE", "default")
+
+          # Cache the cluster endpoint + CA across warm invocations.
+          _CLUSTER = {}
+
+          def _resp(status, body_bytes, headers=None):
+              return {"status": status, "headers": headers or {},
+                      "body_b64": base64.b64encode(body_bytes).decode()}
+
+          def _err(status, msg):
+              return _resp(status, msg.encode() if isinstance(msg, str) else msg)
+
+          # ---- Generic HTTP forward (Triton readiness / model ops) --------------
+          def _http_forward(event):
+              method = (event.get("method") or "GET").upper()
+              url = event.get("url")
+              if not url:
+                  return _err(400, "missing url")
+              headers = dict(event.get("headers") or {})
+              data = None
+              if event.get("json") is not None:
+                  data = json.dumps(event["json"]).encode("utf-8")
+                  headers.setdefault("Content-Type", "application/json")
+              elif event.get("body") is not None:
+                  data = base64.b64decode(event["body"])
+              req = urllib.request.Request(url=url, data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=590) as r:
+                      return _resp(getattr(r, "status", r.getcode()),
+                                   r.read(), {k: v for k, v in r.headers.items()})
+              except urllib.error.HTTPError as e:
+                  return _resp(e.code, e.read(), {k: v for k, v in (e.headers or {}).items()})
+              except Exception as e:  # noqa: BLE001
+                  return _err(502, str(e))
+
+          # ---- EKS / K8s API helpers -------------------------------------------
+          def _eks_token():
+              # Standard EKS bearer token: presigned STS GetCallerIdentity with the
+              # cluster name header, base64url-encoded, prefixed "k8s-aws-v1.".
+              session = boto3.session.Session()
+              signer = RequestSigner(
+                  session.client("sts").meta.service_model.service_id,
+                  REGION, "sts", "v4", session.get_credentials(), session.events,
+              )
+              signed = signer.generate_presigned_url(
+                  {"method": "GET",
+                   "url": f"https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+                   "body": {}, "headers": {"x-k8s-aws-id": CLUSTER_NAME}, "context": {}},
+                  region_name=REGION, expires_in=60, operation_name="",
+              )
+              return "k8s-aws-v1." + base64.urlsafe_b64encode(signed.encode()).decode().rstrip("=")
+
+          def _cluster():
+              if not _CLUSTER:
+                  c = boto3.client("eks", region_name=REGION).describe_cluster(name=CLUSTER_NAME)["cluster"]
+                  ca_path = "/tmp/eks-ca.crt"
+                  with open(ca_path, "wb") as f:
+                      f.write(base64.b64decode(c["certificateAuthority"]["data"]))
+                  _CLUSTER["endpoint"] = c["endpoint"]
+                  _CLUSTER["ca"] = ca_path
+              return _CLUSTER
+
+          def _k8s(method, path, body=None):
+              cl = _cluster()
+              ctx = ssl.create_default_context(cafile=cl["ca"])
+              headers = {"Authorization": f"Bearer {_eks_token()}", "Accept": "application/json"}
+              data = None
+              if body is not None:
+                  data = json.dumps(body).encode()
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(cl["endpoint"] + path, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+                  return r.status, json.loads(r.read() or b"{}")
+
+          # ---- On-demand optimize Job ------------------------------------------
+          def _launch_optimize_job(event):
+              if not CLUSTER_NAME or not OPTIMIZER_IMAGE:
+                  return _err(500, "optimizer proxy misconfigured: CLUSTER_NAME/OPTIMIZER_IMAGE unset")
+              if event.get("json") is not None:
+                  opt_body = event["json"]
+              elif event.get("body") is not None:
+                  opt_body = json.loads(base64.b64decode(event["body"]))
+              else:
+                  return _err(400, "optimize request has no body")
+              output_uri = opt_body.get("output_uri")
+              if not output_uri:
+                  return _err(400, "optimize request missing output_uri")
+
+              name = "optimize-" + uuid.uuid4().hex[:12]
+              job = {
+                  "apiVersion": "batch/v1", "kind": "Job",
+                  "metadata": {"name": name, "labels": {"app": "model-optimizer", "role": "on-demand"}},
+                  "spec": {
+                      "backoffLimit": 0,
+                      "ttlSecondsAfterFinished": 600,
+                      "template": {
+                          "metadata": {"labels": {"app": "model-optimizer", "role": "on-demand"}},
+                          "spec": {
+                              "restartPolicy": "Never",
+                              "serviceAccountName": OPTIMIZER_SA,
+                              "nodeSelector": {"nvidia.com/gpu": "present"},
+                              "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+                              "containers": [{
+                                  "name": "optimize",
+                                  "image": OPTIMIZER_IMAGE,
+                                  "args": ["--optimize-once"],
+                                  "env": [
+                                      {"name": "AWS_REGION", "value": REGION},
+                                      {"name": "AWS_DEFAULT_REGION", "value": REGION},
+                                      {"name": "OPTIMIZE_REQUEST_JSON", "value": json.dumps(opt_body)},
+                                  ],
+                                  "resources": {
+                                      "requests": {"cpu": "2", "memory": "8Gi", "nvidia.com/gpu": "1"},
+                                      "limits": {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"},
+                                  },
+                              }],
+                          },
+                      },
+                  },
+              }
+              try:
+                  _k8s("POST", f"/apis/batch/v1/namespaces/{JOB_NAMESPACE}/jobs", job)
+              except Exception as e:  # noqa: BLE001
+                  return _err(502, f"failed to create optimize Job: {e}")
+
+              # Poll until the Job completes. Leave ~30s headroom under the Lambda timeout.
+              deadline = time.time() + 840
+              while time.time() < deadline:
+                  time.sleep(10)
+                  try:
+                      _, j = _k8s("GET", f"/apis/batch/v1/namespaces/{JOB_NAMESPACE}/jobs/{name}")
+                  except Exception:  # noqa: BLE001 - transient API error, retry
+                      continue
+                  st = j.get("status", {})
+                  if st.get("succeeded", 0) >= 1:
+                      # Engine written to output_uri by the Job. Return the same shape
+                      # the old always-on optimizer service returned.
+                      return _resp(200, json.dumps({
+                          "output_uri": output_uri,
+                          "model_name": opt_body.get("model_name", ""),
+                          "precision": opt_body.get("precision", "fp16"),
+                          "source_model_uri": opt_body.get("source_model_uri", ""),
+                      }).encode())
+                  if st.get("failed", 0) >= 1:
+                      return _err(500, f"optimize Job {name} failed (see pod logs: kubectl logs job/{name})")
+              return _err(504, f"optimize Job {name} did not finish within the Lambda timeout")
+
+          def handler(event, context):
+              url = event.get("url") or ""
+              method = (event.get("method") or "GET").upper()
+              # Path-based dispatch: /v1/optimize -> on-demand Job; everything else
+              # (Triton /v2 health + model ops) -> plain HTTP forward.
+              if method == "POST" and url.rstrip("/").endswith("/v1/optimize"):
+                  return _launch_optimize_job(event)
+              return _http_forward(event)
+
+Outputs:
+  ProxyFunctionArn:
+    Description: ARN of the VPC proxy Lambda (pass to the Governance runtime as VPC_PROXY_LAMBDA_ARN).
+    Value: !GetAtt ProxyFunction.Arn
+  ProxyFunctionName:
+    Description: Name of the VPC proxy Lambda.
+    Value: !Ref ProxyFunction
+  ProxyFunctionRoleArn:
+    Description: >-
+      IAM role ARN of the proxy Lambda. Map this into the cluster's aws-auth with a
+      group bound to RBAC that allows creating/reading Jobs (see deploy_closed_loop.sh).
+    Value: !GetAtt ProxyFunctionRole.Arn

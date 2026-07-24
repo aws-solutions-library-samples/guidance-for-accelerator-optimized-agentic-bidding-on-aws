@@ -5,9 +5,8 @@ services:
   orchestrator:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.orchestrator
       args:
-        CONTAINER: orchestrator
         AGENT_NAME: artf-orchestrator
     ports:
       - "8080:8000"   # REST API for the frontend
@@ -62,7 +61,8 @@ services:
       - artf
 
   # -----------------------------------------------------------------------
-  # Wide & Deep Segment Activator — ACTIVATE_SEGMENTS intent
+  # Wide & Deep Segment Activator — ACTIVATE_SEGMENTS intent (rule-based, no
+  # Triton dependency; see source/containers/widedeep_segment_activator/app.py)
   # -----------------------------------------------------------------------
   widedeep:
     build:

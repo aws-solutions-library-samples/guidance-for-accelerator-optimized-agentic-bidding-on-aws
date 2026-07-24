@@ -1,11 +1,11 @@
 {
   "agents": [
     {
-      "name": "BidShadingStrategyAgent",
+      "name": "AdaptiveBiddingStrategyAgent",
       "language": "Python",
       "framework": "Custom",
       "type": "create",
-      "codeLocation": "agents/bid_shading",
+      "codeLocation": "agents/adaptive_bidding",
       "entrypoint": "handler.py",
       "build": "Container",
       "protocol": "HTTP",

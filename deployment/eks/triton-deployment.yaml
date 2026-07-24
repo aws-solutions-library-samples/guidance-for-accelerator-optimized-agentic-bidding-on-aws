@@ -59,6 +59,11 @@ spec:
             - --log-verbose=0
             - --strict-model-config=true
             - --exit-on-error=false
+            # Part 2: poll mode so Triton auto-loads new model versions / canary
+            # models that the Model Optimizer writes to the S3 repo (base engines
+            # are built at deploy time; canary + promoted versions appear later).
+            - --model-control-mode=poll
+            - --repository-poll-secs=30
           env:
             - name: AWS_DEFAULT_REGION
               value: "__REGION__"

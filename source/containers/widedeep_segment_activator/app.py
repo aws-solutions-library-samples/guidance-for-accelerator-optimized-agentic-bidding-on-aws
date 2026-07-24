@@ -1,20 +1,27 @@
-"""Wide & Deep Segment Activator — ARTF container for ACTIVATE_SEGMENTS.
+"""Segment Activator — ARTF container for ACTIVATE_SEGMENTS.
 
-Implements the Wide & Deep architecture (Cheng et al. 2016) as used in
-NVIDIA Merlin Models and NVIDIA DeepLearningExamples.
+Deterministic, rule-based audience-segment activation. This container
+previously scored segments with a Wide & Deep neural network served on
+NVIDIA Triton. That model is being replaced by a partner ISV implementation
+(see GUIDANCE.md — "[Future] Location Activator (ISV)" and related entries).
+Until that partner model is wired in, this container activates segments from
+transparent, inspectable rules over real bid-request signals:
 
-- NVIDIA Merlin: https://nvidia-merlin.github.io/models/
-- Paper: https://arxiv.org/abs/1606.07792
+- IAB content-category → interest-segment mapping (site/app ``cat``)
+- Age bucketing from the user's year of birth (``user.yob``)
+- Keyword matching against any first/third-party DMP segments already present
+  on the request (``user.data[].segment[].name``)
+- Contextual signals: bid floor tier, mobile user-agent, video inventory
 
-When USE_TRITON=true, inference is delegated to NVIDIA Triton Inference
-Server via tritonclient.http.  Otherwise, PyTorch runs inline (CPU).
+No model inference, no randomness, no fabricated scores — every activation is
+traceable to a specific rule and a specific field in the bid request.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -23,112 +30,111 @@ from shared.artf_types import (
     RTBRequest, RTBResponse, intent_applicable,
 )
 
-USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
-
-CANDIDATE_SEGMENTS = [
-    "demo-18-24", "demo-25-34", "demo-35-44", "demo-45-54",
-    "int-sports", "int-tech", "int-fashion", "int-auto",
-    "int-finance", "int-travel", "int-gaming", "int-food",
-    "ctx-premium", "ctx-mobile", "ctx-video",
-]
-NUM_SEGMENTS = len(CANDIDATE_SEGMENTS)
+MODEL_VERSION = "segment-rules-v1"
 ACTIVATION_THRESHOLD = 0.55
 
+# IAB content-category (tier-1) -> interest segment. Real IAB2 taxonomy codes.
+_IAB_SEGMENT_MAP: dict[str, str] = {
+    "IAB2": "int-auto",
+    "IAB8": "int-food",
+    "IAB9": "int-gaming",
+    "IAB13": "int-finance",
+    "IAB17": "int-sports",
+    "IAB18": "int-fashion",
+    "IAB19": "int-tech",
+    "IAB20": "int-travel",
+}
 
-# ---------------------------------------------------------------------------
-# Inference backend — Triton or PyTorch
-# ---------------------------------------------------------------------------
+# Keyword -> interest segment, matched against existing DMP segment names
+# already present on the request (real first/third-party signal, not inferred).
+_KEYWORD_SEGMENT_MAP: tuple[tuple[str, str], ...] = (
+    ("sport", "int-sports"),
+    ("auto", "int-auto"),
+    ("travel", "int-travel"),
+    ("fashion", "int-fashion"),
+    ("style", "int-fashion"),
+    ("finance", "int-finance"),
+    ("food", "int-food"),
+    ("gam", "int-gaming"),
+    ("tech", "int-tech"),
+)
 
-if USE_TRITON:
-    import numpy as np
-    from container.triton_inference import predict_segments as _triton_predict_segments
+_AGE_BUCKETS: tuple[tuple[int, int, str], ...] = (
+    (18, 24, "demo-18-24"),
+    (25, 34, "demo-25-34"),
+    (35, 44, "demo-35-44"),
+    (45, 54, "demo-45-54"),
+)
 
-    MODEL_VERSION = "widedeep-nvidia-triton-v1"
-
-    def _score_segments(bid_request: dict, threshold: float = ACTIVATION_THRESHOLD) -> list[str]:
-        wide, deep = _extract_np(bid_request)
-        scores = _triton_predict_segments(wide, deep)
-        return [CANDIDATE_SEGMENTS[i] for i in range(min(len(scores), NUM_SEGMENTS))
-                if scores[i] > threshold]
-
-    def _extract_np(br: dict):
-        user, site, device = br.get("user", {}), br.get("site", {}), br.get("device", {})
-        imp = (br.get("imp") or [{}])[0]
-        age = max(0.0, min(1.0, (2025 - user.get("yob", 1990)) / 80.0))
-        g = 0.5 if user.get("gender", "") not in ("M", "F") else (0.0 if user.get("gender") == "M" else 1.0)
-        cats = site.get("cat", [])
-        ch, dh = _h(cats[0] if cats else "x"), _h(site.get("domain", "x"))
-        uh, gh = _h(device.get("ua", "")[:30]), _h((device.get("geo") or {}).get("country", "US"))
-        bf = float(imp.get("bidfloor", 1.0)) / 20.0
-        vid = 1.0 if imp.get("video") else 0.0
-        wide = np.array([[age*ch, g*dh, gh*uh, bf*vid, age*g, ch*gh, dh*bf, uh*vid]], dtype=np.float32)
-        deep = np.array([[age, g, ch, dh, bf, vid]], dtype=np.float32)
-        return wide, deep
-
-else:
-    import torch
-    import torch.nn as nn
-
-    class WideAndDeepModel(nn.Module):
-        """Wide & Deep model following NVIDIA Merlin's WideAndDeepModel architecture."""
-
-        def __init__(self, num_wide: int = 8, num_deep: int = 6, num_outputs: int = 15):
-            super().__init__()
-            self.wide = nn.Linear(num_wide, num_outputs)
-            self.deep = nn.Sequential(
-                nn.Linear(num_deep, 64), nn.ReLU(), nn.BatchNorm1d(64),
-                nn.Linear(64, 32), nn.ReLU(), nn.BatchNorm1d(32),
-                nn.Linear(32, num_outputs),
-            )
-
-        def forward(self, wide_features, deep_features):
-            return torch.sigmoid(self.wide(wide_features) + self.deep(deep_features))
-
-    _model = WideAndDeepModel()
-    _model.eval()
-    MODEL_VERSION = "widedeep-nvidia-merlin-arch-v1"
-
-    def _score_segments(bid_request: dict, threshold: float = ACTIVATION_THRESHOLD) -> list[str]:
-        wide, deep = _extract_torch(bid_request)
-        with torch.no_grad():
-            scores = _model(wide, deep).squeeze(0)
-        return [CANDIDATE_SEGMENTS[i] for i in range(min(len(scores), NUM_SEGMENTS))
-                if scores[i].item() > threshold]
-
-    def _extract_torch(br: dict):
-        user, site, device = br.get("user", {}), br.get("site", {}), br.get("device", {})
-        imp = (br.get("imp") or [{}])[0]
-        age = max(0.0, min(1.0, (2025 - user.get("yob", 1990)) / 80.0))
-        g = 0.5 if user.get("gender", "") not in ("M", "F") else (0.0 if user.get("gender") == "M" else 1.0)
-        cats = site.get("cat", [])
-        ch, dh = _h(cats[0] if cats else "x"), _h(site.get("domain", "x"))
-        uh, gh = _h(device.get("ua", "")[:30]), _h((device.get("geo") or {}).get("country", "US"))
-        bf = float(imp.get("bidfloor", 1.0)) / 20.0
-        vid = 1.0 if imp.get("video") else 0.0
-        wide = torch.tensor([[age*ch, g*dh, gh*uh, bf*vid, age*g, ch*gh, dh*bf, uh*vid]], dtype=torch.float32)
-        deep = torch.tensor([[age, g, ch, dh, bf, vid]], dtype=torch.float32)
-        return wide, deep
+_MOBILE_UA_MARKERS = ("Mobile", "iPhone", "Android")
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
+def _score_segments(bid_request: dict, threshold: float = ACTIVATION_THRESHOLD) -> list[str]:
+    """Score candidate segments from real bid-request signals via fixed rules.
 
-def _h(val: str, dim: int = 1000) -> float:
-    return (int(hashlib.md5(val.encode(), usedforsecurity=False).hexdigest(), 16) % dim) / dim  # nosec B324
+    Returns the segment IDs whose accumulated score exceeds ``threshold``.
+    Scores are deterministic point values from the rules below, clamped to
+    [0, 1] — not a model's probability output.
+    """
+    scores: dict[str, float] = {}
 
+    def _bump(segment: str, value: float) -> None:
+        scores[segment] = min(1.0, max(scores.get(segment, 0.0), value))
 
-# ---------------------------------------------------------------------------
-# ARTF mutate
-# ---------------------------------------------------------------------------
+    site = bid_request.get("site") or bid_request.get("app") or {}
+    user = bid_request.get("user") or {}
+    device = bid_request.get("device") or {}
+    imps = bid_request.get("imp") or [{}]
+
+    # Rule 1: IAB content category -> interest segment
+    for cat in site.get("cat", []):
+        segment = _IAB_SEGMENT_MAP.get(cat)
+        if segment:
+            _bump(segment, 0.85)
+
+    # Rule 2: age bucket from year of birth
+    yob = user.get("yob")
+    if isinstance(yob, int) and 1900 < yob <= datetime.now(timezone.utc).year:
+        age = datetime.now(timezone.utc).year - yob
+        for lo, hi, segment in _AGE_BUCKETS:
+            if lo <= age <= hi:
+                _bump(segment, 0.9)
+                break
+
+    # Rule 3: keyword match against existing DMP-provided segments (real
+    # first/third-party signal already on the request — we only reclassify it
+    # into our own segment taxonomy, we don't invent it).
+    for provider in user.get("data", []):
+        for seg in provider.get("segment", []):
+            name = (seg.get("name") or seg.get("id") or "").lower()
+            for keyword, segment in _KEYWORD_SEGMENT_MAP:
+                if keyword in name:
+                    _bump(segment, 0.75)
+
+    # Rule 4: contextual signals from the impression / device
+    for imp in imps:
+        bidfloor = float(imp.get("bidfloor", 0.0) or 0.0)
+        if bidfloor >= 4.0:
+            _bump("ctx-premium", 0.8)
+        elif bidfloor >= 2.5:
+            _bump("ctx-premium", 0.6)
+        if imp.get("video"):
+            _bump("ctx-video", 0.9)
+
+    ua = device.get("ua", "")
+    if any(marker in ua for marker in _MOBILE_UA_MARKERS):
+        _bump("ctx-mobile", 0.85)
+
+    return sorted(seg for seg, score in scores.items() if score > threshold)
+
 
 def mutate(req: RTBRequest) -> RTBResponse:
     if not intent_applicable(Intent.ACTIVATE_SEGMENTS, req.applicable_intents):
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
-    # Read model parameter overrides from the request (frontend sliders)
+    # Read parameter overrides from the request (frontend sliders)
     params = req.model_params or {}
-    threshold = params.get('segment_threshold', ACTIVATION_THRESHOLD)
+    threshold = params.get("segment_threshold", ACTIVATION_THRESHOLD)
 
     activated = _score_segments(req.bid_request, threshold=threshold)
 
@@ -142,4 +148,4 @@ def mutate(req: RTBRequest) -> RTBResponse:
 
 if __name__ == "__main__":
     from shared.server import run_artf_server
-    run_artf_server(mutate, agent_name="widedeep-segment-activator", grpc_port=50051, mcp_port=8081, health_port=8080)
+    run_artf_server(mutate, agent_name="segment-activator", grpc_port=50051, mcp_port=8081, health_port=8080)

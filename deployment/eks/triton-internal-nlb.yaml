@@ -1,0 +1,39 @@
+# Internal NLB for Triton — Part 2 governance reachability ONLY.
+# =============================================================================
+# The Model Promotion Governance AgentCore runtime (VPC-attached) reaches Triton's
+# HTTP model-control / health API (/v2/...) through this internal NLB during
+# canary deploy / promote / rollback.
+#
+# This is ADDITIVE and deliberately separate from the existing
+# `triton-inference-server` ClusterIP Service (triton-deployment.yaml), which the
+# ARTF containers use for in-cluster inference. That ClusterIP is left untouched,
+# so the ARTF real-time serving path is unchanged (ARTF steering compliance).
+#
+# NOTE: Triton must run with a runtime model-control mode (explicit or poll) for
+# the /v2/repository/models/{name}/{load,unload} API used by the Canary Deployer
+# to take effect. That Triton arg is set in triton-deployment.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-internal
+  labels:
+    app: triton
+    component: governance-access
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http
+    # Prometheus metrics — the Model Promotion Governance agent reads per-model
+    # (stable vs canary) serving metrics here for the live A/B guardrails.
+    - port: 8002
+      targetPort: 8002
+      protocol: TCP
+      name: metrics
+  selector:
+    app: triton

@@ -1,4 +1,4 @@
-"""AgentCore HTTP entrypoint for the Bid Shading Strategy Agent.
+"""AgentCore HTTP entrypoint for the Adaptive Bidding Strategy Agent.
 
 This is the handler that runs inside AgentCore's Firecracker microVM.
 
@@ -6,20 +6,22 @@ AgentCore HTTP protocol contract (from official docs):
 - POST :8080/invocations  - invocation handler (JSON payload)
 - GET  :8080/ping         - health check returning {"status": "Healthy"}
 
-All on port 8080. ARM64 container on host 0.0.0.0.
+The agent is a Strands + Amazon Bedrock reasoning agent: each invocation it reads the
+real market state from CloudWatch, reasons about how shade_factor / conversion_value
+should move, and writes the adjustments to the DynamoDB Parameter Store (which enforces
+bounds and versioning). If the Bedrock model is unavailable, the invocation returns an
+honest error and makes no change — no formula fallback, no fabricated adjustment.
 
-Requirements: 7.1, 7.6, 11.1
+Requirements: 7.1, 7.6, 11.1 (parent spec); Req 2.2, 2.7, 2.9 (this spec).
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import os
 import sys
-import asyncio
 import time
-from typing import Any
 
 # Ensure shared/ and agents/ are importable from the AgentCore container context
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -30,10 +32,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from agents.bid_shading.agent import BidShadingStrategyAgent, ParameterUpdate
+from agents.adaptive_bidding.agent import AdaptiveBiddingStrategyAgent
 from shared.parameter_store import ParameterStore
 
-logger = logging.getLogger("agentcore.bid_shading")
+logger = logging.getLogger("agentcore.adaptive_bidding")
 
 # ---------------------------------------------------------------------------
 # Configuration from environment variables
@@ -41,6 +43,7 @@ logger = logging.getLogger("agentcore.bid_shading")
 
 PARAMETER_STORE_TABLE = os.environ.get("PARAMETER_STORE_TABLE", "parameter-store")
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+ADAPTIVE_BIDDING_MODEL_ID = os.environ.get("ADAPTIVE_BIDDING_MODEL_ID", "")
 
 
 # ---------------------------------------------------------------------------
@@ -51,52 +54,61 @@ AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "
 async def handle_invocation(request: Request) -> JSONResponse:
     """AgentCore HTTP invocation handler at POST /invocations.
 
-    Initializes the BidShadingStrategyAgent, runs a single evaluation cycle,
-    and returns the parameter updates made.
+    Runs one reasoning cycle (read metrics -> reason -> write parameter updates) and
+    returns the applied updates plus the model's rationale.
     """
     invocation_start = time.time()
 
     try:
         try:
-            payload = await request.json()
+            await request.json()
         except Exception:
-            payload = {}
+            pass  # payload is not required for the scheduled cycle
 
-        # Initialize dependencies
+        if not ADAPTIVE_BIDDING_MODEL_ID:
+            # Honest configuration error — do not silently fall back to a formula.
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": (
+                        "ADAPTIVE_BIDDING_MODEL_ID is not configured; the reasoning agent "
+                        "cannot run. Set the Bedrock model id on the runtime."
+                    ),
+                    "timestamp": invocation_start,
+                },
+                status_code=500,
+            )
+
         parameter_store = ParameterStore(
             table_name=PARAMETER_STORE_TABLE,
             region=AWS_REGION,
         )
         cloudwatch_client = boto3.client("cloudwatch", region_name=AWS_REGION)
 
-        # Create agent instance
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=parameter_store,
             cloudwatch_client=cloudwatch_client,
+            model_id=ADAPTIVE_BIDDING_MODEL_ID,
+            region=AWS_REGION,
         )
 
-        # Run the evaluation cycle
-        updates = await agent.evaluate_and_adjust()
+        # The reasoning cycle is synchronous (Strands agent loop + tool calls that
+        # bridge to the async store). Run it in a worker thread so it doesn't block
+        # the event loop and so the tool bridge has no active loop to conflict with.
+        result = await asyncio.to_thread(agent.run_cycle)
 
-        # Serialize updates for the response
-        serialized_updates = [
-            {
-                "parameter_name": u.parameter_name,
-                "old_value": u.old_value,
-                "new_value": u.new_value,
-                "reason": u.reason,
-                "confidence": u.confidence,
-            }
-            for u in updates
-        ]
+        # Emit real CloudWatch events for any applied changes.
+        agent.emit_update_event()
 
         duration_ms = (time.time() - invocation_start) * 1000.0
-
         return JSONResponse(
             {
                 "status": "completed",
-                "updates": serialized_updates,
-                "updates_count": len(serialized_updates),
+                "updates": result["updates"],
+                "updates_count": result["updates_count"],
+                "rationale": result["rationale"],
+                "market_state": result["market_state"],
+                "model_id": ADAPTIVE_BIDDING_MODEL_ID,
                 "duration_ms": round(duration_ms, 2),
                 "timestamp": invocation_start,
             },
@@ -147,9 +159,10 @@ def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     logger.info(
-        "Bid Shading Strategy Agent starting (table=%s, region=%s)",
+        "Adaptive Bidding Strategy Agent starting (table=%s, region=%s, model=%s)",
         PARAMETER_STORE_TABLE,
         AWS_REGION,
+        ADAPTIVE_BIDDING_MODEL_ID or "<unset>",
     )
     logger.info("Serving on :8080 (AgentCore HTTP contract: POST /invocations, GET /ping)")
 

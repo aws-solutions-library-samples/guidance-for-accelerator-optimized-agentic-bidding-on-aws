@@ -1,18 +1,17 @@
-# DLRM Bid Shader — NVIDIA Triton Inference Server configuration
-# Architecture: NVIDIA DeepLearningExamples DLRM with dot-product interaction
-# Backend: ONNX Runtime (CPU or GPU via CUDA EP)
+# DLRM Bid Shader — CANARY ROUTER (Triton Python backend).
+# =============================================================================
+# This is the model the ARTF DLRM container calls by name ("dlrm_bid_shader") —
+# UNCHANGED client-facing signature. It forwards each request to either
+# dlrm_bid_shader_stable or dlrm_bid_shader_canary (TensorRT engines) based on an
+# in-memory canary_traffic_pct read at load/reload (control-plane), so the
+# bidstream path has NO external dependency (ARTF-compliant). Model source:
+# source/triton/router/model.py.
 #
-# Inputs:
-#   dense_features: [batch, 4] float32 — bidfloor, hour, age_norm, has_video
-#   sparse_user:    [batch]    int64   — hashed user ID (0..999)
-#   sparse_domain:  [batch]    int64   — hashed site domain (0..999)
-#   sparse_device:  [batch]    int64   — hashed device UA (0..999)
-#
-# Output:
-#   ctr_prediction: [batch]    float32 — predicted click-through rate
+# No dynamic_batching here (per-request routing); GPU batching happens in the
+# stable/canary TensorRT models, which keep their own dynamic_batching.
 
 name: "dlrm_bid_shader"
-backend: "onnxruntime"
+backend: "python"
 max_batch_size: 64
 
 input [
@@ -25,19 +24,16 @@ input [
     name: "sparse_user"
     data_type: TYPE_INT64
     dims: [ 1 ]
-    reshape: { shape: [] }
   },
   {
     name: "sparse_domain"
     data_type: TYPE_INT64
     dims: [ 1 ]
-    reshape: { shape: [] }
   },
   {
     name: "sparse_device"
     data_type: TYPE_INT64
     dims: [ 1 ]
-    reshape: { shape: [] }
   }
 ]
 
@@ -46,18 +42,18 @@ output [
     name: "ctr_prediction"
     data_type: TYPE_FP32
     dims: [ 1 ]
-    reshape: { shape: [] }
   }
 ]
 
-dynamic_batching {
-  preferred_batch_size: [ 8, 16, 32 ]
-  max_queue_delay_microseconds: 500
-}
+parameters [
+  { key: "stable_model", value: { string_value: "dlrm_bid_shader_stable" } },
+  { key: "canary_model", value: { string_value: "dlrm_bid_shader_canary" } },
+  { key: "canary_traffic_pct", value: { string_value: "0" } }
+]
 
 instance_group [
   {
     count: 2
-    kind: KIND_GPU
+    kind: KIND_CPU
   }
 ]

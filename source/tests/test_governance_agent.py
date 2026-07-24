@@ -1,15 +1,15 @@
-"""Tests for ModelGovernanceAgent validation pipeline and decisions.
+"""Tests for ModelPromotionGovernanceAgent validation pipeline and decisions.
 
 Validates the full governance pipeline:
 - Full pipeline: optimize → deploy → AB pass → promote → registry updated
 - Guardrail breach: deploy → AB detects guardrail violation → reject + rollback
 - Inconclusive: AB reaches max duration → inconclusive + rollback
-- NIM optimization failure → reject with reason
+- Model optimization failure → reject with reason
 - Canary load failure → reject with reason
 - Audit record written for promote/reject/inconclusive
 - Registry status updated correctly ("Approved" vs "Rejected")
 
-Mock: NIM API (HTTP), Triton API (HTTP), SageMaker registry client (boto3), CloudWatch (boto3)
+Mock: Model Optimizer (HTTP), Triton API (HTTP), SageMaker registry client (boto3), CloudWatch (boto3)
 Real: ABEvaluator logic, decision logic
 
 **Validates: Requirements 4.2, 4.5, 4.6, 4.7, 4.8, 10.1, 10.3**
@@ -28,7 +28,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agents.governance.ab_evaluator import ABEvaluator, ABTestConfig, ABTestResult, TestStatus
-from agents.governance.governance_agent import GovernanceDecision, ModelGovernanceAgent
+from agents.governance.governance_agent import GovernanceDecision, ModelPromotionGovernanceAgent
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,10 @@ GUARDRAIL_TREATMENT_LATENCY_NEG = [
 # ---------------------------------------------------------------------------
 
 
-class MockNIMOptimizer:
-    """Mock NIM optimizer that returns a deterministic optimized URI."""
+class MockModelOptimizer:
+    """Mock Model Optimizer that returns a deterministic optimized URI."""
 
-    def __init__(self, *, should_fail: bool = False, error_message: str = "NIM API error"):
+    def __init__(self, *, should_fail: bool = False, error_message: str = "optimizer error"):
         self._should_fail = should_fail
         self._error_message = error_message
         self.optimize_calls: list[dict] = []
@@ -190,22 +190,22 @@ def _build_agent(
     deploy_should_fail: bool = False,
     guardrail_violations: list[str] | None = None,
 ) -> tuple[
-    ModelGovernanceAgent,
-    MockNIMOptimizer,
+    ModelPromotionGovernanceAgent,
+    MockModelOptimizer,
     MockCanaryDeployer,
     MockGuardrailMonitor,
     MockModelRegistryClient,
     MockAuditStore,
 ]:
-    """Build a ModelGovernanceAgent with all mock dependencies."""
-    nim = MockNIMOptimizer(should_fail=nim_should_fail)
+    """Build a ModelPromotionGovernanceAgent with all mock dependencies."""
+    nim = MockModelOptimizer(should_fail=nim_should_fail)
     canary = MockCanaryDeployer(deploy_should_fail=deploy_should_fail)
     guardrail = MockGuardrailMonitor(violations=guardrail_violations)
     registry = MockModelRegistryClient()
     audit = MockAuditStore()
 
-    agent = ModelGovernanceAgent(
-        nim_optimizer=nim,
+    agent = ModelPromotionGovernanceAgent(
+        model_optimizer=nim,
         canary_deployer=canary,
         ab_evaluator_factory=lambda config: ABEvaluator(config),
         guardrail_monitor=guardrail,
@@ -519,7 +519,7 @@ class TestNIMFailure:
         )
 
         assert result.decision == "reject"
-        assert "NIM optimization failed" in result.reason
+        assert "Model optimization failed" in result.reason
 
     @pytest.mark.asyncio
     async def test_nim_failure_no_canary_deploy(self):
@@ -650,7 +650,7 @@ class TestAuditRecords:
 
         assert len(audit.records) == 1
         record = audit.records[0]
-        assert record["actor"] == "governance_agent"
+        assert record["actor"] == "model_promotion_governance_agent"
         assert record["decision"] == "promote"
         assert record["model_type"] == "dlrm_bid_shader"
         assert record["version_arn"] == "arn:aws:sagemaker:us-east-1:123:model-package/v1.1"
@@ -676,7 +676,7 @@ class TestAuditRecords:
         assert len(audit.records) == 1
         record = audit.records[0]
         assert record["decision"] == "reject"
-        assert record["actor"] == "governance_agent"
+        assert record["actor"] == "model_promotion_governance_agent"
 
     @pytest.mark.asyncio
     async def test_audit_record_written_on_inconclusive(self):
@@ -697,7 +697,7 @@ class TestAuditRecords:
         assert len(audit.records) == 1
         record = audit.records[0]
         assert record["decision"] == "inconclusive"
-        assert record["actor"] == "governance_agent"
+        assert record["actor"] == "model_promotion_governance_agent"
 
     @pytest.mark.asyncio
     async def test_audit_record_written_on_nim_failure(self):
@@ -717,7 +717,7 @@ class TestAuditRecords:
         assert len(audit.records) == 1
         record = audit.records[0]
         assert record["decision"] == "reject"
-        assert "NIM" in record["reason"] or "nim" in record["reason"].lower()
+        assert "Model optimization failed" in record["reason"]
 
     @pytest.mark.asyncio
     async def test_audit_record_written_on_canary_failure(self):

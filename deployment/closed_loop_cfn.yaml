@@ -26,9 +26,36 @@ Parameters:
       Optional email address for SNS training failure alerts.
       If empty, no subscription is created (add manually after deployment).
 
+  TrainingDataBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the S3 bucket holding Glue-labeled training data (from
+      glue_etl_cfn.yaml). Used to scope the SageMaker training execution role's
+      read access. Leave empty to skip creating the training execution role
+      (e.g. a stack update before the Glue stack exists).
+
+  ModelBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the S3 Triton model-repository bucket. The training execution role
+      needs read (onnx-source/ genesis artifacts) and write (job output) access
+      here. Leave empty to skip creating the training execution role.
+
+  TrainingImageRepositoryName:
+    Type: String
+    Default: 'artf-nemo-rl-training'
+    Description: >-
+      ECR repository name for the NeMo-RL training container
+      (deploy_closed_loop.sh Step 4b). Used to scope the training role's ECR pull.
+
 Conditions:
   HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, '']]
+  HasTrainingBuckets: !And
+    - !Not [!Equals [!Ref TrainingDataBucketName, '']]
+    - !Not [!Equals [!Ref ModelBucketName, '']]
 
 # =============================================================================
 # Resources
@@ -141,19 +168,104 @@ Resources:
         Model versions for the NCF Deal Manager - trained on deal activation outcomes.
         Governed by the Model Governance Agent with A/B testing and guardrail checks.
 
+  # NOTE: There is intentionally no Wide&Deep Segment Activator Model Package
+  # Group. Segment activation was switched from a Triton Wide & Deep model to
+  # deterministic rule-based logic (its ONNX graph could not be compiled to a
+  # TensorRT engine, and it is slated to be replaced by a partner ISV
+  # implementation) - see
+  # source/containers/widedeep_segment_activator/app.py. There is no
+  # retrainable model for this container, so no Model Registry group is needed.
+
+  # ===========================================================================
+  # 3c. SageMaker Training Execution Role
+  #
+  # Passed as RoleArn in sagemaker:CreateTrainingJob (see
+  # source/training/pipeline.py TrainingPipeline / the RetrainingTriggerFunction
+  # Lambda in governance_eventbridge_cfn.yaml). Scoped per the SageMaker
+  # CreateTrainingJob execution-role docs: S3 read on the training-data bucket,
+  # S3 read/write on the model bucket (job output + genesis onnx-source read),
+  # ECR pull on the NeMo-RL training repo, CloudWatch metrics, and Logs.
   # ---------------------------------------------------------------------------
-  # 3c. Wide&Deep Segment Activator Model Package Group
-  # ---------------------------------------------------------------------------
-  WideDeepSegmentActivatorModelPackageGroup:
-    Type: AWS::SageMaker::ModelPackageGroup
+  SageMakerTrainingExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: HasTrainingBuckets
     Properties:
-      ModelPackageGroupName: !If
+      RoleName: !If
         - HasStackPrefix
-        - !Sub '${StackPrefix}-artf-widedeep-segment-activator'
-        - 'artf-widedeep-segment-activator'
-      ModelPackageGroupDescription: >-
-        Model versions for the Wide&Deep Segment Activator - trained on segment
-        activation performance. Subject to governance A/B testing before promotion.
+        - !Sub '${StackPrefix}-sagemaker-training-execution-role'
+        - 'sagemaker-training-execution-role'
+      Description: >-
+        Execution role SageMaker assumes to run NeMo-RL retraining jobs
+        (CreateTrainingJob RoleArn).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: TrainingDataReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+        - PolicyName: ModelBucketReadWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/onnx-source/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/models/*'
+        - PolicyName: ECRTrainingImagePull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${TrainingImageRepositoryName}'
+        - PolicyName: CloudWatchMetricsAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
 
   # ===========================================================================
   # 4. SNS Topic - Training Alerts
@@ -318,17 +430,19 @@ Outputs:
         - !Sub '${StackPrefix}-NCFModelPackageGroupName'
         - 'NCFModelPackageGroupName'
 
-  WideDeepModelPackageGroupName:
-    Description: SageMaker Model Package Group for Wide&Deep Segment Activator
+  SageMakerTrainingExecutionRoleArn:
+    Description: >-
+      Execution role ARN for SageMaker training jobs (empty if
+      TrainingDataBucketName/ModelBucketName were not provided).
     Value: !If
-      - HasStackPrefix
-      - !Sub '${StackPrefix}-artf-widedeep-segment-activator'
-      - 'artf-widedeep-segment-activator'
+      - HasTrainingBuckets
+      - !GetAtt SageMakerTrainingExecutionRole.Arn
+      - ''
     Export:
       Name: !If
         - HasStackPrefix
-        - !Sub '${StackPrefix}-WideDeepModelPackageGroupName'
-        - 'WideDeepModelPackageGroupName'
+        - !Sub '${StackPrefix}-SageMakerTrainingExecutionRoleArn'
+        - 'SageMakerTrainingExecutionRoleArn'
 
   UserFeatureTableArn:
     Description: ARN of the DynamoDB User Feature Store table

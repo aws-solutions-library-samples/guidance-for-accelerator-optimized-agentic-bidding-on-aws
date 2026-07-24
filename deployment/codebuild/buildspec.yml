@@ -1,0 +1,283 @@
+# =============================================================================
+# buildspec.yml — CodeBuild specification for building all container images
+#
+# This buildspec handles building and pushing all container images for the
+# ARTF Recommenders solution. It runs remotely on CodeBuild to avoid large
+# image builds (especially NeMo-RL at ~20 GB) overwhelming local machines.
+#
+# Environment variables (passed via CodeBuild project or overrides):
+#   STACK_NAME        — Resource prefix (e.g., "stg-nvidia-artf-recommenders")
+#   IMAGE_TAG         — Docker image tag (e.g., git short SHA or "latest")
+#   AWS_ACCOUNT_ID    — AWS account ID
+#   AWS_DEFAULT_REGION — Target region for ECR
+#   BUILD_TARGET      — Which images to build:
+#                        "all"       — All images (Part 1 + Part 2)
+#                        "part1"     — Part 1 only (Triton, orchestrator, AgentCore)
+#                        "nemo"      — NeMo-RL training container only
+#                        "agents"    — Adaptive Bidding + Model Promotion Governance agent containers
+#                        "optimizer" — TensorRT optimization service (NIM-optimization role)
+#   NGC_API_KEY_SECRET — Secrets Manager secret name/ARN for NGC API key
+#                        (required only for NeMo builds)
+# =============================================================================
+
+version: 0.2
+
+env:
+  variables:
+    BUILD_TARGET: "all"
+    # BUILD_ONLY: optional space-separated list of image KEYS (repo suffixes, e.g.
+    # "orchestrator model-optimizer"). When non-empty it takes precedence over
+    # BUILD_TARGET and ONLY those images are built. Empty => use BUILD_TARGET.
+    BUILD_ONLY: ""
+    IMAGE_TAG: "latest"
+    DOCKER_BUILDKIT: "1"
+
+phases:
+  pre_build:
+    commands:
+      - echo "=== Pre-build phase ==="
+      - echo "Build target=${BUILD_TARGET} Stack=${STACK_NAME} Tag=${IMAGE_TAG}"
+      - echo "Region=${AWS_DEFAULT_REGION} Account=${AWS_ACCOUNT_ID}"
+
+      # Authenticate to ECR
+      - REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      # Log in to NGC whenever a key is available (needed for the NeMo + TensorRT
+      # base images; harmless for the public Part 1 bases). Not gated on
+      # BUILD_TARGET because a BUILD_ONLY build may include the optimizer/NeMo.
+      - |
+        if [ -n "${NGC_API_KEY_SECRET}" ]; then
+          echo "Retrieving NGC API key from Secrets Manager..."
+          NGC_API_KEY=$(aws secretsmanager get-secret-value \
+            --secret-id "${NGC_API_KEY_SECRET}" \
+            --query SecretString --output text --region "${AWS_DEFAULT_REGION}")
+          echo "${NGC_API_KEY}" | docker login nvcr.io --username '$oauthtoken' --password-stdin \
+            || echo "WARNING: NGC login failed (continuing; nvcr.io pulls may fail)"
+        else
+          echo "No NGC_API_KEY_SECRET set — skipping NGC login (only needed for NeMo/TensorRT base images)"
+        fi
+
+      # Set up QEMU for ARM64 cross-compilation and configure buildx
+      - docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+      - docker buildx create --name multiarch --driver docker-container --use 2>/dev/null || docker buildx use multiarch
+      - docker buildx inspect --bootstrap
+
+  build:
+    commands:
+      - echo "=== Build phase ==="
+      - SOURCE_DIR="${CODEBUILD_SRC_DIR}/source"
+
+      # -----------------------------------------------------------------------
+      # Part 1: Triton ARTF containers (amd64)
+      # -----------------------------------------------------------------------
+      - |
+        # Build this group if BUILD_ONLY is set (per-key filter applied in the loop)
+        # or, when BUILD_ONLY is empty, if BUILD_TARGET selects part1.
+        GROUP=0
+        if [ -n "${BUILD_ONLY}" ]; then GROUP=1
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then GROUP=1; fi
+        if [ "${GROUP}" = "1" ]; then
+          echo "--- Building Triton ARTF containers (amd64) ---"
+          for entry in \
+            "containers/dlrm_bid_shader:${STACK_NAME}-dlrm-bid-shader" \
+            "containers/ncf_deal_manager:${STACK_NAME}-ncf-deal-manager"; do
+
+            CONTAINER_PATH="${entry%%:*}"
+            REPO_NAME="${entry##*:}"
+            KEY="${REPO_NAME#${STACK_NAME}-}"
+            if [ -n "${BUILD_ONLY}" ]; then
+              case " ${BUILD_ONLY} " in *" ${KEY} "*) : ;; *) continue ;; esac
+            fi
+            IMAGE="${REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
+            echo "  Building ${REPO_NAME}..."
+            docker buildx build \
+              --platform linux/amd64 \
+              --build-arg CONTAINER="${CONTAINER_PATH}" \
+              -f "${SOURCE_DIR}/triton/Dockerfile.triton-artf" \
+              -t "${IMAGE}" --load "${SOURCE_DIR}"
+            docker push "${IMAGE}"
+            echo "  Pushed ${IMAGE}"
+          done
+        fi
+
+      # -----------------------------------------------------------------------
+      # Rule-based ARTF containers (amd64) — no Triton dependency.
+      # widedeep-segment-activator was switched from the Wide & Deep Triton
+      # model to deterministic rules (its ONNX graph could not be compiled to
+      # a TensorRT engine, and it is slated to be replaced by a partner ISV
+      # implementation). See source/containers/widedeep_segment_activator/app.py.
+      # -----------------------------------------------------------------------
+      - |
+        for entry in \
+          "containers/widedeep_segment_activator:${STACK_NAME}-widedeep-segment-activator:widedeep-segment-activator" \
+          "containers/metrics_enricher:${STACK_NAME}-metrics-enricher:metrics-enricher"; do
+
+          CONTAINER_PATH="$(echo "${entry}" | cut -d: -f1)"
+          REPO_NAME="$(echo "${entry}" | cut -d: -f2)"
+          AGENT_NAME="$(echo "${entry}" | cut -d: -f3)"
+          KEY="${REPO_NAME#${STACK_NAME}-}"
+
+          BUILD=0
+          if [ -n "${BUILD_ONLY}" ]; then
+            case " ${BUILD_ONLY} " in *" ${KEY} "*) BUILD=1 ;; esac
+          elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then BUILD=1; fi
+          if [ "${BUILD}" = "1" ]; then
+            echo "--- Building ${REPO_NAME} (amd64) ---"
+            IMAGE="${REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
+            docker buildx build \
+              --platform linux/amd64 \
+              --build-arg CONTAINER="${CONTAINER_PATH}" \
+              --build-arg AGENT_NAME="${AGENT_NAME}" \
+              -f "${SOURCE_DIR}/Dockerfile" \
+              -t "${IMAGE}" --load "${SOURCE_DIR}"
+            docker push "${IMAGE}"
+            echo "  Pushed ${IMAGE}"
+          fi
+        done
+
+      # -----------------------------------------------------------------------
+      # Orchestrator (amd64)
+      # -----------------------------------------------------------------------
+      - |
+        BUILD=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" orchestrator "*) BUILD=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then BUILD=1; fi
+        if [ "${BUILD}" = "1" ]; then
+          echo "--- Building orchestrator (amd64) ---"
+          ORCH_IMAGE="${REGISTRY}/${STACK_NAME}-orchestrator:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg AGENT_NAME="artf-orchestrator" \
+            -f "${SOURCE_DIR}/Dockerfile.orchestrator" \
+            -t "${ORCH_IMAGE}" --load "${SOURCE_DIR}"
+          docker push "${ORCH_IMAGE}"
+          echo "  Pushed ${ORCH_IMAGE}"
+        fi
+
+      # -----------------------------------------------------------------------
+      # AgentCore MCP container (arm64 — cross-compiled via QEMU+buildx)
+      # -----------------------------------------------------------------------
+      - |
+        BUILD=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" agentcore "*) BUILD=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then BUILD=1; fi
+        if [ "${BUILD}" = "1" ]; then
+          echo "--- Building AgentCore (arm64 via cross-compilation) ---"
+          AC_IMAGE="${REGISTRY}/${STACK_NAME}-agentcore:${IMAGE_TAG}"
+          # Use --push to push directly from buildx (avoids --load limitation for cross-platform)
+          docker buildx build \
+            --platform linux/arm64 \
+            -f "${SOURCE_DIR}/Dockerfile.agentcore" \
+            -t "${AC_IMAGE}" --push "${SOURCE_DIR}"
+          echo "  Pushed ${AC_IMAGE}"
+        fi
+
+      # -----------------------------------------------------------------------
+      # NeMo-RL training container (amd64, ~20 GB base image)
+      # -----------------------------------------------------------------------
+      - |
+        BUILD=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" nemo "*|*" nemo-rl-training "*) BUILD=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "nemo" ]; then BUILD=1; fi
+        if [ "${BUILD}" = "1" ]; then
+          echo "--- Building NeMo-RL training container (amd64) ---"
+          TRAINING_REPO="artf-nemo-rl-training"
+
+          # Ensure ECR repo exists
+          aws ecr describe-repositories --repository-names "${TRAINING_REPO}" \
+            --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${TRAINING_REPO}" \
+              --region "${AWS_DEFAULT_REGION}" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+
+          # Use the default builder (not multiarch) for this native amd64 build
+          # to avoid QEMU/platform confusion with the large NeMo base image
+          docker buildx use default 2>/dev/null || true
+          docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SOURCE_DIR}/training/container/"
+          docker buildx use multiarch 2>/dev/null || true
+
+          # widedeep is intentionally absent — segment activation is rule-based,
+          # not a trainable model (see
+          # source/containers/widedeep_segment_activator/app.py).
+          for tag in dlrm ncf; do
+            docker tag "${TRAINING_REPO}:latest" "${REGISTRY}/${TRAINING_REPO}:${tag}"
+            docker push "${REGISTRY}/${TRAINING_REPO}:${tag}"
+          done
+          echo "  Pushed ${REGISTRY}/${TRAINING_REPO} (dlrm, ncf)"
+        fi
+
+      # -----------------------------------------------------------------------
+      # Closed-loop reasoning agents (arm64, for AgentCore HTTP runtimes)
+      # -----------------------------------------------------------------------
+      - |
+        BUILD_AB=0; BUILD_GOV=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" adaptive-bidding-agent "*) BUILD_AB=1 ;; esac
+          case " ${BUILD_ONLY} " in *" model-promotion-governance-agent "*) BUILD_GOV=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "agents" ]; then BUILD_AB=1; BUILD_GOV=1; fi
+        if [ "${BUILD_AB}" = "1" ]; then
+          echo "--- Building adaptive-bidding-agent (arm64) ---"
+          ADAPTIVE_BIDDING_REPO="${STACK_NAME}-adaptive-bidding-agent"
+          aws ecr describe-repositories --repository-names "${ADAPTIVE_BIDDING_REPO}" \
+            --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${ADAPTIVE_BIDDING_REPO}" \
+              --region "${AWS_DEFAULT_REGION}" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          ADAPTIVE_BIDDING_IMAGE="${REGISTRY}/${ADAPTIVE_BIDDING_REPO}:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/arm64 \
+            -f "${SOURCE_DIR}/Dockerfile.adaptive-bidding-agent" \
+            -t "${ADAPTIVE_BIDDING_IMAGE}" --push "${SOURCE_DIR}"
+          echo "  Pushed ${ADAPTIVE_BIDDING_IMAGE}"
+        fi
+        if [ "${BUILD_GOV}" = "1" ]; then
+          echo "--- Building model-promotion-governance-agent (arm64) ---"
+          GOVERNANCE_REPO="${STACK_NAME}-model-promotion-governance-agent"
+          aws ecr describe-repositories --repository-names "${GOVERNANCE_REPO}" \
+            --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${GOVERNANCE_REPO}" \
+              --region "${AWS_DEFAULT_REGION}" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          GOVERNANCE_IMAGE="${REGISTRY}/${GOVERNANCE_REPO}:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/arm64 \
+            -f "${SOURCE_DIR}/Dockerfile.governance" \
+            -t "${GOVERNANCE_IMAGE}" --push "${SOURCE_DIR}"
+          echo "  Pushed ${GOVERNANCE_IMAGE}"
+        fi
+
+      # -----------------------------------------------------------------------
+      # Model Optimizer service (amd64 — GPU x86, matches Triton A10G)
+      # The design's model-optimization role: ONNX -> TensorRT engine plan.
+      # TensorRT-based (NOT stock NIM). Built on nvcr.io/nvidia/tensorrt (NGC login
+      # above) to match Triton 24.08.
+      # -----------------------------------------------------------------------
+      - |
+        BUILD=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" model-optimizer "*) BUILD=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "optimizer" ]; then BUILD=1; fi
+        if [ "${BUILD}" = "1" ]; then
+          echo "--- Building model-optimizer (amd64) ---"
+          OPTIMIZER_REPO="${STACK_NAME}-model-optimizer"
+          aws ecr describe-repositories --repository-names "${OPTIMIZER_REPO}" \
+            --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${OPTIMIZER_REPO}" \
+              --region "${AWS_DEFAULT_REGION}" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          OPTIMIZER_IMAGE="${REGISTRY}/${OPTIMIZER_REPO}:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/amd64 \
+            -f "${SOURCE_DIR}/Dockerfile.optimizer" \
+            -t "${OPTIMIZER_IMAGE}" --push "${SOURCE_DIR}"
+          echo "  Pushed ${OPTIMIZER_IMAGE}"
+        fi
+
+  post_build:
+    commands:
+      - echo "=== Build complete ==="
+      - echo "All requested images built and pushed to ${REGISTRY}"

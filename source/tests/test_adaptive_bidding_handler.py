@@ -1,4 +1,4 @@
-"""Tests for agents.bid_shading.handler — AgentCore HTTP entrypoint.
+"""Tests for agents.adaptive_bidding.handler — AgentCore HTTP entrypoint (Adaptive Bidding Strategy Agent).
 
 Validates:
 - Handler accepts an EventBridge payload and returns a JSON response
@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from starlette.testclient import TestClient
 
-from agents.bid_shading.handler import app
-from agents.bid_shading.agent import ParameterUpdate
+from agents.adaptive_bidding.handler import app
+from agents.adaptive_bidding.agent import ParameterUpdate
 from shared.parameter_store import ParameterState
 
 
@@ -57,7 +57,7 @@ def _mock_parameter_state(param_name="shade_factor", value=0.65, version=5):
         current_value=value,
         previous_value=value - 0.01,
         updated_at=1700000000.0,
-        updated_by="bid_shading_agent",
+        updated_by="adaptive_bidding_agent",
         version=version,
         min_value=min_val,
         max_value=max_val,
@@ -83,8 +83,8 @@ def _mock_current_params():
 class TestHandlerInvocation:
     """Test the HTTP handler accepts EventBridge payloads and returns responses."""
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
     def test_accepts_eventbridge_payload_returns_response(
         self, mock_store_cls, mock_boto3
     ):
@@ -110,7 +110,7 @@ class TestHandlerInvocation:
             "detail-type": "Scheduled Event",
             "detail": {},
         }
-        response = client.post("/invoke", json=payload)
+        response = client.post("/invocations", json=payload)
 
         assert response.status_code == 200
         body = response.json()
@@ -120,8 +120,8 @@ class TestHandlerInvocation:
         assert "duration_ms" in body
         assert isinstance(body["updates"], list)
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
     def test_returns_parameter_updates_when_adjustment_needed(
         self, mock_store_cls, mock_boto3
     ):
@@ -140,7 +140,7 @@ class TestHandlerInvocation:
         mock_boto3.client.return_value = mock_cw
 
         client = TestClient(app)
-        response = client.post("/invoke", json={})
+        response = client.post("/invocations", json={})
 
         assert response.status_code == 200
         body = response.json()
@@ -154,8 +154,8 @@ class TestHandlerInvocation:
         assert len(shade_updates) == 1
         assert shade_updates[0]["new_value"] > shade_updates[0]["old_value"]
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
     def test_returns_empty_updates_when_within_tolerance(
         self, mock_store_cls, mock_boto3
     ):
@@ -173,7 +173,7 @@ class TestHandlerInvocation:
         mock_boto3.client.return_value = mock_cw
 
         client = TestClient(app)
-        response = client.post("/invoke", json={})
+        response = client.post("/invocations", json={})
 
         assert response.status_code == 200
         body = response.json()
@@ -181,8 +181,8 @@ class TestHandlerInvocation:
         assert body["updates_count"] == 0
         assert body["updates"] == []
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
     def test_returns_500_on_failure(self, mock_store_cls, mock_boto3):
         """Handler returns 500 with error details when an exception occurs."""
         mock_store_cls.side_effect = Exception("DynamoDB connection failed")
@@ -191,7 +191,7 @@ class TestHandlerInvocation:
         mock_boto3.client.return_value = mock_cw
 
         client = TestClient(app)
-        response = client.post("/invoke", json={})
+        response = client.post("/invocations", json={})
 
         assert response.status_code == 500
         body = response.json()
@@ -200,8 +200,8 @@ class TestHandlerInvocation:
         assert "timestamp" in body
         assert "duration_ms" in body
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
     def test_handles_empty_body(self, mock_store_cls, mock_boto3):
         """Handler works correctly even with an empty POST body."""
         mock_store = AsyncMock()
@@ -217,18 +217,18 @@ class TestHandlerInvocation:
 
         client = TestClient(app)
         # Send request with no body (Content-Type not set to JSON)
-        response = client.post("/invoke")
+        response = client.post("/invocations")
 
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "completed"
 
-    @patch("agents.bid_shading.handler.boto3")
-    @patch("agents.bid_shading.handler.ParameterStore")
-    def test_root_endpoint_also_handles_invocation(
+    @patch("agents.adaptive_bidding.handler.boto3")
+    @patch("agents.adaptive_bidding.handler.ParameterStore")
+    def test_invocations_endpoint_handles_repeat_invocation(
         self, mock_store_cls, mock_boto3
     ):
-        """The root endpoint / also handles invocations (alternative route)."""
+        """The /invocations endpoint handles repeated invocations (session reuse)."""
         mock_store = AsyncMock()
         mock_store.read_all_parameters.return_value = _mock_current_params()
         mock_store_cls.return_value = mock_store
@@ -241,7 +241,7 @@ class TestHandlerInvocation:
         mock_boto3.client.return_value = mock_cw
 
         client = TestClient(app)
-        response = client.post("/", json={})
+        response = client.post("/invocations", json={})
 
         assert response.status_code == 200
         body = response.json()

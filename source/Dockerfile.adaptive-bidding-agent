@@ -1,0 +1,30 @@
+# Adaptive Bidding Strategy Agent — AgentCore HTTP Runtime
+# ========================================================
+#
+# Runs as a Bedrock AgentCore HTTP-protocol runtime in a Firecracker microVM.
+# Invoked by EventBridge Scheduler (every 5 min) to read CloudWatch market
+# metrics and write updated bidding parameters to the DynamoDB Parameter Store.
+#
+# AgentCore HTTP contract (all on port 8080):
+#   - POST /invocations  -> invocation handler (reads CloudWatch, writes DynamoDB)
+#   - GET  /ping         -> {"status": "Healthy"}
+#
+# Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
+
+FROM --platform=linux/arm64 python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY agents/adaptive_bidding/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Copy source — handler needs shared/ and agents/adaptive_bidding/
+COPY shared/ /app/shared/
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/adaptive_bidding/ /app/agents/adaptive_bidding/
+
+# AgentCore runs the container as an HTTP server on port 8080
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "agents.adaptive_bidding.handler"]

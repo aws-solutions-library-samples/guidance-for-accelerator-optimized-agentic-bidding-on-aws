@@ -6,12 +6,16 @@ Creates the Triton model repository structure:
         dlrm_bid_shader/
             config.pbtxt
             1/model.onnx
-        widedeep_segment_activator/
-            config.pbtxt
-            1/model.onnx
         ncf_deal_manager/
             config.pbtxt
             1/model.onnx
+
+NOTE: Wide & Deep (segment activation) is NOT exported here. It was replaced
+by deterministic rule-based logic in
+source/containers/widedeep_segment_activator/app.py — its ONNX graph could
+not be compiled to a TensorRT engine (BatchNorm1d fusion is unsupported for
+this shape by TensorRT 10.3.0) and it is slated to be swapped for a partner
+ISV implementation. See GUIDANCE.md.
 
 Usage:
     python triton/export_models.py                    # export all
@@ -47,8 +51,16 @@ class DLRMModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+        # NOTE: plain nn.Embedding, not nn.EmbeddingBag. Every call site feeds
+        # a bag of exactly one index (sparse_X.unsqueeze(1) -> mode="sum"), and
+        # summing a single-element bag is mathematically identical to a direct
+        # embedding lookup. EmbeddingBag's ONNX export lowers to a Loop node
+        # that TensorRT's Myelin builder cannot compile here ("Device to shape
+        # host node should not be folded into myelin" — Error Code 2). A plain
+        # Embedding lookup exports as a single Gather with no control flow, so
+        # trtexec can build the engine, with no change to the model's outputs.
         self.embeddings = nn.ModuleList([
-            nn.EmbeddingBag(VOCAB_SIZE, EMBEDDING_DIM, mode="sum")
+            nn.Embedding(VOCAB_SIZE, EMBEDDING_DIM)
             for _ in range(NUM_SPARSE)
         ])
         self.bottom_mlp = nn.Sequential(
@@ -72,11 +84,24 @@ class DLRMModel(nn.Module):
     def forward(self, dense, sparse_0, sparse_1, sparse_2):
         """Forward with explicit sparse inputs for ONNX export (no list args)."""
         dense_out = self.bottom_mlp(dense)
-        s0 = self.embeddings[0](sparse_0.unsqueeze(1))
-        s1 = self.embeddings[1](sparse_1.unsqueeze(1))
-        s2 = self.embeddings[2](sparse_2.unsqueeze(1))
+        # sparse_X is a 1-D tensor of one index per batch row; nn.Embedding
+        # looks each up directly (no bagging/summing needed for a bag of 1).
+        s0 = self.embeddings[0](sparse_0)
+        s1 = self.embeddings[1](sparse_1)
+        s2 = self.embeddings[2](sparse_2)
         interaction_out = self._interaction(dense_out, [s0, s1, s2])
-        return torch.sigmoid(self.top_mlp(interaction_out)).squeeze(-1)
+        out = self.top_mlp(interaction_out)
+        # NOTE: reshape(-1) instead of squeeze(-1). top_mlp's last Linear has a
+        # statically-known output width of 1, but torch.onnx's exporter cannot
+        # prove that at trace time for squeeze() on a non-batch dim, so it
+        # lowers squeeze(-1) into an ONNX If/Loop conditional (branches on
+        # whether the dim size == 1). TensorRT's ONNX parser cannot parse the
+        # resulting IIfConditionalOutputLayer here (mismatched branch shapes
+        # [-1] vs [-1,1]), so trtexec fails with "Invalid Node - /If" and the
+        # base engine build never completes. reshape(-1) is a static op with
+        # no conditional, and is exactly equivalent here since dim -1 is
+        # always size 1.
+        return torch.sigmoid(out).reshape(-1)
 
 
 def export_dlrm(output_dir: str) -> str:
@@ -84,9 +109,9 @@ def export_dlrm(output_dir: str) -> str:
     model = DLRMModel()
     torch.manual_seed(42)
     for m in model.modules():
-        if isinstance(m, (nn.Linear, nn.EmbeddingBag)):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
             if hasattr(m, "weight"):
-                if m.weight.dim() > 1:
+                if m.weight.dim() > 1 and not isinstance(m, nn.Embedding):
                     nn.init.xavier_uniform_(m.weight)
                 else:
                     nn.init.normal_(m.weight, std=0.01)
@@ -118,54 +143,6 @@ def export_dlrm(output_dir: str) -> str:
         dynamo=False,
     )
     print(f"  Exported DLRM → {onnx_path}")
-    return onnx_path
-
-
-# ---------------------------------------------------------------------------
-# Wide & Deep Model (matches containers/widedeep_segment_activator/app.py)
-# ---------------------------------------------------------------------------
-
-class WideAndDeepModel(nn.Module):
-    """Wide & Deep following NVIDIA Merlin's WideAndDeepModel architecture."""
-
-    def __init__(self, num_wide=8, num_deep=6, num_outputs=15):
-        super().__init__()
-        self.wide = nn.Linear(num_wide, num_outputs)
-        self.deep = nn.Sequential(
-            nn.Linear(num_deep, 64), nn.ReLU(), nn.BatchNorm1d(64),
-            nn.Linear(64, 32), nn.ReLU(), nn.BatchNorm1d(32),
-            nn.Linear(32, num_outputs),
-        )
-
-    def forward(self, wide_features, deep_features):
-        return torch.sigmoid(self.wide(wide_features) + self.deep(deep_features))
-
-
-def export_widedeep(output_dir: str) -> str:
-    """Export Wide & Deep to ONNX."""
-    model = WideAndDeepModel()
-    model.eval()
-
-    wide = torch.randn(1, 8)
-    deep = torch.randn(1, 6)
-
-    model_dir = os.path.join(output_dir, "widedeep_segment_activator", "1")
-    os.makedirs(model_dir, exist_ok=True)
-    onnx_path = os.path.join(model_dir, "model.onnx")
-
-    torch.onnx.export(
-        model, (wide, deep), onnx_path,
-        input_names=["wide_features", "deep_features"],
-        output_names=["segment_scores"],
-        dynamic_axes={
-            "wide_features": {0: "batch"},
-            "deep_features": {0: "batch"},
-            "segment_scores": {0: "batch"},
-        },
-        opset_version=17,
-        dynamo=False,
-    )
-    print(f"  Exported Wide & Deep → {onnx_path}")
     return onnx_path
 
 
@@ -259,7 +236,7 @@ def export_ncf(output_dir: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Export ARTF models to ONNX for Triton")
-    parser.add_argument("--model", choices=["dlrm", "widedeep", "ncf", "all"], default="all")
+    parser.add_argument("--model", choices=["dlrm", "ncf", "all"], default="all")
     parser.add_argument("--output-dir", default=os.path.join(REPO_ROOT, "triton", "model_repository"))
     args = parser.parse_args()
 
@@ -268,8 +245,6 @@ def main():
 
     if args.model in ("dlrm", "all"):
         export_dlrm(args.output_dir)
-    if args.model in ("widedeep", "all"):
-        export_widedeep(args.output_dir)
     if args.model in ("ncf", "all"):
         export_ncf(args.output_dir)
 

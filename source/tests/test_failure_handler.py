@@ -106,10 +106,6 @@ class TestFailureCounter:
 
         assert handler.get_failure_count(ModelType.DLRM_BID_SHADER) == 2
         assert handler.get_failure_count(ModelType.NCF_DEAL_MANAGER) == 1
-        assert (
-            handler.get_failure_count(ModelType.WIDEDEEP_SEGMENT_ACTIVATOR)
-            == 0
-        )
 
     @pytest.mark.asyncio
     async def test_success_resets_counter(self):
@@ -299,9 +295,6 @@ class TestPauseLogic:
 
         assert handler.is_paused(ModelType.DLRM_BID_SHADER) is True
         assert handler.is_paused(ModelType.NCF_DEAL_MANAGER) is False
-        assert (
-            handler.is_paused(ModelType.WIDEDEEP_SEGMENT_ACTIVATOR) is False
-        )
 
     @pytest.mark.asyncio
     async def test_custom_max_consecutive_failures(self):
@@ -370,7 +363,6 @@ class TestRegistrationEvent:
         expected = {
             ModelType.DLRM_BID_SHADER: "artf-dlrm-bid-shader",
             ModelType.NCF_DEAL_MANAGER: "artf-ncf-deal-manager",
-            ModelType.WIDEDEEP_SEGMENT_ACTIVATOR: "artf-widedeep-segment-activator",
         }
 
         for model_type, expected_group in expected.items():
