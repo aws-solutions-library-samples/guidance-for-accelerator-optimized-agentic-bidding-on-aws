@@ -1,13 +1,23 @@
 # ARTF container deployments.
 #
-# This guidance has four NVIDIA containers. The three GPU-backed model
-# containers (DLRM, Wide&Deep, NCF) run on GPU nodes alongside Triton for
-# minimal inference latency. The fourth container, the Metrics Enricher, is
-# rule-based and runs on CPU nodes (no GPU dependency).
+# This guidance has four NVIDIA containers. Two model containers (DLRM, NCF)
+# delegate inference to Triton over the cluster network and hold NO GPU
+# themselves, so their node placement is parameterized via __ARTF_NODE_ROLE__
+# (set by deploy.sh --artf-node-role):
+#   - services (DEFAULT): run on CPU nodes — keeps load-test scale-out off the
+#     scarce GPU nodes; they reach Triton via its ClusterIP Service DNS.
+#   - inference: co-locate on the GPU node (role=inference) for minimal hop.
+# The GPU toleration is kept in both cases (harmless on CPU nodes, required on the
+# GPU node). The other two containers, the Wide & Deep Segment Activator and the
+# Metrics Enricher, are rule-based and always run on CPU nodes (role=services, no
+# GPU dependency, no Triton call). Segment activation was switched from a Triton
+# Wide & Deep model to deterministic rules (its ONNX graph could not be compiled
+# to a TensorRT engine, and it is slated to be replaced by a partner ISV
+# implementation) — see source/containers/widedeep_segment_activator/app.py.
 #
 # Architecture:
-#   [GPU model container (GPU node)] --tritonclient.http--> [Triton Server (same node)]
-#   [Metrics Enricher (CPU node)] -- rule-based, no Triton -->
+#   [DLRM / NCF] --tritonclient.http--> [Triton Server (GPU node)]
+#   [Wide & Deep Segment Activator / Metrics Enricher] (CPU node) -- rule-based, no Triton -->
 
 ---
 # DLRM Bid Shader — runs on GPU node for co-location with Triton
@@ -31,7 +41,7 @@ spec:
         model: dlrm
     spec:
       nodeSelector:
-        role: inference
+        role: __ARTF_NODE_ROLE__
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
@@ -94,7 +104,10 @@ spec:
     model: dlrm
 
 ---
-# Wide & Deep Segment Activator — runs on GPU node for co-location with Triton
+# Wide & Deep Segment Activator — rule-based (no Triton, no GPU); always runs
+# on CPU nodes. Segment activation was switched from a Triton Wide & Deep model
+# to deterministic rules — see
+# source/containers/widedeep_segment_activator/app.py.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -115,11 +128,7 @@ spec:
         model: widedeep
     spec:
       nodeSelector:
-        role: inference
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
+        role: services
       containers:
         - name: widedeep
           image: __REGISTRY__/__STACK_NAME__-widedeep-segment-activator:__IMAGE_TAG__
@@ -131,11 +140,6 @@ spec:
               name: health
             - containerPort: 50051
               name: grpc
-          env:
-            - name: TRITON_URL
-              value: "triton-inference-server:8000"
-            - name: USE_TRITON
-              value: "true"
           resources:
             requests:
               cpu: "250m"
@@ -193,7 +197,7 @@ spec:
         model: ncf
     spec:
       nodeSelector:
-        role: inference
+        role: __ARTF_NODE_ROLE__
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists

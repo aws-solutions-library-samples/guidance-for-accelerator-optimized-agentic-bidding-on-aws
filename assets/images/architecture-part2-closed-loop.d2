@@ -80,19 +80,19 @@ aws: "AWS Cloud" {
   agents: "Amazon Bedrock AgentCore Runtimes" {
     style.stroke: "#ED7100"
     gov: "Model Governance Agent\nA/B test + approval gate"
-    bsa: "Bid Shading Strategy Agent\ntunes pricing parameters"
+    bsa: "Adaptive Bidding Strategy Agent\ntunes pricing parameters"
   }
 
   deploy: "Zero-Downtime Deployment" {
     style.stroke: "#76b900"
     direction: down
-    nim: "NVIDIA NIM\nTensorRT optimization" {
+    optimizer: "Model Optimizer (in-cluster)\nlocal TensorRT engine build — NIM-like, no external dependency" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
     canary: "Canary Deployer\nProgressive rollout"
-    nim -> canary: "optimized model"
+    optimizer -> canary: "optimized model"
   }
 
   events: "Amazon EventBridge\nRule + Scheduler" {
@@ -118,7 +118,7 @@ aws.retrain.registry -> aws.events: "new version registered"
 
 # Governance + deployment
 aws.events -> aws.agents.gov: "invoke (rule)"
-aws.agents.gov -> aws.deploy.nim: "approved"
+aws.agents.gov -> aws.deploy.optimizer: "approved"
 aws.deploy.canary -> aws.rtb.triton: "canary → promote"
 
 # Agentic parameter-tuning loop

@@ -378,10 +378,15 @@ async def list_containers(request: Request) -> JSONResponse:
         triton_evidence = await _probe_http(tc, triton_health_url)
     triton_ready = triton_evidence["ok"]
 
-    # Check individual Triton model readiness
+    # Check individual Triton model readiness. widedeep_segment_activator is
+    # intentionally absent — it is no longer served by Triton (segment
+    # activation is rule-based; see
+    # source/containers/widedeep_segment_activator/app.py). Probing for it
+    # here would always report UNAVAILABLE and misrepresent a healthy
+    # rules-based container as degraded.
     triton_models: dict[str, dict] = {}
     if triton_ready:
-        model_names = ["dlrm_bid_shader", "widedeep_segment_activator", "ncf_deal_manager"]
+        model_names = ["dlrm_bid_shader", "ncf_deal_manager"]
         async with httpx.AsyncClient(timeout=2.0) as tc:
             for model_name in model_names:
                 ev = await _probe_http(tc, f"http://{triton_url}/v2/models/{model_name}/ready")
@@ -390,10 +395,11 @@ async def list_containers(request: Request) -> JSONResponse:
                     "evidence": ev,
                 }
 
-    # Map container names to their Triton model names
+    # Map container names to their Triton model names. widedeep-segment-activator
+    # maps to None like metrics-enricher — both are rules-based, no Triton model.
     container_to_model = {
         "dlrm-bid-shader": "dlrm_bid_shader",
-        "widedeep-segment-activator": "widedeep_segment_activator",
+        "widedeep-segment-activator": None,  # rules-based, no Triton model
         "ncf-deal-manager": "ncf_deal_manager",
         "metrics-enricher": None,  # rules-based, no Triton model
     }
@@ -700,6 +706,7 @@ try:
         from orchestrator.closed_loop_api import (  # noqa: E402
             list_scenarios_handler as cl_scenarios,
             generate_handler as cl_generate,
+            sample_outcomes_handler as cl_sample_outcomes,
             parameters_handler as cl_parameters,
             audit_handler as cl_audit,
             models_handler as cl_models,
@@ -711,6 +718,7 @@ try:
         from closed_loop_api import (  # noqa: E402
             list_scenarios_handler as cl_scenarios,
             generate_handler as cl_generate,
+            sample_outcomes_handler as cl_sample_outcomes,
             parameters_handler as cl_parameters,
             audit_handler as cl_audit,
             models_handler as cl_models,
@@ -732,6 +740,7 @@ def _closed_loop_routes(prefix: str) -> list:
     return [
         Route(f"{prefix}/v1/closed-loop/scenarios", cl_scenarios, methods=["GET"]),
         Route(f"{prefix}/v1/closed-loop/generate", cl_generate, methods=["POST"]),
+        Route(f"{prefix}/v1/closed-loop/sample-outcomes", cl_sample_outcomes, methods=["GET"]),
         Route(f"{prefix}/v1/closed-loop/parameters", cl_parameters, methods=["GET"]),
         Route(f"{prefix}/v1/closed-loop/audit", cl_audit, methods=["GET"]),
         Route(f"{prefix}/v1/closed-loop/models", cl_models, methods=["GET"]),

@@ -19,7 +19,7 @@ pytest source/tests/test_reward.py -v
 | File | What it covers | Requirements |
 |------|---------------|-------------|
 | `test_reward.py` | Reward function with known outcomes (profitable win, overpayment, lost high-value, lost low-value, bounds) | 3.3 |
-| `test_bid_shading_agent.py` | Adjustment policy with synthetic MarketState (below/above target, within tolerance, bounded, min_samples) | 7.2, 7.3, 7.4, 7.5, 7.7, 8.5, 10.1 |
+| `test_adaptive_bidding_agent.py` | Adjustment policy with synthetic MarketState (below/above target, within tolerance, bounded, min_samples) | 7.2, 7.3, 7.4, 7.5, 7.7, 8.5, 10.1 |
 | `test_ab_evaluator.py` | A/B evaluator with known distributions (clear winner, clear loser, identical, SPRT, guardrails) | 4.3, 4.4 |
 | `test_canary_deployer.py` | Canary routing with deterministic hashes (same request_id same version, traffic distribution, promote/rollback) | 5.4, 5.5, 5.6, 5.7 |
 
@@ -36,6 +36,7 @@ pytest source/tests/test_reward.py -v
 | `test_guardrail_monitor.py` | Latency/error-rate guardrail detection and rollback |
 | `test_training_pipeline.py` | Retraining trigger, at-most-one job, registration |
 | `test_failure_handler.py` | Consecutive failure tracking and pause logic |
+| `test_register_genesis_models.py` | Genesis (v1 unretrained-starter) model registration: idempotency, honest skip on missing ONNX artifact, CLI exit code |
 | `test_glue_etl.py` | Glue ETL feature engineering and labeling |
 | `test_signal_associator.py` | Late-arriving signal association by request_id |
 | `test_signal_receiver.py` | Signal ingestion handling |

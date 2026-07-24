@@ -1,48 +1,35 @@
-"""Decision invoker — calls deployed AgentCore runtimes.
+"""Closed-loop demo helpers (orchestrator side) — NO agent invocation.
 
-Agentic loop: Invokes the Bid Shading Strategy Agent via its Bedrock AgentCore
-runtime. The agent runs in a Firecracker microVM, reads CloudWatch metrics and
-DynamoDB parameters, computes adjustments, and writes updates — all inside the
-runtime. The orchestrator reads the before/after state from DynamoDB to show the
-full picture.
+ARCHITECTURE (corrected): the real-time bidding orchestrator MUST NOT invoke
+closed-loop agent runtimes. The UI invokes the Adaptive Bidding agent
+**directly** (browser-direct, SigV4 via the Cognito Identity Pool) — the same way
+production invokes it (EventBridge). This module therefore provides only
+**non-invocation** helpers used by the orchestrator's closed-loop *data-plane*
+endpoints:
 
-Governance loop: Runs the ABEvaluator locally (it's a pure statistical
-computation with no infrastructure dependencies — no AgentCore runtime needed).
+- ``prepare_agentic_context`` — ensure the bidding parameters exist and snapshot
+  the current ("before") parameter state plus the synthetic ``market_state`` that
+  was emitted to CloudWatch. Performs **no** agent invocation.
+- ``run_governance_decision`` — run the A/B statistical gate (Welch's t-test +
+  SPRT) via the real ``ABEvaluator``. This is a pure statistical computation with
+  no infrastructure dependency and is **not** an agent invocation.
+
+The Adaptive Bidding agent's actual decision (parameter updates + the model's
+``rationale`` + the market state it read from CloudWatch) is produced by the
+direct browser -> AgentCore invocation and read back by the UI; the orchestrator
+later reads the persisted "after" state from DynamoDB via the parameters endpoint.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import time
-from typing import Any, Optional
-
-import boto3
+from typing import Any
 
 from agents.governance.ab_evaluator import ABEvaluator, ABTestConfig
 from closed_loop_demo.scenarios import Scenario, LOOP_AGENTIC, LOOP_GOVERNANCE
-from shared.parameter_store import (
-    OptimisticLockError,
-    ParameterBoundsError,
-    ParameterState,
-)
+from shared.parameter_store import OptimisticLockError, ParameterState
 
 logger = logging.getLogger(__name__)
-
-# AgentCore runtime ARN — MUST be set for agentic scenarios to work.
-_BID_SHADING_RUNTIME_ARN = os.environ.get("BID_SHADING_RUNTIME_ARN", "")
-_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-
-# Lazy client
-_agentcore_client: Any = None
-
-
-def _get_agentcore_client():
-    global _agentcore_client
-    if _agentcore_client is None:
-        _agentcore_client = boto3.client("bedrock-agentcore", region_name=_REGION)
-    return _agentcore_client
 
 
 # Initialization defaults so agent writes satisfy the store's per-write delta
@@ -88,87 +75,41 @@ def _params_snapshot(params: dict[str, ParameterState]) -> dict[str, dict]:
     }
 
 
-def _invoke_agentcore(runtime_arn: str, payload: dict) -> dict:
-    """Invoke a Bedrock AgentCore HTTP-protocol runtime.
-
-    Uses the bedrock-agentcore data-plane API ``invoke_agent_runtime``.
-    The runtime's handler receives the payload as the POST body and returns
-    a JSON response.
-
-    Args:
-        runtime_arn: Full ARN of the AgentCore runtime.
-        payload: JSON-serializable dict to send as the invocation body.
-
-    Returns:
-        Parsed JSON response from the agent.
-    """
-    client = _get_agentcore_client()
-
-    # Generate a unique session ID for this invocation (min 33 chars)
-    session_id = f"cl-invoke-{int(time.time() * 1000)}-{os.urandom(8).hex()}"
-
-    response = client.invoke_agent_runtime(
-        agentRuntimeArn=runtime_arn,
-        qualifier="DEFAULT",
-        runtimeSessionId=session_id,
-        contentType="application/json",
-        accept="application/json",
-        payload=json.dumps(payload).encode("utf-8"),
-    )
-
-    # Read the streaming response body
-    status_code = response.get("statusCode", 200)
-    body = response["response"].read()
-    parsed = json.loads(body) if body else {}
-
-    if status_code >= 400:
-        raise RuntimeError(
-            f"AgentCore runtime returned HTTP {status_code}: "
-            f"{parsed.get('error', body.decode('utf-8', errors='replace'))}"
-        )
-
-    return parsed
-
-
-async def run_agentic_decision(
+async def prepare_agentic_context(
     scenario: Scenario,
     parameter_store: Any,
-    real_cloudwatch_client: Any | None = None,
-    config: dict | None = None,
 ) -> dict:
-    """Invoke the Bid Shading Strategy Agent via AgentCore runtime.
+    """Prepare the "before" context for an agentic scenario — NO agent invocation.
 
-    The agent runs remotely in a Firecracker microVM. It reads the CloudWatch
-    metrics (which the generator already wrote) and the DynamoDB parameters,
-    computes its decision, and writes updates — all inside the runtime.
+    Ensures the bidding parameters exist, snapshots the current (before) parameter
+    state, and echoes the synthetic ``market_state`` that the generator emitted to
+    CloudWatch. The browser invokes the Adaptive Bidding AgentCore runtime directly
+    (SigV4) to produce the actual decision + rationale; the UI then reads the
+    persisted "after" state via the parameters endpoint.
 
-    This function reads the before/after DynamoDB state to surface the full
-    picture in the UI.
+    Returns a dict the UI uses to render the "before" side of the loop and to label
+    that the invocation is performed browser-direct against AgentCore.
     """
     if scenario.bid_metrics is None:
         raise ValueError(f"Scenario '{scenario.key}' has no bid metrics")
 
-    if not _BID_SHADING_RUNTIME_ARN:
-        raise RuntimeError(
-            "BID_SHADING_RUNTIME_ARN environment variable not set. "
-            "Deploy the AgentCore runtime and configure the orchestrator."
-        )
-
     model_type = scenario.model_type
 
-    # Ensure parameters exist before the agent tries to read/write them.
+    # Ensure parameters exist before the agent (invoked by the browser) reads/writes them.
     await ensure_parameters_initialized(parameter_store, model_type)
 
-    # Snapshot before
     before = await parameter_store.read_all_parameters(model_type)
-
     m = scenario.bid_metrics
-    result: dict = {
+
+    return {
         "loop": LOOP_AGENTIC,
         "scenario": scenario.key,
         "model_type": model_type,
-        "invoked_via": "agentcore",
-        "runtime_arn": _BID_SHADING_RUNTIME_ARN,
+        # The UI performs the agent invocation directly against AgentCore (SigV4).
+        # The orchestrator never invokes the runtime (architecture rule).
+        "invocation": "browser-direct-agentcore",
+        # Synthetic input we emitted to CloudWatch for this scenario. The agent
+        # reads the real CloudWatch metrics itself; this is shown as the emitted input.
         "market_state": {
             "total_bids": m.total_bids,
             "wins": m.wins,
@@ -176,56 +117,17 @@ async def run_agentic_decision(
             "roi": round(m.roi, 4),
         },
         "before": _params_snapshot(before),
-        "updates": [],
-        "skipped": False,
-        "error": None,
     }
-
-    try:
-        # Invoke the AgentCore runtime — the agent reads CloudWatch & DynamoDB
-        # and writes parameter updates, all within the microVM.
-        invoke_start = time.time()
-        agent_response = _invoke_agentcore(
-            _BID_SHADING_RUNTIME_ARN,
-            {
-                "scenario": scenario.key,
-                "model_type": model_type,
-            },
-        )
-        invoke_duration_ms = (time.time() - invoke_start) * 1000.0
-        result["agentcore_duration_ms"] = round(invoke_duration_ms, 1)
-
-        # Parse the agent's response
-        if agent_response.get("status") == "error":
-            result["error"] = agent_response.get("error", "Unknown agent error")
-        else:
-            updates = agent_response.get("updates", [])
-            result["updates"] = [
-                {
-                    "parameter_name": u["parameter_name"],
-                    "old_value": round(u["old_value"], 6),
-                    "new_value": round(u["new_value"], 6),
-                    "delta": round(u["new_value"] - u["old_value"], 6),
-                    "reason": u.get("reason", ""),
-                    "confidence": round(u.get("confidence", 0), 4),
-                }
-                for u in updates
-            ]
-            result["skipped"] = len(updates) == 0
-
-    except Exception as exc:
-        result["error"] = f"{type(exc).__name__}: {exc}"
-
-    # Snapshot after — reflects whatever the agent wrote in the runtime
-    result["after"] = _params_snapshot(await parameter_store.read_all_parameters(model_type))
-    return result
 
 
 def run_governance_decision(scenario: Scenario) -> dict:
     """Run the A/B evaluator against the scenario's generated samples.
 
     This is a pure statistical computation (Welch's t-test + SPRT) with no
-    infrastructure dependencies — runs locally, no AgentCore runtime needed.
+    infrastructure dependencies — it runs locally and is **not** an agent
+    invocation. It is the same ``ABEvaluator`` the deployed Governance agent uses
+    as its decision gate. Governance *reasoning* (the model's rationale) is shown
+    separately via a direct browser -> Governance runtime call (see design R-2).
     """
     if scenario.ab_samples is None:
         raise ValueError(f"Scenario '{scenario.key}' has no A/B samples")

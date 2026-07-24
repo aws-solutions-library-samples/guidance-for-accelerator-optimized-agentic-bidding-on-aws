@@ -1,9 +1,8 @@
 # EKS cluster configuration for Accelerator-optimized Agentic Bidding with Triton Inference Server.
-# Uses g5.xlarge instances (1x NVIDIA A10G GPU, 4 vCPU, 16 GiB) for cost-effective
+# The GPU node group uses the g5 family (all 1x NVIDIA A10G GPU) for cost-effective
 # GPU inference of recommendation models (DLRM, Wide & Deep, NCF).
 #
 # For production with larger models, upgrade to:
-#   g5.2xlarge (1x A10G, 8 vCPU, 32 GiB) or
 #   p4d.24xlarge (8x A100, 96 vCPU, 1152 GiB) for multi-model serving
 #
 # Usage:
@@ -19,9 +18,19 @@ metadata:
   version: "1.31"
 
 managedNodeGroups:
-  # GPU node group for Triton Inference Server
+  # GPU node group for Triton Inference Server.
+  # Instance-type diversification for capacity resilience: all three sizes carry a
+  # SINGLE NVIDIA A10G GPU (4 / 8 / 16 vCPU respectively). When g5.xlarge is
+  # capacity-constrained in an AZ (Server.InsufficientInstanceCapacity), EKS falls
+  # back to the other A10G sizes instead of leaving the node group stuck Pending.
+  #
+  # IMPORTANT — keep every type in this list on the A10G (Ampere, sm_86)
+  # architecture. Triton serves pre-built TensorRT engines (platform:
+  # tensorrt_plan) compiled by the Model Optimizer for A10G; a plan built for one
+  # GPU arch will NOT load on another. Do NOT add g4dn (T4, sm_75) or g6 (L4,
+  # sm_89) here — it would silently break Triton engine loading.
   - name: gpu-inference
-    instanceType: g5.xlarge
+    instanceTypes: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
     desiredCapacity: 1
     minSize: 1
     maxSize: __MAX_GPUS__

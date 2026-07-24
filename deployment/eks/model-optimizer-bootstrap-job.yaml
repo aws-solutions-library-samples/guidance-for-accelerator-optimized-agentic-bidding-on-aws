@@ -1,0 +1,82 @@
+# Model Optimizer — base-engine bootstrap Job (on-demand, GPU-transient).
+# =============================================================================
+# Builds the base (stable) TensorRT engine plans that Triton serves, then EXITS —
+# so no optimizer pod holds a GPU at steady state (the example runs on a single
+# GPU: Triton only). Promotions build canary engines via separate on-demand Jobs
+# that the VPC proxy Lambda launches (--optimize-once), NOT via an always-on
+# service.
+#
+# This Job requires a GPU on the SAME architecture as the Triton serving GPU
+# (A10G / g5) because TensorRT engine plans are GPU-architecture-specific. It runs
+# on the gpu-inference node group. deploy.sh runs it (and waits for completion)
+# BEFORE Triton so, on a single GPU node, the engines are built and the Job frees
+# the GPU before Triton claims it.
+#
+# It is NOT in the ARTF real-time serving path — the ARTF containers only ever
+# call in-cluster Triton. This is a real NVIDIA TensorRT toolchain (trtexec).
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-optimizer-sa
+  annotations:
+    # __OPTIMIZER_ROLE_ARN__ is replaced by the deploy script (IRSA: S3 rw on the
+    # Triton model bucket for reading ONNX + writing optimized engines). Used by
+    # both this bootstrap Job and the on-demand promotion Jobs the Lambda creates.
+    eks.amazonaws.com/role-arn: "__OPTIMIZER_ROLE_ARN__"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-optimizer-bootstrap
+  labels:
+    app: model-optimizer
+    component: optimization
+    role: bootstrap
+spec:
+  # Build attempts before giving up. A failure here means Triton cannot serve a
+  # base model, so fail loudly rather than retry forever.
+  backoffLimit: 2
+  # Auto-clean the finished Job/pod after 1h so re-deploys start clean.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: model-optimizer
+        component: optimization
+        role: bootstrap
+    spec:
+      restartPolicy: Never
+      serviceAccountName: model-optimizer-sa
+      nodeSelector:
+        nvidia.com/gpu: "present"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: model-optimizer-bootstrap
+          image: __REGISTRY__/__STACK_NAME__-model-optimizer:__IMAGE_TAG__
+          imagePullPolicy: Always
+          args: ["--bootstrap"]
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "__REGION__"
+            - name: AWS_REGION
+              value: "__REGION__"
+            - name: MODEL_BUCKET
+              value: "__MODEL_BUCKET__"
+            # Base-engine build spec: {"models":[{model_name,source_model_uri,
+            # output_uri,precision?,max_workspace_size?,input_profiles?}, ...]}.
+            - name: OPTIMIZER_BOOTSTRAP_URI
+              value: "s3://__MODEL_BUCKET__/optimizer-bootstrap/spec.json"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"

@@ -1,7 +1,7 @@
 """DynamoDB-backed Parameter Store for bidding parameters.
 
 Holds the current ``shade_factor`` and ``conversion_value`` parameters read by
-the DLRM container at inference time and written by the Bid Shading Strategy
+the DLRM container at inference time and written by the Adaptive Bidding Strategy
 Agent. Provides:
 
 - **Bounds enforcement**: Writes are rejected at the application layer if the
@@ -15,7 +15,7 @@ Agent. Provides:
 
 Security notes (handled at the deployment/IAM layer, not in application code):
 - DynamoDB table is encrypted at rest (SSE-KMS) — configured in CloudFormation.
-- Write access is restricted to the Bid_Shading_Agent Workload Identity role
+- Write access is restricted to the Adaptive_Bidding_Agent Workload Identity role
   via IAM policy — configured in the AgentCore deployment.
 
 Requirements: 8.1, 8.2, 8.4, 10.2, 12.3
@@ -76,7 +76,7 @@ class ParameterBounds:
 
 @dataclass
 class ParameterState:
-    """Stored in DynamoDB for the Bid Shading Strategy Agent.
+    """Stored in DynamoDB for the Adaptive Bidding Strategy Agent.
 
     Attributes:
         model_type: Partition key (e.g. "dlrm_bid_shader")
@@ -84,7 +84,7 @@ class ParameterState:
         current_value: The active parameter value
         previous_value: Value before the last update
         updated_at: Unix timestamp of last write
-        updated_by: Identity of the writer ("bid_shading_agent" | "manual")
+        updated_by: Identity of the writer ("adaptive_bidding_agent" | "manual")
         version: Monotonically increasing integer for optimistic locking
         min_value: Lower bound for this parameter
         max_value: Upper bound for this parameter

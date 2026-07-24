@@ -110,11 +110,14 @@ export default function GpuControl() {
   return (
     <div className="gpu-control">
       <div className="gpu-control-header">
-        <h3>GPU Inference (g5.xlarge · A10G)</h3>
+        <h3>GPU Inference (g5 family · A10G)</h3>
         <span className={`gpu-status-badge ${badgeClass}`}>{badgeText}</span>
       </div>
       <p className="gpu-control-desc">
-        Scale the GPU node group to control costs. Starting takes ~3-5 min.
+        The GPU node runs NVIDIA Triton (the shared inference server). The model
+        containers run on CPU and call Triton over the network, and the Model
+        Optimizer runs on-demand, so a single GPU is enough. Scale it to control
+        costs; starting takes ~3-5 min.
       </p>
       <div className="gpu-control-actions">
         <button className="btn-gpu-start" onClick={handleStart} disabled={startDisabled}>

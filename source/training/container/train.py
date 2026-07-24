@@ -35,11 +35,12 @@ SM_CHANNEL_TRAINING = os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/
 SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
 SM_HP_FILE = "/opt/ml/input/config/hyperparameters.json"
 
-# Model architecture registry
+# Model architecture registry. widedeep_segment_activator is intentionally
+# absent — segment activation is rule-based, not a trainable model. See
+# source/containers/widedeep_segment_activator/app.py.
 MODEL_REGISTRY = {
     "dlrm_bid_shader": "models.dlrm",
     "ncf_deal_manager": "models.ncf",
-    "widedeep_segment_activator": "models.widedeep",
 }
 
 
@@ -99,9 +100,6 @@ def build_model(model_type: str, hp: dict) -> nn.Module:
     elif model_type == "ncf_deal_manager":
         from models.ncf import NCFModel
         return NCFModel()
-    elif model_type == "widedeep_segment_activator":
-        from models.widedeep import WideDeepModel
-        return WideDeepModel()
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -255,9 +253,6 @@ def export_to_onnx(model: nn.Module, model_type: str, output_dir: str) -> str:
         input_names = ["dense_features"]
     elif model_type == "ncf_deal_manager":
         dummy = torch.randn(1, 2)  # [user_id, item_id] as floats for export
-        input_names = ["features"]
-    elif model_type == "widedeep_segment_activator":
-        dummy = torch.randn(1, 14)  # [wide(8) + deep(6)]
         input_names = ["features"]
     else:
         raise ValueError(f"Unknown model_type for ONNX export: {model_type}")

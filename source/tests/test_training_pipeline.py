@@ -185,10 +185,6 @@ class TestTriggerRetraining:
         for model_type, expected_image in [
             (ModelType.DLRM_BID_SHADER, "nemo-rl-dlrm:latest"),
             (ModelType.NCF_DEAL_MANAGER, "nemo-rl-ncf:latest"),
-            (
-                ModelType.WIDEDEEP_SEGMENT_ACTIVATOR,
-                "nemo-rl-widedeep:latest",
-            ),
         ]:
             client = _make_mock_sagemaker_client()
             pipeline = _make_pipeline(client)
@@ -469,7 +465,6 @@ class TestRegisterModel:
         expected_groups = {
             ModelType.DLRM_BID_SHADER: "artf-dlrm-bid-shader",
             ModelType.NCF_DEAL_MANAGER: "artf-ncf-deal-manager",
-            ModelType.WIDEDEEP_SEGMENT_ACTIVATOR: "artf-widedeep-segment-activator",
         }
 
         for model_type, expected_group in expected_groups.items():
@@ -626,7 +621,3 @@ class TestDataModels:
         """ModelType enum has the expected values."""
         assert ModelType.DLRM_BID_SHADER.value == "dlrm_bid_shader"
         assert ModelType.NCF_DEAL_MANAGER.value == "ncf_deal_manager"
-        assert (
-            ModelType.WIDEDEEP_SEGMENT_ACTIVATOR.value
-            == "widedeep_segment_activator"
-        )

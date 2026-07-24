@@ -1,0 +1,34 @@
+# RBAC for the VPC proxy Lambda to launch on-demand Model Optimizer Jobs.
+# =============================================================================
+# The proxy Lambda's IAM role is mapped (via `eksctl create iamidentitymapping`)
+# to the K8s group `optimizer-job-launcher`. This Role/RoleBinding grants that
+# group the MINIMUM needed to create and watch the on-demand optimize Jobs (and
+# read their pods/logs for troubleshooting) in the optimizer namespace — nothing
+# cluster-wide, no secrets, no exec.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: optimizer-job-launcher
+  namespace: __JOB_NAMESPACE__
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: optimizer-job-launcher
+  namespace: __JOB_NAMESPACE__
+subjects:
+  - kind: Group
+    name: optimizer-job-launcher
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: optimizer-job-launcher
+  apiGroup: rbac.authorization.k8s.io

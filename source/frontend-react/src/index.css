@@ -1,4 +1,92 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   Typography — Amazon Ember (Alexa/Echo brand typeface).
+   Self-hosted TrueType files in public/fonts/ (see public/fonts/README.md).
+   If absent, the UI falls back to the system stack (font-display: swap).
+   No separate "Display" cut is shipped — headings use Amazon Ember (700/800).
+   ─────────────────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Th.ttf") format("truetype");
+  font-weight: 100 200;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Lt.ttf") format("truetype");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_LtIt.ttf") format("truetype");
+  font-weight: 300;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Rg.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_RgIt.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/Amazon-Ember-Medium.ttf") format("truetype");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/Amazon-Ember-MediumItalic.ttf") format("truetype");
+  font-weight: 500;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Bd.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_BdIt.ttf") format("truetype");
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_He.ttf") format("truetype");
+  font-weight: 800 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_HeIt.ttf") format("truetype");
+  font-weight: 800 900;
+  font-style: italic;
+  font-display: swap;
+}
+
 :root {
+  /* Brand font stacks (FR-13) */
+  --font-sans: "Amazon Ember", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-display: "Amazon Ember", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
   --accent: #6366f1;
   --accent-light: #818cf8;
   --accent-glow: rgba(99,102,241,.15);
@@ -16,12 +104,21 @@
   --code-bg: #f8fafc;
   --editor-bg: #1e293b;
   --editor-text: #e2e8f0;
+
+  /* ── styleguide.md canvas + glow tokens (FR-12) ── */
+  --canvas-base: #f8fafc;
+  --surface-low: #f1f5f9;
+  --surface-raised: #ffffff;
+  --glow-neutral-ambient: rgba(148, 163, 184, 0.06);
+  --glow-brand-primary: rgba(99, 102, 241, 0.12);
+  --glow-brand-success: rgba(34, 197, 94, 0.10);
+  --glow-processing-halo: rgba(99, 102, 241, 0.18);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg);
   color: var(--text);
   font-size: clamp(13px, 1.1vw, 15px);
@@ -1002,6 +1099,13 @@ body {
   animation: spin .6s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* Gentle breathing halo for "running/processing" flow + pipeline nodes
+   (referenced by .cl-pi-stage--running and .cl-flow-node--processing). */
+@keyframes sg-halo-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(99,102,241,.2), 0 2px 8px rgba(99,102,241,.08); }
+  50%      { box-shadow: 0 0 0 3px rgba(99,102,241,.3), 0 8px 24px var(--glow-brand-primary); }
+}
 
 /* ── Raw Panel (below timeline, full width) ── */
 .raw-panel {
@@ -2617,360 +2721,401 @@ body {
   border-color: var(--text-secondary, #888);
 }
 
-/* ── Model Tuning Page ── */
-.cl-page {
-  padding: 24px;
-}
-.cl-page-header h2 {
-  margin: 0 0 6px;
-  font-size: 20px;
-  font-weight: 700;
-}
-.cl-page-desc {
-  font-size: 13px;
-  color: var(--text-muted);
-  margin: 0 0 20px;
-  line-height: 1.4;
+/* NOTE: The pre-redesign "Model Tuning Page" cl-* block was removed here. The
+   redesigned closed-loop panel (agent reasoning + architecture-mapped flow) is
+   defined below, after the styleguide utilities. See ClosedLoopPanel.jsx. */
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Styleguide utilities (styleguide.md — FR-12). Light canvas, ambient glows,
+   subtle feedback. Guardrails: static glow/shadow transitions 150–250ms;
+   processing halo ≥ 1.8s/cycle; box-shadow blur ≤ 24px; text contrast ≥ 4.5:1.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Display typeface for headings (Amazon Ember Display). */
+h1, h2, h3, .sg-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
 }
 
-/* Two-column layout: scenarios left, results right */
-.cl-layout {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 24px;
-  align-items: start;
+/* Three-point ambient elevation for cards/containers/panels. */
+.sg-elevated {
+  background: var(--surface-raised);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px var(--glow-neutral-ambient),
+    0px 8px 24px rgba(148, 163, 184, 0.04);
+  border-radius: 14px;
 }
-@media (max-width: 900px) {
-  .cl-layout { grid-template-columns: 1fr; }
+
+/* Interactive "glow state" — colored aura on hover, ring halo on focus. */
+.sg-interactive {
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.cl-layout-left {
-  min-width: 0;
+.sg-interactive:hover {
+  box-shadow:
+    0px 0px 0px 1px rgba(99, 102, 241, 0.15),
+    0px 4px 20px var(--glow-brand-primary);
 }
-.cl-layout-right {
-  min-width: 0;
-  position: sticky;
-  top: 24px;
+.sg-interactive:focus-visible {
+  outline: none;
+  box-shadow:
+    0px 0px 0px 2px var(--surface-raised),
+    0px 0px 0px 5px var(--glow-brand-primary),
+    inset 0px 1px 2px rgba(0, 0, 0, 0.05);
 }
-.cl-empty-state {
-  text-align: center;
-  padding: 48px 24px;
-  color: var(--text-muted);
-  font-size: 13px;
-  border: 1px dashed var(--border);
-  border-radius: 8px;
+
+/* Processing "color halo" — breathing aura for in-flight/compute states. */
+.state-processing {
+  animation: sg-halo-pulse 2.2s infinite ease-in-out;
 }
-.cl-running-state {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 48px 24px;
-  color: var(--text-muted);
-  font-size: 13px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+@keyframes sg-halo-pulse {
+  0% {
+    box-shadow:
+      0px 0px 0px 1px rgba(99, 102, 241, 0.2),
+      0px 2px 8px rgba(99, 102, 241, 0.08);
+  }
+  50% {
+    box-shadow:
+      0px 0px 0px 3px rgba(99, 102, 241, 0.3),
+      0px 8px 24px var(--glow-processing-halo);
+  }
+  100% {
+    box-shadow:
+      0px 0px 0px 1px rgba(99, 102, 241, 0.2),
+      0px 2px 8px rgba(99, 102, 241, 0.08);
+  }
 }
+@media (prefers-reduced-motion: reduce) {
+  .state-processing { animation: none; }
+}
+
+/* Success-tinted ambient (e.g. promote / applied states). */
+.sg-glow-success {
+  box-shadow: 0px 0px 0px 1px rgba(34, 197, 94, 0.2), 0px 4px 20px var(--glow-brand-success);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Closed-Loop panel (Adaptive Bidding & Governance) — styleguide.md (FR-12/FR-13)
+   Light canvas, ambient elevation, gentle glows, architecture-mapped circle flow.
+   ══════════════════════════════════════════════════════════════════════════ */
+.cl-page { padding: 4px 2px 40px; }
+.cl-page-header { margin-bottom: 18px; }
+.cl-page-header h2 { font-family: var(--font-display); font-size: clamp(20px, 2vw, 26px); font-weight: 700; color: var(--text); }
+.cl-page-desc { font-size: clamp(12px, 1.1vw, 14px); color: var(--text-secondary); line-height: 1.5; margin-top: 4px; max-width: 720px; }
+
+.cl-layout { display: grid; grid-template-columns: minmax(0, 420px) minmax(0, 1fr); gap: 24px; align-items: start; margin-bottom: 20px; }
+@media (max-width: 1024px) { .cl-layout { grid-template-columns: 1fr; } }
+.cl-layout-left { min-width: 0; }
+.cl-layout-right { min-width: 0; position: sticky; top: 84px; }
 
 .cl-section-title {
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: .04em;
-  color: var(--text-muted);
-  margin: 14px 0 8px;
+  font-family: var(--font-display);
+  font-size: clamp(11px, 1vw, 13px); font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-muted); margin: 18px 0 10px;
 }
 
-.cl-scenario-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 8px;
+/* ── Controls bar — single compact row: scenario select, model select, run
+   button, matching the prototype's controls-bar (not a scenario-card grid). ── */
+.cl-controls-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 12px 16px; border-radius: 12px;
+  background: var(--surface-raised); border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
 }
-@media (max-width: 560px) {
-  .cl-scenario-grid { grid-template-columns: 1fr; }
-}
+.cl-control-group { display: flex; align-items: center; gap: 8px; }
+.cl-control-group label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+.cl-run-status { font-size: 11px; color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+/* ── Scenario cards ── */
+.cl-scenario-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 560px) { .cl-scenario-grid { grid-template-columns: 1fr; } }
 .cl-scenario-card {
-  text-align: left;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
-  background: var(--surface-solid, #fff);
-  cursor: pointer;
-  transition: border-color .15s, box-shadow .15s, background .15s;
+  padding: 0; color: var(--text);
+  display: flex; flex-direction: column; font-family: inherit; overflow: hidden;
 }
-.cl-scenario-card:hover { border-color: #76b900; }
 .cl-scenario-card.selected {
-  border-color: #76b900;
-  box-shadow: 0 0 0 2px rgba(118, 185, 0, .25);
-  background: rgba(118, 185, 0, .06);
+  box-shadow: 0 0 0 2px var(--accent), 0 6px 22px var(--glow-brand-primary);
 }
-.cl-scenario-label { font-weight: 700; font-size: 13px; color: var(--text); margin-bottom: 3px; }
-.cl-scenario-desc { font-size: 11px; color: var(--text-muted); line-height: 1.35; }
-.cl-scenario-expected {
-  font-size: 10px;
-  font-weight: 600;
-  color: #0891b2;
-  margin-top: 6px;
+.cl-scenario-card-btn {
+  text-align: left; padding: 14px 14px 10px; cursor: pointer; color: inherit;
+  display: flex; flex-direction: column; gap: 6px; font-family: inherit;
+  background: none; border: none; width: 100%;
 }
+/* Selected-scenario "peek" card (single card, not a grid) — same body layout
+   as the button variant, minus the click-to-select affordance. */
+.cl-scenario-peek { margin-bottom: 20px; }
+.cl-scenario-card-body {
+  padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 6px;
+}
+.cl-scenario-label { font-weight: 700; font-size: clamp(13px, 1.1vw, 14px); }
+.cl-scenario-desc { font-size: clamp(11px, 1vw, 12px); color: var(--text-secondary); line-height: 1.45; }
+.cl-scenario-hint { font-size: clamp(10px, 0.9vw, 12px); color: var(--text-secondary); margin-top: 2px; }
+.cl-hint-tag {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--accent); background: var(--glow-brand-primary);
+  padding: 1px 7px; border-radius: 10px; margin-right: 4px;
+}
+.cl-samples-link {
+  text-align: left; padding: 8px 14px; cursor: pointer; font-family: inherit;
+  background: var(--surface-low); border: none; border-top: 1px solid var(--border);
+  font-size: 11px; font-weight: 600; color: var(--accent);
+}
+.cl-samples-link:hover { background: var(--glow-brand-primary); }
 
-.cl-result {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  margin-top: 8px;
-  background: var(--bg, #f8fafc);
-}
-.cl-result-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
-
-.cl-block { margin-top: 12px; }
-.cl-block-title {
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: .03em;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-}
-
-.cl-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 11px;
-}
-.cl-table th, .cl-table td {
-  text-align: left;
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-}
-.cl-table th {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: .03em;
-  color: var(--text-muted);
-}
-
-.cl-error {
-  color: #b91c1c;
-  background: rgba(220, 38, 38, .08);
-  border: 1px solid rgba(220, 38, 38, .25);
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 11px;
-  margin: 6px 0;
-}
-.cl-error-inline { color: #b91c1c; font-size: 10px; }
-.cl-skipped {
-  color: #92400e;
-  background: rgba(217, 119, 6, .08);
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 11px;
-}
-
+.cl-run-row { display: flex; gap: 12px; align-items: center; margin: 16px 0 4px; }
 .cl-select {
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 12px;
-  background: var(--surface-solid, #fff);
-  color: var(--text);
+  font-family: inherit; font-size: clamp(11px, 1vw, 13px); padding: 6px 10px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--surface-raised); color: var(--text);
 }
 
-/* ── Feedback loop step visualization ── */
-.cl-flow {
-  margin-top: 20px;
-}
+/* ── Right column: empty + flow ── */
+.cl-empty { padding: 40px 24px; text-align: center; color: var(--text-muted); font-size: clamp(12px, 1.1vw, 14px); line-height: 1.6; }
+.cl-flow { padding: 22px 20px; }
 
-/* Horizontal node track */
-.cl-flow-track {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0;
-  padding: 20px 0;
+.cl-flow-track { display: flex; align-items: flex-start; justify-content: center; gap: 4px; flex-wrap: wrap; }
+.cl-flow-connector {
+  flex: 0 0 28px; height: 2px; margin-top: 34px; border-radius: 2px;
+  background: var(--border); opacity: .5; transition: background .2s ease, opacity .2s ease;
 }
+.cl-flow-connector.active { background: var(--accent); opacity: .55; }
 
 .cl-flow-node {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  opacity: 0;
-  animation: cl-node-appear 0.4s ease forwards;
+  width: 96px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center;
+  opacity: 0; transform: translateY(6px);
+  transition: opacity .25s ease, transform .25s ease;
 }
+.cl-flow-node.revealed { opacity: 1; transform: translateY(0); }
 .cl-flow-icon {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  background: var(--bg, #f1f5f9);
-  border: 2px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-muted);
-  transition: border-color 0.3s, box-shadow 0.3s, background 0.3s, color 0.3s;
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-raised); color: var(--text-secondary);
+  border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+  transition: color .2s ease, box-shadow .25s ease;
 }
-.cl-flow-node.active.ok .cl-flow-icon {
-  border-color: #76b900;
-  background: rgba(118, 185, 0, .08);
-  box-shadow: 0 0 0 4px rgba(118, 185, 0, .12);
-  color: #4d7c0f;
-}
-.cl-flow-node.active.error .cl-flow-icon {
-  border-color: #dc2626;
-  background: rgba(220, 38, 38, .06);
-  box-shadow: 0 0 0 4px rgba(220, 38, 38, .10);
-  color: #dc2626;
-}
-.cl-flow-node.active.skip .cl-flow-icon {
-  border-color: #d97706;
-  background: rgba(217, 119, 6, .06);
-  box-shadow: 0 0 0 4px rgba(217, 119, 6, .10);
-  color: #d97706;
-}
-.cl-flow-node.pending .cl-flow-icon {
-  opacity: 0.4;
-}
-.cl-flow-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-muted);
-  text-align: center;
-  white-space: nowrap;
-}
-.cl-flow-node.active .cl-flow-label {
-  color: var(--text);
-}
+.cl-flow-label { font-size: 11px; font-weight: 700; color: var(--text); line-height: 1.2; }
+.cl-flow-service { font-size: 9px; color: var(--text-muted); line-height: 1.2; }
 
-/* Connector line between nodes */
-.cl-flow-connector {
-  width: 48px;
-  height: 2px;
-  background: var(--border);
-  flex-shrink: 0;
-  margin: 0 4px;
-  margin-bottom: 28px; /* align with icon center */
-  opacity: 0;
-  animation: cl-connector-appear 0.3s ease forwards;
-}
-.cl-flow-connector.active {
-  background: #76b900;
-}
+/* Node states — colored icon ring + gentle glow (no harsh strokes) */
+.cl-flow-node--ok .cl-flow-icon { color: var(--green); box-shadow: 0 0 0 1px rgba(34,197,94,.25), 0 4px 18px var(--glow-brand-success); }
+.cl-flow-node--processing .cl-flow-icon { color: var(--accent); animation: sg-halo-pulse 2.2s infinite ease-in-out; }
+.cl-flow-node--error .cl-flow-icon { color: var(--red); box-shadow: 0 0 0 1px rgba(239,68,68,.25), 0 4px 16px rgba(239,68,68,.10); }
+.cl-flow-node--warn .cl-flow-icon { color: #d97706; box-shadow: 0 0 0 1px rgba(245,158,11,.25), 0 4px 16px var(--aws-glow); }
+.cl-flow-node--skip .cl-flow-icon { color: var(--text-muted); opacity: .85; }
+.cl-flow-node--event .cl-flow-icon { color: var(--text-muted); border-style: dashed; }
+.cl-flow-node--pending .cl-flow-icon { color: var(--text-muted); opacity: .6; }
 
-/* Detail panels below the track */
-.cl-flow-details {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
+/* ── Detail panels below the track ── */
+.cl-flow-details { margin-top: 18px; display: flex; flex-direction: column; gap: 10px; }
 .cl-flow-detail {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 16px;
-  background: var(--surface-solid, #fff);
-  opacity: 0;
-  animation: cl-detail-appear 0.4s ease forwards;
+  background: var(--surface-low); border-radius: 12px; padding: 12px 14px;
+  border-left: 3px solid var(--border); animation: cl-fade-in .25s ease;
 }
-.cl-flow-detail-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text);
-  margin-bottom: 6px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.cl-flow-detail--ok { border-left-color: var(--green); }
+.cl-flow-detail--error { border-left-color: var(--red); }
+.cl-flow-detail--warn { border-left-color: #d97706; }
+.cl-flow-detail--event { border-left-color: var(--text-muted); }
+.cl-flow-detail-head { font-size: 11px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.cl-flow-detail-head span { color: var(--text-muted); font-weight: 500; }
+@keyframes cl-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+.cl-detail-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cl-dur { font-size: 10px; font-weight: 600; color: var(--text-muted); background: var(--surface-raised); border-radius: 8px; padding: 1px 7px; }
+.cl-kv { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--text-secondary); }
+.cl-kv b { color: var(--text); font-variant-numeric: tabular-nums; }
+.cl-kv small { color: var(--text-muted); }
+
+.cl-rationale {
+  font-size: 12.5px; line-height: 1.6; color: var(--text); margin: 4px 0 8px;
+  background: var(--surface-raised); border-radius: 10px; padding: 10px 12px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
 }
-.cl-flow-duration {
-  font-size: 10px;
-  font-weight: 400;
-  color: var(--text-muted);
-  margin-left: auto;
+/* Rendered markdown (MarkdownLite) inside the rationale card */
+.cl-rationale > :first-child { margin-top: 0; }
+.cl-rationale > :last-child { margin-bottom: 0; }
+.cl-rationale p { margin: 0 0 8px; }
+.cl-rationale ul, .cl-rationale ol { margin: 4px 0 8px; padding-left: 18px; }
+.cl-rationale li { margin: 2px 0; }
+.cl-rationale strong { font-weight: 700; color: var(--text); }
+.cl-rationale em { font-style: italic; }
+.cl-rationale code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  background: var(--surface-low); padding: 1px 5px; border-radius: 5px;
+}
+.cl-updates { display: flex; flex-direction: column; gap: 8px; }
+.cl-update { padding: 10px 12px; }
+.cl-update-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--text); flex-wrap: wrap; }
+.cl-update-reason { font-size: 11.5px; color: var(--text-secondary); margin-top: 4px; line-height: 1.45; }
+
+.cl-chip { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 10px; }
+.cl-chip-skip { background: rgba(148,163,184,.18); color: var(--text-secondary); }
+.cl-chip-applied { background: var(--glow-brand-success); color: #15803d; }
+
+.cl-rec-badge, .cl-approval-badge {
+  display: inline-block; align-self: flex-start; width: auto; flex: none;
+  color: #fff; font-size: 10px; font-weight: 700; padding: 3px 12px; border-radius: 20px; letter-spacing: .03em;
 }
 
-/* KV row — inline items */
-.cl-kv-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 16px;
-  font-size: 12px;
-  color: var(--text-muted);
+/* Honest unknown/unreachable states (no fabricated data). */
+.cl-honest {
+  font-size: 12px; color: #b45309; background: rgba(245, 158, 11, .10);
+  border-radius: 8px; padding: 8px 10px; line-height: 1.45;
 }
-.cl-kv-row strong {
-  color: var(--text);
-  font-family: 'SF Mono', 'Fira Code', monospace;
-  font-size: 11px;
+.cl-honest-block { margin-bottom: 12px; }
+
+/* ── Persisted-state blocks + tables ── */
+.cl-block { padding: 14px 16px; margin-top: 14px; }
+.cl-block-title { font-family: var(--font-display); font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+.cl-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.cl-table th { text-align: left; color: var(--text-muted); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.cl-table td { padding: 5px 8px; border-bottom: 1px solid rgba(148,163,184,.12); color: var(--text); vertical-align: top; }
+.cl-table tr:last-child td { border-bottom: none; }
+
+/* ── Sample outcomes modal ── */
+.cl-modal-overlay {
+  position: fixed; inset: 0; background: rgba(15, 23, 42, .45);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  z-index: 1000; animation: cl-fade-in .2s ease;
 }
-.cl-kv-row small {
-  color: var(--text-muted);
-  font-size: 10px;
+.cl-modal {
+  background: var(--surface-raised); border-radius: 16px; padding: 20px 22px;
+  max-width: 640px; width: 100%; max-height: 80vh; overflow-y: auto;
+  border: 1px solid rgba(255,255,255,.7);
+}
+.cl-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.cl-modal-title { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--text); }
+.cl-modal-close {
+  background: var(--surface-low); border: none; border-radius: 8px; width: 26px; height: 26px;
+  color: var(--text-secondary); cursor: pointer; font-size: 12px; line-height: 1;
+}
+.cl-modal-close:hover { background: var(--glow-brand-primary); color: var(--accent); }
+.cl-modal-note {
+  font-size: 11.5px; color: var(--text-secondary); line-height: 1.5;
+  background: var(--surface-low); border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
 }
 
-.cl-metric-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   ARTF mutation framing (Model Governance panel) — mutation-intent cards,
+   technical popovers, verdict card, bidstream-impact card, session audit.
+   Ports the visual structure of aidlc-docs/model-governance-specs/
+   reference_prototype.html into the styleguide token system.
+   ══════════════════════════════════════════════════════════════════════════ */
 
-/* Animations */
-@keyframes cl-node-appear {
-  from { opacity: 0; transform: scale(0.7); }
-  to { opacity: 1; transform: scale(1); }
+/* ── Pipeline bar (top of page, icon steps) — sized and animated to match
+   the Adaptive Bidding FlowTrack (.cl-flow-node / .cl-flow-icon) so both
+   closed-loop views feel consistent. ── */
+.cl-pipeline-bar {
+  display: flex; align-items: flex-start; justify-content: center; gap: 4px;
+  padding: 22px 20px; margin-bottom: 16px; flex-wrap: wrap;
 }
-@keyframes cl-connector-appear {
-  from { opacity: 0; width: 0; }
-  to { opacity: 1; width: 48px; }
+.cl-pi-stage {
+  width: 96px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center;
+  opacity: 0; transform: translateY(6px);
+  transition: opacity .25s ease, transform .25s ease;
 }
-@keyframes cl-detail-appear {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+.cl-pi-stage.revealed { opacity: 1; transform: translateY(0); }
+.cl-pi-icon {
+  width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); background: var(--surface-raised);
+  border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+  transition: color .2s ease, box-shadow .25s ease, border-color .25s ease;
 }
+.cl-pi-icon svg { width: 24px; height: 24px; }
+.cl-pi-name { font-size: 12px; font-weight: 700; text-align: center; color: var(--text); line-height: 1.2; }
+.cl-pi-service { font-size: 10px; color: var(--text-muted); text-align: center; line-height: 1.2; }
+.cl-pi-conn {
+  flex: 0 0 28px; height: 2px; margin-top: 34px; border-radius: 2px;
+  background: var(--border); opacity: .5; transition: background .2s ease, opacity .2s ease;
+}
+.cl-pi-conn.active { background: var(--accent); opacity: .55; }
 
-/* Badges */
-.cl-badge {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 2px 8px;
-  border-radius: 4px;
-  text-transform: uppercase;
-  letter-spacing: .03em;
-}
-.cl-badge--applied { background: rgba(118, 185, 0, .15); color: #3d6600; }
-.cl-badge--skip { background: rgba(217, 119, 6, .12); color: #92400e; }
-.cl-badge--error { background: rgba(220, 38, 38, .12); color: #b91c1c; }
-.cl-badge--agentcore { background: rgba(59, 130, 246, .12); color: #1d4ed8; }
+/* Stage states — colored icon ring + gentle glow, matching .cl-flow-node--* */
+.cl-pi-stage--active .cl-pi-icon { color: var(--green); box-shadow: 0 0 0 1px rgba(34,197,94,.25), 0 4px 18px var(--glow-brand-success); }
+.cl-pi-stage--running .cl-pi-icon { color: var(--accent); box-shadow: 0 0 0 1px rgba(99,102,241,.25), 0 4px 18px var(--glow-brand-primary); animation: sg-halo-pulse 2.2s infinite ease-in-out; }
+.cl-pi-stage--error .cl-pi-icon { color: var(--red); box-shadow: 0 0 0 1px rgba(239,68,68,.25), 0 4px 16px rgba(239,68,68,.10); }
+.cl-pi-stage--done .cl-pi-icon { color: var(--text-muted); }
 
-/* Decision cards */
-.cl-decisions { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
-.cl-decision-card {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 10px;
-  background: var(--bg, #f8fafc);
+/* ── Step-by-step log (simple text lines, not per-stage detail cards) ── */
+.cl-steplog { font-size: 11px; line-height: 2; color: var(--text-secondary); }
+.cl-steplog-line { padding: 2px 0; }
+.cl-steplog-line strong { color: var(--text); }
+
+.cl-mutation-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;
 }
-.cl-decision-param {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  margin-bottom: 4px;
+@media (max-width: 780px) { .cl-mutation-grid { grid-template-columns: 1fr; } }
+
+/* ── Generic card (verdict / bidstream-impact / session audit) ── */
+.cl-card { padding: 14px 16px; }
+.cl-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.cl-card-title { font-size: 12px; font-weight: 700; display: flex; align-items: center; gap: 6px; color: var(--text); }
+.cl-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; }
+.cl-dot--purple { background: var(--accent); }
+.cl-dot--green { background: var(--green); }
+.cl-dot--ink { background: var(--text); }
+.cl-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 5px; text-transform: uppercase; letter-spacing: .03em; }
+.cl-badge--agentcore { background: var(--glow-brand-primary); color: #5b21b6; }
+
+/* ── Mutation intent card ── */
+.cl-intent-card { padding: 14px 16px; position: relative; }
+.cl-intent-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.cl-intent-icon {
+  width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+  flex: none; color: var(--accent); background: var(--glow-brand-primary);
 }
-.cl-decision-delta {
-  font-size: 12px;
-  font-family: 'SF Mono', 'Fira Code', monospace;
+.cl-intent-icon--ncf_deal_manager { color: #16a34a; background: rgba(34, 197, 94, .10); }
+.cl-intent-name { font-size: 12px; font-weight: 700; color: var(--text); }
+.cl-intent-artf {
+  font-size: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent);
+  background: var(--glow-brand-primary); padding: 1px 6px; border-radius: 4px; margin-left: 6px;
 }
-.cl-decision-reason {
-  font-size: 11px;
-  color: var(--text);
-  line-height: 1.4;
-  margin-bottom: 4px;
+.cl-intent-desc { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; line-height: 1.5; }
+.cl-intent-outcome { padding: 8px 10px; background: var(--surface-low); border-radius: 6px; font-size: 11px; }
+.cl-outcome-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 3px; }
+.cl-outcome-val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cl-outcome-impact { font-size: 10px; color: var(--text-secondary); margin-top: 4px; line-height: 1.5; }
+
+/* ── Technical detail popover (hover / focus / click) ── */
+.cl-has-detail { position: relative; }
+.cl-detail-trigger {
+  display: inline-flex; align-items: center; gap: 3px; font-size: 9px; font-weight: 600;
+  color: var(--accent); background: none; border: none; border-bottom: 1px dashed var(--accent);
+  cursor: pointer; margin-top: 6px; padding: 0; font-family: inherit;
 }
-.cl-decision-confidence { font-size: 10px; color: var(--text-muted); }
-.cl-skip-reason { font-size: 12px; color: #92400e; padding: 6px 0; }
-.cl-metric-pill {
-  display: inline-block;
-  background: var(--bg, #f1f5f9);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 6px;
-  font-size: 10px;
+.cl-detail-pop {
+  position: absolute; left: 0; bottom: calc(100% + 8px); width: 320px; max-width: 90vw;
+  background: #0f1729; color: #e8ecf3; padding: 12px 14px; border-radius: 8px;
+  font-size: 10px; line-height: 1.6; z-index: 50; box-shadow: 0 12px 30px rgba(15, 23, 41, .4);
 }
+.cl-detail-pop::after {
+  content: ''; position: absolute; top: 100%; left: 20px; border: 6px solid transparent;
+  border-top-color: #0f1729;
+}
+.cl-detail-pop strong { color: #fff; }
+.cl-detail-pop code { background: rgba(255, 255, 255, .1); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
+.cl-detail-pop > div { margin-bottom: 8px; }
+.cl-detail-pop > div:last-child { margin-bottom: 0; }
+
+/* ── Verdict card ── */
+.cl-verdict-card { display: flex; flex-direction: column; align-items: flex-start; }
+.cl-verdict-text { font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin-top: 10px; align-self: stretch; }
+.cl-verdict-text strong { color: var(--text); }
+.cl-verdict-text p { margin: 0 0 8px; }
+.cl-verdict-text p:last-child { margin-bottom: 0; }
+
+/* ── Bidstream impact card ── */
+.cl-bidstream-impact { font-size: 12px; color: var(--text-secondary); line-height: 1.55; }
+.cl-bidstream-impact p { margin: 0 0 8px; }
+.cl-bidstream-impact p:last-child { margin-bottom: 0; }
+.cl-bidstream-impact strong { color: var(--text); }
+
+/* ── Session audit trail ── */
+.cl-audit-list {
+  font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-secondary);
+  line-height: 1.8; max-height: 160px; overflow-y: auto;
+}
+.cl-audit-empty { color: var(--text-muted); font-style: italic; font-family: var(--font-sans); }
+.cl-audit-entry { padding: 2px 0; border-bottom: 1px solid rgba(148, 163, 184, .10); }
+.cl-audit-entry:last-child { border-bottom: none; }

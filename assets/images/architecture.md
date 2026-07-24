@@ -10,30 +10,42 @@ the same picture in a maintainable, text-authored form.
 
 The solution implements **four** ARTF-compliant (IAB Tech Lab Agentic RTB Framework)
 containers that produce real-time bidstream mutations for OpenRTB auctions. Each
-container maps to one ARTF intent (or intent pair) and, where it needs a model,
-calls **NVIDIA Triton Inference Server** for GPU-accelerated inference:
+container maps to one ARTF intent (or intent pair). Two call **NVIDIA Triton
+Inference Server** for GPU-accelerated inference; two are deterministic and
+rule-based on CPU:
 
 | Container | ARTF intent(s) | Model served by Triton |
 |-----------|----------------|------------------------|
 | DLRM bid shader (`dlrm_bid_shader`) | `BID_SHADE` | DLRM → predicted CTR |
-| Wide & Deep segment activator (`widedeep_segment_activator`) | `ACTIVATE_SEGMENTS` | Wide & Deep → segment scores |
+| Segment activator (`widedeep_segment_activator`) | `ACTIVATE_SEGMENTS` | Rule-based (no Triton) |
 | NCF deal manager (`ncf_deal_manager`) | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | NCF / NeuMF → per-deal relevance |
 | Metrics enricher (`metrics_enricher`) | `ADD_METRICS` | Rule-based (no Triton) |
 
-Triton serves **three ONNX models** (DLRM, Wide & Deep, NCF) on a single NVIDIA
-**A10G GPU** (`g5.xlarge`) using ONNX Runtime with the CUDA Execution Provider; for
-higher throughput, the more powerful Amazon EC2 **G7e** instances are an
-alternative. The metrics enricher is rule-based and needs no GPU model.
+Triton serves **two models** (DLRM, NCF) on a single NVIDIA **A10G GPU**
+(`g5.xlarge`) with the CUDA Execution Provider; for higher throughput, the more
+powerful Amazon EC2 **G7e** instances are an alternative. The segment activator
+and metrics enricher are rule-based and need no GPU model. The segment activator
+previously scored segments with a Wide & Deep neural network on Triton — that
+model's ONNX graph could not be compiled to a TensorRT engine (a `BatchNorm1d`
+fusion limitation), so it was replaced with transparent rules over real
+bid-request signals, and is slated to be replaced by a partner ISV
+implementation.
 
-> **Note on the models.** These three models are *reference architectures* following
-> the published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) and NVIDIA Merlin
-> (Wide & Deep) designs. They are defined in `source/triton/export_models.py` and
-> exported to ONNX with **randomly initialized (seeded) weights** — they are **not
-> pretrained or production-trained**. They exist to demonstrate the GPU inference path
-> and the ARTF container/Triton integration; train the architectures on your own data
-> (or supply your own ONNX models) before relying on their predictions. The Triton
-> Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine
-> upstream NVIDIA NGC container.
+> **Serving backend.** The Part 1 baseline serves the exported ONNX models via ONNX
+> Runtime. Part 2 is a progression that upgrades Triton serving to compiled **TensorRT
+> engine plans** (`tensorrt_plan`), built from the same ONNX by an in-cluster Model
+> Optimizer microservice, and rolls new versions out through a Triton-side stable/canary
+> router. See the top-level `README.md` (Part 2) for details.
+
+> **Note on the models.** DLRM and NCF are *reference architectures* following the
+> published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) designs. They are defined
+> in `source/triton/export_models.py` and exported to ONNX with **randomly
+> initialized (seeded) weights** — they are **not pretrained or production-trained**.
+> They exist to demonstrate the GPU inference path and the ARTF container/Triton
+> integration; train the architectures on your own data (or supply your own ONNX
+> models) before relying on their predictions. The Triton Inference Server image
+> (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine upstream NVIDIA NGC
+> container.
 
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
 Amazon Cognito JWT, and **fans out in parallel** to the four containers over gRPC
@@ -64,16 +76,17 @@ graph TB
         ORCH["Orchestrator (Starlette)<br/>JWT verify + parallel fan-out<br/>gRPC primary · MCP/REST"]
 
         subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G (or Amazon EC2 G7e)"]
-            TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + CUDA EP<br/>3 models on GPU"]
+            TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + CUDA EP<br/>2 models on GPU"]
             DLRM_C["DLRM bid shader<br/>BID_SHADE"]
-            WD_C["Wide & Deep segment activator<br/>ACTIVATE_SEGMENTS"]
             NCF_C["NCF deal manager<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
-            MET_C["Metrics enricher<br/>ADD_METRICS (rule-based)"]
         end
+
+        WD_C["Segment activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
+        MET_C["Metrics enricher<br/>ADD_METRICS (rule-based)"]
     end
 
     subgraph Models["Model Storage"]
-        S3M["Amazon S3 model repository<br/>dlrm_bid_shader · widedeep_segment_activator · ncf_deal_manager<br/>(model.onnx each)"]
+        S3M["Amazon S3 model repository<br/>dlrm_bid_shader · ncf_deal_manager<br/>(model.onnx each)"]
     end
 
     subgraph Bedrock["Amazon Bedrock AgentCore"]
@@ -92,7 +105,6 @@ graph TB
     ORCH -->|"gRPC / MCP fan-out"| NCF_C
     ORCH -->|"gRPC / MCP fan-out"| MET_C
     DLRM_C -->|"tritonclient"| TRITON
-    WD_C -->|"tritonclient"| TRITON
     NCF_C -->|"tritonclient"| TRITON
     TRITON -.->|"load models at startup"| S3M
     AC -.->|"extend_rtb → orchestrator"| ORCH
@@ -119,9 +131,9 @@ graph TB
    unauthenticated requests.
 4. The orchestrator **fans out the OpenRTB request in parallel** to the four
    containers, respecting the OpenRTB `tmax` timeout.
-5. The DLRM, Wide & Deep, and NCF containers call **Triton** via `tritonclient` for
-   GPU inference; the metrics enricher returns rule-based mutations.
-6. **Triton** loads the three ONNX models from the **S3 model repository** at startup
+5. The DLRM and NCF containers call **Triton** via `tritonclient` for GPU inference;
+   the segment activator and metrics enricher return rule-based mutations.
+6. **Triton** loads the two ONNX models from the **S3 model repository** at startup
    and runs inference on the A10G GPU (or the more powerful Amazon EC2 G7e).
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
    it through the NLB and CloudFront to the caller.

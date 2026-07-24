@@ -1,4 +1,4 @@
-"""Tests for agents.bid_shading.agent — BidShadingStrategyAgent.
+"""Tests for agents.adaptive_bidding.agent — AdaptiveBiddingStrategyAgent.
 
 Validates:
 - compute_adjustment with win_rate below target → increases shade_factor
@@ -22,8 +22,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agents.bid_shading.agent import (
-    BidShadingStrategyAgent,
+from agents.adaptive_bidding.agent import (
+    AdaptiveBiddingStrategyAgent,
     MarketState,
     ParameterUpdate,
     DEFAULT_CONFIG,
@@ -81,7 +81,7 @@ def _make_param_state(
         current_value=current_value,
         previous_value=current_value - 0.01,
         updated_at=1700000000.0,
-        updated_by="bid_shading_agent",
+        updated_by="adaptive_bidding_agent",
         version=version,
         min_value=min_val,
         max_value=max_val,
@@ -101,12 +101,12 @@ def _make_current_params(
     }
 
 
-def _make_agent(config_overrides: dict | None = None) -> BidShadingStrategyAgent:
-    """Create a BidShadingStrategyAgent with mocked external dependencies."""
+def _make_agent(config_overrides: dict | None = None) -> AdaptiveBiddingStrategyAgent:
+    """Create a AdaptiveBiddingStrategyAgent with mocked external dependencies."""
     mock_store = MagicMock()
     mock_cloudwatch = MagicMock()
     config = config_overrides or {}
-    return BidShadingStrategyAgent(
+    return AdaptiveBiddingStrategyAgent(
         parameter_store=mock_store,
         cloudwatch_client=mock_cloudwatch,
         config=config,
@@ -355,7 +355,7 @@ class TestMinSamplesThreshold:
             ]
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=mock_store,
             cloudwatch_client=mock_cw,
             config={"min_samples": 1000},
@@ -385,7 +385,7 @@ class TestMinSamplesThreshold:
         }
         mock_cw.put_metric_data = MagicMock()
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=mock_store,
             cloudwatch_client=mock_cw,
             config={"min_samples": 1000},
@@ -426,7 +426,7 @@ class TestEvaluateAndAdjustIntegration:
         }
         mock_cw.put_metric_data = MagicMock()
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=mock_store,
             cloudwatch_client=mock_cw,
         )
@@ -464,7 +464,7 @@ class TestEvaluateAndAdjustIntegration:
         }
         mock_cw.put_metric_data = MagicMock()
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=mock_store,
             cloudwatch_client=mock_cw,
         )
@@ -495,7 +495,7 @@ class TestEvaluateAndAdjustIntegration:
         }
         mock_cw.put_metric_data = MagicMock()
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=mock_store,
             cloudwatch_client=mock_cw,
         )
@@ -532,7 +532,7 @@ class TestGetMarketState:
             ]
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=MagicMock(),
             cloudwatch_client=mock_cw,
         )
@@ -563,7 +563,7 @@ class TestGetMarketState:
             ]
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=MagicMock(),
             cloudwatch_client=mock_cw,
         )
@@ -588,7 +588,7 @@ class TestGetMarketState:
             ]
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=MagicMock(),
             cloudwatch_client=mock_cw,
         )

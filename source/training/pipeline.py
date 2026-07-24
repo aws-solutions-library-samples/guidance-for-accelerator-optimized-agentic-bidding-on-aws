@@ -33,11 +33,18 @@ logger = logging.getLogger(__name__)
 
 
 class ModelType(Enum):
-    """Supported model types in the bidding platform."""
+    """Supported model types in the bidding platform.
+
+    NOTE: widedeep_segment_activator (audience segment activation) is
+    intentionally absent — it is no longer a trainable neural model. Its ONNX
+    graph could not be compiled to a TensorRT engine, so it was replaced with
+    deterministic rule-based logic and is slated for replacement by a partner
+    ISV implementation. See
+    source/containers/widedeep_segment_activator/app.py.
+    """
 
     DLRM_BID_SHADER = "dlrm_bid_shader"
     NCF_DEAL_MANAGER = "ncf_deal_manager"
-    WIDEDEEP_SEGMENT_ACTIVATOR = "widedeep_segment_activator"
 
 
 @dataclass(frozen=True)
@@ -146,14 +153,12 @@ class TrainingJobFailedError(Exception):
 _TRAINING_IMAGE_MAP: dict[ModelType, str] = {
     ModelType.DLRM_BID_SHADER: "{account}.dkr.ecr.{region}.amazonaws.com/artf-nemo-rl-training:dlrm",
     ModelType.NCF_DEAL_MANAGER: "{account}.dkr.ecr.{region}.amazonaws.com/artf-nemo-rl-training:ncf",
-    ModelType.WIDEDEEP_SEGMENT_ACTIVATOR: "{account}.dkr.ecr.{region}.amazonaws.com/artf-nemo-rl-training:widedeep",
 }
 
 # Model Package Group names in SageMaker Model Registry
 _MODEL_PACKAGE_GROUP_MAP: dict[ModelType, str] = {
     ModelType.DLRM_BID_SHADER: "artf-dlrm-bid-shader",
     ModelType.NCF_DEAL_MANAGER: "artf-ncf-deal-manager",
-    ModelType.WIDEDEEP_SEGMENT_ACTIVATOR: "artf-widedeep-segment-activator",
 }
 
 

@@ -1,0 +1,35 @@
+# Model Promotion Governance Agent — AgentCore HTTP Runtime
+# =========================================================
+#
+# Runs as a Bedrock AgentCore HTTP-protocol runtime in a Firecracker microVM.
+# Invoked by the Invocation Shim Lambda on ModelPackageGroupChanged events (event
+# mode) and by the frontend for conversational governance review (query mode).
+#
+# The deterministic statistical gate (Welch's t-test + SPRT + guardrails) decides
+# promote/reject/inconclusive; a Strands + Bedrock reasoning layer explains the
+# decision and answers operator questions from the real audit trail.
+#
+# AgentCore HTTP contract (all on port 8080):
+#   - POST /invocations  -> event or conversational handler
+#   - GET  /ping         -> {"status": "Healthy"}
+#
+# Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
+
+FROM --platform=linux/arm64 python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY agents/governance/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Copy source — the governance handler needs agents/governance/ and the real
+# deployment components (NIM optimizer, Triton loader, canary deployer, guardrails).
+COPY agents/__init__.py /app/agents/__init__.py
+COPY agents/governance/ /app/agents/governance/
+COPY deployment/ /app/deployment/
+
+# AgentCore runs the container as an HTTP server on port 8080
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "agents.governance.handler"]

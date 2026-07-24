@@ -1,32 +1,31 @@
 """Scenario presets for the closed-loop demo.
 
-Each scenario encodes a deterministic set of **input** market metrics and the
-**decision it is expected to drive** through the real Part 2 decision code.
+Each scenario encodes a deterministic set of **input** market metrics (and, for
+governance scenarios, deterministic A/B samples). These are the *inputs* fed to
+the real Part 2 decision code — not a pre-computed result.
 
-The numeric targets here were chosen against the *actual* thresholds used by
-``agents.bid_shading.agent.BidShadingStrategyAgent`` and
-``agents.governance.ab_evaluator.ABEvaluator`` so that a generated scenario
-produces a specific, verifiable decision:
+Two different decision surfaces consume these inputs:
 
-Bid-shading agent defaults (see ``DEFAULT_CONFIG`` in the agent):
-    target_win_rate = 0.35   win_rate_tolerance = 0.05
-    max_adjustment  = 0.05   learning_rate      = 0.10
-    min_samples     = 1000
+* Adaptive Bidding (``agents.adaptive_bidding.agent.AdaptiveBiddingStrategyAgent``)
+  is a **reasoning agent** (Strands + Amazon Bedrock). It has **no** fixed target
+  win rate, learning rate, tolerance, or gradient formula — the model weighs the
+  real metrics (win rate, ROI, prices, sample counts) and explains its own choice.
+  Hard safety limits (``shade_factor ∈ [0.3, 0.95]``, ``conversion_value ∈
+  [1.0, 50.0]``, a per-update max delta, and optimistic version checks) are
+  enforced by the DynamoDB Parameter Store write layer, not by this scenario data.
+  Because the decision is the agent's reasoning, each agentic scenario's
+  ``expected_decision`` is guidance — "**what to watch for**" — not a guaranteed
+  outcome. The authoritative result is whatever the agent actually reasons and
+  writes at run time.
 
-shade_factor policy:
-    error = win_rate - target
-    if |error| <= tolerance: no change
-    raw   = -error * learning_rate * (0.5 + 0.5 * clamp(roi, 0, 1))
-    adj   = clamp(raw, -max_adjustment, +max_adjustment)   → clamp value to [0.30, 0.95]
+* Governance (``agents.governance.ab_evaluator.ABEvaluator``) is a **real
+  statistical** gate (Welch's t-test + SPRT). Here the A/B sample means/variances
+  deterministically drive a specific, verifiable recommendation (promote / reject
+  / extend), so the governance ``expected_decision`` values are reliable.
 
-conversion_value policy:
-    roi < 0 and win_rate > target  → decrease
-    roi > 0 and win_rate < target  → increase
-    else                           → no change
-
-These presets are pure data; nothing here performs I/O or randomness that a
-user sees as a "result". The A/B sample lists are materialized deterministically
-from a fixed seed purely so the real statistical evaluator has realistic input.
+These presets are pure data; nothing here performs I/O or randomness that a user
+sees as a "result". The A/B sample lists are materialized deterministically from a
+fixed seed purely so the real statistical evaluator has realistic input.
 """
 
 from __future__ import annotations
@@ -45,8 +44,8 @@ from typing import Optional
 class BidOutcomeMetrics:
     """Target values for the ``ARTF/BidOutcome`` CloudWatch metrics.
 
-    These are the six metrics the Bid Shading Strategy Agent reads to compute
-    its MarketState (see ``BidShadingStrategyAgent.get_market_state``).
+    These are the six metrics the Adaptive Bidding Strategy Agent reads to compute
+    its MarketState (see ``AdaptiveBiddingStrategyAgent.compute_market_state``).
     """
 
     total_bids: int
@@ -83,6 +82,69 @@ class BidOutcomeMetrics:
             "TotalCost": float(self.total_cost),
         }
 
+    def sample_outcomes(self, n: int = 10, seed: int = 4242) -> list[dict]:
+        """Deterministically generate ``n`` illustrative individual bid-outcome records.
+
+        These are NOT a reconstruction of specific historical bids — there is no
+        per-bid data behind this aggregate scenario preset. Instead this produces a
+        small, fixed-seed sample of individual-record *shapes* (``won`` /
+        ``price_paid`` / ``impression`` / ``click`` / ``conversion``, matching the
+        real ``BidOutcomeEvent`` schema in ``shared.feedback_models``) that are
+        statistically consistent with this scenario's aggregate metrics (win_rate,
+        avg prices). Same seed ⇒ same records on every call — reproducible and
+        inspectable, not randomized per-request to "look real".
+
+        Callers MUST label this data as an illustrative synthetic sample (see
+        ``Scenario.sample_outcomes``), never as an observed/real outcome feed.
+        """
+        if self.total_bids <= 0 or n <= 0:
+            return []
+        n = min(n, self.total_bids)
+        rng = random.Random(seed)
+
+        # Deterministically distribute the expected number of wins across the n
+        # sampled slots (rather than flipping a per-record biased coin, which
+        # would make small samples drift noticeably from the target win_rate).
+        target_wins = round(n * self.win_rate)
+        won_flags = [False] * n
+        if target_wins > 0:
+            step = n / target_wins
+            for i in range(target_wins):
+                idx = min(n - 1, int(i * step))
+                won_flags[idx] = True
+
+        price_std = max(self.avg_shaded_price * 0.08, 0.01)
+        paid_std = max(self.avg_price_paid * 0.08, 0.01)
+
+        records = []
+        for i in range(n):
+            won = won_flags[i]
+            shaded_price = round(max(0.0, rng.gauss(self.avg_shaded_price, price_std)), 4)
+            price_paid = (
+                round(max(0.0, rng.gauss(self.avg_price_paid, paid_std)), 4) if won else None
+            )
+            # Downstream signals are monotonic per the real BidOutcomeEvent contract
+            # (impression ⇒ won; click ⇒ impression; conversion ⇒ click). Click/
+            # conversion rates below are illustrative assumptions, not scenario
+            # inputs — they exist only to give the sample table realistic shape.
+            impression = won
+            click = bool(impression and rng.random() < 0.05)
+            conversion = bool(click and rng.random() < 0.10)
+            conversion_value = round(rng.uniform(5.0, 25.0), 2) if conversion else None
+            records.append(
+                {
+                    "index": i,
+                    "won": won,
+                    "shaded_price": shaded_price,
+                    "price_paid": price_paid,
+                    "impression": impression,
+                    "click": click,
+                    "conversion": conversion,
+                    "conversion_value": conversion_value,
+                }
+            )
+        return records
+
 
 @dataclass(frozen=True)
 class ABSamples:
@@ -113,6 +175,21 @@ class ABSamples:
         rng2 = random.Random(self.seed + 1)
         treatment = [rng2.gauss(self.treatment_mean, self.treatment_std) for _ in range(self.n_per_group)]
         return control, treatment
+
+    def sample_outcomes(self, n: int = 10) -> dict:
+        """Return the first ``n`` control/treatment values actually fed to the
+        real ``ABEvaluator`` (the same lists ``materialize()`` produces — this is
+        not a separate random draw, just a truncated view of the real input).
+        """
+        control, treatment = self.materialize()
+        n = max(0, min(n, len(control), len(treatment)))
+        return {
+            "primary_metric": self.primary_metric,
+            "n_shown": n,
+            "n_per_group": self.n_per_group,
+            "control": [round(v, 4) for v in control[:n]],
+            "treatment": [round(v, 4) for v in treatment[:n]],
+        }
 
 
 @dataclass(frozen=True)
@@ -181,22 +258,62 @@ class Scenario:
             }
         return out
 
+    def sample_outcomes(self, n: int = 10) -> dict:
+        """A JSON-serializable subset of individual synthetic sample records.
+
+        For agentic scenarios: ``n`` illustrative individual bid-outcome records
+        (won/price_paid/impression/click/conversion) consistent with this
+        scenario's aggregate ``bid_metrics``.
+
+        For governance scenarios: the first ``n`` control/treatment values from
+        the same deterministic A/B sample lists fed to the real ``ABEvaluator``.
+
+        Always deterministic (fixed seed) and explicitly labelled as synthetic
+        sample input — never a fabricated "result".
+        """
+        if self.bid_metrics is not None:
+            return {
+                "loop": self.loop,
+                "kind": "bid_outcome_records",
+                "records": self.bid_metrics.sample_outcomes(n=n),
+                "note": (
+                    "Illustrative synthetic bid-outcome records consistent with this "
+                    "scenario's aggregate metrics (win_rate, avg prices). Not a "
+                    "reconstruction of real historical bids."
+                ),
+            }
+        if self.ab_samples is not None:
+            return {
+                "loop": self.loop,
+                "kind": "ab_samples",
+                **self.ab_samples.sample_outcomes(n=n),
+                "note": (
+                    "First N values of the deterministic control/treatment lists "
+                    "actually fed to the real ABEvaluator (Welch's t-test + SPRT) "
+                    "for this scenario."
+                ),
+            }
+        return {"loop": self.loop, "kind": "none", "records": [], "note": "No sample data for this scenario."}
+
 
 # ---------------------------------------------------------------------------
 # Agentic parameter-loop scenarios
 # ---------------------------------------------------------------------------
-# Each drives a specific, verified decision by the real bid-shading agent.
+# Each sets a distinct real market condition. The Adaptive Bidding reasoning agent
+# decides what (if anything) to change; the ``expected_decision`` text below is
+# "what to watch for" guidance, not a guaranteed formula output.
 
 _UNDERBIDDING = Scenario(
     key="underbidding",
-    label="Underbidding — raise shade_factor",
+    label="Underbidding — likely raise shade_factor",
     loop=LOOP_AGENTIC,
     description=(
-        "Win rate 20% (well below the 35% target) with healthy ROI. The agent "
-        "should bid more aggressively: raise shade_factor and raise "
-        "conversion_value."
+        "Low win rate (~20%) with healthy positive ROI — the platform is leaving "
+        "winnable, profitable impressions on the table. Watch whether the agent "
+        "reasons toward bidding more aggressively (raising shade_factor and/or "
+        "conversion_value)."
     ),
-    expected_decision="shade_factor ↑ and conversion_value ↑",
+    expected_decision="likely bids up — watch for shade_factor ↑ / conversion_value ↑",
     bid_metrics=BidOutcomeMetrics(
         total_bids=2000,
         wins=400,            # win_rate = 0.20
@@ -209,14 +326,14 @@ _UNDERBIDDING = Scenario(
 
 _OVERPAYING = Scenario(
     key="overpaying",
-    label="Overpaying — lower shade_factor",
+    label="Overpaying — likely lower shade_factor",
     loop=LOOP_AGENTIC,
     description=(
-        "Win rate 55% (well above target) but negative ROI — we are winning too "
-        "much and overpaying. The agent should pull back: lower shade_factor and "
-        "lower conversion_value."
+        "High win rate (~55%) but negative ROI — the platform is winning too much "
+        "and overpaying. Watch whether the agent reasons toward pulling back "
+        "(lowering shade_factor and/or conversion_value)."
     ),
-    expected_decision="shade_factor ↓ and conversion_value ↓",
+    expected_decision="likely pulls back — watch for shade_factor ↓ / conversion_value ↓",
     bid_metrics=BidOutcomeMetrics(
         total_bids=2000,
         wins=1100,           # win_rate = 0.55
@@ -229,14 +346,15 @@ _OVERPAYING = Scenario(
 
 _HEALTHY = Scenario(
     key="healthy",
-    label="Healthy — no change (stability)",
+    label="Healthy — likely no change (stability)",
     loop=LOOP_AGENTIC,
     description=(
-        "Win rate at the 35% target with slightly positive ROI. Within tolerance, "
-        "so the agent should make no adjustment — demonstrating convergence and "
-        "that the loop does not oscillate."
+        "A moderate win rate (~35%) with slightly positive ROI — parameters look "
+        "well-placed. Watch whether the agent reasons that no adjustment is "
+        "warranted, demonstrating that the loop holds steady rather than "
+        "oscillating."
     ),
-    expected_decision="no change (within tolerance)",
+    expected_decision="likely holds steady — watch for no change",
     bid_metrics=BidOutcomeMetrics(
         total_bids=2000,
         wins=700,            # win_rate = 0.35 (== target)
@@ -249,14 +367,14 @@ _HEALTHY = Scenario(
 
 _INSUFFICIENT = Scenario(
     key="insufficient_data",
-    label="Insufficient data — agent skips",
+    label="Thin data — agent likely declines to act",
     loop=LOOP_AGENTIC,
     description=(
-        "Only 500 bids in the window — below the 1000-sample minimum. The agent "
-        "should skip this cycle and make no change, demonstrating the min-samples "
-        "safety guard."
+        "Only 500 bids in the window — a thin sample. The agent is told the sample "
+        "counts and is instructed to decline to act on data too sparse to draw a "
+        "conclusion. Watch whether it reasons to make no change on low confidence."
     ),
-    expected_decision="skipped (below min_samples)",
+    expected_decision="likely declines — watch for no change on thin data",
     bid_metrics=BidOutcomeMetrics(
         total_bids=500,
         wins=100,            # win_rate = 0.20 but below min_samples
@@ -322,10 +440,79 @@ _INCONCLUSIVE = Scenario(
     expected_decision="extend",
     ab_samples=ABSamples(
         control_mean=1.00,
-        control_std=0.30,
-        treatment_mean=1.01,
-        treatment_std=0.30,
+        control_std=0.05,
+        treatment_mean=0.99,
+        treatment_std=0.05,
         n_per_group=120,
+    ),
+)
+
+# NCF Deal Manager variants of the same three governance outcomes. Each set of
+# ab_samples below was verified against the real ABEvaluator (not just picked
+# to match DESIGN_BRIEF.md's illustrative figures) — see
+# aidlc-docs/construction/model-governance-panel/ncf-governance-scenario-verification.md
+# for the exact evaluate() output each produces.
+
+_CHALLENGER_WINS_NCF = Scenario(
+    key="challenger_wins_ncf",
+    label="Challenger wins — promote",
+    loop=LOOP_GOVERNANCE,
+    description=(
+        "A retrained NCF challenger delivers a higher deal_hit_rate than the "
+        "incumbent with tight variance. The real A/B evaluator should find this "
+        "statistically significant and recommend promote."
+    ),
+    expected_decision="promote",
+    model_type="ncf_deal_manager",
+    ab_samples=ABSamples(
+        control_mean=0.567,
+        control_std=0.05,
+        treatment_mean=0.612,
+        treatment_std=0.05,
+        n_per_group=300,
+        primary_metric="deal_hit_rate",
+    ),
+)
+
+_CHALLENGER_LOSES_NCF = Scenario(
+    key="challenger_loses_ncf",
+    label="Challenger loses — reject",
+    loop=LOOP_GOVERNANCE,
+    description=(
+        "The NCF challenger's deal_hit_rate is meaningfully worse than the "
+        "incumbent's. The real A/B evaluator should recommend reject and the "
+        "incumbent stays in production."
+    ),
+    expected_decision="reject",
+    model_type="ncf_deal_manager",
+    ab_samples=ABSamples(
+        control_mean=0.567,
+        control_std=0.05,
+        treatment_mean=0.498,
+        treatment_std=0.05,
+        n_per_group=300,
+        primary_metric="deal_hit_rate",
+    ),
+)
+
+_INCONCLUSIVE_NCF = Scenario(
+    key="inconclusive_ncf",
+    label="Too close to call — extend",
+    loop=LOOP_GOVERNANCE,
+    description=(
+        "The NCF challenger and incumbent perform almost identically on "
+        "deal_hit_rate. With no significant difference, the real evaluator "
+        "should recommend extend (keep testing) rather than promote or reject."
+    ),
+    expected_decision="extend",
+    model_type="ncf_deal_manager",
+    ab_samples=ABSamples(
+        control_mean=0.567,
+        control_std=0.05,
+        treatment_mean=0.552,
+        treatment_std=0.05,
+        n_per_group=120,
+        primary_metric="deal_hit_rate",
     ),
 )
 
@@ -342,6 +529,9 @@ _ALL_SCENARIOS: tuple[Scenario, ...] = (
     _CHALLENGER_WINS,
     _CHALLENGER_LOSES,
     _INCONCLUSIVE,
+    _CHALLENGER_WINS_NCF,
+    _CHALLENGER_LOSES_NCF,
+    _INCONCLUSIVE_NCF,
 )
 
 SCENARIOS: dict[str, Scenario] = {s.key: s for s in _ALL_SCENARIOS}

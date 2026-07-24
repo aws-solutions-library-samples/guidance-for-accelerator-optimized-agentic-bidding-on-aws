@@ -1,11 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  EventBridge rules for Model Governance Agent and Bid Shading Agent AgentCore Runtimes.
-  - EventBridge rule on ModelPackageGroupChanged -> Governance Agent Runtime (AWS_IAM auth)
-  - EventBridge Scheduler for Bid Shading Agent (every 5 minutes)
-  - IAM roles with least-privilege for EventBridge to invoke AgentCore runtimes
-  - Resource-based policies restricted to specific EventBridge rule ARNs (no wildcard principals)
-  Requirements: 4.1, 11.1, 11.3, 11.6, 10.4
+  Invocation paths for the closed-loop AgentCore runtimes. EventBridge Rules and
+  Scheduler cannot target AgentCore runtimes directly, so both go through a Lambda
+  that calls bedrock-agentcore:InvokeAgentRuntime:
+    - EventBridge Scheduler (every 5 min) -> Adaptive Bidding invoker Lambda -> runtime
+    - EventBridge Rule (ModelPackageGroupChanged) -> Governance shim Lambda -> runtime
+  Each Lambda's role is scoped to invoke only its specific runtime ARN. No Lambda
+  Function URLs and no wildcard resource policies.
+  Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 7.1, 11.1, 11.3, 11.6
 
 # =============================================================================
 # Parameters
@@ -16,17 +18,20 @@ Parameters:
     Default: artf
     Description: Prefix for resource names
 
-  GovernanceAgentRuntimeArn:
+  AdaptiveBiddingAgentRuntimeArn:
     Type: String
     Description: >-
-      ARN of the deployed Model Governance Agent AgentCore Runtime endpoint.
-      Format: arn:aws:bedrock-agentcore:<region>:<account>:agent-runtime/<id>
+      ARN of the deployed Adaptive Bidding Strategy Agent AgentCore Runtime.
 
-  BidShadingAgentRuntimeArn:
+  ModelPromotionGovernanceAgentRuntimeArn:
     Type: String
     Description: >-
-      ARN of the deployed Bid Shading Strategy Agent AgentCore Runtime endpoint.
-      Format: arn:aws:bedrock-agentcore:<region>:<account>:agent-runtime/<id>
+      ARN of the deployed Model Promotion Governance Agent AgentCore Runtime.
+
+  AdaptiveBiddingScheduleRate:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: EventBridge Scheduler rate expression for the Adaptive Bidding Agent
 
   GovernanceAgentMaxLifetimeHours:
     Type: Number
@@ -34,112 +39,133 @@ Parameters:
     MinValue: 1
     MaxValue: 8
     Description: >-
-      Maximum session lifetime for the Governance Agent in hours.
-      Must be sufficient to cover a full A/B test window (up to 8h).
+      Max session lifetime hint for the Governance Agent, forwarded in the invocation
+      payload. Must cover a full A/B test window (up to 8h).
 
-  BidShadingScheduleRate:
-    Type: String
-    Default: 'rate(5 minutes)'
-    Description: EventBridge Scheduler rate expression for the Bid Shading Agent
-
-  ManualOverrideRoleArn:
+  SageMakerTrainingExecutionRoleArn:
     Type: String
     Default: ''
     Description: >-
-      ARN of the IAM role permitted to manually approve/reject models.
-      Must have governance:ApproveModel permission.
+      ARN of the SageMaker training execution role (from closed_loop_cfn.yaml's
+      SageMakerTrainingExecutionRoleArn output). Passed as RoleArn in
+      CreateTrainingJob. If empty, the scheduled-retraining resources are not
+      created (Condition: HasRetrainingConfig).
+
+  ModelBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Triton model-repository S3 bucket. Training job output is written under
+      models/<model_type>/<job_name>/ here.
+
+  TrainingDataBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 bucket holding Glue-labeled training data (from glue_etl_cfn.yaml).
+
+  TrainingImageRegistry:
+    Type: String
+    Default: ''
+    Description: >-
+      ECR registry host (<account>.dkr.ecr.<region>.amazonaws.com) for the
+      NeMo-RL training container. Leave empty to skip scheduled retraining.
+
+  DLRMModelPackageGroupName:
+    Type: String
+    Default: ''
+    Description: SageMaker Model Package Group name for dlrm_bid_shader.
+
+  NCFModelPackageGroupName:
+    Type: String
+    Default: ''
+    Description: SageMaker Model Package Group name for ncf_deal_manager.
+
+  RetrainingScheduleRate:
+    Type: String
+    Default: 'rate(6 hours)'
+    Description: EventBridge Scheduler rate expression for scheduled retraining.
+
+Conditions:
+  HasRetrainingConfig: !And
+    - !Not [!Equals [!Ref SageMakerTrainingExecutionRoleArn, '']]
+    - !Not [!Equals [!Ref ModelBucketName, '']]
+    - !Not [!Equals [!Ref TrainingDataBucketName, '']]
+    - !Not [!Equals [!Ref TrainingImageRegistry, '']]
+    - !Not [!Equals [!Ref DLRMModelPackageGroupName, '']]
+    - !Not [!Equals [!Ref NCFModelPackageGroupName, '']]
 
 # =============================================================================
 # Resources
 # =============================================================================
 Resources:
 
-  # ---------------------------------------------------------------------------
-  # EventBridge Rule: ModelPackageGroupChanged -> Governance Agent Runtime
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Adaptive Bidding: EventBridge Scheduler -> Lambda -> InvokeAgentRuntime
+  # ===========================================================================
 
-  GovernanceEventRule:
-    Type: AWS::Events::Rule
+  AdaptiveBiddingInvokerFunction:
+    Type: AWS::Lambda::Function
     Properties:
-      Name: !Sub '${StackPrefix}-governance-model-registered'
-      Description: >-
-        Routes ModelPackageGroupChanged events from the training pipeline to
-        the Model Governance Agent AgentCore Runtime for validation.
-      State: ENABLED
-      EventPattern:
-        source:
-          - 'artf.training-pipeline'
-        detail-type:
-          - 'ModelPackageGroupChanged'
-      Targets:
-        - Id: GovernanceAgentTarget
-          Arn: !Ref GovernanceAgentRuntimeArn
-          RoleArn: !GetAtt GovernanceEventRuleRole.Arn
-          InputTransformer:
-            InputPathsMap:
-              modelType: '$.detail.ModelType'
-              modelPackageArn: '$.detail.ModelPackageArn'
-              modelPackageGroupName: '$.detail.ModelPackageGroupName'
-            InputTemplate: |
-              {
-                "detail": {
-                  "ModelType": <modelType>,
-                  "ModelPackageArn": <modelPackageArn>,
-                  "ModelPackageGroupName": <modelPackageGroupName>
-                },
-                "max_lifetime_hours": ${GovernanceAgentMaxLifetimeHours}
-              }
+      FunctionName: !Sub '${StackPrefix}-adaptive-bidding-invoker'
+      Description: Invokes the Adaptive Bidding Strategy Agent runtime (from Scheduler).
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt AdaptiveBiddingInvokerRole.Arn
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AdaptiveBiddingAgentRuntimeArn
+          AWS_REGION_NAME: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import boto3, json, os, time
 
-  # IAM Role for EventBridge to invoke the Governance Agent Runtime (AWS_IAM auth)
-  GovernanceEventRuleRole:
+          def handler(event, context):
+              client = boto3.client('bedrock-agentcore',
+                  region_name=os.environ.get('AWS_REGION_NAME', 'us-east-1'))
+              arn = os.environ['AGENT_RUNTIME_ARN']
+              session_id = f"sched-{int(time.time() * 1000)}-{context.aws_request_id}"
+              resp = client.invoke_agent_runtime(
+                  agentRuntimeArn=arn,
+                  runtimeSessionId=session_id,
+                  payload=json.dumps(event).encode('utf-8'),
+                  contentType='application/json',
+                  qualifier='DEFAULT',
+              )
+              body = resp['response'].read()
+              return json.loads(body) if body else {'status': 'empty_response'}
+
+  AdaptiveBiddingInvokerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${StackPrefix}-eventbridge-invoke-governance'
+      RoleName: !Sub '${StackPrefix}-adaptive-bidding-invoker-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: events.amazonaws.com
+              Service: lambda.amazonaws.com
             Action: 'sts:AssumeRole'
-            Condition:
-              ArnEquals:
-                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${StackPrefix}-governance-model-registered'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
-        - PolicyName: InvokeGovernanceAgentRuntime
+        - PolicyName: InvokeAdaptiveBiddingRuntime
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - 'bedrock-agentcore:InvokeAgentRuntime'
-                Resource: !Ref GovernanceAgentRuntimeArn
+                Resource:
+                  - !Ref AdaptiveBiddingAgentRuntimeArn
+                  - !Sub '${AdaptiveBiddingAgentRuntimeArn}/*'
 
-  # ---------------------------------------------------------------------------
-  # EventBridge Scheduler: Bid Shading Agent (every 5 minutes)
-  # ---------------------------------------------------------------------------
-
-  BidShadingSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: !Sub '${StackPrefix}-bid-shading-scheduler'
-      Description: >-
-        Invokes the Bid Shading Strategy Agent AgentCore Runtime every 5 minutes
-        to evaluate market conditions and adjust bidding parameters.
-      ScheduleExpression: !Ref BidShadingScheduleRate
-      FlexibleTimeWindow:
-        Mode: 'OFF'
-      State: ENABLED
-      Target:
-        Arn: !Ref BidShadingAgentRuntimeArn
-        RoleArn: !GetAtt BidShadingSchedulerRole.Arn
-        Input: '{"source": "eventbridge-scheduler", "schedule": "rate(5 minutes)"}'
-
-  # IAM Role for EventBridge Scheduler to invoke the Bid Shading Agent Runtime
-  BidShadingSchedulerRole:
+  AdaptiveBiddingSchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${StackPrefix}-scheduler-invoke-bid-shading'
+      RoleName: !Sub '${StackPrefix}-scheduler-invoke-adaptive-bidding'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -148,71 +174,582 @@ Resources:
               Service: scheduler.amazonaws.com
             Action: 'sts:AssumeRole'
             Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
               ArnEquals:
-                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${StackPrefix}-bid-shading-scheduler'
+                # Scheduler presents the schedule-GROUP ARN as aws:SourceArn (not the
+                # schedule ARN). The schedule below is in the 'default' group.
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default'
       Policies:
-        - PolicyName: InvokeBidShadingAgentRuntime
+        - PolicyName: InvokeAdaptiveBiddingLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt AdaptiveBiddingInvokerFunction.Arn
+
+  AdaptiveBiddingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${StackPrefix}-adaptive-bidding-scheduler'
+      Description: Invokes the Adaptive Bidding Strategy Agent every 5 minutes via Lambda.
+      ScheduleExpression: !Ref AdaptiveBiddingScheduleRate
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt AdaptiveBiddingInvokerFunction.Arn
+        RoleArn: !GetAtt AdaptiveBiddingSchedulerRole.Arn
+        Input: '{"source": "eventbridge-scheduler", "action": "evaluate_and_adjust"}'
+
+  # ===========================================================================
+  # Governance: EventBridge Rule (ModelPackageGroupChanged) -> shim Lambda -> runtime
+  #
+  # EventBridge Rules cannot target AgentCore directly; the shim forwards the event
+  # detail unchanged to the Governance Agent runtime.
+  # ===========================================================================
+
+  GovernanceInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-governance-invoker'
+      Description: >-
+        Invocation shim: forwards ModelPackageGroupChanged events to the Model Promotion
+        Governance Agent runtime via InvokeAgentRuntime.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 128
+      Role: !GetAtt GovernanceInvokerRole.Arn
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref ModelPromotionGovernanceAgentRuntimeArn
+          AWS_REGION_NAME: !Ref 'AWS::Region'
+          MAX_LIFETIME_HOURS: !Ref GovernanceAgentMaxLifetimeHours
+      Code:
+        ZipFile: |
+          import boto3, json, os, time
+
+          def handler(event, context):
+              # Forward the EventBridge event unchanged; the runtime reads event["detail"].
+              client = boto3.client('bedrock-agentcore',
+                  region_name=os.environ.get('AWS_REGION_NAME', 'us-east-1'))
+              arn = os.environ['AGENT_RUNTIME_ARN']
+              session_id = f"gov-{int(time.time() * 1000)}-{context.aws_request_id}"
+              payload = dict(event) if isinstance(event, dict) else {"detail": {}}
+              payload.setdefault("max_lifetime_hours", os.environ.get("MAX_LIFETIME_HOURS"))
+              try:
+                  resp = client.invoke_agent_runtime(
+                      agentRuntimeArn=arn,
+                      runtimeSessionId=session_id,
+                      payload=json.dumps(payload).encode('utf-8'),
+                      contentType='application/json',
+                      qualifier='DEFAULT',
+                  )
+                  body = resp['response'].read()
+                  return json.loads(body) if body else {'status': 'empty_response'}
+              except Exception as exc:
+                  # Surface the failure honestly via metrics + re-raise for EventBridge retry/DLQ.
+                  cw = boto3.client('cloudwatch', region_name=os.environ.get('AWS_REGION_NAME', 'us-east-1'))
+                  cw.put_metric_data(Namespace='ARTF/Governance', MetricData=[{
+                      'MetricName': 'InvocationError', 'Value': 1.0, 'Unit': 'Count'}])
+                  raise
+
+  GovernanceInvokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-governance-invoker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: InvokeGovernanceRuntime
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - 'bedrock-agentcore:InvokeAgentRuntime'
-                Resource: !Ref BidShadingAgentRuntimeArn
+                Resource:
+                  - !Ref ModelPromotionGovernanceAgentRuntimeArn
+                  - !Sub '${ModelPromotionGovernanceAgentRuntimeArn}/*'
+        - PolicyName: EmitGovernanceMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'ARTF/Governance'
 
-  # ---------------------------------------------------------------------------
-  # IAM Policy: Manual Override requires governance:ApproveModel permission
-  # ---------------------------------------------------------------------------
-
-  ManualOverridePolicy:
-    Type: AWS::IAM::ManagedPolicy
+  GovernanceEventRule:
+    Type: AWS::Events::Rule
     Properties:
-      ManagedPolicyName: !Sub '${StackPrefix}-governance-manual-override'
+      Name: !Sub '${StackPrefix}-governance-model-registered'
       Description: >-
-        Grants the governance:ApproveModel permission required for manual
-        model promotion or rejection overrides. Attach to operator roles.
-      PolicyDocument:
+        Routes ModelPackageGroupChanged events from the training pipeline to the
+        Governance invoker Lambda, which invokes the Governance Agent runtime.
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'artf.training-pipeline'
+        detail-type:
+          - 'ModelPackageGroupChanged'
+      Targets:
+        - Id: GovernanceInvokerTarget
+          Arn: !GetAtt GovernanceInvokerFunction.Arn
+
+  GovernanceInvokerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GovernanceInvokerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GovernanceEventRule.Arn
+
+  # ===========================================================================
+  # Scheduled Retraining: EventBridge Scheduler -> Trigger Lambda -> CreateTrainingJob
+  #                        -> [SageMaker runs the job] -> EventBridge Rule (state
+  #                        change: Completed) -> Registration Lambda -> CreateModelPackage
+  #                        -> PutEvents ModelPackageGroupChanged -> GovernanceEventRule
+  #                        (already deployed above, unchanged).
+  #
+  # A Lambda cannot poll a training job to completion (jobs run far past the 15-min
+  # Lambda limit), so this is split at the async boundary SageMaker already provides:
+  # the "SageMaker Training Job State Change" EventBridge event. See
+  # aidlc-docs/construction/closed-loop-retraining-wiring/design.md.
+  # ===========================================================================
+
+  RetrainingTriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasRetrainingConfig
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-retraining-trigger'
+      Description: >-
+        Scheduled (6h default): resolves the latest Approved model version per
+        model type and starts a SageMaker training job (fire-and-forget, no polling).
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt RetrainingTriggerFunctionRole.Arn
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref 'AWS::Region'
+          SAGEMAKER_ROLE_ARN: !Ref SageMakerTrainingExecutionRoleArn
+          MODEL_BUCKET: !Ref ModelBucketName
+          TRAINING_DATA_BUCKET: !Ref TrainingDataBucketName
+          TRAINING_IMAGE_REGISTRY: !Ref TrainingImageRegistry
+          DLRM_PACKAGE_GROUP: !Ref DLRMModelPackageGroupName
+          NCF_PACKAGE_GROUP: !Ref NCFModelPackageGroupName
+      Code:
+        ZipFile: |
+          import boto3, json, os, time, uuid
+
+          # model_type -> (Model Package Group env var, training image tag)
+          _MODEL_TYPES = [
+              ("dlrm_bid_shader", "DLRM_PACKAGE_GROUP", "dlrm"),
+              ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf"),
+          ]
+
+          def _latest_approved_version(sm, package_group):
+              # Newest first: SortBy=CreationTime, SortOrder=Descending.
+              resp = sm.list_model_packages(
+                  ModelPackageGroupName=package_group,
+                  ModelApprovalStatus='Approved',
+                  SortBy='CreationTime',
+                  SortOrder='Descending',
+                  MaxResults=1,
+              )
+              packages = resp.get('ModelPackageSummaryList', [])
+              if not packages:
+                  return None
+              return packages[0]['ModelPackageArn']
+
+          def handler(event, context):
+              region = os.environ.get('AWS_REGION_NAME', 'us-east-1')
+              sm = boto3.client('sagemaker', region_name=region)
+              role_arn = os.environ['SAGEMAKER_ROLE_ARN']
+              model_bucket = os.environ['MODEL_BUCKET']
+              training_data_bucket = os.environ['TRAINING_DATA_BUCKET']
+              registry = os.environ['TRAINING_IMAGE_REGISTRY']
+
+              started = {}
+              skipped = {}
+              for model_type, group_env, image_tag in _MODEL_TYPES:
+                  package_group = os.environ[group_env]
+                  base_version = _latest_approved_version(sm, package_group)
+                  if not base_version:
+                      # Honest skip: no Approved version yet (genesis registration
+                      # has not run, or was not configured). Do not fabricate a
+                      # base_model_version.
+                      skipped[model_type] = 'no_approved_version'
+                      continue
+
+                  job_name = f"{model_type}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                  training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
+                  output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
+
+                  sm.create_training_job(
+                      TrainingJobName=job_name,
+                      AlgorithmSpecification={
+                          'TrainingImage': training_image,
+                          'TrainingInputMode': 'File',
+                      },
+                      RoleArn=role_arn,
+                      InputDataConfig=[{
+                          'ChannelName': 'training',
+                          'DataSource': {'S3DataSource': {
+                              'S3DataType': 'S3Prefix',
+                              'S3Uri': f"s3://{training_data_bucket}/training-data/",
+                              'S3DataDistributionType': 'FullyReplicated',
+                          }},
+                          'ContentType': 'application/x-parquet',
+                      }],
+                      OutputDataConfig={'S3OutputPath': output_path},
+                      ResourceConfig={
+                          'InstanceType': 'ml.g5.2xlarge',
+                          'InstanceCount': 1,
+                          'VolumeSizeInGB': 100,
+                      },
+                      StoppingCondition={'MaxRuntimeInSeconds': 14400},
+                      HyperParameters={
+                          'model_type': model_type,
+                          'base_model_version': base_version,
+                          'window_days': '7',
+                          'cadence_hours': '6.0',
+                      },
+                  )
+                  started[model_type] = job_name
+
+              return {'started': started, 'skipped': skipped}
+
+  RetrainingTriggerFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasRetrainingConfig
+    Properties:
+      RoleName: !Sub '${StackPrefix}-retraining-trigger-role'
+      AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowManualModelApproval
-            Effect: Allow
-            Action:
-              - 'governance:ApproveModel'
-            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: StartTrainingJobs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CreateTrainingJob'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm_bid_shader-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf_deal_manager-*'
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:ListModelPackages'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DLRMModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !Ref SageMakerTrainingExecutionRoleArn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'sagemaker.amazonaws.com'
+
+  RetrainingSchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: HasRetrainingConfig
+    Properties:
+      RoleName: !Sub '${StackPrefix}-scheduler-invoke-retraining-trigger'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: 'sts:AssumeRole'
             Condition:
               StringEquals:
-                'aws:PrincipalTag/governance-role': 'approver'
-          - Sid: AllowSageMakerRegistryUpdate
-            Effect: Allow
-            Action:
-              - 'sagemaker:UpdateModelPackage'
-            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/*'
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnEquals:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default'
+      Policies:
+        - PolicyName: InvokeRetrainingTriggerLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt RetrainingTriggerFunction.Arn
+
+  RetrainingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: HasRetrainingConfig
+    Properties:
+      Name: !Sub '${StackPrefix}-retraining-scheduler'
+      Description: Triggers scheduled model retraining (SageMaker CreateTrainingJob) via Lambda.
+      ScheduleExpression: !Ref RetrainingScheduleRate
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt RetrainingTriggerFunction.Arn
+        RoleArn: !GetAtt RetrainingSchedulerRole.Arn
+        Input: '{"source": "eventbridge-scheduler", "action": "trigger_retraining"}'
+
+  # ---------------------------------------------------------------------------
+  # Registration Lambda: fired on SageMaker Training Job State Change (Completed),
+  # for training jobs matching our naming convention. Registers the trained model
+  # and emits ModelPackageGroupChanged so the existing GovernanceEventRule fires.
+  # ---------------------------------------------------------------------------
+
+  RetrainingRegistrationFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasRetrainingConfig
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-retraining-registration'
+      Description: >-
+        Fired when a scheduled retraining job completes: registers the trained
+        model in the Model Registry and emits ModelPackageGroupChanged.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt RetrainingRegistrationFunctionRole.Arn
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref 'AWS::Region'
+          TRAINING_IMAGE_REGISTRY: !Ref TrainingImageRegistry
+          DLRM_PACKAGE_GROUP: !Ref DLRMModelPackageGroupName
+          NCF_PACKAGE_GROUP: !Ref NCFModelPackageGroupName
+      Code:
+        ZipFile: |
+          import boto3, json, os
+
+          _PACKAGE_GROUP_BY_PREFIX = {
+              'dlrm_bid_shader-': ('DLRM_PACKAGE_GROUP', 'dlrm'),
+              'ncf_deal_manager-': ('NCF_PACKAGE_GROUP', 'ncf'),
+          }
+
+          def _resolve_model_type(job_name):
+              for prefix, cfg in _PACKAGE_GROUP_BY_PREFIX.items():
+                  if job_name.startswith(prefix):
+                      return prefix.rstrip('-'), cfg
+              return None, None
+
+          def handler(event, context):
+              region = os.environ.get('AWS_REGION_NAME', 'us-east-1')
+              detail = event.get('detail', {})
+              job_name = detail.get('TrainingJobName', '')
+              status = detail.get('TrainingJobStatus', '')
+
+              if status != 'Completed':
+                  # This Lambda's EventBridge Rule already filters to Completed,
+                  # but guard here too in case of a future pattern change.
+                  return {'status': 'ignored', 'reason': f'status={status}'}
+
+              model_type, cfg = _resolve_model_type(job_name)
+              if model_type is None:
+                  return {'status': 'ignored', 'reason': f'unrecognized job name {job_name}'}
+              group_env, image_tag = cfg
+              package_group = os.environ[group_env]
+              registry = os.environ['TRAINING_IMAGE_REGISTRY']
+
+              sm = boto3.client('sagemaker', region_name=region)
+              job = sm.describe_training_job(TrainingJobName=job_name)
+
+              model_artifact_uri = job.get('ModelArtifacts', {}).get('S3ModelArtifacts', '')
+              metrics = {
+                  m['MetricName']: m['Value']
+                  for m in job.get('FinalMetricDataList', [])
+                  if 'MetricName' in m and 'Value' in m
+              }
+              hyperparams = job.get('HyperParameters', {})
+
+              customer_metadata = {
+                  'training_job_name': job_name,
+                  'model_artifact_uri': model_artifact_uri,
+                  'base_model_version': hyperparams.get('base_model_version', ''),
+                  'window_days': hyperparams.get('window_days', ''),
+              }
+              for metric_name, value in metrics.items():
+                  customer_metadata[f'metric_{metric_name}'] = str(value)
+
+              training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
+
+              response = sm.create_model_package(
+                  ModelPackageGroupName=package_group,
+                  ModelPackageDescription=f"Model trained by job {job_name} for {model_type}",
+                  InferenceSpecification={
+                      'Containers': [{
+                          'Image': training_image,
+                          'ModelDataUrl': model_artifact_uri,
+                      }],
+                      'SupportedContentTypes': ['application/octet-stream'],
+                      'SupportedResponseMIMETypes': ['application/octet-stream'],
+                      'SupportedRealtimeInferenceInstanceTypes': ['ml.g5.xlarge', 'ml.p4d.24xlarge'],
+                  },
+                  ModelApprovalStatus='PendingManualApproval',
+                  CustomerMetadataProperties=customer_metadata,
+              )
+              model_package_arn = response['ModelPackageArn']
+
+              events_client = boto3.client('events', region_name=region)
+              events_client.put_events(Entries=[{
+                  'Source': 'artf.training-pipeline',
+                  'DetailType': 'ModelPackageGroupChanged',
+                  'Detail': json.dumps({
+                      'ModelPackageGroupName': package_group,
+                      'ModelPackageArn': model_package_arn,
+                      'ModelType': model_type,
+                  }),
+                  'Resources': [model_package_arn],
+              }])
+
+              return {'status': 'registered', 'model_package_arn': model_package_arn}
+
+  RetrainingRegistrationFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasRetrainingConfig
+    Properties:
+      RoleName: !Sub '${StackPrefix}-retraining-registration-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DescribeAndRegisterTrainedModels
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeTrainingJob'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm_bid_shader-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf_deal_manager-*'
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CreateModelPackage'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DLRMModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${NCFModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DLRMModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
+        - PolicyName: EmitModelPackageGroupChanged
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+
+  RetrainingCompletedEventRule:
+    Type: AWS::Events::Rule
+    Condition: HasRetrainingConfig
+    Properties:
+      Name: !Sub '${StackPrefix}-retraining-job-completed'
+      Description: >-
+        Routes completed scheduled-retraining SageMaker training jobs (matching our
+        job-naming convention) to the registration Lambda.
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'aws.sagemaker'
+        'detail-type':
+          - 'SageMaker Training Job State Change'
+        detail:
+          TrainingJobStatus:
+            - 'Completed'
+          TrainingJobName:
+            - prefix: 'dlrm_bid_shader-'
+            - prefix: 'ncf_deal_manager-'
+      Targets:
+        - Id: RetrainingRegistrationTarget
+          Arn: !GetAtt RetrainingRegistrationFunction.Arn
+
+  RetrainingRegistrationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasRetrainingConfig
+    Properties:
+      FunctionName: !Ref RetrainingRegistrationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RetrainingCompletedEventRule.Arn
 
 # =============================================================================
 # Outputs
 # =============================================================================
 Outputs:
+  AdaptiveBiddingScheduleArn:
+    Description: ARN of the EventBridge Scheduler for the Adaptive Bidding Agent
+    Value: !GetAtt AdaptiveBiddingSchedule.Arn
+
+  AdaptiveBiddingInvokerFunctionArn:
+    Description: ARN of the Adaptive Bidding invoker Lambda
+    Value: !GetAtt AdaptiveBiddingInvokerFunction.Arn
 
   GovernanceEventRuleArn:
-    Description: ARN of the EventBridge rule that invokes the Governance Agent
+    Description: ARN of the EventBridge rule that routes model-registration events
     Value: !GetAtt GovernanceEventRule.Arn
-    Export:
-      Name: !Sub '${StackPrefix}-governance-event-rule-arn'
 
-  GovernanceEventRuleRoleArn:
-    Description: ARN of the IAM role for EventBridge to invoke Governance Agent
-    Value: !GetAtt GovernanceEventRuleRole.Arn
+  GovernanceInvokerFunctionArn:
+    Description: ARN of the Governance invoker (shim) Lambda
+    Value: !GetAtt GovernanceInvokerFunction.Arn
 
-  BidShadingScheduleArn:
-    Description: ARN of the EventBridge Scheduler for the Bid Shading Agent
-    Value: !GetAtt BidShadingSchedule.Arn
-    Export:
-      Name: !Sub '${StackPrefix}-bid-shading-schedule-arn'
+  RetrainingScheduleArn:
+    Description: >-
+      ARN of the EventBridge Scheduler for scheduled retraining (empty if
+      HasRetrainingConfig is false - see the Parameters required above).
+    Value: !If
+      - HasRetrainingConfig
+      - !GetAtt RetrainingSchedule.Arn
+      - ''
 
-  BidShadingSchedulerRoleArn:
-    Description: ARN of the IAM role for the Bid Shading Scheduler
-    Value: !GetAtt BidShadingSchedulerRole.Arn
+  RetrainingTriggerFunctionArn:
+    Description: ARN of the retraining trigger Lambda (empty if not configured)
+    Value: !If
+      - HasRetrainingConfig
+      - !GetAtt RetrainingTriggerFunction.Arn
+      - ''
 
-  ManualOverridePolicyArn:
-    Description: ARN of the managed policy for manual governance overrides
-    Value: !Ref ManualOverridePolicy
+  RetrainingCompletedEventRuleArn:
+    Description: ARN of the EventBridge rule routing completed training jobs (empty if not configured)
+    Value: !If
+      - HasRetrainingConfig
+      - !GetAtt RetrainingCompletedEventRule.Arn
+      - ''
+
+  RetrainingRegistrationFunctionArn:
+    Description: ARN of the retraining registration Lambda (empty if not configured)
+    Value: !If
+      - HasRetrainingConfig
+      - !GetAtt RetrainingRegistrationFunction.Arn
+      - ''

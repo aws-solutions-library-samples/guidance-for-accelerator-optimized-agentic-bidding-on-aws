@@ -22,8 +22,8 @@ import hypothesis.strategies as st
 
 from shared.feedback_models import BidOutcomeRecord
 from training.reward import compute_rl_reward
-from agents.bid_shading.agent import (
-    BidShadingStrategyAgent,
+from agents.adaptive_bidding.agent import (
+    AdaptiveBiddingStrategyAgent,
     MarketState,
     ParameterUpdate,
 )
@@ -217,7 +217,7 @@ class TestParameterBoundsProperty:
             "conversion_value": _MockParameterState(conversion_value),
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=None,
             cloudwatch_client=None,
             config={"target_win_rate": 0.35, "win_rate_tolerance": 0.05,
@@ -252,7 +252,7 @@ class TestParameterBoundsProperty:
             "conversion_value": _MockParameterState(conversion_value),
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=None,
             cloudwatch_client=None,
             config={"target_win_rate": 0.35, "win_rate_tolerance": 0.05,
@@ -287,7 +287,7 @@ class TestParameterBoundsProperty:
             "conversion_value": _MockParameterState(conversion_value),
         }
 
-        agent = BidShadingStrategyAgent(
+        agent = AdaptiveBiddingStrategyAgent(
             parameter_store=None,
             cloudwatch_client=None,
             config={"target_win_rate": 0.35, "win_rate_tolerance": 0.05,

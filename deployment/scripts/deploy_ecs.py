@@ -303,6 +303,67 @@ def deploy(*, stack_name: str, region: str, account_id: str, image_tag: str) -> 
         "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess",
     ])
 
+    # Closed-loop (Part 2) permissions for the orchestrator task role. Applied
+    # idempotently as an inline policy (put_role_policy overwrites), scoped by
+    # name/ARN patterns so it holds whether or not a stack prefix is used.
+    _closed_loop_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "EmitBidOutcomeMetrics",
+                "Effect": "Allow",
+                "Action": ["cloudwatch:PutMetricData"],
+                "Resource": "*",
+                "Condition": {"StringLike": {"cloudwatch:namespace": ["ARTF/*"]}},
+            },
+            {
+                "Sid": "ReadMetrics",
+                "Effect": "Allow",
+                "Action": ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics"],
+                "Resource": "*",
+            },
+            {
+                "Sid": "ParameterStoreAndAudit",
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem",
+                    "dynamodb:BatchGetItem", "dynamodb:DescribeTable",
+                ],
+                "Resource": [
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/parameter-store",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/audit-trail",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/*-parameter-store",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/*-audit-trail",
+                ],
+            },
+            {
+                "Sid": "ModelRegistryRead",
+                "Effect": "Allow",
+                "Action": ["sagemaker:ListModelPackages", "sagemaker:DescribeModelPackage"],
+                "Resource": [
+                    f"arn:aws:sagemaker:{region}:{account_id}:model-package-group/*artf-*",
+                    f"arn:aws:sagemaker:{region}:{account_id}:model-package/*artf-*/*",
+                ],
+            },
+            {
+                "Sid": "KmsForDynamoDb",
+                "Effect": "Allow",
+                "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+                "Resource": "*",
+                "Condition": {"StringEquals": {"kms:ViaService": [f"dynamodb.{region}.amazonaws.com"]}},
+            },
+        ],
+    }
+    try:
+        iam.put_role_policy(
+            RoleName=task_role_name,
+            PolicyName="closed-loop-access",
+            PolicyDocument=json.dumps(_closed_loop_policy),
+        )
+        _LOG.info("Attached closed-loop inline policy to %s", task_role_name)
+    except ClientError as exc:
+        _LOG.warning("Could not attach closed-loop policy to %s: %s", task_role_name, exc)
+
     # -----------------------------------------------------------------
     # Log group
     # -----------------------------------------------------------------
@@ -383,6 +444,12 @@ def deploy(*, stack_name: str, region: str, account_id: str, image_tag: str) -> 
     _LOG.info("Registering task: %s", orch_family)
 
     orch_env = [{"name": k, "value": v} for k, v in container_urls.items()]
+    # Region + Part 2 closed-loop table names for the orchestrator's boto3 clients.
+    orch_env += [
+        {"name": "AWS_DEFAULT_REGION", "value": region},
+        {"name": "PARAMETER_STORE_TABLE", "value": "parameter-store"},
+        {"name": "AUDIT_TRAIL_TABLE", "value": "audit-trail"},
+    ]
     ecs.register_task_definition(
         family=orch_family,
         networkMode="awsvpc",

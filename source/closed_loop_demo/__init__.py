@@ -2,7 +2,7 @@
 
 This package is an explicit **demo data generator**. It produces *synthetic
 bid-outcome market data* and feeds it as **input** to the real closed-loop
-learning components (the Bid Shading Strategy Agent and the A/B evaluator).
+learning components (the Adaptive Bidding Strategy Agent and the A/B evaluator).
 
 Design contract (per the repo's no-fabricated-data rule):
 

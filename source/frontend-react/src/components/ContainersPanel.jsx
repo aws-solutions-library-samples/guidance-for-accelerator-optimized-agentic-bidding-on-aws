@@ -86,6 +86,17 @@ export default function ContainersPanel({ onClose }) {
         {/* Single GPU control for the whole node group */}
         <GpuControl />
 
+        {/* Topology note: the model containers run on CPU by default and call
+            Triton over the network, so they stay reachable even when the GPU is
+            stopped — "gpu offline" on a model row means Triton (GPU) is down, not
+            the container. Only Triton needs the GPU; the optimizer runs on-demand. */}
+        <div style={{ ...SUBTLE, margin: "0 0 12px", padding: "8px 10px", border: "1px solid var(--border)", borderRadius: "6px" }}>
+          The three model containers run on CPU and delegate inference to Triton. A
+          <strong> "gpu offline"</strong> badge means Triton (the GPU node) is stopped —
+          the container itself is still reachable. Only Triton holds a GPU; the Model
+          Optimizer runs as an on-demand Job.
+        </div>
+
         {/* Triton evidence */}
         {triton && (
           <div className="container-item" style={{ flexDirection: "column", alignItems: "stretch" }}>

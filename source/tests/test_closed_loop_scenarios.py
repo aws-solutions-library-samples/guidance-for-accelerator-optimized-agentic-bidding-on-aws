@@ -1,17 +1,23 @@
-"""Tests for the closed-loop demo scenario → decision mapping.
+"""Tests for the closed-loop demo scenario helpers (orchestrator data-plane).
 
-These verify that each controllable scenario drives the *specific* decision it
-claims, running the REAL Part 2 decision code:
+ARCHITECTURE: the real-time bidding orchestrator MUST NOT invoke the closed-loop
+agent runtimes. The browser invokes the Adaptive Bidding agent directly (SigV4).
+So these tests verify the orchestrator-side helpers only:
 
-- Agentic scenarios run through ``closed_loop_demo.invoker.run_agentic_decision``,
-  which builds the real ``BidShadingStrategyAgent`` and calls its real
-  ``evaluate_and_adjust``. Only the DynamoDB boundary is replaced by an
-  in-memory fake that mirrors the real ParameterStore semantics (bounds,
-  optimistic version, audit) — no decision logic is stubbed.
-- Governance scenarios run through the real ``ABEvaluator`` (Welch's t-test +
-  SPRT) via ``run_governance_decision``.
+- Agentic scenarios go through ``closed_loop_demo.invoker.prepare_agentic_context``,
+  which ensures the parameters exist, snapshots the current ("before") state, and
+  echoes the synthetic ``market_state`` emitted to CloudWatch. It performs **no**
+  agent invocation and returns **no** decision — the real decision + rationale come
+  from the direct browser -> AgentCore call. Only the DynamoDB boundary is replaced
+  by an in-memory fake mirroring the real ParameterStore semantics.
+- Governance scenarios go through the real ``ABEvaluator`` (Welch's t-test + SPRT)
+  via ``run_governance_decision`` — a pure statistical computation, not an agent
+  invocation.
 
-No fabricated results: assertions check the real computed decision.
+No fabricated results: assertions check the real snapshot / computed decision. The
+adaptive agent's own reasoning decision is intentionally NOT asserted here because
+it is produced by a Bedrock reasoning agent invoked directly by the browser (there
+is no deterministic formula to assert against, and the orchestrator never invokes it).
 """
 
 import os
@@ -133,6 +139,30 @@ def test_registry_has_expected_scenarios():
     keys = {s.key for s in list_scenarios()}
     assert {"underbidding", "overpaying", "healthy", "insufficient_data"} <= keys
     assert {"challenger_wins", "challenger_loses", "inconclusive"} <= keys
+    assert {"challenger_wins_ncf", "challenger_loses_ncf", "inconclusive_ncf"} <= keys
+
+
+def test_agentic_and_governance_loops_partitioned():
+    agentic = {s.key for s in list_scenarios(LOOP_AGENTIC)}
+    governance = {s.key for s in list_scenarios(LOOP_GOVERNANCE)}
+    assert agentic == {"underbidding", "overpaying", "healthy", "insufficient_data"}
+    assert governance == {
+        "challenger_wins", "challenger_loses", "inconclusive",
+        "challenger_wins_ncf", "challenger_loses_ncf", "inconclusive_ncf",
+    }
+    assert agentic.isdisjoint(governance)
+
+
+def test_governance_scenarios_cover_both_canary_models():
+    """Each governance outcome (promote/reject/extend) exists for both
+    GPU-accelerated, canary-routed models — DLRM and NCF — not just DLRM.
+    Selecting a model in the UI must actually change which real scenario runs.
+    """
+    governance = [s for s in list_scenarios(LOOP_GOVERNANCE)]
+    model_types = {s.model_type for s in governance}
+    assert model_types == {"dlrm_bid_shader", "ncf_deal_manager"}
+    ncf_scenarios = {s.key for s in governance if s.model_type == "ncf_deal_manager"}
+    assert ncf_scenarios == {"challenger_wins_ncf", "challenger_loses_ncf", "inconclusive_ncf"}
 
 
 def test_bid_metrics_derived_values():
@@ -147,67 +177,72 @@ def test_bid_metrics_derived_values():
 
 
 # ---------------------------------------------------------------------------
-# Agentic loop — real agent decision through the invoker
+# Agentic loop — orchestrator prepares context only (NO invocation, NO decision)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_underbidding_raises_shade_and_conversion():
+async def test_prepare_agentic_context_snapshots_before_without_invoking():
     store = FakeParameterStore()
-    result = await invoker.run_agentic_decision(get_scenario("underbidding"), store)
+    ctx = await invoker.prepare_agentic_context(get_scenario("underbidding"), store)
 
-    assert result["error"] is None
-    assert result["skipped"] is False
-    updates = {u["parameter_name"]: u for u in result["updates"]}
-    assert "shade_factor" in updates and updates["shade_factor"]["delta"] > 0
-    assert "conversion_value" in updates and updates["conversion_value"]["delta"] > 0
-    # Persisted state reflects the increase
-    assert result["after"]["shade_factor"]["current_value"] > result["before"]["shade_factor"]["current_value"]
+    # Loop + emitted synthetic market input echoed for the "before" side of the UI.
+    assert ctx["loop"] == LOOP_AGENTIC
+    assert ctx["scenario"] == "underbidding"
+    assert ctx["market_state"]["win_rate"] == pytest.approx(0.20)
+    assert ctx["market_state"]["roi"] == pytest.approx(0.50)
+
+    # Parameters were ensured and snapshotted at their initial versions.
+    before = ctx["before"]
+    assert set(before) == {"shade_factor", "conversion_value"}
+    assert before["shade_factor"]["version"] == 0
+    assert before["conversion_value"]["version"] == 0
 
 
 @pytest.mark.asyncio
-async def test_overpaying_lowers_shade_and_conversion():
-    store = FakeParameterStore()
-    result = await invoker.run_agentic_decision(get_scenario("overpaying"), store)
+async def test_prepare_agentic_context_does_not_invoke_or_decide():
+    """The orchestrator path must never invoke the agent or return a decision.
 
-    assert result["error"] is None
-    assert result["skipped"] is False
-    updates = {u["parameter_name"]: u for u in result["updates"]}
-    assert updates["shade_factor"]["delta"] < 0
-    assert updates["conversion_value"]["delta"] < 0
+    Absence of these keys is the contract that keeps the EKS orchestrator out of the
+    agent-invocation path (FR-6): the real decision comes from the browser-direct
+    SigV4 call, not from here.
+    """
+    store = FakeParameterStore()
+    ctx = await invoker.prepare_agentic_context(get_scenario("overpaying"), store)
+
+    assert ctx["invocation"] == "browser-direct-agentcore"
+    for decision_key in ("updates", "rationale", "recommendation", "decision", "after"):
+        assert decision_key not in ctx
+    # No parameter writes happened (no invocation) — only the idempotent init.
+    assert store.audit == []
 
 
 @pytest.mark.asyncio
-async def test_healthy_makes_no_change():
+async def test_prepare_agentic_context_is_idempotent_and_non_mutating():
     store = FakeParameterStore()
-    result = await invoker.run_agentic_decision(get_scenario("healthy"), store)
+    first = await invoker.prepare_agentic_context(get_scenario("healthy"), store)
+    # Re-running must not raise (params already initialized) and must not change state.
+    second = await invoker.prepare_agentic_context(get_scenario("healthy"), store)
 
-    assert result["error"] is None
-    assert result["skipped"] is True
-    assert result["updates"] == []
+    assert first["before"] == second["before"]
+    assert first["before"]["shade_factor"]["version"] == 0
+    assert store.audit == []
 
 
 @pytest.mark.asyncio
-async def test_insufficient_data_skips():
+async def test_prepare_agentic_context_handles_thin_data_scenario():
+    """The thin-data scenario carries real (small) metrics; the orchestrator still
+    only snapshots — it does not apply any min-samples guard (that reasoning now
+    lives in the agent, invoked directly by the browser)."""
     store = FakeParameterStore()
-    result = await invoker.run_agentic_decision(get_scenario("insufficient_data"), store)
+    ctx = await invoker.prepare_agentic_context(get_scenario("insufficient_data"), store)
 
-    assert result["error"] is None
-    assert result["skipped"] is True
-    assert result["updates"] == []
-
-
-@pytest.mark.asyncio
-async def test_shade_delta_bounded_to_five_percent():
-    store = FakeParameterStore()
-    result = await invoker.run_agentic_decision(get_scenario("underbidding"), store)
-    for u in result["updates"]:
-        if u["parameter_name"] == "shade_factor":
-            assert abs(u["delta"]) <= 0.05 + 1e-9
+    assert ctx["market_state"]["total_bids"] == 500
+    assert "updates" not in ctx  # no decision on the orchestrator side
 
 
 # ---------------------------------------------------------------------------
-# Governance loop — real A/B evaluator
+# Governance loop — real A/B evaluator (Welch's t-test + SPRT)
 # ---------------------------------------------------------------------------
 
 
@@ -228,3 +263,73 @@ def test_inconclusive_extends():
     result = invoker.run_governance_decision(get_scenario("inconclusive"))
     assert result["recommendation"] == "extend"
     assert result["p_value"] > 0.05
+
+
+def test_ncf_challenger_wins_promotes():
+    result = invoker.run_governance_decision(get_scenario("challenger_wins_ncf"))
+    assert result["recommendation"] == "promote"
+    assert result["model_type"] == "ncf_deal_manager"
+    assert 0.0 <= result["p_value"] <= 1.0
+    assert result["treatment_metric"] > result["control_metric"]
+
+
+def test_ncf_challenger_loses_rejects():
+    result = invoker.run_governance_decision(get_scenario("challenger_loses_ncf"))
+    assert result["recommendation"] == "reject"
+    assert result["model_type"] == "ncf_deal_manager"
+    assert 0.0 <= result["p_value"] <= 1.0
+
+
+def test_ncf_inconclusive_extends():
+    result = invoker.run_governance_decision(get_scenario("inconclusive_ncf"))
+    assert result["recommendation"] == "extend"
+    assert result["model_type"] == "ncf_deal_manager"
+    assert result["p_value"] > 0.05
+
+
+# ---------------------------------------------------------------------------
+# Sample outcomes — individual synthetic records shown in the UI
+# ---------------------------------------------------------------------------
+
+
+def test_agentic_sample_outcomes_are_bid_outcome_records():
+    out = get_scenario("underbidding").sample_outcomes(n=10)
+    assert out["kind"] == "bid_outcome_records"
+    assert out["loop"] == LOOP_AGENTIC
+    records = out["records"]
+    assert len(records) == 10
+    for r in records:
+        # Monotonic outcome contract mirrors shared.feedback_models.BidOutcomeEvent
+        assert not (r["conversion"] and not r["click"])
+        assert not (r["click"] and not r["impression"])
+        assert not (r["impression"] and not r["won"])
+        assert (r["price_paid"] is not None) == r["won"]
+        assert (r["conversion_value"] is not None) == r["conversion"]
+
+
+def test_agentic_sample_outcomes_win_count_matches_scenario_win_rate():
+    scenario = get_scenario("overpaying")  # win_rate = 0.55
+    records = scenario.sample_outcomes(n=20)["records"]
+    wins = sum(1 for r in records if r["won"])
+    assert wins == round(20 * scenario.bid_metrics.win_rate)
+
+
+def test_agentic_sample_outcomes_deterministic():
+    a = get_scenario("healthy").sample_outcomes(n=8)
+    b = get_scenario("healthy").sample_outcomes(n=8)
+    assert a == b
+
+
+def test_governance_sample_outcomes_match_materialized_lists():
+    scenario = get_scenario("challenger_wins")
+    out = scenario.sample_outcomes(n=5)
+    assert out["kind"] == "ab_samples"
+    assert out["loop"] == LOOP_GOVERNANCE
+    control, treatment = scenario.ab_samples.materialize()
+    assert out["control"] == [round(v, 4) for v in control[:5]]
+    assert out["treatment"] == [round(v, 4) for v in treatment[:5]]
+
+
+def test_governance_sample_outcomes_deterministic():
+    scenario = get_scenario("inconclusive")
+    assert scenario.sample_outcomes(n=6) == scenario.sample_outcomes(n=6)

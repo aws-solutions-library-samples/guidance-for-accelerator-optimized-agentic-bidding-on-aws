@@ -38,10 +38,16 @@ export default function Header({ loading, error, onContainersClick, view, onView
             Scenarios
           </button>
           <button
-            className={`header-nav-link${view === "tuning" ? " active" : ""}`}
-            onClick={() => onViewChange("tuning")}
+            className={`header-nav-link${view === "adaptive" ? " active" : ""}`}
+            onClick={() => onViewChange("adaptive")}
           >
             Adaptive Bidding
+          </button>
+          <button
+            className={`header-nav-link${view === "governance" ? " active" : ""}`}
+            onClick={() => onViewChange("governance")}
+          >
+            Governance
           </button>
         </nav>
         {userEmail && (

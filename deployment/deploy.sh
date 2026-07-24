@@ -6,8 +6,8 @@
 #   1. ECR repositories for all container images
 #   2. Export PyTorch models to ONNX for NVIDIA Triton
 #   3. Upload ONNX model repository to S3
-#   4. Build and push container images (tritonclient-backed + orchestrator)
-#   5. Create or update EKS cluster with GPU node group (g5.xlarge / A10G)
+#   4. Build and push container images (via AWS CodeBuild, or locally with --local-build)
+#   5. Create or update EKS cluster with GPU node group (g5 family / A10G)
 #   6. Install NVIDIA Kubernetes Device Plugin
 #   7. Configure IRSA for Triton S3 model access
 #   8. Deploy Kubernetes manifests (Triton server, ARTF containers, orchestrator)
@@ -18,20 +18,25 @@
 #   ./deploy.sh                                # full deploy
 #   ./deploy.sh --prefix v1                    # resources named v1-nvidia-artf-*
 #   ./deploy.sh --prefix prod --skip-agentcore # combine flags
-#   ./deploy.sh --with-retraining              # include NeMo-RL training, Model Registry, Glue ETL
-#   ./deploy.sh --prefix dv --with-retraining  # full stack with retraining
+#   ./deploy.sh                                # FULL stack incl. Part 2 closed-loop (default)
+#   ./deploy.sh --no-retraining                # Part 1 only (skip NeMo-RL, Model Registry, Glue ETL, agents)
+#   ./deploy.sh --model-id global.anthropic.claude-opus-4-8  # override the agents' Bedrock model
+#   ./deploy.sh --local-build                  # build images locally with Docker (requires ~30 GB free disk)
+#   ./deploy.sh --ngc-key KEY                  # NGC key stored automatically (for NeMo builds)
 #   ./deploy.sh --ui-only                      # redeploy frontend only (fast)
 #   ./deploy.sh --skip-cluster                 # reuse existing EKS cluster
 #   ./deploy.sh --export-only                  # just export ONNX models, no deploy
 #   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
+#   ./deploy.sh --artf-node-role inference      # co-locate ARTF model containers on the GPU node
+#                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
 #   ./deploy.sh --destroy                      # tear down the entire stack
 #   AWS_REGION=us-west-2 ./deploy.sh           # different region
 #
 # Prerequisites:
 #   - AWS CLI v2 with credentials
-#   - Docker with buildx
 #   - Python 3.11+ with boto3, torch, onnx, onnxscript
 #   - jq, eksctl, kubectl
+#   - Docker with buildx (only if using --local-build)
 # =============================================================================
 
 set -euo pipefail
@@ -48,9 +53,25 @@ SKIP_IMAGES=0
 UI_ONLY=0
 SKIP_CLUSTER=0
 EXPORT_ONLY=0
-WITH_RETRAINING=0
+# Part 2 closed-loop (NeMo-RL training, Model Registry, Glue ETL, the Adaptive
+# Bidding + Governance agents) is ON by default. Disable with --no-retraining.
+WITH_RETRAINING=1
+LOCAL_BUILD=0
+NGC_SECRET="${NGC_SECRET:-}"
+NGC_KEY="${NGC_KEY:-}"
+# Bedrock model id for the Part 2 reasoning agents (Adaptive Bidding + Governance).
+# Model access is automatic, so this defaults to the Claude Opus 4.8 GLOBAL
+# cross-region inference profile (set below). Override with BEDROCK_MODEL_ID /
+# --model-id, or per-agent with ADAPTIVE_BIDDING_MODEL_ID / GOVERNANCE_MODEL_ID.
+# Forwarded to deploy_closed_loop.sh in Step 11.
+BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-}"
 START_AT=1
 MAX_GPUS="${MAX_GPUS:-3}"
+# Node group the three NVIDIA ARTF model containers schedule onto. They call Triton
+# over the network and hold no GPU, so they default to the CPU node group
+# (role=services) — keeping load-test scale-out off the scarce GPU nodes. Use
+# --artf-node-role=inference (or --artf-on-gpu) to co-locate them on the GPU node.
+ARTF_NODE_ROLE="${ARTF_NODE_ROLE:-services}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 for arg in "$@"; do
   case "${arg}" in
@@ -61,11 +82,23 @@ for arg in "$@"; do
     --ui-only)          UI_ONLY=1 ;;
     --skip-cluster)     SKIP_CLUSTER=1 ;;
     --export-only)      EXPORT_ONLY=1 ;;
-    --with-retraining)  WITH_RETRAINING=1 ;;
+    --with-retraining)  WITH_RETRAINING=1 ;;   # default; kept for back-compat
+    --no-retraining|--skip-retraining) WITH_RETRAINING=0 ;;
+    --remote-build)     LOCAL_BUILD=0 ;;
+    --local-build)      LOCAL_BUILD=1 ;;
+    --ngc-secret=*)     NGC_SECRET="${arg#--ngc-secret=}" ;;
+    --ngc-secret)       ;; # value comes in next arg, handled below
+    --ngc-key=*)        NGC_KEY="${arg#--ngc-key=}" ;;
+    --ngc-key)          ;; # value comes in next arg, handled below
     --prefix=*)         STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)           ;; # value comes in next arg, handled below
     --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}" ;;
     --maxGPUs)          ;; # value comes in next arg, handled below
+    --model-id=*)       BEDROCK_MODEL_ID="${arg#--model-id=}" ;;
+    --model-id)         ;; # value comes in next arg, handled below
+    --artf-node-role=*) ARTF_NODE_ROLE="${arg#--artf-node-role=}" ;;
+    --artf-node-role)   ;; # value comes in next arg, handled below
+    --artf-on-gpu)      ARTF_NODE_ROLE="inference" ;;
     --start-at)         ;; # value comes in next arg, handled below
     -h|--help)          sed -n '2,24p' "$0"; exit 0 ;;
     *)
@@ -75,6 +108,14 @@ for arg in "$@"; do
         MAX_GPUS="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]]; then
         START_AT="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--model-id" ]]; then
+        BEDROCK_MODEL_ID="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--artf-node-role" ]]; then
+        ARTF_NODE_ROLE="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--ngc-secret" ]]; then
+        NGC_SECRET="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then
+        NGC_KEY="${arg}"
       fi
       ;;
   esac
@@ -93,11 +134,28 @@ if ! [[ "${MAX_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# Validate --artf-node-role: 'services' (CPU nodes, default) or 'inference' (GPU node)
+if [[ "${ARTF_NODE_ROLE}" != "services" && "${ARTF_NODE_ROLE}" != "inference" ]]; then
+  printf '\033[0;31m[fail]\033[0m %s\n' "--artf-node-role must be 'services' or 'inference' (got '${ARTF_NODE_ROLE}')" >&2
+  exit 1
+fi
+
 # Apply prefix to stack name AFTER arg parsing
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
 if [[ -n "${STACK_PREFIX}" ]]; then
   STACK_NAME="${STACK_PREFIX}-${STACK_NAME}"
 fi
+
+# Resolve the Bedrock model id for the Part 2 reasoning agents. Model access is
+# automatic, so default to the Claude Opus 4.8 GLOBAL cross-region inference profile,
+# which routes to all commercial regions and works from any source region.
+# Overridable via BEDROCK_MODEL_ID / --model-id.
+if [[ -z "${BEDROCK_MODEL_ID}" ]]; then
+  BEDROCK_MODEL_ID="global.anthropic.claude-opus-4-8"
+fi
+# Per-agent overrides fall back to the shared model id (mirrors deploy_closed_loop.sh).
+ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID:-${BEDROCK_MODEL_ID}}"
+GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID:-${BEDROCK_MODEL_ID}}"
 
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[warn]\033[0m %s\n' "$*"; }
@@ -107,9 +165,12 @@ fail() { printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # Preflight
 # =========================================================================
 log "Preflight checks"
-for bin in aws docker jq eksctl kubectl; do
+for bin in aws jq eksctl kubectl; do
   command -v "${bin}" >/dev/null 2>&1 || fail "missing: ${bin}"
 done
+if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
+  command -v docker >/dev/null 2>&1 || fail "missing: docker (required for --local-build)"
+fi
 
 # Resolve Python 3 binary (prefer python3, fall back to python if it's 3.x)
 if command -v python3 >/dev/null 2>&1; then
@@ -237,14 +298,20 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     fi
   done
 
-  log "Deleting Bid Shading AgentCore runtime..."
-  BID_SHADING_ID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
-    --query "agentRuntimes[?contains(agentRuntimeName,'BidShadingStrategy')].agentRuntimeId | [0]" \
-    --output text 2>/dev/null || echo 'None')"
-  if [[ -n "${BID_SHADING_ID}" && "${BID_SHADING_ID}" != "None" ]]; then
-    aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${BID_SHADING_ID}" --region "${AWS_REGION}" 2>/dev/null || true
-    log "  Deleted runtime ${BID_SHADING_ID}"
-  fi
+  log "Deleting closed-loop AgentCore runtimes..."
+  for RUNTIME_MATCH in "AdaptiveBiddingStrategy" "ModelPromotionGovernance"; do
+    RID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+      --query "agentRuntimes[?contains(agentRuntimeName,'${RUNTIME_MATCH}')].agentRuntimeId | [0]" \
+      --output text 2>/dev/null || echo 'None')"
+    if [[ -n "${RID}" && "${RID}" != "None" ]]; then
+      aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${RID}" --region "${AWS_REGION}" 2>/dev/null || true
+      log "  Deleted runtime ${RID} (${RUNTIME_MATCH})"
+    fi
+  done
+
+  log "Deleting Cognito (user pool, identity pool, authenticated role)..."
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy \
+    --stack-name "${STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
 
   log "Destroy complete."
   log ""
@@ -268,7 +335,43 @@ if [[ "${UI_ONLY}" -eq 1 ]]; then
     NLB_DNS="localhost"
   fi
 
-  # Primary distribution: React UI
+  # Regenerate the frontend build config so a standalone UI redeploy bakes in the
+  # CURRENT Cognito + agent runtime ARNs. The UI must be (re)built AFTER the agents
+  # exist for the VITE_* env vars to be embedded in the bundle at build time.
+  COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
+  COGNITO_USER_POOL_ID="$(jq -r '.UserPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
+  COGNITO_CLIENT_ID="$(jq -r '.ClientId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
+  IDENTITY_POOL_ID="$(jq -r '.IdentityPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
+  # NOTE: `--query '...|[0]' --output text` on the AWS CLI renders this specific
+  # pipe-into-index JMESPath shape as TWO lines ("None" then the real value) —
+  # not the single scalar you'd expect — because the underlying result is a
+  # single-element list, and the text formatter prints one line per list
+  # element with "None" standing in for the (nonexistent) filter match at the
+  # top level. Capturing that into a shell variable via $(...) previously
+  # produced a literal "None\n<arn>" string, which got baked into the IAM
+  # policy Resource list as leading garbage before failing to match any real
+  # ARN, and also broken the VITE_* env values consumed by Vite (which reads
+  # only the first line as the value up to the first newline, if you're lucky,
+  # otherwise corrupts .env.production's later lines). Use --output json + jq
+  # -r instead, which returns exactly the scalar (or empty string if no match).
+  ADAPTIVE_BIDDING_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'AdaptiveBiddingStrategy')].agentRuntimeArn | [0]" \
+    --output json 2>/dev/null | jq -r '. // empty')"
+  GOVERNANCE_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?contains(agentRuntimeName,'ModelPromotionGovernance')].agentRuntimeArn | [0]" \
+    --output json 2>/dev/null | jq -r '. // empty')"
+  REACT_ENV="${SCRIPT_DIR}/../source/frontend-react/.env.production"
+  cat > "${REACT_ENV}" <<EOF
+VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
+VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
+VITE_COGNITO_REGION=${AWS_REGION}
+VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}
+VITE_GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}
+EOF
+  log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}"
+
+  # Primary distribution: React UI (fresh build embeds the env above)
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
@@ -280,6 +383,54 @@ if [[ "${UI_ONLY}" -eq 1 ]]; then
 
   log "React UI: https://${CF_DOMAIN:-'(pending)'}"
   exit 0
+fi
+
+# =========================================================================
+# Preflight: GPU capacity for Triton + (optional) Model Optimizer
+# =========================================================================
+# Triton and the Model Optimizer each require their own A10G GPU node (the
+# gpu-inference group uses the g5 family: g5.xlarge/2xlarge/4xlarge = 4/8/16 vCPU,
+# 1 A10G each). With Part 2 closed-loop enabled (default) BOTH must run, so the
+# deploy needs room for 2 GPU nodes. Fail fast with a clear message instead of
+# letting the Model Optimizer sit Pending for hours (which leaves Triton unable to
+# load its tensorrt_plan engines and the GPU containers stuck "gpu offline").
+if [[ "${EXPORT_ONLY}" -eq 0 ]]; then
+  # Steady state needs ONE GPU node (Triton only). The Model Optimizer no longer
+  # runs as an always-on GPU Deployment — base engines are built by a one-shot
+  # bootstrap Job (which exits and frees the GPU before Triton claims it) and
+  # promotions by on-demand Jobs, both using a GPU only transiently. So 1 is the
+  # hard minimum; a 2nd GPU is only needed transiently (bursts within --maxGPUs).
+  REQUIRED_GPUS=1
+
+  if [[ "${MAX_GPUS}" -lt "${REQUIRED_GPUS}" ]]; then
+    fail "GPU capacity too low: --maxGPUs=${MAX_GPUS} but at least ${REQUIRED_GPUS} GPU node is needed for Triton (g5-family A10G). Re-run with --maxGPUs 1 (or 2+ to leave headroom for on-demand optimize / NeMo-RL retraining bursts)."
+  fi
+
+  # Retraining (NeMo-RL) spins up a GPU training job on top of the 2 steady-state
+  # nodes; recommend headroom so it doesn't fight Triton/optimizer for a node.
+  if [[ "${WITH_RETRAINING}" -eq 1 && "${MAX_GPUS}" -lt 3 ]]; then
+    warn "  --with-retraining is on (default) but --maxGPUs=${MAX_GPUS}. NeMo-RL retraining jobs may wait for a GPU. Consider --maxGPUs 3 (or --no-retraining)."
+  fi
+
+  # Soft check: the account's On-Demand G/VT vCPU service quota must fit the GPU
+  # nodes. This is a FLOOR based on the smallest g5 size (g5.xlarge = 4 vCPU); if
+  # EKS falls back to a larger A10G size (g5.2xlarge=8, g5.4xlarge=16 vCPU) it
+  # consumes more quota. This is the usual cause of a node that never launches.
+  # Warn (don't hard-fail) if the quota can't be read.
+  NEEDED_VCPUS=$(( REQUIRED_GPUS * 4 ))
+  GVT_QUOTA="$(aws service-quotas get-service-quota \
+    --service-code ec2 --quota-code L-DB2E81BA \
+    --region "${AWS_REGION}" --query 'Quota.Value' --output text 2>/dev/null || echo '')"
+  if [[ -n "${GVT_QUOTA}" && "${GVT_QUOTA}" != "None" ]]; then
+    GVT_VCPUS="${GVT_QUOTA%.*}"   # strip any decimal
+    if [[ "${GVT_VCPUS}" -lt "${NEEDED_VCPUS}" ]]; then
+      fail "AWS quota too low for GPU nodes: 'Running On-Demand G and VT instances' (L-DB2E81BA) is ${GVT_VCPUS} vCPUs in ${AWS_REGION}, but at least ${NEEDED_VCPUS} are needed for ${REQUIRED_GPUS}x g5-family A10G nodes. Request an increase (Service Quotas console -> EC2 -> L-DB2E81BA) or use --no-retraining."
+    fi
+    log "  GPU quota OK: ${GVT_VCPUS} G/VT vCPUs available, need >= ${NEEDED_VCPUS} (${REQUIRED_GPUS}x g5-family A10G, min 4 vCPU each)"
+  else
+    warn "  Could not read the G/VT vCPU service quota (needs service-quotas:GetServiceQuota)."
+    warn "  Ensure 'Running On-Demand G and VT instances' >= ${NEEDED_VCPUS} vCPUs in ${AWS_REGION}, or the GPU node(s) may never launch."
+  fi
 fi
 
 # =========================================================================
@@ -296,8 +447,10 @@ REPOS=(
 
 if [[ "${START_AT}" -le 1 ]]; then
 log "Step 1: Ensuring ECR repositories"
-aws ecr get-login-password --region "${AWS_REGION}" | \
-  docker login --username AWS --password-stdin "${REGISTRY}"
+if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
+  aws ecr get-login-password --region "${AWS_REGION}" | \
+    docker login --username AWS --password-stdin "${REGISTRY}"
+fi
 
 for repo in "${REPOS[@]}"; do
   aws ecr describe-repositories --repository-names "${repo}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
@@ -325,12 +478,18 @@ fi
 # =========================================================================
 # Step 2: Export PyTorch models to ONNX
 # =========================================================================
-log "Step 2: Exporting PyTorch models to ONNX for Triton"
+log "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
+# Part 2: Triton serves TensorRT engines (tensorrt_plan). The exported ONNX is the
+# SOURCE the Model Optimizer compiles into engines — it is uploaded to onnx-source/
+# (Step 3a), NOT served directly. Export to a staging dir so it does not collide
+# with the router/engine configs committed under triton/model_repository/.
+ONNX_STAGING="${SCRIPT_DIR}/../source/triton/onnx_export"
+rm -rf "${ONNX_STAGING}"
 ${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
-  --output-dir "${SCRIPT_DIR}/../source/triton/model_repository"
+  --output-dir "${ONNX_STAGING}"
 
 if [[ "${EXPORT_ONLY}" -eq 1 ]]; then
-  log "Export complete (--export-only). Models at triton/model_repository/"
+  log "Export complete (--export-only). ONNX at ${ONNX_STAGING}/"
   exit 0
 fi
 
@@ -341,72 +500,299 @@ log "Step 3: Ensuring S3 model bucket ${MODEL_BUCKET}"
 if ! aws s3api head-bucket --bucket "${MODEL_BUCKET}" 2>/dev/null; then
   aws s3 mb "s3://${MODEL_BUCKET}" --region "${AWS_REGION}"
 fi
-aws s3 sync "${SCRIPT_DIR}/../source/triton/model_repository/" \
-  "s3://${MODEL_BUCKET}/triton-models/" \
-  --delete --region "${AWS_REGION}"
-log "  Models uploaded to s3://${MODEL_BUCKET}/triton-models/"
+
+# widedeep_segment_activator is intentionally absent — segment activation is
+# rule-based, not a Triton/TensorRT model (see
+# source/containers/widedeep_segment_activator/app.py).
+RECOMMENDER_MODELS=(dlrm_bid_shader ncf_deal_manager)
+
+# 3a. Upload exported ONNX to onnx-source/ — the Model Optimizer reads these to
+#     build TensorRT engines. NOT served directly by Triton.
+for m in "${RECOMMENDER_MODELS[@]}"; do
+  aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
+    "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
+done
+log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
+
+# 3b. Assemble and upload the served Triton repo: router configs + stable/canary
+#     engine configs (committed under triton/model_repository/) plus the canary
+#     router model.py injected into each router model's version dir. Engines
+#     (model.plan) are built by the Model Optimizer at Step 8b, so they are NOT
+#     uploaded here (and NO --delete, which would wipe engines on re-deploy).
+SERVED_STAGING="$(mktemp -d)"
+cp -R "${SCRIPT_DIR}/../source/triton/model_repository/." "${SERVED_STAGING}/"
+for m in "${RECOMMENDER_MODELS[@]}"; do
+  mkdir -p "${SERVED_STAGING}/${m}/1"
+  cp "${SCRIPT_DIR}/../source/triton/router/model.py" "${SERVED_STAGING}/${m}/1/model.py"
+done
+aws s3 sync "${SERVED_STAGING}/" "s3://${MODEL_BUCKET}/triton-models/" \
+  --exclude "*.onnx" --region "${AWS_REGION}"
+rm -rf "${SERVED_STAGING}"
+log "  Triton served repo (routers + engine configs) uploaded; engines built at Step 8b"
+
+# 3c. Upload the Model Optimizer bootstrap spec (base-engine build instructions).
+BOOTSTRAP_TMP="$(mktemp)"
+sed "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+  "${SCRIPT_DIR}/optimizer-bootstrap.json" > "${BOOTSTRAP_TMP}"
+aws s3 cp "${BOOTSTRAP_TMP}" \
+  "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
+rm -f "${BOOTSTRAP_TMP}"
+log "  Model Optimizer bootstrap spec uploaded"
 fi # START_AT <= 1 (steps 1-3)
 
 # =========================================================================
 # Step 4: Build and push container images
 # =========================================================================
-if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
-  log "Step 4: Building and pushing container images"
+# Part 1 images are lightweight (python:3.12-slim). CodeBuild finishes in
+# 5-10 minutes. We wait synchronously — no async complexity needed here.
+# =========================================================================
+IMAGE_OUTPUTS="${SCRIPT_DIR}/.image-outputs.json"
 
-  # Triton-backed ARTF containers (tritonclient, no PyTorch — lighter)
-  TRITON_CONTAINERS=(
-    "containers/dlrm_bid_shader:${STACK_NAME}-dlrm-bid-shader"
-    "containers/widedeep_segment_activator:${STACK_NAME}-widedeep-segment-activator"
-    "containers/ncf_deal_manager:${STACK_NAME}-ncf-deal-manager"
-  )
-  for entry in "${TRITON_CONTAINERS[@]}"; do
-    CONTAINER_PATH="${entry%%:*}"
-    REPO_NAME="${entry##*:}"
-    IMAGE="${REGISTRY}/${REPO_NAME}:${IMAGE_TAG}"
-    log "  Building ${REPO_NAME} (amd64, tritonclient)"
-    docker buildx build \
-      --platform linux/amd64 \
-      --build-arg CONTAINER="${CONTAINER_PATH}" \
-      -f "${SCRIPT_DIR}/../source/triton/Dockerfile.triton-artf" \
-      -t "${IMAGE}" --load "${SCRIPT_DIR}/../source"
-    docker push "${IMAGE}"
+# Always read the outputs file if it exists (needed for --start-at to use the correct tag)
+if [[ -f "${IMAGE_OUTPUTS}" ]]; then
+  PREV_TAG="$(jq -r '.ImageTag // empty' "${IMAGE_OUTPUTS}" 2>/dev/null || echo '')"
+  PREV_REGISTRY="$(jq -r '.Registry // empty' "${IMAGE_OUTPUTS}" 2>/dev/null || echo '')"
+  if [[ -n "${PREV_TAG}" && "${PREV_REGISTRY}" == "${REGISTRY}" ]]; then
+    IMAGE_TAG="${PREV_TAG}"
+  fi
+fi
+
+# =========================================================================
+# Content-hash helpers — detect source drift under a reused IMAGE_TAG
+# =========================================================================
+# IMAGE_TAG defaults to the git short SHA, so re-running deploy.sh at the SAME
+# commit (e.g. after fixing a live issue without committing, or re-running
+# --start-at=4) previously skipped a build purely because that tag already
+# existed in ECR — even if the image content underneath it was stale (e.g.
+# built from source that predates a bugfix, then never rebuilt because the SHA
+# didn't change). This computes a content hash over each image's actual
+# Dockerfile + COPY'd source, and treats that hash — not just IMAGE_TAG — as
+# the source of truth for "is a rebuild needed".
+
+# Pick whichever sha256 tool is on PATH (sha256sum on Linux/CodeBuild, shasum
+# on macOS).
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    shasum -a 256
+  fi
+}
+
+# Compute a short content hash for the given image key over exactly the files
+# that Dockerfile actually COPYs (kept in sync with build_image_local's cases
+# and the Dockerfiles under source/). Returns empty on an unrecognized key so
+# callers can fail safe (rebuild) instead of silently trusting a stale image.
+_source_hash() {
+  local key="$1"
+  local src="${SCRIPT_DIR}/../source"
+  local paths=()
+  case "${key}" in
+    dlrm-bid-shader|ncf-deal-manager)
+      paths=("${src}/triton/Dockerfile.triton-artf" "${src}/shared" "${src}/containers/${key//-/_}") ;;
+    widedeep-segment-activator|metrics-enricher)
+      paths=("${src}/Dockerfile" "${src}/shared" "${src}/containers/${key//-/_}") ;;
+    orchestrator)
+      paths=("${src}/Dockerfile.orchestrator" "${src}/shared" "${src}/agents" "${src}/closed_loop_demo" "${src}/orchestrator") ;;
+    agentcore)
+      paths=("${src}/Dockerfile.agentcore" "${src}/shared" "${src}/containers" "${src}/agentcore") ;;
+    model-optimizer)
+      paths=("${src}/Dockerfile.optimizer" "${src}/optimizer") ;;
+    *)
+      return 1 ;;
+  esac
+  local f rel manifest=""
+  for p in "${paths[@]}"; do
+    if [[ -f "${p}" ]]; then
+      rel="${p#${src}/}"
+      manifest+="${rel}:$(_sha256 < "${p}" | awk '{print $1}')"$'\n'
+    elif [[ -d "${p}" ]]; then
+      while IFS= read -r f; do
+        rel="${f#${src}/}"
+        manifest+="${rel}:$(_sha256 < "${f}" | awk '{print $1}')"$'\n'
+      done < <(find "${p}" -type f | LC_ALL=C sort)
+    fi
+    # A path that is neither a file nor a directory (e.g. deleted) is silently
+    # skipped — this only affects the resulting hash value, not correctness.
+  done
+  printf '%s' "${manifest}" | _sha256 | awk '{print $1}' | cut -c1-16
+}
+
+# Make ${dest_tag} point at the same image as ${src_tag} in ${repo}, without
+# re-uploading any layers (fetches the manifest and re-registers it under the
+# new tag). Used to (a) attach a content-hash tag right after a fresh build,
+# and (b) reuse an already-built image under a new IMAGE_TAG when its content
+# hash shows nothing actually changed. Best-effort: returns non-zero on any
+# failure so the caller can fall back to a full rebuild instead of trusting a
+# tag that may not have been created.
+_ensure_tag_alias() {
+  local repo="$1" src_tag="$2" dest_tag="$3"
+  [[ "${src_tag}" == "${dest_tag}" ]] && return 0
+
+  local src_digest dest_digest
+  src_digest="$(aws ecr describe-images --repository-name "${repo}" --image-ids imageTag="${src_tag}" \
+    --region "${AWS_REGION}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
+  [[ -z "${src_digest}" || "${src_digest}" == "None" ]] && return 1
+
+  dest_digest="$(aws ecr describe-images --repository-name "${repo}" --image-ids imageTag="${dest_tag}" \
+    --region "${AWS_REGION}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
+  [[ "${dest_digest}" == "${src_digest}" ]] && return 0
+
+  local manifest media_type
+  manifest="$(aws ecr batch-get-image --repository-name "${repo}" --image-ids imageTag="${src_tag}" \
+    --region "${AWS_REGION}" --query 'images[0].imageManifest' --output text 2>/dev/null || echo '')"
+  [[ -z "${manifest}" || "${manifest}" == "None" ]] && return 1
+  media_type="$(aws ecr batch-get-image --repository-name "${repo}" --image-ids imageTag="${src_tag}" \
+    --region "${AWS_REGION}" --query 'images[0].imageManifestMediaType' --output text 2>/dev/null || echo '')"
+
+  if [[ -n "${media_type}" && "${media_type}" != "None" ]]; then
+    aws ecr put-image --repository-name "${repo}" --image-tag "${dest_tag}" \
+      --image-manifest "${manifest}" --image-manifest-media-type "${media_type}" \
+      --region "${AWS_REGION}" >/dev/null 2>&1
+  else
+    aws ecr put-image --repository-name "${repo}" --image-tag "${dest_tag}" \
+      --image-manifest "${manifest}" --region "${AWS_REGION}" >/dev/null 2>&1
+  fi
+}
+
+# Build one Part-1/optimizer image locally by key (repo suffix).
+build_image_local() {
+  local key="$1"
+  local repo="${STACK_NAME}-${key}"
+  local image="${REGISTRY}/${repo}:${IMAGE_TAG}"
+  local src="${SCRIPT_DIR}/../source"
+  aws ecr describe-repositories --repository-names "${repo}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
+    aws ecr create-repository --repository-name "${repo}" --region "${AWS_REGION}" \
+      --image-scanning-configuration scanOnPush=true >/dev/null
+  case "${key}" in
+    dlrm-bid-shader|ncf-deal-manager)
+      log "  Building ${repo} (amd64, tritonclient)"
+      docker buildx build --platform linux/amd64 --build-arg CONTAINER="containers/${key//-/_}" \
+        -f "${src}/triton/Dockerfile.triton-artf" -t "${image}" --load "${src}"
+      docker push "${image}" ;;
+    widedeep-segment-activator|metrics-enricher)
+      # Rule-based container — no Triton dependency (segment activation was
+      # switched from the Wide & Deep Triton model to deterministic rules; see
+      # source/containers/widedeep_segment_activator/app.py). Uses the plain
+      # ARTF Dockerfile like metrics-enricher.
+      log "  Building ${repo} (amd64)"
+      docker buildx build --platform linux/amd64 \
+        --build-arg CONTAINER="containers/${key//-/_}" --build-arg AGENT_NAME="${key}" \
+        -f "${src}/Dockerfile" -t "${image}" --load "${src}"
+      docker push "${image}" ;;
+    orchestrator)
+      log "  Building ${repo} (amd64)"
+      docker buildx build --platform linux/amd64 --build-arg AGENT_NAME="artf-orchestrator" \
+        -f "${src}/Dockerfile.orchestrator" -t "${image}" --load "${src}"
+      docker push "${image}" ;;
+    agentcore)
+      log "  Building ${repo} (arm64)"
+      docker buildx build --platform linux/arm64 \
+        -f "${src}/Dockerfile.agentcore" -t "${image}" --load "${src}"
+      docker push "${image}" ;;
+    model-optimizer)
+      log "  Building ${repo} (amd64)"
+      docker buildx build --platform linux/amd64 \
+        -f "${src}/Dockerfile.optimizer" -t "${image}" --load "${src}"
+      docker push "${image}" ;;
+    *)
+      warn "  Unknown image key '${key}' — skipping" ;;
+  esac
+}
+
+if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
+  # Per-image build: (re)build only images whose CONTENT has changed, instead
+  # of an all-or-nothing rebuild. deploy.sh (Step 4) owns the Part 1 images +
+  # the Model Optimizer; the Part 2 agents and NeMo are built later by
+  # deploy_closed_loop.sh.
+  #
+  # IMAGE_TAG alone (default: git short SHA) is NOT sufficient to decide
+  # "skip this build" — re-running deploy.sh at the same commit (e.g. after
+  # editing source without committing, or via --start-at=4) would previously
+  # skip rebuilding as long as ANY image existed at that tag, even one built
+  # from stale source. Each image also gets a content-hash tag
+  # (src-<16 hex chars>, hashed over exactly the files its Dockerfile COPYs).
+  # A build is skipped only when that hash tag already exists in ECR — i.e.
+  # this exact source content has already been built — not merely because
+  # IMAGE_TAG exists. To force a rebuild regardless, delete both tags (or
+  # change the source, which changes the hash automatically).
+  STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher orchestrator model-optimizer)
+  if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then STEP4_KEYS+=(agentcore); fi
+
+  MISSING_KEYS=()
+  HASH_KEYS=()   # parallel array to MISSING_KEYS (bash 3.2 has no assoc arrays)
+  HASH_VALS=()
+  for key in "${STEP4_KEYS[@]}"; do
+    repo="${STACK_NAME}-${key}"
+    src_hash="$(_source_hash "${key}" || echo '')"
+    if [[ -z "${src_hash}" ]]; then
+      warn "Step 4: could not hash source for '${key}' (unrecognized key) — will rebuild"
+      MISSING_KEYS+=("${key}")
+      continue
+    fi
+    src_tag="src-${src_hash}"
+    if aws ecr describe-images --repository-name "${repo}" --image-ids imageTag="${src_tag}" \
+         --region "${AWS_REGION}" >/dev/null 2>&1; then
+      log "Step 4: ${key} content unchanged (${src_tag}) — reusing existing image, no rebuild"
+      if _ensure_tag_alias "${repo}" "${src_tag}" "${IMAGE_TAG}"; then
+        log "  ${repo}:${IMAGE_TAG} -> ${src_tag}"
+      else
+        warn "  Could not alias ${repo}:${IMAGE_TAG} to ${src_tag} — rebuilding to be safe"
+        MISSING_KEYS+=("${key}")
+        HASH_KEYS+=("${key}"); HASH_VALS+=("${src_tag}")
+      fi
+    else
+      MISSING_KEYS+=("${key}")
+      HASH_KEYS+=("${key}"); HASH_VALS+=("${src_tag}")
+    fi
   done
 
-  # Metrics enricher (rule-based, shared container Dockerfile — no Triton needed)
-  METRICS_IMAGE="${REGISTRY}/${STACK_NAME}-metrics-enricher:${IMAGE_TAG}"
-  log "  Building ${STACK_NAME}-metrics-enricher (amd64)"
-  docker buildx build \
-    --platform linux/amd64 \
-    --build-arg CONTAINER="containers/metrics_enricher" \
-    --build-arg AGENT_NAME="metrics-enricher" \
-    -f "${SCRIPT_DIR}/../source/Dockerfile" \
-    -t "${METRICS_IMAGE}" --load "${SCRIPT_DIR}/../source"
-  docker push "${METRICS_IMAGE}"
-
-  # Orchestrator (dedicated Dockerfile — packages shared/, agents/, and
-  # closed_loop_demo/ alongside orchestrator/ so the Part 1 + Part 2 REST API,
-  # including the closed-loop endpoints, resolve their absolute imports).
-  ORCH_IMAGE="${REGISTRY}/${STACK_NAME}-orchestrator:${IMAGE_TAG}"
-  log "  Building ${STACK_NAME}-orchestrator (amd64)"
-  docker buildx build \
-    --platform linux/amd64 \
-    --build-arg AGENT_NAME="artf-orchestrator" \
-    -f "${SCRIPT_DIR}/../source/Dockerfile.orchestrator" \
-    -t "${ORCH_IMAGE}" --load "${SCRIPT_DIR}/../source"
-  docker push "${ORCH_IMAGE}"
-
-  # AgentCore container (ARM64)
-  if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
-    AC_IMAGE="${REGISTRY}/${STACK_NAME}-agentcore:${IMAGE_TAG}"
-    log "  Building AgentCore image (arm64)"
-    docker buildx build \
-      --platform linux/arm64 \
-      -f "${SCRIPT_DIR}/../source/Dockerfile.agentcore" \
-      -t "${AC_IMAGE}" --load "${SCRIPT_DIR}/../source"
-    docker push "${AC_IMAGE}"
+  if [[ ${#MISSING_KEYS[@]} -eq 0 ]]; then
+    log "Step 4: All required images content-matched. Nothing to build."
+  elif [[ "${LOCAL_BUILD}" -eq 0 ]]; then
+    log "Step 4: Building changed images via CodeBuild (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
+    NGC_FLAG=()
+    if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
+    elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
+    "${SCRIPT_DIR}/codebuild/remote_build.sh" \
+      --stack-name "${STACK_NAME}" \
+      --only "${MISSING_KEYS[*]}" \
+      --tag "${IMAGE_TAG}" \
+      --region "${AWS_REGION}" \
+      "${NGC_FLAG[@]}"
+  else
+    log "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
+    aws ecr get-login-password --region "${AWS_REGION}" | \
+      docker login --username AWS --password-stdin "${REGISTRY}"
+    for key in "${MISSING_KEYS[@]}"; do
+      build_image_local "${key}"
+    done
+    log "  Changed images built and pushed"
   fi
 
-  log "All images pushed"
+  # Record a content-hash tag alias for every image we just (re)built, so the
+  # NEXT run recognizes this exact source content without rebuilding — works
+  # for both the CodeBuild and local build paths since it only reads/writes
+  # ECR tag metadata (no re-upload of layers).
+  for i in "${!HASH_KEYS[@]}"; do
+    key="${HASH_KEYS[$i]}"; src_tag="${HASH_VALS[$i]}"
+    repo="${STACK_NAME}-${key}"
+    if _ensure_tag_alias "${repo}" "${IMAGE_TAG}" "${src_tag}"; then
+      log "  Tagged ${repo}:${IMAGE_TAG} as ${src_tag} (content-hash cache)"
+    else
+      warn "  Could not record content-hash tag ${src_tag} for ${repo} — next run will rebuild it even if unchanged"
+    fi
+  done
+
+  # Record the tag/registry so --start-at re-runs reference the same images.
+  cat > "${IMAGE_OUTPUTS}" <<EOF
+{
+  "Registry": "${REGISTRY}",
+  "ImageTag": "${IMAGE_TAG}",
+  "StackName": "${STACK_NAME}",
+  "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
 else
   warn "Skipping image build (--skip-images)"
 fi
@@ -560,6 +946,38 @@ TRITON_ROLE_ARN="$(kubectl get sa triton-sa -o jsonpath='{.metadata.annotations.
 log "  Triton IRSA role: ${TRITON_ROLE_ARN}"
 
 # =========================================================================
+# Step 7.1: IRSA for the Model Optimizer (S3 read/write on the model repo)
+# The optimizer reads ONNX from onnx-source/ and writes TensorRT engines to
+# triton-models/ (base engines + canary engines). It needs read+write+list.
+# =========================================================================
+log "Step 7.1: Ensuring IRSA for the Model Optimizer S3 access"
+OPTIMIZER_POLICY_NAME="${STACK_NAME}-model-optimizer-s3-${STACK_UID}"
+OPTIMIZER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${OPTIMIZER_POLICY_NAME}"
+OPTIMIZER_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::${MODEL_BUCKET}/*\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":\"arn:aws:s3:::${MODEL_BUCKET}\"}]}"
+if aws iam get-policy --policy-arn "${OPTIMIZER_POLICY_ARN}" >/dev/null 2>&1; then
+  aws iam create-policy-version \
+    --policy-arn "${OPTIMIZER_POLICY_ARN}" \
+    --policy-document "${OPTIMIZER_POLICY_DOC}" \
+    --set-as-default 2>/dev/null || true
+else
+  aws iam create-policy \
+    --policy-name "${OPTIMIZER_POLICY_NAME}" \
+    --policy-document "${OPTIMIZER_POLICY_DOC}" >/dev/null
+fi
+
+eksctl create iamserviceaccount \
+  --name model-optimizer-sa \
+  --namespace default \
+  --cluster "${CLUSTER_NAME}" \
+  --region "${AWS_REGION}" \
+  --attach-policy-arn "${OPTIMIZER_POLICY_ARN}" \
+  --approve \
+  --override-existing-serviceaccounts 2>/dev/null || true
+
+OPTIMIZER_ROLE_ARN="$(kubectl get sa model-optimizer-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
+
+# =========================================================================
 # Step 7.5: DynamoDB permissions for orchestrator pods
 # =========================================================================
 log "Step 7.5: Ensuring DynamoDB access for orchestrator"
@@ -623,7 +1041,6 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"EmitBidOutcomeMetrics\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:PutMetricData\"],\"Resource\":\"*\",\"Condition\":{\"StringLike\":{\"cloudwatch:namespace\":[\"ARTF/*\"]}}},\
 {\"Sid\":\"ReadMetrics\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:GetMetricData\",\"cloudwatch:GetMetricStatistics\"],\"Resource\":\"*\"},\
 {\"Sid\":\"ParameterStoreAndAudit\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:BatchGetItem\",\"dynamodb:DescribeTable\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]},\
-{\"Sid\":\"InvokeAgentRuntime\",\"Effect\":\"Allow\",\"Action\":[\"bedrock-agentcore:InvokeAgentRuntime\"],\"Resource\":[\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*\",\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*/*\"]},\
 {\"Sid\":\"SchedulerToggle\",\"Effect\":\"Allow\",\"Action\":[\"scheduler:GetSchedule\",\"scheduler:UpdateSchedule\"],\"Resource\":[\"arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/default/*\"]},\
 {\"Sid\":\"ModelRegistryRead\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListModelPackages\",\"sagemaker:DescribeModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package-group/*artf-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
 {\"Sid\":\"KmsForDynamoDb\",\"Effect\":\"Allow\",\"Action\":[\"kms:Decrypt\",\"kms:GenerateDataKey\",\"kms:DescribeKey\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":[\"dynamodb.${AWS_REGION}.amazonaws.com\"]}}}\
@@ -668,89 +1085,115 @@ if [[ -z "${COGNITO_USER_POOL_ID}" ]]; then
   warn "Cognito pool ID is empty — orchestrator auth will be DISABLED until patched!"
 fi
 
-# --- Create Cognito Identity Pool (gives browser AWS SDK credentials) ---
-IDENTITY_POOL_NAME="${STACK_NAME}-identity-pool"
-IDENTITY_POOL_ID=""
-# Check if it already exists
-IDENTITY_POOL_ID="$(aws cognito-identity list-identity-pools --max-results 60 --region "${AWS_REGION}" \
-  --query "IdentityPools[?IdentityPoolName=='${IDENTITY_POOL_NAME}'].IdentityPoolId | [0]" \
-  --output text 2>/dev/null || echo '')"
+# --- Cognito Identity Pool + authenticated role (provisioned by deploy_cognito.py) ---
+# deploy_cognito.py creates the Identity Pool and the authenticated IAM role. The
+# least-privilege InvokeAgentRuntime grant (scoped to the specific runtime ARNs) is
+# applied in Step 11 via `deploy_cognito.py --action grant-agent-invoke`, once the
+# ARNs exist. The orchestrator is deliberately NOT granted agent-invoke — the browser
+# invokes the closed-loop agents directly via SigV4 (see FR-6 / agentcore-verification-findings.md).
+IDENTITY_POOL_ID="$(jq -r '.IdentityPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
+ID_POOL_AUTH_ROLE_NAME="$(jq -r '.AuthRoleName // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
+log "  Identity Pool: ${IDENTITY_POOL_ID:-<none>}  Auth role: ${ID_POOL_AUTH_ROLE_NAME:-<none>}"
 
-if [[ -z "${IDENTITY_POOL_ID}" || "${IDENTITY_POOL_ID}" == "None" ]]; then
-  log "  Creating Cognito Identity Pool: ${IDENTITY_POOL_NAME}"
-  IDENTITY_POOL_ID="$(aws cognito-identity create-identity-pool \
-    --identity-pool-name "${IDENTITY_POOL_NAME}" \
-    --no-allow-unauthenticated-identities \
-    --cognito-identity-providers \
-      "ProviderName=cognito-idp.${AWS_REGION}.amazonaws.com/${COGNITO_USER_POOL_ID},ClientId=${COGNITO_CLIENT_ID},ServerSideTokenCheck=false" \
-    --region "${AWS_REGION}" \
-    --query 'IdentityPoolId' --output text)"
-  log "  Created Identity Pool: ${IDENTITY_POOL_ID}"
-
-  # Create the authenticated IAM role
-  ID_POOL_AUTH_ROLE_NAME="${STACK_NAME}-cognito-auth-${STACK_UID}"
-  log "  Creating authenticated role: ${ID_POOL_AUTH_ROLE_NAME}"
-  aws iam create-role --role-name "${ID_POOL_AUTH_ROLE_NAME}" \
-    --assume-role-policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"cognito-identity.amazonaws.com\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\"cognito-identity.amazonaws.com:aud\":\"${IDENTITY_POOL_ID}\"},\"ForAnyValue:StringLike\":{\"cognito-identity.amazonaws.com:amr\":\"authenticated\"}}}]}" \
-    --description "Authenticated role for ${STACK_NAME} frontend users" >/dev/null 2>&1 || true
-
-  # Grant InvokeAgentRuntime permission
-  aws iam put-role-policy --role-name "${ID_POOL_AUTH_ROLE_NAME}" \
-    --policy-name AllowAgentCoreInvoke \
-    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"bedrock-agentcore:InvokeAgentRuntime\"],\"Resource\":[\"arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/*\"]}]}"
-
-  # Attach role to identity pool
-  ID_POOL_AUTH_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ID_POOL_AUTH_ROLE_NAME}"
-  aws cognito-identity set-identity-pool-roles \
-    --identity-pool-id "${IDENTITY_POOL_ID}" \
-    --roles "authenticated=${ID_POOL_AUTH_ROLE_ARN}" \
-    --region "${AWS_REGION}"
-  log "  Identity Pool roles configured"
-else
-  log "  Identity Pool already exists: ${IDENTITY_POOL_ID}"
-fi
-
-# Resolve AgentCore runtime ARN for the bid shading agent.
-# First check if a runtime named *bid*shading* or *BidShading* exists.
-# Allow override via env var for pre-deployed runtimes.
-if [[ -z "${BID_SHADING_RUNTIME_ARN:-}" ]]; then
-  BID_SHADING_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
-    --query "agentRuntimes[?contains(agentRuntimeName,'BidShading')].agentRuntimeArn | [0]" \
-    --output text 2>/dev/null || echo '')"
-  if [[ -z "${BID_SHADING_RUNTIME_ARN}" || "${BID_SHADING_RUNTIME_ARN}" == "None" ]]; then
-    BID_SHADING_RUNTIME_ARN=""
-    warn "No Bid Shading AgentCore runtime found. Deploy it with: ./deploy.sh --with-retraining"
-    warn "The Adaptive Bidding page will show an error until the runtime is deployed and BID_SHADING_RUNTIME_ARN is set."
-  fi
-fi
-log "  Bid Shading AgentCore ARN: ${BID_SHADING_RUNTIME_ARN:-<not deployed>}"
+# NOTE: The closed-loop agent runtime ARNs are resolved and wired into the frontend
+# build in Step 11 (after the agents are deployed by deploy_closed_loop.sh). The
+# orchestrator is NOT wired to any agent runtime — the browser invokes them directly
+# via SigV4 (FR-6). See Step 11 for the ARN resolution + Identity-Pool invoke grant.
 
 # All workloads (Triton, agent containers, orchestrator) deploy into the
 # `default` namespace, matching the triton-sa IRSA service account. Keeping
 # them co-located lets the orchestrator reach backends by bare service name.
 
-# Wait for GPU node to be available before applying Triton deployment
+# Steady state needs ONE GPU node (Triton only). The Model Optimizer no longer runs
+# as an always-on GPU Deployment — base engines come from a one-shot bootstrap Job
+# and promotions from on-demand Jobs. The node group can still burst to --maxGPUs
+# for those transient Jobs / NeMo retraining.
+GPU_DESIRED=1
+
+# The bootstrap Job (Step 8a) needs its OWN GPU while it runs. On a first-time
+# deploy Triton isn't up yet, so 1 GPU node would be enough — but on a REDEPLOY,
+# Triton is typically already running and occupying the sole GPU node, which
+# leaves the bootstrap Job stuck Pending (0/N nodes available: Insufficient
+# nvidia.com/gpu) until its 15-minute wait below times out. Scale to 2 GPU nodes
+# BEFORE running the bootstrap Job so it always has room alongside any
+# already-running Triton, then scale back down to GPU_DESIRED (1) once the Job
+# finishes, since steady state only needs Triton's GPU.
+BOOTSTRAP_GPU_DESIRED=$(( GPU_DESIRED + 1 ))
+if [[ "${BOOTSTRAP_GPU_DESIRED}" -gt "${MAX_GPUS}" ]]; then
+  BOOTSTRAP_GPU_DESIRED="${MAX_GPUS}"
+  if [[ "${BOOTSTRAP_GPU_DESIRED}" -le "${GPU_DESIRED}" ]]; then
+    warn "  --maxGPUs=${MAX_GPUS} leaves no headroom for the bootstrap Job to run alongside an already-running Triton; it may have to wait for a GPU to free up."
+  fi
+fi
+
+log "  Scaling GPU node group 'gpu-inference' to desired ${BOOTSTRAP_GPU_DESIRED} (headroom for the one-shot bootstrap Job)"
+aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+  --scaling-config "minSize=1,maxSize=${MAX_GPUS},desiredSize=${BOOTSTRAP_GPU_DESIRED}" \
+  --region "${AWS_REGION}" >/dev/null 2>&1 || warn "  Could not scale gpu-inference node group (continuing)"
+
+# Wait for GPU node(s) to be available before applying Triton + optimizer deployments
 log "  Checking for GPU node availability..."
-GPU_WAIT_TIMEOUT=300
+GPU_WAIT_TIMEOUT=420
 GPU_WAIT_INTERVAL=15
 GPU_ELAPSED=0
 while true; do
   GPU_NODES="$(kubectl get nodes -l nvidia.com/gpu=present --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "${GPU_NODES}" -gt 0 ]]; then
-    log "  GPU node(s) available (${GPU_NODES} found)"
+  if [[ "${GPU_NODES}" -ge "${BOOTSTRAP_GPU_DESIRED}" ]]; then
+    log "  GPU node(s) available (${GPU_NODES} found, need ${BOOTSTRAP_GPU_DESIRED})"
     break
   fi
   if [[ "${GPU_ELAPSED}" -ge "${GPU_WAIT_TIMEOUT}" ]]; then
-    warn "No GPU nodes after ${GPU_WAIT_TIMEOUT}s — Triton may stay pending."
+    warn "Only ${GPU_NODES}/${BOOTSTRAP_GPU_DESIRED} GPU nodes after ${GPU_WAIT_TIMEOUT}s — the bootstrap Job and/or Triton may stay pending."
     warn "Check node group: eksctl get nodegroup --cluster ${CLUSTER_NAME} --region ${AWS_REGION}"
     break
   fi
-  log "  Waiting for GPU node to scale up... (${GPU_ELAPSED}s / ${GPU_WAIT_TIMEOUT}s)"
+  log "  Waiting for GPU node(s) to scale up... (${GPU_NODES}/${BOOTSTRAP_GPU_DESIRED}, ${GPU_ELAPSED}s / ${GPU_WAIT_TIMEOUT}s)"
   sleep "${GPU_WAIT_INTERVAL}"
   GPU_ELAPSED=$((GPU_ELAPSED + GPU_WAIT_INTERVAL))
 done
 
-for manifest in triton-deployment.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml triton-hpa.yaml; do
+# -------------------------------------------------------------------------
+# Images are guaranteed ready (Step 4 is synchronous). Apply manifests.
+# -------------------------------------------------------------------------
+
+# Step 8a: build base TensorRT engines via a one-shot Job. Runs on its own GPU
+# node (see the scale-up above), independent of whether Triton is already
+# running on another node, and EXITS when done — no always-on optimizer pod.
+log "  Step 8a: building base TensorRT engines (one-shot optimizer bootstrap Job)..."
+BOOTSTRAP_MANIFEST="/tmp/${CLUSTER_NAME}-model-optimizer-bootstrap-job.yaml"
+sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
+    -e "s|__REGION__|${AWS_REGION}|g" \
+    -e "s|__REGISTRY__|${REGISTRY}|g" \
+    -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+    -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+    -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
+    "${SCRIPT_DIR}/eks/model-optimizer-bootstrap-job.yaml" > "${BOOTSTRAP_MANIFEST}"
+# Jobs are immutable — delete any prior run before re-applying (idempotent redeploy).
+kubectl delete job model-optimizer-bootstrap --ignore-not-found >/dev/null 2>&1 || true
+kubectl apply -f "${BOOTSTRAP_MANIFEST}"
+log "  Waiting for base-engine build to complete (up to 15m; idempotent — skips engines already in S3)..."
+if kubectl wait --for=condition=complete job/model-optimizer-bootstrap --timeout=900s 2>/dev/null; then
+  log "  Base engines built (optimizer Job exited)."
+else
+  warn "  Base-engine bootstrap Job did not complete (timeout or failure)."
+  warn "  Triton cannot serve tensorrt_plan models until the base engines exist."
+  warn "  Inspect: kubectl logs job/model-optimizer-bootstrap ; kubectl describe job/model-optimizer-bootstrap"
+fi
+
+# Scale back down to steady state (Triton only) now that the bootstrap Job has
+# finished (or given up) — no need to keep the extra GPU node around.
+if [[ "${BOOTSTRAP_GPU_DESIRED}" -ne "${GPU_DESIRED}" ]]; then
+  log "  Scaling GPU node group 'gpu-inference' back to desired ${GPU_DESIRED} (steady state: Triton only)"
+  aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+    --scaling-config "minSize=1,maxSize=${MAX_GPUS},desiredSize=${GPU_DESIRED}" \
+    --region "${AWS_REGION}" >/dev/null 2>&1 || warn "  Could not scale gpu-inference node group back down (continuing)"
+fi
+
+# Step 8b: apply Triton + ARTF containers + orchestrator. The Model Optimizer is
+# NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
+# node group (role=services) since they call Triton over the network and hold no
+# GPU; --artf-node-role=inference co-locates them on the GPU node instead.
+for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml triton-hpa.yaml; do
   PROCESSED="/tmp/${CLUSTER_NAME}-${manifest}"
   sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
       -e "s|__REGION__|${AWS_REGION}|g" \
@@ -758,8 +1201,11 @@ for manifest in triton-deployment.yaml artf-containers-deployment.yaml orchestra
       -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
       -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
       -e "s|__TRITON_ROLE_ARN__|${TRITON_ROLE_ARN}|g" \
+      -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
+      -e "s|__ARTF_NODE_ROLE__|${ARTF_NODE_ROLE}|g" \
       -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
-      -e "s|__BID_SHADING_RUNTIME_ARN__|${BID_SHADING_RUNTIME_ARN:-}|g" \
+      -e "s|__PARAMETER_STORE_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store|g" \
+      -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
   kubectl apply -f "${PROCESSED}"
 done
@@ -771,13 +1217,9 @@ kubectl rollout status deployment/triton-inference-server --timeout=300s || \
 log "  Waiting for orchestrator..."
 kubectl rollout status deployment/orchestrator --timeout=120s || true
 
-# Patch the orchestrator with the Bid Shading runtime ARN if available.
-# This runs on every deploy so re-deploys pick up the correct ARN even if
-# it was empty during manifest apply (e.g., runtime created after manifests).
-if [[ -n "${BID_SHADING_RUNTIME_ARN}" && "${BID_SHADING_RUNTIME_ARN}" != "None" ]]; then
-  kubectl set env deployment/orchestrator "BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}" 2>/dev/null || true
-  log "  Orchestrator patched with BID_SHADING_RUNTIME_ARN"
-fi
+# NOTE: the orchestrator is intentionally NOT patched with any agent runtime ARN.
+# It must never invoke the closed-loop agents (FR-6) — the browser invokes them
+# directly via SigV4. Agent ARNs are wired into the frontend build in Step 11.
 
 # Wait for the LoadBalancer to get an external hostname
 log "  Waiting for orchestrator LoadBalancer endpoint..."
@@ -848,14 +1290,19 @@ COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
 COGNITO_USER_POOL_ID="$(jq -r '.UserPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 COGNITO_CLIENT_ID="$(jq -r '.ClientId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 
-# --- Step 9c: Write Cognito config for React build ---
+# --- Step 9c: Write frontend build config (auth). The agent runtime ARNs are not
+# known until the agents deploy in Step 11 (--with-retraining), which re-writes this
+# file with the resolved ARNs and rebuilds. Empty ARNs here → the UI honestly shows
+# "agent not deployed" until Step 11 completes. This file is generated (git-ignored),
+# never committed with real values. ---
 REACT_ENV="${SCRIPT_DIR}/../source/frontend-react/.env.production"
 cat > "${REACT_ENV}" <<EOF
 VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
 VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
 VITE_COGNITO_REGION=${AWS_REGION}
 VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
-VITE_BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}
+VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=
+VITE_GOVERNANCE_RUNTIME_ARN=
 EOF
 
 # React UI distribution
@@ -985,36 +1432,35 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   if [[ "${SKIP_AGENTCORE}" -eq 1 ]]; then
     CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --skip-agentcore"
   fi
+  if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --local-build"
+  fi
+  if [[ -n "${NGC_SECRET}" ]]; then
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-secret ${NGC_SECRET}"
+  fi
+  if [[ -n "${NGC_KEY}" ]]; then
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-key ${NGC_KEY}"
+  fi
 
   VPC_ID="${CL_VPC_ID}" \
   SUBNET_IDS="${CL_SUBNET_IDS}" \
   EKS_NODE_ROLE="${CL_NODE_ROLE_ARN}" \
+  MODEL_BUCKET="${MODEL_BUCKET}" \
+  CLUSTER_NAME="${CLUSTER_NAME}" \
+  BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID}" \
+  ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID}" \
+  GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID}" \
   "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} || {
     warn "Closed-loop deployment returned non-zero. Check output above for errors."
     warn "The core EKS deployment succeeded — retraining infra may need manual intervention."
   }
 
-  # Resolve the actual runtime ARN (deploy_closed_loop.sh exports it, but subshell won't propagate)
-  BID_SHADING_RUNTIME_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
-    --query "agentRuntimes[?contains(agentRuntimeName,'BidShadingStrategy')].agentRuntimeArn | [0]" \
-    --output text 2>/dev/null || echo '')"
-  if [[ -n "${BID_SHADING_RUNTIME_ARN}" && "${BID_SHADING_RUNTIME_ARN}" != "None" ]]; then
-    log "  BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}"
-
-    # Re-deploy frontend with the runtime ARN now available
-    log "  Re-deploying frontend with AgentCore runtime ARN..."
-    cat > "${REACT_ENV}" <<EOF
-VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
-VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
-VITE_COGNITO_REGION=${AWS_REGION}
-VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
-VITE_BID_SHADING_RUNTIME_ARN=${BID_SHADING_RUNTIME_ARN}
-EOF
-    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
-      --action deploy \
-      --stack-name "${STACK_NAME}" \
-      --region "${AWS_REGION}" 2>/dev/null || warn "Frontend re-deploy failed"
-  fi
+  # deploy_closed_loop.sh (Step 7) grants the Identity-Pool auth role scoped
+  # InvokeAgentRuntime and rebuilds+redeploys the UI with the now-known agent runtime
+  # ARNs baked in — it owns that step because it is where the ARNs first exist. We do
+  # NOT repeat it here (a second frontend build would be wasteful and could race the
+  # first). The orchestrator is never wired to the agents — the browser invokes them
+  # directly via SigV4 (FR-6).
 
   log "  Closed-loop retraining infrastructure deployed."
 else
@@ -1067,12 +1513,11 @@ log "    Backend:       ONNX Runtime + CUDA Execution Provider"
 log ""
 log "  Models served by Triton:"
 log "    dlrm_bid_shader            — DLRM (NVIDIA DeepLearningExamples)"
-log "    widedeep_segment_activator — Wide & Deep (NVIDIA Merlin)"
 log "    ncf_deal_manager           — NeuMF (NVIDIA DeepLearningExamples)"
 log ""
 log "  Containers (via orchestrator):"
 log "    DLRM Bid Shader        — BID_SHADE"
-log "    Wide&Deep Segments      — ACTIVATE_SEGMENTS"
+log "    Wide&Deep Segments      — ACTIVATE_SEGMENTS (rule-based, no Triton)"
 log "    NCF Deal Manager        — ACTIVATE_DEALS / SUPPRESS_DEALS"
 log "    Metrics Enricher        — ADD_METRICS"
 log ""

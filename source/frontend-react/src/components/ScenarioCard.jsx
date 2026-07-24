@@ -6,7 +6,7 @@ export const SCENARIOS = [
   {
     id: "banner-basic",
     name: "Banner Ad — Segment Activation",
-    desc: "ESPN sports page with a 300×250 banner. Wide & Deep activates audience segments, Metrics adds viewability scores.",
+    desc: "ESPN sports page with a 300×250 banner. The Segment Activator activates audience segments via rules, Metrics adds viewability scores.",
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
       { cls: "metric", label: "ADD_METRICS" },

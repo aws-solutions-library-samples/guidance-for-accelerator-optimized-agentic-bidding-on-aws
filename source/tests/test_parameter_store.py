@@ -45,7 +45,7 @@ def _make_state(
     current_value: float = 0.7,
     previous_value: float = 0.68,
     version: int = 1,
-    updated_by: str = "bid_shading_agent",
+    updated_by: str = "adaptive_bidding_agent",
     reason: str = "Win rate below target",
     confidence: float = 0.85,
 ) -> ParameterState:
@@ -173,7 +173,7 @@ class TestReadParameter:
         assert result.current_value == 0.7
         assert result.previous_value == 0.68
         assert result.version == 1
-        assert result.updated_by == "bid_shading_agent"
+        assert result.updated_by == "adaptive_bidding_agent"
         assert result.reason == "Win rate below target"
         assert result.confidence == 0.85
 
@@ -443,7 +443,7 @@ class TestAuditTrail:
         assert audit_item["parameter_name"] == "shade_factor"
         assert audit_item["old_value"] == "0.7"
         assert audit_item["new_value"] == "0.72"
-        assert audit_item["updated_by"] == "bid_shading_agent"
+        assert audit_item["updated_by"] == "adaptive_bidding_agent"
         assert audit_item["version"] == 3
 
     def test_audit_failure_does_not_block_write(self, mock_dynamodb):
@@ -687,7 +687,7 @@ class TestUpdateParameter:
                 model_type="dlrm_bid_shader",
                 parameter_name="shade_factor",
                 new_value=0.73,
-                updated_by="bid_shading_agent",
+                updated_by="adaptive_bidding_agent",
                 reason="Win rate below target",
                 confidence=0.9,
                 expected_version=3,
@@ -712,7 +712,7 @@ class TestUpdateParameter:
                     model_type="dlrm_bid_shader",
                     parameter_name="shade_factor",
                     new_value=0.99,  # above max 0.95
-                    updated_by="bid_shading_agent",
+                    updated_by="adaptive_bidding_agent",
                     reason="test",
                     confidence=0.5,
                     expected_version=5,

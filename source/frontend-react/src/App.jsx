@@ -3,7 +3,8 @@ import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
 import RawPanel from "./components/RawPanel";
 import ContainersPanel from "./components/ContainersPanel";
-import ClosedLoopPanel from "./components/ClosedLoopPanel";
+import AdaptiveBiddingPanel from "./components/AdaptiveBiddingPanel";
+import GovernancePanel from "./components/GovernancePanel";
 import { LoadTestResults } from "./components/LoadTestPanel";
 import BidBubbleOverlay from "./components/BidBubbleOverlay";
 import DemoToggle from "./components/DemoToggle";
@@ -114,7 +115,7 @@ function AppContent() {
         onViewChange={setView}
       />
       <div className="app-layout">
-        {view !== "tuning" && (
+        {view !== "adaptive" && view !== "governance" && (
           <Sidebar
             onResult={(r) => { }}
             submit={handleSubmit}
@@ -123,8 +124,10 @@ function AppContent() {
           />
         )}
         <main className="app-main">
-          {view === "tuning" ? (
-            <ClosedLoopPanel />
+          {view === "adaptive" ? (
+            <AdaptiveBiddingPanel />
+          ) : view === "governance" ? (
+            <GovernancePanel />
           ) : (
             <>
               {/* Mode selector bar */}

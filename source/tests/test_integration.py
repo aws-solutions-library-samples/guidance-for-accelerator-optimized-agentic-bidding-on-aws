@@ -42,11 +42,11 @@ from deployment.canary_deployer import (
 )
 from deployment.model_deployer import (
     HttpResponse,
-    NIMOptimizer,
+    ModelOptimizer,
     TritonModelLoader,
 )
 from agents.governance.ab_evaluator import ABEvaluator, ABTestConfig, TestStatus
-from agents.governance.governance_agent import ModelGovernanceAgent, GovernanceDecision
+from agents.governance.governance_agent import ModelPromotionGovernanceAgent, GovernanceDecision
 from training.pipeline import ModelType, TrainingPipeline, TrainingResult
 
 
@@ -325,7 +325,7 @@ class TestParameterWriteReadWithinTTL:
             "current_value": "0.70",
             "previous_value": "0.68",
             "updated_at": "1718000000.0",
-            "updated_by": "bid_shading_agent",
+            "updated_by": "adaptive_bidding_agent",
             "version": 3,
             "min_value": "0.3",
             "max_value": "0.95",
@@ -339,7 +339,7 @@ class TestParameterWriteReadWithinTTL:
             "current_value": "12.0",
             "previous_value": "11.0",
             "updated_at": "1718000000.0",
-            "updated_by": "bid_shading_agent",
+            "updated_by": "adaptive_bidding_agent",
             "version": 2,
             "min_value": "1.0",
             "max_value": "50.0",
@@ -355,7 +355,7 @@ class TestParameterWriteReadWithinTTL:
                 model_type="dlrm_bid_shader",
                 parameter_name="shade_factor",
                 new_value=0.72,
-                updated_by="bid_shading_agent",
+                updated_by="adaptive_bidding_agent",
                 reason="Win rate below target",
                 confidence=0.9,
                 expected_version=3,
@@ -430,7 +430,6 @@ class TestParameterWriteReadWithinTTL:
 # ===========================================================================
 
 TRITON_URL = "http://triton:8000"
-NIM_ENDPOINT = "http://nim-service:8080"
 MODEL_BUCKET = "artf-model-bucket"
 MODEL_NAME = "dlrm_bid_shader"
 ARTIFACT_URI = "s3://artf-model-bucket/optimized-models/dlrm_bid_shader/model.engine"
@@ -462,106 +461,162 @@ def _setup_canary_responses(
     )
 
 
-def _make_canary_deployer(http_client: MockHttpClient, tmp_path) -> CanaryDeployer:
-    """Create a CanaryDeployer with mocked HTTP deps."""
-    repo_path = str(tmp_path / "models")
+class _FakePaginator:
+    def __init__(self, s3):
+        self._s3 = s3
+
+    def paginate(self, Bucket, Prefix, Delimiter=None):  # noqa: N803
+        keys = [k for k in self._s3.objects if k.startswith(Prefix)]
+        if Delimiter:
+            prefixes = set()
+            for k in keys:
+                rest = k[len(Prefix):]
+                if Delimiter in rest:
+                    prefixes.add(Prefix + rest.split(Delimiter, 1)[0] + Delimiter)
+            yield {"CommonPrefixes": [{"Prefix": p} for p in sorted(prefixes)]}
+        else:
+            yield {"Contents": [{"Key": k} for k in sorted(keys)]}
+
+
+class _FakeS3:
+    """In-memory S3 stand-in so the REAL TritonModelLoader runs its Option-D
+    control-plane ops (write engine/config, edit router split, delete canary)."""
+
+    class _Exceptions:
+        class NoSuchKey(Exception):
+            pass
+
+    exceptions = _Exceptions()
+
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        if Key not in self.objects:
+            raise _FakeS3.exceptions.NoSuchKey()
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, Bucket, Key, Body):  # noqa: N803
+        self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode()
+
+    def copy_object(self, CopySource, Bucket, Key):  # noqa: N803
+        self.objects[Key] = self.objects.get(CopySource["Key"], b"engine-bytes")
+
+    def delete_objects(self, Bucket, Delete):  # noqa: N803
+        for obj in Delete["Objects"]:
+            self.objects.pop(obj["Key"], None)
+        return {}
+
+    def get_paginator(self, _op):
+        return _FakePaginator(self)
+
+
+_REPO = "triton-models"
+_STABLE_CFG = 'name: "dlrm_bid_shader_stable"\nplatform: "tensorrt_plan"\n'
+_ROUTER_CFG = (
+    'name: "dlrm_bid_shader"\nbackend: "python"\n'
+    'parameters { key: "canary_model" value: { string_value: "" } }\n'
+    'parameters { key: "canary_traffic_pct" value: { string_value: "0" } }\n'
+)
+
+
+def _seeded_s3() -> _FakeS3:
+    return _FakeS3({
+        f"{_REPO}/{MODEL_NAME}/config.pbtxt": _ROUTER_CFG.encode(),
+        f"{_REPO}/{MODEL_NAME}_stable/config.pbtxt": _STABLE_CFG.encode(),
+        f"{_REPO}/{MODEL_NAME}_stable/1/model.plan": b"stable-v1-engine",
+    })
+
+
+def _ready_http() -> MockHttpClient:
+    client = MockHttpClient()
+    client.set_response(f"{TRITON_URL}/v2/models/{MODEL_NAME}_canary/ready", _ok_json({}))
+    client.set_response(f"{TRITON_URL}/v2/models/{MODEL_NAME}_stable/ready", _ok_json({}))
+    return client
+
+
+def _make_canary_deployer(s3: _FakeS3, http_client: MockHttpClient) -> CanaryDeployer:
+    """Real CanaryDeployer + real TritonModelLoader over a fake S3 + HTTP (Option D)."""
     triton_loader = TritonModelLoader(
         triton_url=TRITON_URL,
-        model_repository_path=repo_path,
+        model_bucket=MODEL_BUCKET,
         http_client=http_client,
+        s3_client=s3,
+        region="us-east-1",
+        poll_interval_seconds=0.0,
+        ready_timeout_seconds=0.0,
     )
-    nim_optimizer = NIMOptimizer(
-        nim_endpoint=NIM_ENDPOINT,
+    model_optimizer = ModelOptimizer(
+        optimizer_endpoint="http://model-optimizer:8080",
         model_bucket=MODEL_BUCKET,
         region="us-east-1",
         http_client=http_client,
     )
-    return CanaryDeployer(
-        triton_loader=triton_loader,
-        nim_optimizer=nim_optimizer,
+    return CanaryDeployer(triton_loader=triton_loader, model_optimizer=model_optimizer)
+
+
+def _router_pct(s3: _FakeS3) -> str:
+    import re
+
+    cfg = s3.objects[f"{_REPO}/{MODEL_NAME}/config.pbtxt"].decode()
+    m = re.search(
+        r'key: "canary_traffic_pct" value: \{ string_value: "([^"]*)" \}', cfg
     )
+    return m.group(1) if m else ""
 
 
 class TestCanaryTrafficSplitIntegration:
-    """Integration test: deploy canary, verify traffic split, adjust, rollback.
+    """Integration test: deploy canary, adjust split, rollback — Option D router.
 
-    Exercises the full canary lifecycle using deterministic request IDs
-    to verify hash-based routing distributes traffic correctly.
+    Drives the REAL CanaryDeployer + TritonModelLoader against a fake S3/HTTP.
+    Per-request traffic splitting happens in-process in the Triton router (not
+    here), so these assert the control-plane split written to the router config
+    and the resulting deployment state — the dependency-free ARTF contract.
     """
 
     @pytest.mark.asyncio
-    async def test_50_percent_canary_traffic_distribution(self, tmp_path):
-        """Deploy canary at 50%, route 1000 requests, verify ~50% split."""
-        client = MockHttpClient()
-        _setup_canary_responses(client)
-        deployer = _make_canary_deployer(client, tmp_path)
+    async def test_deploy_sets_router_split_and_state(self):
+        s3 = _seeded_s3()
+        deployer = _make_canary_deployer(s3, _ready_http())
 
-        await deployer.deploy_canary(
-            model_name=MODEL_NAME,
-            artifact_uri=ARTIFACT_URI,
-            initial_traffic_pct=50.0,
+        state = await deployer.deploy_canary(
+            model_name=MODEL_NAME, artifact_uri=ARTIFACT_URI, initial_traffic_pct=50.0,
         )
 
-        # Route 1000 deterministic request IDs
-        canary_count = 0
-        total_requests = 1000
-        for i in range(total_requests):
-            request_id = f"integ-test-request-{i:04d}"
-            version = deployer.route_request(MODEL_NAME, request_id)
-            if version == 2:
-                canary_count += 1
-
-        canary_pct = canary_count / total_requests * 100
-        # With 50% configured, expect roughly 50% ± 7% (statistical tolerance)
-        assert 43.0 <= canary_pct <= 57.0, (
-            f"Expected ~50% canary traffic, got {canary_pct:.1f}%"
-        )
+        assert state.canary_model == f"{MODEL_NAME}_canary"
+        assert state.canary_traffic_pct == 50.0
+        assert state.control_traffic_pct == 50.0
+        # Canary model materialized in the served repo and the router split written.
+        assert f"{_REPO}/{MODEL_NAME}_canary/1/model.plan" in s3.objects
+        assert _router_pct(s3) == "50.0"
 
     @pytest.mark.asyncio
-    async def test_adjust_to_100_all_go_to_canary(self, tmp_path):
-        """Adjust to 100% canary → all requests route to canary version."""
-        client = MockHttpClient()
-        _setup_canary_responses(client)
-        deployer = _make_canary_deployer(client, tmp_path)
-
+    async def test_adjust_to_100_updates_router_split(self):
+        s3 = _seeded_s3()
+        deployer = _make_canary_deployer(s3, _ready_http())
         await deployer.deploy_canary(
-            model_name=MODEL_NAME,
-            artifact_uri=ARTIFACT_URI,
-            initial_traffic_pct=50.0,
+            model_name=MODEL_NAME, artifact_uri=ARTIFACT_URI, initial_traffic_pct=50.0,
         )
 
-        # Adjust to 100%
         state = await deployer.adjust_traffic(MODEL_NAME, 100.0)
         assert state.canary_traffic_pct == 100.0
         assert state.control_traffic_pct == 0.0
-
-        # All requests should go to canary
-        for i in range(100):
-            version = deployer.route_request(MODEL_NAME, f"req-100pct-{i}")
-            assert version == 2, f"Request {i} routed to version {version}, expected 2"
+        assert _router_pct(s3) == "100.0"
 
     @pytest.mark.asyncio
-    async def test_rollback_all_go_to_stable(self, tmp_path):
-        """Rollback → all requests route to stable version."""
-        client = MockHttpClient()
-        _setup_canary_responses(client)
-        deployer = _make_canary_deployer(client, tmp_path)
-
+    async def test_rollback_zeroes_split_and_removes_canary(self):
+        s3 = _seeded_s3()
+        deployer = _make_canary_deployer(s3, _ready_http())
         await deployer.deploy_canary(
-            model_name=MODEL_NAME,
-            artifact_uri=ARTIFACT_URI,
-            initial_traffic_pct=50.0,
+            model_name=MODEL_NAME, artifact_uri=ARTIFACT_URI, initial_traffic_pct=50.0,
         )
 
-        # Rollback
         state = await deployer.rollback(MODEL_NAME)
         assert state.status == "stable"
-        assert state.canary_version is None
-
-        # All requests should go to stable (version 1)
-        for i in range(100):
-            version = deployer.route_request(MODEL_NAME, f"req-rollback-{i}")
-            assert version == 1, f"Request {i} routed to version {version}, expected 1"
+        assert state.canary_model is None
+        assert _router_pct(s3) == "0.0"
+        # Canary model removed from the served repo.
+        assert not any(f"{MODEL_NAME}_canary" in k for k in s3.objects)
 
 
 
@@ -608,8 +663,8 @@ FIXTURE_TRAINING_RESULT = TrainingResult(
 )
 
 
-class MockNIMOptimizer:
-    """Mock NIM optimizer returning a deterministic optimized URI."""
+class MockModelOptimizer:
+    """Mock Model Optimizer returning a deterministic optimized URI."""
 
     def __init__(self, *, should_fail: bool = False):
         self._should_fail = should_fail
@@ -621,7 +676,7 @@ class MockNIMOptimizer:
             "model_name": model_name,
         })
         if self._should_fail:
-            raise RuntimeError("NIM API error")
+            raise RuntimeError("optimizer error")
         return f"s3://models/optimized/{model_name}/model.engine"
 
 
@@ -704,21 +759,21 @@ class TestRegisterABDecisionFlow:
         self,
         guardrail_violations: list[str] | None = None,
     ) -> tuple[
-        ModelGovernanceAgent,
-        MockNIMOptimizer,
+        ModelPromotionGovernanceAgent,
+        MockModelOptimizer,
         MockCanaryDeployerForGovernance,
         MockModelRegistryClient,
         MockAuditStore,
     ]:
         """Build a governance agent with all mock dependencies."""
-        nim = MockNIMOptimizer()
+        nim = MockModelOptimizer()
         canary = MockCanaryDeployerForGovernance()
         guardrail = MockGuardrailMonitor(violations=guardrail_violations)
         registry = MockModelRegistryClient()
         audit = MockAuditStore()
 
-        agent = ModelGovernanceAgent(
-            nim_optimizer=nim,
+        agent = ModelPromotionGovernanceAgent(
+            model_optimizer=nim,
             canary_deployer=canary,
             ab_evaluator_factory=lambda config: ABEvaluator(config),
             guardrail_monitor=guardrail,
@@ -808,7 +863,7 @@ class TestRegisterABDecisionFlow:
         # Verify audit record written
         assert len(audit.records) == 1
         assert audit.records[0]["decision"] == "promote"
-        assert audit.records[0]["actor"] == "governance_agent"
+        assert audit.records[0]["actor"] == "model_promotion_governance_agent"
         assert audit.records[0]["model_type"] == "dlrm_bid_shader"
 
     @pytest.mark.asyncio
@@ -866,4 +921,4 @@ class TestRegisterABDecisionFlow:
         # Verify audit record written
         assert len(audit.records) == 1
         assert audit.records[0]["decision"] == "reject"
-        assert audit.records[0]["actor"] == "governance_agent"
+        assert audit.records[0]["actor"] == "model_promotion_governance_agent"
