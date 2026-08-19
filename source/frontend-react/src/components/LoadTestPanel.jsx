@@ -545,6 +545,8 @@ function MetricItem({ label, value, highlight, delta }) {
 }
 
 function ContainerBreakdown({ containers }) {
+  // Keyed by the unchanged internal container name the orchestrator returns —
+  // see RENAME_MAP.md.
   const CONTAINER_NAMES = [
     "dlrm-bid-shader",
     "widedeep-segment-activator",
@@ -557,6 +559,14 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator": nvidiaLogo,
     "ncf-deal-manager": nvidiaLogo,
     "metrics-enricher": nvidiaLogo,
+  };
+
+  // Job-oriented display labels shown instead of the raw internal name.
+  const CONTAINER_LABELS = {
+    "dlrm-bid-shader": "Bid Pricer",
+    "widedeep-segment-activator": "Audience Activator",
+    "ncf-deal-manager": "Deal Scorer",
+    "metrics-enricher": "Signals Enricher",
   };
 
   const rows = containers && containers.length > 0
@@ -581,7 +591,7 @@ function ContainerBreakdown({ containers }) {
               <td className="loadtest-breakdown-logo">
                 <img src={CONTAINER_LOGOS[c.name]} alt="" className="loadtest-container-logo" />
               </td>
-              <td className="loadtest-breakdown-name">{c.name}</td>
+              <td className="loadtest-breakdown-name">{CONTAINER_LABELS[c.name] || c.name}</td>
               <td>{c.avg_latency_ms != null ? `${c.avg_latency_ms.toFixed(1)}ms` : "—"}</td>
               <td>{c.total_mutations != null ? c.total_mutations.toLocaleString() : "—"}</td>
             </tr>

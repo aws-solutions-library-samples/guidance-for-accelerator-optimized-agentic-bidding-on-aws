@@ -40,14 +40,18 @@ spec:
             - containerPort: 8000
               name: http
           env:
+            # Service DNS names below match the k8s Service names in
+            # artf-containers-deployment.yaml (job-oriented display names — see
+            # RENAME_MAP.md). Env var names are unchanged internal identifiers
+            # read by source/orchestrator/app.py.
             - name: DLRM_URL
-              value: "http://dlrm-bid-shader:8081"
+              value: "http://bid-pricer:8081"
             - name: WIDEDEEP_URL
-              value: "http://widedeep-segment-activator:8081"
+              value: "http://audience-activator:8081"
             - name: NCF_URL
-              value: "http://ncf-deal-manager:8081"
+              value: "http://deal-scorer:8081"
             - name: METRICS_URL
-              value: "http://metrics-enricher:8081"
+              value: "http://signals-enricher:8081"
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME

@@ -2,17 +2,32 @@
 # =============================================================================
 # deploy.sh — Deploy the Accelerator-optimized Agentic Bidding solution to AWS
 #
-# Deploys:
-#   1. ECR repositories for all container images
-#   2. Export PyTorch models to ONNX for NVIDIA Triton
-#   3. Upload ONNX model repository to S3
-#   4. Build and push container images (via AWS CodeBuild, or locally with --local-build)
-#   5. Create or update EKS cluster with GPU node group (g5 family / A10G)
-#   6. Install NVIDIA Kubernetes Device Plugin
-#   7. Configure IRSA for Triton S3 model access
-#   8. Deploy Kubernetes manifests (Triton server, ARTF containers, orchestrator)
-#   9. Deploy frontend to S3 + CloudFront (React UI)
-#  10. Deploy Bedrock AgentCore MCP runtime
+# Deploys in 5 phases:
+#   Phase 1/5 — Preparing models:      ECR repos, ONNX export, S3 upload
+#   Phase 2/5 — Building & provisioning: container images (CodeBuild/local) +
+#                                       EKS cluster (GPU + CPU node groups),
+#                                       built concurrently; NVIDIA device
+#                                       plugin; IRSA/IAM
+#   Phase 3/5 — Deploying workloads:   Kubernetes manifests (Triton, ARTF
+#                                       containers, orchestrator); TensorRT
+#                                       base-engine bootstrap (non-blocking —
+#                                       see "Model-optimizer bootstrap" below)
+#   Phase 4/5 — Setting up access:     frontend (S3 + CloudFront), Cognito
+#   Phase 5/5 — Registering agents:    Bedrock AgentCore MCP runtime, and
+#                                       (default) the Part 2 closed-loop stack
+#
+# Default output shows only phase headers + one-line checkmarked summaries.
+# Pass --verbose for the full detailed log stream. On failure, the phase and
+# step that failed are reported with the real error plus a remediation hint.
+#
+# Model-optimizer bootstrap is fire-and-forget: it runs in the background and
+# does not block Phase 3+. Triton auto-loads the compiled TensorRT engines
+# from its S3 model repository (poll mode) whenever the bootstrap finishes —
+# check status any time with: cat deployment/.bootstrap-status.json
+#
+# BREAKING CHANGE: --start-at now takes a phase number 1-5 instead of the
+# old ad-hoc step numbers. See RENAME_MAP.md for the old-step -> new-phase
+# mapping if you have scripts referencing the previous numbering.
 #
 # Usage:
 #   ./deploy.sh                                # full deploy
@@ -29,6 +44,8 @@
 #   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
 #   ./deploy.sh --artf-node-role inference      # co-locate ARTF model containers on the GPU node
 #                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
+#   ./deploy.sh --start-at 3                   # resume from Phase 3 (skip model prep + images/cluster)
+#   ./deploy.sh --verbose                      # print full detailed logs alongside phase output
 #   ./deploy.sh --destroy                      # tear down the entire stack
 #   AWS_REGION=us-west-2 ./deploy.sh           # different region
 #
@@ -42,6 +59,23 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Job-oriented display names for the 4 ARTF containers, used ONLY for the
+# ECR repository name / image tag and any printed summary text. The
+# underlying "key" (dlrm-bid-shader, widedeep-segment-activator, etc.) is
+# unchanged everywhere else (source directory resolution, content hashing,
+# Dockerfile selection, and the --only key sent to remote_build.sh/
+# buildspec.yml) — see RENAME_MAP.md for the full rationale.
+display_name() {
+  case "$1" in
+    dlrm-bid-shader)             echo "bid-pricer" ;;
+    widedeep-segment-activator)  echo "audience-activator" ;;
+    ncf-deal-manager)            echo "deal-scorer" ;;
+    metrics-enricher)            echo "signals-enricher" ;;
+    *)                           echo "$1" ;;
+  esac
+}
+
 AWS_REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
@@ -53,6 +87,10 @@ SKIP_IMAGES=0
 UI_ONLY=0
 SKIP_CLUSTER=0
 EXPORT_ONLY=0
+# --verbose: print the full detailed log stream (every log/warn line) in
+# addition to the default phase headers + checkmarked summaries. Default (0)
+# shows only the phase-level output.
+VERBOSE=0
 # Part 2 closed-loop (NeMo-RL training, Model Registry, Glue ETL, the Adaptive
 # Bidding + Governance agents) is ON by default. Disable with --no-retraining.
 WITH_RETRAINING=1
@@ -78,6 +116,7 @@ for arg in "$@"; do
     --destroy)          DESTROY=1 ;;
     --skip-agentcore)   SKIP_AGENTCORE=1 ;;
     --skip-images)      SKIP_IMAGES=1 ;;
+    --verbose)          VERBOSE=1 ;;
     --start-at=*)       START_AT="${arg#--start-at=}" ;;
     --ui-only)          UI_ONLY=1 ;;
     --skip-cluster)     SKIP_CLUSTER=1 ;;
@@ -100,7 +139,7 @@ for arg in "$@"; do
     --artf-node-role)   ;; # value comes in next arg, handled below
     --artf-on-gpu)      ARTF_NODE_ROLE="inference" ;;
     --start-at)         ;; # value comes in next arg, handled below
-    -h|--help)          sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help)          sed -n '2,57p' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
         STACK_PREFIX="${arg}"
@@ -123,10 +162,17 @@ for arg in "$@"; do
 done
 unset _PREV_ARG
 
-# --start-at: skip earlier steps by setting SKIP flags
-# Steps: 1-3=models/ECR, 4=images, 5-7=cluster/NVIDIA/IAM, 8=manifests, 9=frontend, 10=agentcore, 11=closed-loop
-if [[ "${START_AT}" -gt 4 ]]; then SKIP_IMAGES=1; fi
-if [[ "${START_AT}" -gt 7 ]]; then SKIP_CLUSTER=1; fi
+# --start-at: skip earlier PHASES by setting SKIP flags. BREAKING CHANGE —
+# this now takes a phase number 1-5 (see the header comment), not the old
+# ad-hoc step numbers. Phase 1 = models/ECR, Phase 2 = images + cluster +
+# NVIDIA device plugin + IAM, Phase 3 = manifests, Phase 4 = frontend,
+# Phase 5 = agentcore + closed-loop.
+if ! [[ "${START_AT}" =~ ^[1-5]$ ]]; then
+  printf '\033[0;31m[fail]\033[0m %s\n' "--start-at must be 1-5 (got '${START_AT}'). See RENAME_MAP.md for the old-step -> new-phase mapping." >&2
+  exit 1
+fi
+if [[ "${START_AT}" -gt 1 ]]; then SKIP_IMAGES=1; fi
+if [[ "${START_AT}" -gt 2 ]]; then SKIP_CLUSTER=1; fi
 
 # Validate --maxGPUs: must be a positive integer (it caps the GPU node group's maxSize)
 if ! [[ "${MAX_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -157,9 +203,60 @@ fi
 ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID:-${BEDROCK_MODEL_ID}}"
 GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID:-${BEDROCK_MODEL_ID}}"
 
-log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
+# say(): always-visible output, regardless of --verbose. Used for the
+# --destroy narration (FR-12: its UX stays exactly as before) and the final
+# deployment summary (FR-6: "print ONLY what the user needs to get started").
+say() { printf '%s\n' "$*"; }
+
+# log(): detailed step-by-step narration. Printed only under --verbose so the
+# default output stays to the 5 phase headers + checkmarked summaries below
+# (FR-10). warn()/fail() always print — a warning or a hard failure is never
+# hidden regardless of verbosity.
+log()  { [[ "${VERBOSE}" -eq 1 ]] && printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; return 0; }
 warn() { printf '\033[0;33m[warn]\033[0m %s\n' "$*"; }
-fail() { printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# phase(): always-visible section header. N is 1-5 (see the phase table in
+# design.md section 2 / RENAME_MAP.md's breaking-change note).
+phase() { printf '\n\033[1;36mPhase %s/5: %s\033[0m\n' "$1" "$2"; }
+
+# ok(): always-visible one-line checkmarked completion summary, printed after
+# the real underlying command has actually succeeded (never before — no
+# fabricated "done" markers).
+ok() { printf '  \033[0;32m[OK]\033[0m %s\n' "$*"; }
+
+# phase_hint(): a short remediation hint per phase, printed by fail() as
+# additional context above the real captured error — never a replacement
+# for it (FR-11). A case statement (not an associative array) for bash 3.2
+# compatibility (macOS default) — see _source_hash()/display_name() above
+# for the same pattern already used elsewhere in this script.
+phase_hint() {
+  case "$1" in
+    1) echo "Check AWS credentials (aws sts get-caller-identity) and that boto3/torch/onnx/onnxscript are installed." ;;
+    2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild, and your EC2 g5 GPU service quota for cluster creation." ;;
+    3) echo "Check GPU node availability: kubectl get nodes -l nvidia.com/gpu=present ; kubectl get pods" ;;
+    4) echo "Check the CloudFront/S3 frontend deploy output above and Cognito user pool creation." ;;
+    5) echo "Check Bedrock model access (--model-id) and the AgentCore runtime IAM roles." ;;
+    *) echo "" ;;
+  esac
+}
+
+# fail(): always prints the real error, then exits non-zero. When called with
+# a phase number as the first argument (fail "<phase>" "<message>"), also
+# prints that phase's remediation hint as additional context above it.
+fail() {
+  if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then
+    local _phase="$1"; shift
+    printf '\033[0;31m[fail]\033[0m Phase %s/5: %s\n' "${_phase}" "$*" >&2
+    local _hint
+    _hint="$(phase_hint "${_phase}")"
+    if [[ -n "${_hint}" ]]; then
+      printf '\033[0;33m[hint]\033[0m %s\n' "${_hint}" >&2
+    fi
+  else
+    printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2
+  fi
+  exit 1
+}
 
 # =========================================================================
 # Preflight
@@ -221,11 +318,14 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   read -r -p "Type 'destroy' to confirm: " CONFIRM
   [[ "${CONFIRM}" == "destroy" ]] || fail "aborted"
 
-  log "Deleting Kubernetes resources..."
+  # FR-12: --destroy's UX stays exactly as it was — its progress narration
+  # uses say() (always-visible), not log() (verbose-gated), so teardown
+  # doesn't go silent by default and look hung.
+  say "Deleting Kubernetes resources..."
   kubectl delete -f "${SCRIPT_DIR}/eks/" --ignore-not-found 2>/dev/null || true
   kubectl delete namespace artf --ignore-not-found 2>/dev/null || true
 
-  log "Deleting EKS cluster ${CLUSTER_NAME}..."
+  say "Deleting EKS cluster ${CLUSTER_NAME}..."
   # Disable termination protection on eksctl-managed stacks first, in case
   # the cluster was deployed before Step 5.5 existed (eksctl enables it by
   # default). Requires cloudformation:UpdateTerminationProtection.
@@ -241,23 +341,23 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   done
   eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null || true
 
-  log "Deleting Triton model bucket..."
+  say "Deleting Triton model bucket..."
   aws s3 rb "s3://${MODEL_BUCKET}" --force 2>/dev/null || true
 
-  log "Deleting DynamoDB table ${LOADTEST_TABLE}..."
+  say "Deleting DynamoDB table ${LOADTEST_TABLE}..."
   aws dynamodb delete-table --table-name "${LOADTEST_TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
 
-  log "Deleting CloudFront + S3 frontend..."
+  say "Deleting CloudFront + S3 frontend..."
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
 
-  log "Deleting AgentCore runtime..."
+  say "Deleting AgentCore runtime..."
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" || true
 
-  log "Deleting Cognito User Pool..."
+  say "Deleting Cognito User Pool..."
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
 
-  log "Deleting IAM policies..."
+  say "Deleting IAM policies..."
   TRITON_POLICY_NAME="${STACK_NAME}-triton-s3-policy-${STACK_UID}"
   TRITON_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${TRITON_POLICY_NAME}"
   DYNAMO_POLICY_NAME="${STACK_NAME}-dynamo-loadtest-${STACK_UID}"
@@ -279,45 +379,45 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     aws iam delete-policy --policy-arn "${POLICY_ARN}" 2>/dev/null || true
   done
 
-  log "Deleting AgentCore IAM role..."
+  say "Deleting AgentCore IAM role..."
   ROLE_NAME="${STACK_NAME}-agentcore-role-${STACK_UID}"
   for ATTACHED in $(aws iam list-attached-role-policies --role-name "${ROLE_NAME}" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
     aws iam detach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${ATTACHED}" 2>/dev/null || true
   done
   aws iam delete-role --role-name "${ROLE_NAME}" 2>/dev/null || true
 
-  log "Deleting IRSA service account IAM role..."
+  say "Deleting IRSA service account IAM role..."
   eksctl delete iamserviceaccount --name triton-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
 
   # --- Part 2 closed-loop resources (if deployed) ---
-  log "Deleting Part 2 closed-loop stacks (if present)..."
+  say "Deleting Part 2 closed-loop stacks (if present)..."
   for CL_STACK in "${STACK_PREFIX:+${STACK_PREFIX}-}agentcore-security" "${STACK_PREFIX:+${STACK_PREFIX}-}closed-loop-core" "${STACK_PREFIX:+${STACK_PREFIX}-}glue-etl" "${STACK_PREFIX:+${STACK_PREFIX}-}feedback-pipeline"; do
     if aws cloudformation describe-stacks --stack-name "${CL_STACK}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-      log "  Deleting ${CL_STACK}..."
+      say "  Deleting ${CL_STACK}..."
       aws cloudformation delete-stack --stack-name "${CL_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
     fi
   done
 
-  log "Deleting closed-loop AgentCore runtimes..."
+  say "Deleting closed-loop AgentCore runtimes..."
   for RUNTIME_MATCH in "AdaptiveBiddingStrategy" "ModelPromotionGovernance"; do
     RID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
       --query "agentRuntimes[?contains(agentRuntimeName,'${RUNTIME_MATCH}')].agentRuntimeId | [0]" \
       --output text 2>/dev/null || echo 'None')"
     if [[ -n "${RID}" && "${RID}" != "None" ]]; then
       aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${RID}" --region "${AWS_REGION}" 2>/dev/null || true
-      log "  Deleted runtime ${RID} (${RUNTIME_MATCH})"
+      say "  Deleted runtime ${RID} (${RUNTIME_MATCH})"
     fi
   done
 
-  log "Deleting Cognito (user pool, identity pool, authenticated role)..."
+  say "Deleting Cognito (user pool, identity pool, authenticated role)..."
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy \
     --stack-name "${STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
 
-  log "Destroy complete."
-  log ""
-  log "Resources RETAINED (manual cleanup if desired):"
-  log "  ECR repos: ${STACK_NAME}-* (contain pushed images)"
-  log "  Delete with: for r in \$(aws ecr describe-repositories --query 'repositories[?starts_with(repositoryName,\`${STACK_NAME}\`)].repositoryName' --output text --region ${AWS_REGION}); do aws ecr delete-repository --repository-name \$r --force --region ${AWS_REGION}; done"
+  say "Destroy complete."
+  say ""
+  say "Resources RETAINED (manual cleanup if desired):"
+  say "  ECR repos: ${STACK_NAME}-* (contain pushed images)"
+  say "  Delete with: for r in \$(aws ecr describe-repositories --query 'repositories[?starts_with(repositoryName,\`${STACK_NAME}\`)].repositoryName' --output text --region ${AWS_REGION}); do aws ecr delete-repository --repository-name \$r --force --region ${AWS_REGION}; done"
   exit 0
 fi
 
@@ -437,15 +537,16 @@ fi
 # Step 1: ECR repositories
 # =========================================================================
 REPOS=(
-  ${STACK_NAME}-dlrm-bid-shader
-  ${STACK_NAME}-widedeep-segment-activator
-  ${STACK_NAME}-ncf-deal-manager
-  ${STACK_NAME}-metrics-enricher
+  ${STACK_NAME}-$(display_name dlrm-bid-shader)
+  ${STACK_NAME}-$(display_name widedeep-segment-activator)
+  ${STACK_NAME}-$(display_name ncf-deal-manager)
+  ${STACK_NAME}-$(display_name metrics-enricher)
   ${STACK_NAME}-orchestrator
   ${STACK_NAME}-agentcore
 )
 
 if [[ "${START_AT}" -le 1 ]]; then
+phase 1 "Preparing models"
 log "Step 1: Ensuring ECR repositories"
 if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
   aws ecr get-login-password --region "${AWS_REGION}" | \
@@ -538,14 +639,17 @@ aws s3 cp "${BOOTSTRAP_TMP}" \
   "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
 rm -f "${BOOTSTRAP_TMP}"
 log "  Model Optimizer bootstrap spec uploaded"
-fi # START_AT <= 1 (steps 1-3)
+ok "Models exported and uploaded"
+fi # START_AT <= 1 (Phase 1)
 
 # =========================================================================
 # Step 4: Build and push container images
 # =========================================================================
-# Part 1 images are lightweight (python:3.12-slim). CodeBuild finishes in
-# 5-10 minutes. We wait synchronously — no async complexity needed here.
-# =========================================================================
+if [[ "${START_AT}" -le 2 ]]; then
+phase 2 "Building containers & provisioning infrastructure"
+log "  This typically takes 15-20 minutes (bounded by EKS cluster creation)."
+fi
+_PHASE2_START=$(date +%s)
 IMAGE_OUTPUTS="${SCRIPT_DIR}/.image-outputs.json"
 
 # Always read the outputs file if it exists (needed for --start-at to use the correct tag)
@@ -655,10 +759,12 @@ _ensure_tag_alias() {
   fi
 }
 
-# Build one Part-1/optimizer image locally by key (repo suffix).
+# Build one Part-1/optimizer image locally by key (repo suffix). The ECR repo
+# name uses the job-oriented display name (see display_name()); "key" itself
+# stays the old model-architecture name for directory/Dockerfile resolution.
 build_image_local() {
   local key="$1"
-  local repo="${STACK_NAME}-${key}"
+  local repo="${STACK_NAME}-$(display_name "${key}")"
   local image="${REGISTRY}/${repo}:${IMAGE_TAG}"
   local src="${SCRIPT_DIR}/../source"
   aws ecr describe-repositories --repository-names "${repo}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
@@ -700,22 +806,26 @@ build_image_local() {
   esac
 }
 
-if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
-  # Per-image build: (re)build only images whose CONTENT has changed, instead
-  # of an all-or-nothing rebuild. deploy.sh (Step 4) owns the Part 1 images +
-  # the Model Optimizer; the Part 2 agents and NeMo are built later by
-  # deploy_closed_loop.sh.
-  #
-  # IMAGE_TAG alone (default: git short SHA) is NOT sufficient to decide
-  # "skip this build" — re-running deploy.sh at the same commit (e.g. after
-  # editing source without committing, or via --start-at=4) would previously
-  # skip rebuilding as long as ANY image existed at that tag, even one built
-  # from stale source. Each image also gets a content-hash tag
-  # (src-<16 hex chars>, hashed over exactly the files its Dockerfile COPYs).
-  # A build is skipped only when that hash tag already exists in ECR — i.e.
-  # this exact source content has already been built — not merely because
-  # IMAGE_TAG exists. To force a rebuild regardless, delete both tags (or
-  # change the source, which changes the hash automatically).
+# Per-image build: (re)build only images whose CONTENT has changed, instead
+# of an all-or-nothing rebuild. deploy.sh (Step 4) owns the Part 1 images +
+# the Model Optimizer; the Part 2 agents and NeMo are built later by
+# deploy_closed_loop.sh.
+#
+# IMAGE_TAG alone (default: git short SHA) is NOT sufficient to decide
+# "skip this build" — re-running deploy.sh at the same commit (e.g. after
+# editing source without committing, or via --start-at=2) would previously
+# skip rebuilding as long as ANY image existed at that tag, even one built
+# from stale source. Each image also gets a content-hash tag
+# (src-<16 hex chars>, hashed over exactly the files its Dockerfile COPYs).
+# A build is skipped only when that hash tag already exists in ECR — i.e.
+# this exact source content has already been built — not merely because
+# IMAGE_TAG exists. To force a rebuild regardless, delete both tags (or
+# change the source, which changes the hash automatically).
+#
+# Factored into a function (was previously inline) so it can run concurrently
+# with ensure_eks_cluster() below (FR-8) — building images has no dependency
+# on the cluster existing.
+build_images() {
   STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher orchestrator model-optimizer)
   if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then STEP4_KEYS+=(agentcore); fi
 
@@ -723,7 +833,7 @@ if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
   HASH_KEYS=()   # parallel array to MISSING_KEYS (bash 3.2 has no assoc arrays)
   HASH_VALS=()
   for key in "${STEP4_KEYS[@]}"; do
-    repo="${STACK_NAME}-${key}"
+    repo="${STACK_NAME}-$(display_name "${key}")"
     src_hash="$(_source_hash "${key}" || echo '')"
     if [[ -z "${src_hash}" ]]; then
       warn "Step 4: could not hash source for '${key}' (unrecognized key) — will rebuild"
@@ -776,7 +886,7 @@ if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
   # ECR tag metadata (no re-upload of layers).
   for i in "${!HASH_KEYS[@]}"; do
     key="${HASH_KEYS[$i]}"; src_tag="${HASH_VALS[$i]}"
-    repo="${STACK_NAME}-${key}"
+    repo="${STACK_NAME}-$(display_name "${key}")"
     if _ensure_tag_alias "${repo}" "${IMAGE_TAG}" "${src_tag}"; then
       log "  Tagged ${repo}:${IMAGE_TAG} as ${src_tag} (content-hash cache)"
     else
@@ -793,9 +903,8 @@ if [[ "${SKIP_IMAGES}" -eq 0 ]]; then
   "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-else
-  warn "Skipping image build (--skip-images)"
-fi
+  ok "Images built and pushed"
+}
 
 # =========================================================================
 # Step 5: Create or reuse EKS cluster
@@ -811,55 +920,88 @@ create_eks_cluster() {
   eksctl create cluster -f "${CLUSTER_CONFIG}"
 }
 
-if [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
+# Factored into a function (was previously inline) so it can run concurrently
+# with build_images() above (FR-8) — cluster creation has no dependency on the
+# images existing. Any internal `fail` call here runs in the backgrounded
+# subshell (see the orchestration block below) and only exits that subshell;
+# the caller checks the real exit code via `wait`.
+ensure_eks_cluster() {
   if eksctl get cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
     log "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
-  else
-    # `eksctl get cluster` found no active cluster, but a previous
-    # `eksctl create cluster` may have left an orphaned CloudFormation stack
-    # (e.g. ROLLBACK_COMPLETE / CREATE_FAILED after a mid-create failure). In
-    # that state a fresh create fails with:
-    #   AlreadyExistsException: Stack [eksctl-<cluster>-cluster] already exists
-    # eksctl base cluster stacks cannot be updated in place, so recovery is:
-    # reuse it if it's healthy, otherwise delete the failed stack and recreate.
-    CLUSTER_STACK="eksctl-${CLUSTER_NAME}-cluster"
-    STACK_STATUS="$(aws cloudformation describe-stacks \
-      --stack-name "${CLUSTER_STACK}" \
-      --region "${AWS_REGION}" \
-      --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
-
-    if [[ -z "${STACK_STATUS}" ]]; then
-      log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
-      create_eks_cluster
-    else
-      warn "Step 5: Found existing eksctl stack ${CLUSTER_STACK} (status: ${STACK_STATUS})"
-      case "${STACK_STATUS}" in
-        CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE)
-          # Stack is healthy but `eksctl get cluster` didn't list it — reuse it
-          # (kubeconfig is refreshed below in Step 5.5). No create needed.
-          log "  Stack is healthy; reusing existing cluster"
-          ;;
-        *_IN_PROGRESS)
-          fail "  Stack ${CLUSTER_STACK} is ${STACK_STATUS}; wait for it to settle, then re-run"
-          ;;
-        ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED|UPDATE_ROLLBACK_FAILED)
-          warn "  Stack is in a failed state; deleting the orphaned cluster before recreating"
-          # Prefer eksctl (cleans up all associated stacks); fall back to a raw
-          # CFN delete if eksctl can't (the cluster resource may never have existed).
-          eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null \
-            || aws cloudformation delete-stack --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}"
-          aws cloudformation wait stack-delete-complete \
-            --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
-          log "  Orphaned stack deleted; creating fresh cluster ${CLUSTER_NAME} (15-20 min)"
-          create_eks_cluster
-          ;;
-        *)
-          fail "  Stack ${CLUSTER_STACK} in unexpected state ${STACK_STATUS}; resolve manually then re-run"
-          ;;
-      esac
-    fi
+    return 0
   fi
+
+  # `eksctl get cluster` found no active cluster, but a previous
+  # `eksctl create cluster` may have left an orphaned CloudFormation stack
+  # (e.g. ROLLBACK_COMPLETE / CREATE_FAILED after a mid-create failure). In
+  # that state a fresh create fails with:
+  #   AlreadyExistsException: Stack [eksctl-<cluster>-cluster] already exists
+  # eksctl base cluster stacks cannot be updated in place, so recovery is:
+  # reuse it if it's healthy, otherwise delete the failed stack and recreate.
+  CLUSTER_STACK="eksctl-${CLUSTER_NAME}-cluster"
+  STACK_STATUS="$(aws cloudformation describe-stacks \
+    --stack-name "${CLUSTER_STACK}" \
+    --region "${AWS_REGION}" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
+
+  if [[ -z "${STACK_STATUS}" ]]; then
+    log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
+    create_eks_cluster
+  else
+    warn "Step 5: Found existing eksctl stack ${CLUSTER_STACK} (status: ${STACK_STATUS})"
+    case "${STACK_STATUS}" in
+      CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE)
+        # Stack is healthy but `eksctl get cluster` didn't list it — reuse it
+        # (kubeconfig is refreshed below in Step 5.5). No create needed.
+        log "  Stack is healthy; reusing existing cluster"
+        ;;
+      *_IN_PROGRESS)
+        fail "  Stack ${CLUSTER_STACK} is ${STACK_STATUS}; wait for it to settle, then re-run"
+        ;;
+      ROLLBACK_COMPLETE|ROLLBACK_FAILED|CREATE_FAILED|DELETE_FAILED|UPDATE_ROLLBACK_FAILED)
+        warn "  Stack is in a failed state; deleting the orphaned cluster before recreating"
+        # Prefer eksctl (cleans up all associated stacks); fall back to a raw
+        # CFN delete if eksctl can't (the cluster resource may never have existed).
+        eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null \
+          || aws cloudformation delete-stack --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}"
+        aws cloudformation wait stack-delete-complete \
+          --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+        log "  Orphaned stack deleted; creating fresh cluster ${CLUSTER_NAME} (15-20 min)"
+        create_eks_cluster
+        ;;
+      *)
+        fail "  Stack ${CLUSTER_STACK} in unexpected state ${STACK_STATUS}; resolve manually then re-run"
+        ;;
+    esac
+  fi
+  ok "EKS cluster ready"
+}
+
+# -------------------------------------------------------------------------
+# Orchestration (FR-8): when both images and cluster need work, build images
+# in the foreground while the cluster is created in a backgrounded subshell,
+# then wait and propagate the subshell's real exit code. `set -e` does not
+# apply inside `$(...)`/background subshells the way it does inline, so the
+# explicit `wait` exit-code check below is what actually catches a cluster
+# creation failure — without it, a failed background `eksctl create cluster`
+# would be silently swallowed and the script would carry on into Step 6+
+# against a cluster that doesn't exist.
+# -------------------------------------------------------------------------
+if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
+  ( ensure_eks_cluster ) &
+  _cluster_pid=$!
+  build_images
+  if ! wait "${_cluster_pid}"; then
+    fail 2 "EKS cluster creation failed (see output above). Check: eksctl get cluster --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+  fi
+elif [[ "${SKIP_IMAGES}" -eq 0 ]]; then
+  build_images
+  warn "Skipping EKS cluster creation (--skip-cluster)"
+elif [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
+  ensure_eks_cluster
+  warn "Skipping image build (--skip-images)"
 else
+  warn "Skipping image build (--skip-images)"
   warn "Skipping EKS cluster creation (--skip-cluster)"
 fi
 
@@ -1062,10 +1204,16 @@ if [[ -n "${SERVICES_NG_ROLE}" && "${SERVICES_NG_ROLE}" != "None" ]]; then
   log "  Attached closed-loop policy to node role: ${SERVICES_NG_ROLE}"
 fi
 
+if [[ "${START_AT}" -le 2 ]]; then
+  _phase2_elapsed=$(( $(date +%s) - _PHASE2_START ))
+  ok "Images and EKS cluster ready ($(( _phase2_elapsed / 60 ))m $(( _phase2_elapsed % 60 ))s)"
+fi
+
 # =========================================================================
 # Step 8: Apply Kubernetes manifests (idempotent — kubectl apply)
 # =========================================================================
-if [[ "${START_AT}" -le 8 ]]; then
+if [[ "${START_AT}" -le 3 ]]; then
+phase 3 "Deploying workloads"
 log "Step 8: Applying Kubernetes manifests"
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
@@ -1159,7 +1307,7 @@ done
 # Step 8a: build base TensorRT engines via a one-shot Job. Runs on its own GPU
 # node (see the scale-up above), independent of whether Triton is already
 # running on another node, and EXITS when done — no always-on optimizer pod.
-log "  Step 8a: building base TensorRT engines (one-shot optimizer bootstrap Job)..."
+log "  Step 8a: starting base TensorRT engine build (one-shot optimizer bootstrap Job)..."
 BOOTSTRAP_MANIFEST="/tmp/${CLUSTER_NAME}-model-optimizer-bootstrap-job.yaml"
 sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
     -e "s|__REGION__|${AWS_REGION}|g" \
@@ -1171,23 +1319,40 @@ sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
 # Jobs are immutable — delete any prior run before re-applying (idempotent redeploy).
 kubectl delete job model-optimizer-bootstrap --ignore-not-found >/dev/null 2>&1 || true
 kubectl apply -f "${BOOTSTRAP_MANIFEST}"
-log "  Waiting for base-engine build to complete (up to 15m; idempotent — skips engines already in S3)..."
-if kubectl wait --for=condition=complete job/model-optimizer-bootstrap --timeout=900s 2>/dev/null; then
-  log "  Base engines built (optimizer Job exited)."
-else
-  warn "  Base-engine bootstrap Job did not complete (timeout or failure)."
-  warn "  Triton cannot serve tensorrt_plan models until the base engines exist."
-  warn "  Inspect: kubectl logs job/model-optimizer-bootstrap ; kubectl describe job/model-optimizer-bootstrap"
-fi
 
-# Scale back down to steady state (Triton only) now that the bootstrap Job has
-# finished (or given up) — no need to keep the extra GPU node around.
-if [[ "${BOOTSTRAP_GPU_DESIRED}" -ne "${GPU_DESIRED}" ]]; then
-  log "  Scaling GPU node group 'gpu-inference' back to desired ${GPU_DESIRED} (steady state: Triton only)"
-  aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
-    --scaling-config "minSize=1,maxSize=${MAX_GPUS},desiredSize=${GPU_DESIRED}" \
-    --region "${AWS_REGION}" >/dev/null 2>&1 || warn "  Could not scale gpu-inference node group back down (continuing)"
-fi
+# FR-9: do NOT block deploy.sh on the bootstrap Job's completion. Nothing
+# downstream (frontend, Cognito, AgentCore, closed-loop) depends on the
+# compiled engines existing yet — Triton runs in --model-control-mode=poll
+# against a fixed S3 path (deployment/eks/triton-deployment.yaml) and will
+# auto-load the engines whenever the Job finishes, independent of deploy.sh's
+# own process lifetime. A detached background watcher performs the real
+# `kubectl wait` and, only on genuine completion, triggers the GPU
+# scale-down that used to happen synchronously right here (R-2) — writing
+# its result to a fixed, checkable path.
+BOOTSTRAP_STATUS_FILE="${SCRIPT_DIR}/.bootstrap-status.json"
+rm -f "${BOOTSTRAP_STATUS_FILE}"
+(
+  if kubectl wait --for=condition=complete job/model-optimizer-bootstrap --timeout=900s >/tmp/"${CLUSTER_NAME}"-bootstrap-wait.log 2>&1; then
+    if [[ "${BOOTSTRAP_GPU_DESIRED}" -ne "${GPU_DESIRED}" ]]; then
+      aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+        --scaling-config "minSize=1,maxSize=${MAX_GPUS},desiredSize=${GPU_DESIRED}" \
+        --region "${AWS_REGION}" >/dev/null 2>&1
+    fi
+    printf '{"status":"complete","finishedAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${BOOTSTRAP_STATUS_FILE}"
+  else
+    printf '{"status":"timeout_or_failed","checkedAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${BOOTSTRAP_STATUS_FILE}"
+  fi
+) &
+disown
+ok "Model-optimizer bootstrap Job started (compiling TensorRT engines in background, up to 15 min)"
+log "  Triton auto-loads engines from s3://${MODEL_BUCKET}/triton-models/ once ready — no restart needed."
+log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat ${BOOTSTRAP_STATUS_FILE}"
+
+# NOTE: the GPU node group is intentionally left at BOOTSTRAP_GPU_DESIRED here
+# (the scale-down to GPU_DESIRED now happens in the background watcher above,
+# once the bootstrap Job genuinely completes — FR-9/R-2). This costs one extra
+# GPU node for a bit longer than before, in exchange for not blocking the rest
+# of the deploy on the bootstrap Job.
 
 # Step 8b: apply Triton + ARTF containers + orchestrator. The Model Optimizer is
 # NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
@@ -1276,12 +1441,14 @@ else
   warn "Could not find GPU ASG — skipping scheduled shutdown setup"
 fi
 
-fi # START_AT <= 8
+ok "Kubernetes workloads deployed"
+fi # START_AT <= 3 (Phase 3)
 
 # =========================================================================
 # Step 9: Deploy frontend to S3 + CloudFront (React UI)
 # =========================================================================
-if [[ "${START_AT}" -le 9 ]]; then
+if [[ "${START_AT}" -le 4 ]]; then
+phase 4 "Setting up access"
 log "Step 9: Deploying frontend"
 
 # Cognito was already provisioned in Step 8 (before manifest apply).
@@ -1370,11 +1537,13 @@ PY
   fi
 fi
 
-fi # START_AT <= 9
+ok "Frontend and Cognito ready"
+fi # START_AT <= 4 (Phase 4)
 
 # =========================================================================
 # Step 10: Deploy AgentCore MCP runtime
 # =========================================================================
+phase 5 "Registering agents"
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   log "Step 10: Deploying AgentCore MCP runtime"
 
@@ -1469,59 +1638,88 @@ else
   log "  This includes: NeMo-RL training container, SageMaker Model Registry,"
   log "  Glue ETL, EventBridge scheduled retraining, and AgentCore agents."
 fi
+ok "Agents registered"
 
 # =========================================================================
-# Summary
+# Summary — always printed regardless of --verbose (FR-6: "print ONLY what
+# the user needs to get started"), so this block uses say() (always-visible)
+# rather than log() (verbose-gated).
 # =========================================================================
-log ""
-log "========================================================="
-log "  Accelerator-optimized Agentic Bidding — Deployed (EKS + Triton)"
-log "========================================================="
-log ""
-log "  Frontend:    https://${CF_DOMAIN:-'(pending)'}"
-log "  Endpoint:    http://${NLB_DNS:-'(pending)'}/v1/mutations"
-log "  Health:      http://${NLB_DNS:-'(pending)'}/health/ready"
+say ""
+say "========================================================="
+say "  Accelerator-optimized Agentic Bidding — Deployed (EKS + Triton)"
+say "========================================================="
+say ""
+say "  Frontend:    https://${CF_DOMAIN:-'(pending)'}"
+say "  Endpoint:    http://${NLB_DNS:-'(pending)'}/v1/mutations"
+say "  Health:      http://${NLB_DNS:-'(pending)'}/health/ready"
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
-log "  AgentCore:   See runtime ARN above"
+say "  AgentCore:   See runtime ARN above"
 fi
-log ""
-log "  Demo Login (Cognito):"
+say ""
+say "  Demo Login (Cognito):"
 case "${DEMO_LOGIN_STATUS:-no-auth}" in
   created)
-    log "    Username:  ${DEMO_USER_EMAIL}"
-    log "    Password:  ${DEMO_USER_TEMP_PASSWORD}"
-    log "    Note:      Temporary password, shown only here — you'll set a permanent one on first login."
+    say "    Username:  ${DEMO_USER_EMAIL}"
+    say "    Password:  ${DEMO_USER_TEMP_PASSWORD}"
+    say "    Note:      Temporary password, shown only here — you'll set a permanent one on first login."
     ;;
   existing)
-    log "    Username:  ${DEMO_USER_EMAIL}"
-    log "    Password:  (existing user — password unchanged, not displayed)"
-    log "    Reset:     aws cognito-idp admin-set-user-password \\"
-    log "                 --user-pool-id ${COGNITO_USER_POOL_ID} --username ${DEMO_USER_EMAIL} \\"
-    log "                 --password '<new-password>' --permanent --region ${AWS_REGION}"
+    say "    Username:  ${DEMO_USER_EMAIL}"
+    say "    Password:  (existing user — password unchanged, not displayed)"
+    say "    Reset:     aws cognito-idp admin-set-user-password \\"
+    say "                 --user-pool-id ${COGNITO_USER_POOL_ID} --username ${DEMO_USER_EMAIL} \\"
+    say "                 --password '<new-password>' --permanent --region ${AWS_REGION}"
     ;;
   *)
-    log "    (Cognito auth not configured — orchestrator auth is disabled)"
+    say "    (Cognito auth not configured — orchestrator auth is disabled)"
     ;;
 esac
-log ""
-log "  NVIDIA Triton Inference Server:"
-log "    EKS Cluster:   ${CLUSTER_NAME}"
-log "    Triton Image:  nvcr.io/nvidia/tritonserver:24.08-py3"
-log "    GPU:           NVIDIA A10G (g5.xlarge)"
-log "    Models:        s3://${MODEL_BUCKET}/triton-models/"
-log "    Backend:       ONNX Runtime + CUDA Execution Provider"
-log ""
-log "  Models served by Triton:"
-log "    dlrm_bid_shader            — DLRM (NVIDIA DeepLearningExamples)"
-log "    ncf_deal_manager           — NeuMF (NVIDIA DeepLearningExamples)"
-log ""
-log "  Containers (via orchestrator):"
-log "    DLRM Bid Shader        — BID_SHADE"
-log "    Wide&Deep Segments      — ACTIVATE_SEGMENTS (rule-based, no Triton)"
-log "    NCF Deal Manager        — ACTIVATE_DEALS / SUPPRESS_DEALS"
-log "    Metrics Enricher        — ADD_METRICS"
-log ""
-log "  Monitoring:"
-log "    kubectl port-forward svc/triton-inference-server 8002:8002"
-log "    curl localhost:8002/metrics  # Prometheus metrics"
-log ""
+say ""
+say "  NVIDIA Triton Inference Server:"
+say "    EKS Cluster:   ${CLUSTER_NAME}"
+say "    Triton Image:  nvcr.io/nvidia/tritonserver:24.08-py3"
+say "    GPU:           NVIDIA A10G (g5.xlarge)"
+say "    Models:        s3://${MODEL_BUCKET}/triton-models/"
+say "    Backend:       ONNX Runtime + CUDA Execution Provider"
+say ""
+say "  Models served by Triton:"
+say "    dlrm_bid_shader            — DLRM (NVIDIA DeepLearningExamples)"
+say "    ncf_deal_manager           — NeuMF (NVIDIA DeepLearningExamples)"
+say ""
+say "  Containers (via orchestrator):"
+say "    Bid Pricer              — BID_SHADE"
+say "    Audience Activator      — ACTIVATE_SEGMENTS (rule-based, no Triton)"
+say "    Deal Scorer             — ACTIVATE_DEALS / SUPPRESS_DEALS"
+say "    Signals Enricher        — ADD_METRICS"
+say ""
+# FR-9/NFR-2: honest status — do not claim the models are ready to serve
+# unless the background bootstrap watcher actually observed completion.
+# Check the fixed path directly (not just the in-run variable) so a
+# --start-at run that skips Phase 3 still reports a real prior status
+# instead of a misleading "pending".
+BOOTSTRAP_STATUS_FILE="${BOOTSTRAP_STATUS_FILE:-${SCRIPT_DIR}/.bootstrap-status.json}"
+say "  Model-optimizer bootstrap (TensorRT engine build):"
+if [[ -f "${BOOTSTRAP_STATUS_FILE}" ]]; then
+  _bootstrap_status="$(jq -r '.status // "unknown"' "${BOOTSTRAP_STATUS_FILE}" 2>/dev/null || echo unknown)"
+else
+  _bootstrap_status="pending"
+fi
+case "${_bootstrap_status}" in
+  complete)
+    say "    Status:    complete — engines are in S3, Triton has loaded them (or will on its next poll)."
+    ;;
+  timeout_or_failed)
+    say "    Status:    did not complete within 15 min — Triton cannot serve tensorrt_plan models yet."
+    say "    Inspect:   kubectl logs job/model-optimizer-bootstrap ; kubectl describe job/model-optimizer-bootstrap"
+    ;;
+  *)
+    say "    Status:    still running in the background (may take up to 15 min from when Phase 3 started)."
+    say "    Check:     kubectl get job model-optimizer-bootstrap  |  cat ${BOOTSTRAP_STATUS_FILE}"
+    ;;
+esac
+say ""
+say "  Monitoring:"
+say "    kubectl port-forward svc/triton-inference-server 8002:8002"
+say "    curl localhost:8002/metrics  # Prometheus metrics"
+say ""

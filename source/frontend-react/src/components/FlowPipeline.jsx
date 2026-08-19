@@ -24,7 +24,7 @@ const AGENT_NODES = [
   },
   {
     id: "dlrm",
-    label: "DLRM Bid Shader",
+    label: "Bid Pricer",
     intents: ["BID_SHADE"],
     model: "DLRM (Deep Learning Recommendation Model)",
     logo: nvidiaLogo,
@@ -33,7 +33,7 @@ const AGENT_NODES = [
   },
   {
     id: "ncf",
-    label: "NCF Deal Manager",
+    label: "Deal Scorer",
     intents: ["ACTIVATE_DEALS", "SUPPRESS_DEALS"],
     model: "Neural Collaborative Filtering (NeuMF)",
     logo: nvidiaLogo,
@@ -42,7 +42,7 @@ const AGENT_NODES = [
   },
   {
     id: "widedeep",
-    label: "Wide & Deep Activator",
+    label: "Audience Activator",
     intents: ["ACTIVATE_SEGMENTS"],
     model: "Wide & Deep (Cheng et al. 2016)",
     logo: nvidiaLogo,
@@ -51,7 +51,7 @@ const AGENT_NODES = [
   },
   {
     id: "metrics",
-    label: "Metrics Enricher",
+    label: "Signals Enricher",
     intents: ["ADD_METRICS"],
     model: "Rule-based (viewability + brand safety)",
     logo: null,

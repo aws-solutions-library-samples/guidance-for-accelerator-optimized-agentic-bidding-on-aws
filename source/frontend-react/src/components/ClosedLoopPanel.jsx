@@ -9,9 +9,9 @@ import {
 } from "../agentCoreClient.js";
 
 const MODEL_TYPES = [
-  { key: "dlrm_bid_shader", label: "DLRM Bid Shader" },
-  { key: "ncf_deal_manager", label: "NCF Deal Manager" },
-  { key: "widedeep_segment_activator", label: "Wide & Deep Segment Activator" },
+  { key: "dlrm_bid_shader", label: "Bid Pricer" },
+  { key: "ncf_deal_manager", label: "Deal Scorer" },
+  { key: "widedeep_segment_activator", label: "Audience Activator" },
 ];
 
 const SUBTLE = { fontSize: "10px", color: "var(--text-muted)" };
