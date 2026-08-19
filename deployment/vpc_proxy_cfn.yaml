@@ -91,6 +91,7 @@ Resources:
         Forwards Triton http(s) from the PUBLIC Governance runtime to the internal
         NLB, and launches on-demand K8s optimize Jobs for /v1/optimize.
       Runtime: python3.12
+      Handler: index.handler
       # Optimize builds run as a K8s Job the Lambda waits on; GPU node cold-start +
       # trtexec can take several minutes, so use the Lambda max timeout (15 min).
       Timeout: 900

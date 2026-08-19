@@ -3,14 +3,15 @@ import GsapTooltip from "./GsapTooltip";
 
 const INTENT_DESCRIPTIONS = {
   ACTIVATE_SEGMENTS: "Audience segments activated from user/location signals.",
-  BID_SHADE: "DLRM predicted CTR and computed the optimal shaded bid price.",
-  ACTIVATE_DEALS: "NCF scored user-deal relevance and activated matching deals.",
-  SUPPRESS_DEALS: "NCF scored user-deal relevance and suppressed poor-fit deals.",
+  BID_SHADE: "The bid pricer predicted CTR and computed the optimal shaded bid price.",
+  ACTIVATE_DEALS: "The deal scorer scored user-deal relevance and activated matching deals.",
+  SUPPRESS_DEALS: "The deal scorer scored user-deal relevance and suppressed poor-fit deals.",
   ADD_METRICS: "Quality and measurement signals added to the bid request.",
   ADD_CIDS: "Identity tokens resolved from fragmented user/device signals.",
 };
 
-// Color map aligned to agent sources (matches FlowPipeline AGENT_NODES)
+// Color map aligned to agent sources (matches FlowPipeline AGENT_NODES).
+// Keyed by the unchanged internal container name — see RENAME_MAP.md.
 const AGENT_COLORS = {
   "dlrm-bid-shader": "#16a34a",
   "widedeep-segment-activator": "#6366f1",
@@ -18,11 +19,12 @@ const AGENT_COLORS = {
   "metrics-enricher": "#0891b2",
 };
 
+// Job-oriented display labels, keyed by the unchanged internal container name.
 const AGENT_LABELS = {
-  "dlrm-bid-shader": "DLRM",
-  "widedeep-segment-activator": "Wide & Deep",
-  "ncf-deal-manager": "NCF",
-  "metrics-enricher": "Metrics",
+  "dlrm-bid-shader": "Bid Pricer",
+  "widedeep-segment-activator": "Audience Activator",
+  "ncf-deal-manager": "Deal Scorer",
+  "metrics-enricher": "Signals Enricher",
 };
 
 function intentColorClass(intent) {

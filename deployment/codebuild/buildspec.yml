@@ -28,6 +28,11 @@ env:
     # BUILD_ONLY: optional space-separated list of image KEYS (repo suffixes, e.g.
     # "orchestrator model-optimizer"). When non-empty it takes precedence over
     # BUILD_TARGET and ONLY those images are built. Empty => use BUILD_TARGET.
+    # NOTE: KEY values for the 4 ARTF containers are the unchanged internal
+    # names (dlrm-bid-shader, widedeep-segment-activator, ncf-deal-manager,
+    # metrics-enricher) — matching deploy.sh's STEP4_KEYS. The ECR repo name
+    # each entry builds uses the job-oriented DISPLAY name instead (see the
+    # display_name() helper below and RENAME_MAP.md).
     BUILD_ONLY: ""
     IMAGE_TAG: "latest"
     DOCKER_BUILDKIT: "1"
@@ -79,13 +84,16 @@ phases:
         elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then GROUP=1; fi
         if [ "${GROUP}" = "1" ]; then
           echo "--- Building Triton ARTF containers (amd64) ---"
+          # entry format is CONTAINER_PATH:KEY:REPO_NAME — KEY is the unchanged
+          # internal name matched against BUILD_ONLY; REPO_NAME is the
+          # job-oriented ECR repo name (see RENAME_MAP.md).
           for entry in \
-            "containers/dlrm_bid_shader:${STACK_NAME}-dlrm-bid-shader" \
-            "containers/ncf_deal_manager:${STACK_NAME}-ncf-deal-manager"; do
+            "containers/dlrm_bid_shader:dlrm-bid-shader:${STACK_NAME}-bid-pricer" \
+            "containers/ncf_deal_manager:ncf-deal-manager:${STACK_NAME}-deal-scorer"; do
 
-            CONTAINER_PATH="${entry%%:*}"
-            REPO_NAME="${entry##*:}"
-            KEY="${REPO_NAME#${STACK_NAME}-}"
+            CONTAINER_PATH="$(echo "${entry}" | cut -d: -f1)"
+            KEY="$(echo "${entry}" | cut -d: -f2)"
+            REPO_NAME="$(echo "${entry}" | cut -d: -f3)"
             if [ -n "${BUILD_ONLY}" ]; then
               case " ${BUILD_ONLY} " in *" ${KEY} "*) : ;; *) continue ;; esac
             fi
@@ -109,14 +117,18 @@ phases:
       # implementation). See source/containers/widedeep_segment_activator/app.py.
       # -----------------------------------------------------------------------
       - |
+        # entry format is CONTAINER_PATH:KEY:REPO_NAME:AGENT_NAME — KEY is the
+        # unchanged internal name matched against BUILD_ONLY; REPO_NAME is the
+        # job-oriented ECR repo name; AGENT_NAME is the unchanged internal
+        # build arg (see RENAME_MAP.md).
         for entry in \
-          "containers/widedeep_segment_activator:${STACK_NAME}-widedeep-segment-activator:widedeep-segment-activator" \
-          "containers/metrics_enricher:${STACK_NAME}-metrics-enricher:metrics-enricher"; do
+          "containers/widedeep_segment_activator:widedeep-segment-activator:${STACK_NAME}-audience-activator:widedeep-segment-activator" \
+          "containers/metrics_enricher:metrics-enricher:${STACK_NAME}-signals-enricher:metrics-enricher"; do
 
           CONTAINER_PATH="$(echo "${entry}" | cut -d: -f1)"
-          REPO_NAME="$(echo "${entry}" | cut -d: -f2)"
-          AGENT_NAME="$(echo "${entry}" | cut -d: -f3)"
-          KEY="${REPO_NAME#${STACK_NAME}-}"
+          KEY="$(echo "${entry}" | cut -d: -f2)"
+          REPO_NAME="$(echo "${entry}" | cut -d: -f3)"
+          AGENT_NAME="$(echo "${entry}" | cut -d: -f4)"
 
           BUILD=0
           if [ -n "${BUILD_ONLY}" ]; then

@@ -103,15 +103,17 @@ display_status() {
   echo "══════════════════════════════════════════════════════════════"
   echo ""
 
-  # Part 1 images (synchronous — should already be done)
+  # Part 1 images (synchronous — should already be done). Repo names are the
+  # job-oriented display names (see RENAME_MAP.md) — matching deploy.sh's
+  # display_name() lookup.
   echo "  Part 1 Images (needed for: kubectl apply, AgentCore):"
   echo "  ─────────────────────────────────────────────────────"
   local part1_ok=true
   for repo in \
-    "${STACK_NAME}-dlrm-bid-shader" \
-    "${STACK_NAME}-widedeep-segment-activator" \
-    "${STACK_NAME}-ncf-deal-manager" \
-    "${STACK_NAME}-metrics-enricher" \
+    "${STACK_NAME}-bid-pricer" \
+    "${STACK_NAME}-audience-activator" \
+    "${STACK_NAME}-deal-scorer" \
+    "${STACK_NAME}-signals-enricher" \
     "${STACK_NAME}-orchestrator" \
     "${STACK_NAME}-agentcore"; do
     if aws ecr describe-images --repository-name "${repo}" \

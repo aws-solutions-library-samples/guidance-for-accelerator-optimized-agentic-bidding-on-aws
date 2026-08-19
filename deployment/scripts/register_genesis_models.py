@@ -52,11 +52,14 @@ _MODEL_TYPES: list[tuple[str, str]] = [
     ("ncf_deal_manager", "ncf"),
 ]
 
+# SageMaker's CustomerMetadataProperties values must match
+# ([\p{L}\p{Z}\p{N}_.:\/=+\-@]*){1,256} - no semicolons, commas, or
+# parentheses. Keep this note plain prose within that character set.
 _GENESIS_METADATA_NOTE = (
     "Unretrained starter model - seeded weights exported from the same "
     "source used by the ARTF Triton containers at inference time. This is "
-    "NOT a trained result; it exists so the first retraining job has a real "
-    "base_model_version to fine-tune from."
+    "NOT a trained result - it exists so the first retraining job has a real "
+    "base model version to fine-tune from."
 )
 
 
@@ -88,6 +91,25 @@ def _onnx_artifact_exists(s3_client, bucket: str, key: str) -> bool:
         raise
 
 
+def _training_image_exists(ecr_client, repository: str, tag: str) -> bool:
+    """Verify the training image tag this registration will reference is
+    actually present in ECR. The NeMo-RL training image builds asynchronously
+    (CodeBuild, 15-50 min) and deploy_closed_loop.sh does not block on it, so
+    on a fresh deploy this image usually does not exist yet when genesis
+    registration first runs. CreateModelPackage validates the referenced
+    image and fails otherwise - checking first lets the caller skip honestly
+    instead of attempting (and failing) a doomed API call.
+    """
+    try:
+        ecr_client.describe_images(repositoryName=repository, imageIds=[{"imageTag": tag}])
+        return True
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "")
+        if error_code in ("ImageNotFoundException", "RepositoryNotFoundException"):
+            return False
+        raise
+
+
 def register_genesis_models(
     *,
     model_bucket: str,
@@ -107,18 +129,22 @@ def register_genesis_models(
         package_groups: model_type -> Model Package Group name.
         training_image_repository: ECR repo name for the training image
             (used as the InferenceSpecification container image reference,
-            mirroring TrainingPipeline.register_model's pattern).
+            mirroring TrainingPipeline.register_model's pattern). Each model
+            type's own tag (from _MODEL_TYPES, e.g. "dlrm"/"ncf") is checked
+            for existence before registering that model type.
         account_id: AWS account id. Resolved via STS if not supplied.
         sagemaker_client / s3_client / sts_client: optional pre-built boto3
             clients (for testing).
 
     Returns:
-        Dict of model_type -> outcome string ("registered:<arn>", "skipped:
-        exists", or "skipped:missing-artifact").
+        Dict of model_type -> outcome string ("registered:<arn>",
+        "skipped:exists", "skipped:missing-artifact", or
+        "skipped:training-image-not-ready").
     """
     sagemaker_client = sagemaker_client or boto3.client("sagemaker", region_name=region)
     s3_client = s3_client or boto3.client("s3", region_name=region)
     sts_client = sts_client or boto3.client("sts", region_name=region)
+    ecr_client = boto3.client("ecr", region_name=region)
 
     if account_id is None:
         account_id = _resolve_account_id(sts_client)
@@ -154,8 +180,23 @@ def register_genesis_models(
             results[model_type] = "skipped:missing-artifact"
             continue
 
+        if not _training_image_exists(ecr_client, training_image_repository, image_tag):
+            _LOG.warning(
+                "  %s: training image %s:%s not found in ECR yet - the NeMo-RL "
+                "training container builds asynchronously (15-50 min) and this "
+                "registration references it as the InferenceSpecification "
+                "container. Skipping honestly (not attempting a call that would "
+                "fail validation). Re-run this script (or ./check_builds.sh) once "
+                "the training image has finished building.",
+                model_type,
+                training_image_repository,
+                image_tag,
+            )
+            results[model_type] = "skipped:training-image-not-ready"
+            continue
+
         model_data_url = f"s3://{model_bucket}/{onnx_key}"
-        training_image = (
+        training_image_uri = (
             f"{account_id}.dkr.ecr.{region}.amazonaws.com/"
             f"{training_image_repository}:{image_tag}"
         )
@@ -169,7 +210,7 @@ def register_genesis_models(
             "InferenceSpecification": {
                 "Containers": [
                     {
-                        "Image": training_image,
+                        "Image": training_image_uri,
                         "ModelDataUrl": model_data_url,
                     }
                 ],
@@ -238,7 +279,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     missing = [m for m, outcome in results.items() if outcome == "skipped:missing-artifact"]
+    not_ready = [m for m, outcome in results.items() if outcome == "skipped:training-image-not-ready"]
     _LOG.info("Genesis registration complete: %s", results)
+    if not_ready:
+        _LOG.warning(
+            "%d model type(s) are waiting on the NeMo-RL training image to finish "
+            "building: %s. Re-run this script (or ./check_builds.sh) once it is ready.",
+            len(not_ready),
+            not_ready,
+        )
     if missing:
         _LOG.error(
             "%d model type(s) had no genesis artifact to register: %s",

@@ -71,7 +71,7 @@ graph TB
         COG["Amazon Cognito<br/>User Pool + SRP / JWT"]
     end
 
-    subgraph EKS["Compute (Amazon EKS — primary; ECS Fargate alternative)"]
+    subgraph EKS["Compute (Amazon EKS)"]
         NLB["Network Load Balancer"]
         ORCH["Orchestrator (Starlette)<br/>JWT verify + parallel fan-out<br/>gRPC primary · MCP/REST"]
 
@@ -142,13 +142,10 @@ The same fan-out is reachable as an MCP tool (`extend_rtb`) — either through t
 orchestrator's `/api/mcp` endpoint or through the optional **Bedrock AgentCore** MCP
 runtime.
 
-## Deployment paths
+## Deployment path
 
-- **Primary — Amazon EKS** via `deployment/deploy.sh`: provisions ECR repositories,
+- **Amazon EKS** via `deployment/deploy.sh`: provisions ECR repositories,
   exports and uploads ONNX models to S3, builds and pushes images, creates/reuses the
   EKS cluster (GPU `g5.xlarge` — or the more powerful Amazon EC2 G7e — + CPU `c5.xlarge` node groups), installs the NVIDIA
   device plugin, applies the manifests under `deployment/eks/`, and deploys the
   frontend (S3 + CloudFront + Cognito).
-- **Alternative — Amazon ECS Fargate** via `deployment/scripts/deploy_ecs.py`: an
-  alternative compute path for running the same containers without managing a
-  Kubernetes cluster.
