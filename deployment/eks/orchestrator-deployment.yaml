@@ -20,6 +20,15 @@ spec:
         app: artf
         component: orchestrator
     spec:
+      # Pin to the CPU/services node group. The orchestrator is a lightweight
+      # always-on router with no GPU workload — without this it can schedule
+      # onto the GPU/inference node, whose node role never gets the
+      # closed-loop IAM policy attached (deploy.sh Step 7.7 attaches it only
+      # to the services node group), causing every DynamoDB
+      # parameter-store/audit-trail read from that pod to fail with
+      # AccessDeniedException.
+      nodeSelector:
+        role: services
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -72,6 +81,17 @@ spec:
               value: "__PARAMETER_STORE_TABLE__"
             - name: AUDIT_TRAIL_TABLE
               value: "__AUDIT_TRAIL_TABLE__"
+            # SageMaker Model Package Group names, stack-prefix-aware to match
+            # closed_loop_cfn.yaml's HasStackPrefix naming (e.g.
+            # "dv2-artf-dlrm-bid-shader"). Without these, closed_loop_api.py's
+            # _model_group() falls back to the unprefixed default
+            # ("artf-dlrm-bid-shader"), which does not exist when a stack
+            # prefix is in use — the Governance page's model registry list
+            # would query a group name that was never created.
+            - name: CLOSED_LOOP_MODEL_GROUP_DLRM_BID_SHADER
+              value: "__DLRM_MODEL_GROUP__"
+            - name: CLOSED_LOOP_MODEL_GROUP_NCF_DEAL_MANAGER
+              value: "__NCF_MODEL_GROUP__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.

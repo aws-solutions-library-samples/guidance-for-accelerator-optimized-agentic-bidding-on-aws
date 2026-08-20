@@ -543,6 +543,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     --container-uri "${ADAPTIVE_BIDDING_IMAGE}" \
     --protocol HTTP \
     --environment "PARAMETER_STORE_TABLE=${PARAM_TABLE_NAME}" \
+    --environment "AUDIT_TRAIL_TABLE=${AUDIT_TABLE_NAME}" \
     --environment "AWS_REGION=${AWS_REGION}" \
     --environment "ADAPTIVE_BIDDING_MODEL_ID=${ADAPTIVE_BIDDING_MODEL_ID}" \
     --description "Adaptive Bidding Strategy Agent — Bedrock reasoning agent for bid parameter tuning" \

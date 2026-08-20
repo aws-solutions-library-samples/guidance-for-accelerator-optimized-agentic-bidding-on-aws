@@ -347,7 +347,7 @@ After `deploy.sh` completes, validate the deployment:
    | **Banner Ad — Segment Activation** | ESPN sports page with a 300×250 banner | `ACTIVATE_SEGMENTS`, `ADD_METRICS` |
    | **Bid Shading — DLRM Price Optimization** | Nike DSP bid response at $7.50; DLRM predicts CTR and shades the bid | `BID_SHADE` |
    | **Video + PMP Deals — NCF Scoring** | Video impression with 3 private marketplace deals | `ACTIVATE_DEALS`, `SUPPRESS_DEALS`, `ADD_METRICS` |
-   | **Full Pipeline — All 4 Containers** | CNN sports page triggering segments, deals, bid shading, and metrics | `ACTIVATE_SEGMENTS`, `ACTIVATE_DEALS`, `BID_SHADE`, `ADD_METRICS` |
+   | **SSP Enrichment — 3 Containers** | CNN sports page triggering the SSP-side enrichment intents: segments, deals, and metrics. Bid shading is excluded — it's a DSP-side decision, not something an SSP would request | `ACTIVATE_SEGMENTS`, `ACTIVATE_DEALS`, `ADD_METRICS` |
 
    Clicking a scenario submits the corresponding OpenRTB payload to the orchestrator and displays the results:
 
