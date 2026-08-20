@@ -3,7 +3,7 @@
   "tmax": 100,
   "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
   "originator": {"type": "TYPE_EXCHANGE", "id": "exchange-ecosystem-demo-001"},
-  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "BID_SHADE", "ADD_METRICS", "ADD_CIDS"],
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "ADD_METRICS", "ADD_CIDS"],
   "bid_request": {
     "id": "auction-eco-001",
     "imp": [

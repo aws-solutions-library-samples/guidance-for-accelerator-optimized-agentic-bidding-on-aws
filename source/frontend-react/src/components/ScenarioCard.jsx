@@ -36,12 +36,11 @@ export const SCENARIOS = [
   },
   {
     id: "full-pipeline",
-    name: "Full Pipeline — All 4 Containers",
-    desc: "CNN sports page triggering all containers: segment activation, deal scoring, bid pricing, and signal enrichment in one fan-out.",
+    name: "SSP Enrichment — 3 Containers",
+    desc: "CNN sports page triggering the SSP-side enrichment containers: segment activation, deal scoring, and signal enrichment in one fan-out. Bid shading is a DSP-side decision made downstream, not something the SSP would request.",
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
       { cls: "deal", label: "ACTIVATE_DEALS" },
-      { cls: "shade", label: "BID_SHADE" },
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "isv-ecosystem.json",

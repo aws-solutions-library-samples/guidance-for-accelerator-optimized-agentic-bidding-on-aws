@@ -9,27 +9,26 @@ the same picture in a maintainable, text-authored form.
 ## Solution overview
 
 The solution implements **four** ARTF-compliant (IAB Tech Lab Agentic RTB Framework)
-containers that produce real-time bidstream mutations for OpenRTB auctions. Each
-container maps to one ARTF intent (or intent pair). Two call **NVIDIA Triton
-Inference Server** for GPU-accelerated inference; two are deterministic and
-rule-based on CPU:
+containers, each doing one job in the bidstream. Two run GPU-accelerated inference
+on **NVIDIA Triton Inference Server**; two are deterministic and rule-based on CPU:
 
-| Container | ARTF intent(s) | Model served by Triton |
-|-----------|----------------|------------------------|
-| DLRM bid shader (`dlrm_bid_shader`) | `BID_SHADE` | DLRM → predicted CTR |
-| Segment activator (`widedeep_segment_activator`) | `ACTIVATE_SEGMENTS` | Rule-based (no Triton) |
-| NCF deal manager (`ncf_deal_manager`) | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | NCF / NeuMF → per-deal relevance |
-| Metrics enricher (`metrics_enricher`) | `ADD_METRICS` | Rule-based (no Triton) |
+| Container | What it does | ARTF intent(s) | Model (implementation detail) |
+|-----------|--------------|-----------------|--------------------------------|
+| **Bid Pricer** (`bid-pricer`) | Prices bids by shading down from a CTR prediction | `BID_SHADE` | DLRM (Triton) |
+| **Audience Activator** (`audience-activator`) | Activates audience segments from bid-request signals | `ACTIVATE_SEGMENTS` | Rule-based (no Triton) |
+| **Deal Scorer** (`deal-scorer`) | Scores and activates/suppresses PMP deals | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | NCF / NeuMF (Triton) |
+| **Signals Enricher** (`signals-enricher`) | Adds viewability + brand-safety quality signals | `ADD_METRICS` | Rule-based (no Triton) |
 
-Triton serves **two models** (DLRM, NCF) on a single NVIDIA **A10G GPU**
-(`g5.xlarge`) with the CUDA Execution Provider; for higher throughput, the more
-powerful Amazon EC2 **G7e** instances are an alternative. The segment activator
-and metrics enricher are rule-based and need no GPU model. The segment activator
-previously scored segments with a Wide & Deep neural network on Triton — that
-model's ONNX graph could not be compiled to a TensorRT engine (a `BatchNorm1d`
-fusion limitation), so it was replaced with transparent rules over real
-bid-request signals, and is slated to be replaced by a partner ISV
-implementation.
+Triton serves **two models** (DLRM for the bid pricer, NCF for the deal scorer) on
+a single NVIDIA **A10G GPU** (`g5.xlarge`) with the CUDA Execution Provider; for
+higher throughput, the more powerful Amazon EC2 **G7e** instances are an
+alternative. The audience activator and signals enricher are rule-based and need
+no GPU model. The audience activator previously scored segments with a Wide & Deep
+neural network on Triton — that model's ONNX graph could not be compiled to a
+TensorRT engine (a `BatchNorm1d` fusion limitation), so it was replaced with
+transparent rules over real bid-request signals, and is slated to be replaced by a
+partner ISV implementation. See [RENAME_MAP.md](../../RENAME_MAP.md) for the full
+old-name → new-name mapping.
 
 > **Serving backend.** The Part 1 baseline serves the exported ONNX models via ONNX
 > Runtime. Part 2 is a progression that upgrades Triton serving to compiled **TensorRT
@@ -77,12 +76,12 @@ graph TB
 
         subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G (or Amazon EC2 G7e)"]
             TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + CUDA EP<br/>2 models on GPU"]
-            DLRM_C["DLRM bid shader<br/>BID_SHADE"]
-            NCF_C["NCF deal manager<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
+            DLRM_C["Bid Pricer<br/>BID_SHADE"]
+            NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
         end
 
-        WD_C["Segment activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
-        MET_C["Metrics enricher<br/>ADD_METRICS (rule-based)"]
+        WD_C["Audience Activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
+        MET_C["Signals Enricher<br/>ADD_METRICS (rule-based)"]
     end
 
     subgraph Models["Model Storage"]
@@ -131,8 +130,9 @@ graph TB
    unauthenticated requests.
 4. The orchestrator **fans out the OpenRTB request in parallel** to the four
    containers, respecting the OpenRTB `tmax` timeout.
-5. The DLRM and NCF containers call **Triton** via `tritonclient` for GPU inference;
-   the segment activator and metrics enricher return rule-based mutations.
+5. The bid pricer and deal scorer call **Triton** via `tritonclient` for GPU
+   inference; the audience activator and signals enricher return rule-based
+   mutations.
 6. **Triton** loads the two ONNX models from the **S3 model repository** at startup
    and runs inference on the A10G GPU (or the more powerful Amazon EC2 G7e).
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
