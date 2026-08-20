@@ -106,6 +106,20 @@ class TestIsTrainingInProgress:
         call_kwargs = mock_client.list_training_jobs.call_args[1]
         assert call_kwargs["StatusEquals"] == "InProgress"
 
+    def test_name_contains_has_no_underscore(self):
+        """Regression test: SageMaker's ListTrainingJobs NameContains param
+        only accepts [a-zA-Z0-9\\-]+ (verified live — a real deployment hit
+        botocore.exceptions.ClientError: ValidationException on
+        NameContains='dlrm_bid_shader-' because model_type contains an
+        underscore). NameContains must use the hyphenated form."""
+        mock_client = MagicMock()
+        mock_client.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            is_training_in_progress("dlrm_bid_shader")
+        call_kwargs = mock_client.list_training_jobs.call_args[1]
+        assert call_kwargs["NameContains"] == "dlrm-bid-shader-"
+        assert "_" not in call_kwargs["NameContains"]
+
 
 class TestTriggerTraining:
     _COMMON_KWARGS = dict(
@@ -169,3 +183,27 @@ class TestTriggerTraining:
         assert call_kwargs["StoppingCondition"]["MaxRuntimeInSeconds"] == 14400
         assert call_kwargs["HyperParameters"]["base_model_version"] == result.base_model_version
         assert call_kwargs["HyperParameters"]["triggered_by"] == "governance_ui_on_demand"
+        # HyperParameters.model_type must stay the real model_type (used for
+        # downstream resolution), unlike the job name itself.
+        assert call_kwargs["HyperParameters"]["model_type"] == "dlrm_bid_shader"
+
+    def test_training_job_name_has_no_underscore(self):
+        """Regression test: CreateTrainingJob's TrainingJobName only accepts
+        [a-zA-Z0-9\\-]+ — same live failure mode as NameContains above. The
+        job name must be hyphenated even though model_type (with
+        underscores) is still used everywhere else (HyperParameters, S3
+        paths, Model Package Group lookup)."""
+        mock_client = MagicMock()
+        mock_client.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+        mock_client.list_model_packages.return_value = {
+            "ModelPackageSummaryList": [
+                {"ModelPackageArn": "arn:aws:sagemaker:us-east-1:123:model-package/artf-dlrm-bid-shader/3"}
+            ]
+        }
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            result = trigger_training("dlrm_bid_shader", confirmed=True, **self._COMMON_KWARGS)
+
+        call_kwargs = mock_client.create_training_job.call_args[1]
+        assert "_" not in call_kwargs["TrainingJobName"]
+        assert call_kwargs["TrainingJobName"].startswith("dlrm-bid-shader-")
+        assert "_" not in result.job_name

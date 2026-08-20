@@ -144,6 +144,19 @@ def _sagemaker_client():
     return boto3.client("sagemaker", region_name=region)
 
 
+def _job_name_prefix(model_type: str) -> str:
+    """SageMaker resource-name-safe prefix for model_type.
+
+    ``TrainingJobName`` and ``ListTrainingJobs``'s ``NameContains`` only
+    accept ``[a-zA-Z0-9\\-]+`` — model_type values contain underscores
+    (e.g. "dlrm_bid_shader"), which SageMaker rejects with a
+    ValidationException on both APIs. Translating to hyphens here is the
+    only change; model_type itself (used for HyperParameters, Model
+    Package Group lookup, etc.) is left untouched.
+    """
+    return model_type.replace("_", "-")
+
+
 def is_training_in_progress(model_type: str) -> tuple[bool, str | None]:
     """Live SageMaker ListTrainingJobs check — the actual enforcement
     mechanism (per the resolved Application Design Follow-up Question A;
@@ -155,7 +168,7 @@ def is_training_in_progress(model_type: str) -> tuple[bool, str | None]:
     """
     client = _sagemaker_client()
     resp = client.list_training_jobs(
-        NameContains=f"{model_type}-",
+        NameContains=f"{_job_name_prefix(model_type)}-",
         StatusEquals="InProgress",
         MaxResults=1,
         SortBy="CreationTime",
@@ -222,7 +235,7 @@ def trigger_training(
 
     base_model_version = _resolve_base_model_version(model_type)
 
-    job_name = f"{model_type}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    job_name = f"{_job_name_prefix(model_type)}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     training_image = f"{training_image_registry}/artf-nemo-rl-training:{_IMAGE_TAG[model_type]}"
     output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
 
