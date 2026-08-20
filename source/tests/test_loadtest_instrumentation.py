@@ -117,7 +117,7 @@ class TestEmitLoadTestOutcome:
             feedback_integration._feedback_collector = mock_collector
 
             async def _run():
-                emit_load_test_outcome("run-1", 0, "dlrm_bid_shader_stable:v1")
+                emit_load_test_outcome("run-1", 0, "dlrm_bid_shader_stable:v1", "dlrm_bid_shader")
                 await asyncio.sleep(0.01)
 
             asyncio.run(_run())
@@ -126,6 +126,7 @@ class TestEmitLoadTestOutcome:
             assert isinstance(event, BidOutcomeEvent)
             assert event.source == "load_test"
             assert event.model_version == "dlrm_bid_shader_stable:v1"
+            assert event.model_type == "dlrm_bid_shader"
         finally:
             feedback_integration._feedback_collector = original
 
@@ -136,7 +137,7 @@ class TestEmitLoadTestOutcome:
         original = feedback_integration._feedback_collector
         try:
             feedback_integration._feedback_collector = None
-            emit_load_test_outcome("run-1", 0, "v1")  # must not raise
+            emit_load_test_outcome("run-1", 0, "v1", "dlrm_bid_shader")  # must not raise
         finally:
             feedback_integration._feedback_collector = original
 
@@ -152,7 +153,7 @@ class TestEmitLoadTestOutcome:
             feedback_integration._feedback_collector = mock_collector
 
             async def _run():
-                emit_load_test_outcome("run-1", 0, "v1")  # must not raise
+                emit_load_test_outcome("run-1", 0, "v1", "dlrm_bid_shader")  # must not raise
                 await asyncio.sleep(0.01)
 
             asyncio.run(_run())

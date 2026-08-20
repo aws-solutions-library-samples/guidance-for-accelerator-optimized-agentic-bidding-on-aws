@@ -1,7 +1,7 @@
 """Tests for the Glue ETL feature engineering and deduplication logic.
 
 Tests use a local PySpark session (no Glue dependencies required) to validate:
-- De-duplication by request_id (keep latest event_timestamp)
+- De-duplication by request_id (keep latest timestamp)
 - Feature engineering (ROI, shade_ratio, label, win_rate_bucket)
 - PII detection and filtering
 
@@ -22,11 +22,9 @@ pyspark = pytest.importorskip("pyspark", reason="PySpark required for Glue ETL t
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    ArrayType,
     BooleanType,
     DoubleType,
     IntegerType,
-    LongType,
     StringType,
     StructField,
     StructType,
@@ -46,100 +44,80 @@ from etl.glue_feature_engineering import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-# Schema matching the Glue catalog table (raw_bid_outcomes)
+# Schema matching the Glue catalog table (raw_bid_outcomes) -- these columns
+# match shared/feedback_models.py's BidOutcomeEvent field names/types
+# exactly, since that's what Firehose's JSON->Parquet conversion actually
+# populates (see feedback_pipeline_cfn.yaml's raw_bid_outcomes table).
 _RAW_SCHEMA = StructType(
     [
         StructField("request_id", StringType(), False),
-        StructField("event_timestamp", LongType(), False),
-        StructField("model_type", StringType(), False),
+        StructField("timestamp", DoubleType(), False),
         StructField("model_version", StringType(), False),
         StructField("source", StringType(), False),
-        StructField("intent", StringType(), False),
+        StructField("model_type", StringType(), True),
         StructField("original_price", DoubleType(), False),
         StructField("shaded_price", DoubleType(), False),
         StructField("bid_floor", DoubleType(), False),
-        StructField("price_paid", DoubleType(), True),
         StructField("won", BooleanType(), False),
+        StructField("price_paid", DoubleType(), True),
         StructField("impression", BooleanType(), False),
         StructField("click", BooleanType(), False),
         StructField("conversion", BooleanType(), False),
         StructField("conversion_value", DoubleType(), True),
         StructField("user_id_hash", StringType(), False),
-        StructField("site_domain_hash", StringType(), False),
+        StructField("site_domain", StringType(), False),
         StructField("device_type", StringType(), False),
-        StructField("geo_country", StringType(), False),
         StructField("hour_of_day", IntegerType(), False),
-        StructField("day_of_week", IntegerType(), False),
-        StructField("has_video", BooleanType(), False),
-        StructField("iab_categories", ArrayType(StringType()), False),
         StructField("shade_factor_used", DoubleType(), False),
-        StructField("conversion_value_estimate", DoubleType(), False),
-        StructField("partition_date", StringType(), False),
-        StructField("partition_hour", StringType(), False),
+        StructField("conversion_value_estimate_used", DoubleType(), False),
     ]
 )
 
 
 def _make_record(
     request_id="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    event_timestamp=1718000000000,
-    model_type="dlrm_bid_shader",
+    timestamp=1718000000.0,
     model_version="v1.0.0",
     source="live",
-    intent="BID_SHADE",
+    model_type="dlrm_bid_shader",
     original_price=5.0,
     shaded_price=4.0,
     bid_floor=2.0,
-    price_paid=3.5,
     won=True,
+    price_paid=3.5,
     impression=True,
     click=False,
     conversion=False,
     conversion_value=None,
     user_id_hash="abc123def456789012345678abcdef01",
-    site_domain_hash="fedcba9876543210fedcba9876543210",
+    site_domain="espn.com",
     device_type="mobile",
-    geo_country="US",
     hour_of_day=14,
-    day_of_week=3,
-    has_video=False,
-    iab_categories=None,
     shade_factor_used=0.8,
-    conversion_value_estimate=10.0,
-    partition_date="2025-06-10",
-    partition_hour="14",
+    conversion_value_estimate_used=10.0,
 ):
     """Create a test record tuple matching _RAW_SCHEMA."""
-    if iab_categories is None:
-        iab_categories = ["IAB1"]
     return (
         request_id,
-        event_timestamp,
-        model_type,
+        timestamp,
         model_version,
         source,
-        intent,
+        model_type,
         original_price,
         shaded_price,
         bid_floor,
-        price_paid,
         won,
+        price_paid,
         impression,
         click,
         conversion,
         conversion_value,
         user_id_hash,
-        site_domain_hash,
+        site_domain,
         device_type,
-        geo_country,
         hour_of_day,
-        day_of_week,
-        has_video,
-        iab_categories,
         shade_factor_used,
-        conversion_value_estimate,
-        partition_date,
-        partition_hour,
+        conversion_value_estimate_used,
     )
 
 
@@ -207,24 +185,24 @@ class TestPIIHelpers:
 class TestDeduplication:
     """Tests for deduplicate_by_request_id."""
 
-    def test_keeps_latest_by_event_timestamp(self, spark):
+    def test_keeps_latest_by_timestamp(self, spark):
         """When multiple records share request_id, only the latest is kept."""
         records = [
             _make_record(
                 request_id="aaaa1111-2222-3333-4444-555566667777",
-                event_timestamp=1000,
+                timestamp=1000.0,
                 click=False,
                 conversion=False,
             ),
             _make_record(
                 request_id="aaaa1111-2222-3333-4444-555566667777",
-                event_timestamp=2000,
+                timestamp=2000.0,
                 click=False,
                 conversion=False,
             ),
             _make_record(
                 request_id="aaaa1111-2222-3333-4444-555566667777",
-                event_timestamp=3000,
+                timestamp=3000.0,
                 click=True,
                 conversion=False,
             ),
@@ -234,7 +212,7 @@ class TestDeduplication:
 
         assert result.count() == 1
         row = result.collect()[0]
-        assert row["event_timestamp"] == 3000
+        assert row["timestamp"] == 3000.0
         assert row["click"] is True
 
     def test_distinct_request_ids_preserved(self, spark):
@@ -242,15 +220,15 @@ class TestDeduplication:
         records = [
             _make_record(
                 request_id="aaaa1111-2222-3333-4444-555566667777",
-                event_timestamp=1000,
+                timestamp=1000.0,
             ),
             _make_record(
                 request_id="bbbb1111-2222-3333-4444-555566667777",
-                event_timestamp=2000,
+                timestamp=2000.0,
             ),
             _make_record(
                 request_id="cccc1111-2222-3333-4444-555566667777",
-                event_timestamp=3000,
+                timestamp=3000.0,
             ),
         ]
         df = spark.createDataFrame(records, schema=_RAW_SCHEMA)
@@ -513,10 +491,7 @@ class TestPIIValidation:
     def test_valid_hashes_pass(self, spark):
         """Records with valid hex hashes pass through unchanged."""
         records = [
-            _make_record(
-                user_id_hash="abc123def456789012345678abcdef01",
-                site_domain_hash="fedcba9876543210fedcba9876543210",
-            )
+            _make_record(user_id_hash="abc123def456789012345678abcdef01"),
         ]
         df = spark.createDataFrame(records, schema=_RAW_SCHEMA)
         result = validate_no_raw_pii(df)
@@ -526,10 +501,7 @@ class TestPIIValidation:
     def test_email_in_user_id_hash_dropped(self, spark):
         """Record with email pattern in user_id_hash is dropped."""
         records = [
-            _make_record(
-                user_id_hash="user@example.com",
-                site_domain_hash="fedcba9876543210fedcba9876543210",
-            )
+            _make_record(user_id_hash="user@example.com"),
         ]
         df = spark.createDataFrame(records, schema=_RAW_SCHEMA)
         result = validate_no_raw_pii(df)
@@ -539,10 +511,7 @@ class TestPIIValidation:
     def test_short_non_hash_string_dropped(self, spark):
         """Record with a short non-hex string in hash column is dropped."""
         records = [
-            _make_record(
-                user_id_hash="john",  # Too short, not a hash
-                site_domain_hash="fedcba9876543210fedcba9876543210",
-            )
+            _make_record(user_id_hash="john"),  # Too short, not a hash
         ]
         df = spark.createDataFrame(records, schema=_RAW_SCHEMA)
         result = validate_no_raw_pii(df)
@@ -555,12 +524,10 @@ class TestPIIValidation:
             _make_record(
                 request_id="aaaa1111-2222-3333-4444-555566667777",
                 user_id_hash="abc123def456789012345678abcdef01",
-                site_domain_hash="fedcba9876543210fedcba9876543210",
             ),
             _make_record(
                 request_id="bbbb1111-2222-3333-4444-555566667777",
                 user_id_hash="plaintext_user_name@mail.org",
-                site_domain_hash="fedcba9876543210fedcba9876543210",
             ),
         ]
         df = spark.createDataFrame(records, schema=_RAW_SCHEMA)

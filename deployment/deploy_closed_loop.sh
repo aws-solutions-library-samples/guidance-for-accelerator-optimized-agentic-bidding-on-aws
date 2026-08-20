@@ -298,10 +298,19 @@ log "Step 2: Deploying Glue ETL"
 GLUE_SCRIPT_S3_PATH="${GLUE_SCRIPT_S3_PATH:-${STACK_PREFIX:+${STACK_PREFIX}-}artf-scripts-${ACCOUNT_ID}/etl/glue_feature_engineering.py}"
 TRAINING_DATA_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}training-data-${ACCOUNT_ID}-${AWS_REGION}"
 
+# The real Glue database name feedback_pipeline_cfn.yaml created in Step 1
+# (stack-prefix-aware — e.g. "nvd_feedback_pipeline", not the unprefixed
+# "feedback_pipeline" glue_etl_cfn.yaml previously hardcoded). Falls back to
+# the unprefixed default only if the output can't be resolved (e.g. Step 1
+# was skipped via --start-at=2), matching glue_etl_cfn.yaml's own default.
+RAW_OUTCOMES_GLUE_DATABASE="$(get_stack_output "${FEEDBACK_STACK}" "GlueDatabaseName" 2>/dev/null || echo '')"
+RAW_OUTCOMES_GLUE_DATABASE="${RAW_OUTCOMES_GLUE_DATABASE:-feedback_pipeline}"
+
 deploy_cfn_stack "${GLUE_STACK}" "${SCRIPT_DIR}/glue_etl_cfn.yaml" \
   "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
   "ParameterKey=GlueScriptS3Path,ParameterValue=${GLUE_SCRIPT_S3_PATH}" \
-  "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}"
+  "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}" \
+  "ParameterKey=RawOutcomesGlueDatabaseName,ParameterValue=${RAW_OUTCOMES_GLUE_DATABASE}"
 
 # =========================================================================
 # Step 3: Closed-Loop Core (DynamoDB/DAX/SageMaker Model Registry/SNS)

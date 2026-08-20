@@ -534,7 +534,9 @@ async def _run_load_test(
                     and inv.status == "ok"
                 ):
                     per_request_versions.append(inv.model_version)
-                    sample_value = emit_load_test_outcome(test_id, request_index, inv.model_version)
+                    sample_value = emit_load_test_outcome(
+                        test_id, request_index, inv.model_version, target_model_type
+                    )
                     outcome_sample_count += 1
                     if len(outcome_samples) < _MAX_STORED_SAMPLES:
                         outcome_samples.append(sample_value)
