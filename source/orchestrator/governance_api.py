@@ -28,6 +28,7 @@ API's naming conventions):
 
 from __future__ import annotations
 
+import logging
 import os
 
 from starlette.requests import Request
@@ -178,6 +179,12 @@ async def train_handler(request: Request) -> JSONResponse:
         )
     except NoApprovedBaseVersionError as exc:
         return JSONResponse({"error": str(exc), "reason": "no_approved_base_version"}, status_code=422)
+    except Exception as exc:
+        # Fail-safe: any other error (e.g. a boto3 ClientError) must still
+        # return valid JSON, never fall through to a plain-text 500 that
+        # breaks the UI's resp.json() call.
+        logging.getLogger(__name__).exception("train_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
 
     return JSONResponse({
         "job_name": result.job_name,
@@ -201,11 +208,16 @@ async def eligible_runs_handler(request: Request) -> JSONResponse:
     if role not in ("current", "challenger"):
         return JSONResponse({"error": "role must be 'current' or 'challenger'"}, status_code=422)
 
-    history_fn = _get_loadtest_history_fn()
-    history = history_fn(limit=200)
+    try:
+        history_fn = _get_loadtest_history_fn()
+        history = history_fn(limit=200)
 
-    eligible = list_eligible_runs(history, model_type, role)
-    most_recent = most_recent_eligible(history, model_type, role)
+        eligible = list_eligible_runs(history, model_type, role)
+        most_recent = most_recent_eligible(history, model_type, role)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("eligible_runs_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
+
     return JSONResponse({"runs": eligible, "most_recent": most_recent})
 
 
@@ -222,29 +234,32 @@ async def compare_handler(request: Request) -> JSONResponse:
     current_run_id = body.get("current_run_id", "")
     challenger_run_id = body.get("challenger_run_id", "")
 
-    history_fn = _get_loadtest_history_fn()
-    history = history_fn(limit=200)
-    by_id = {run.get("id"): run for run in history}
-
-    current_run = by_id.get(current_run_id)
-    challenger_run = by_id.get(challenger_run_id)
-    if current_run is None:
-        return JSONResponse({"error": f"Run '{current_run_id}' not found."}, status_code=422)
-    if challenger_run is None:
-        return JSONResponse({"error": f"Run '{challenger_run_id}' not found."}, status_code=422)
-
-    request_obj = ComparisonRequest(
-        model_type=model_type,
-        current_run_id=current_run_id,
-        current_samples=[float(v) for v in (current_run.get("outcome_samples") or [])],
-        challenger_run_id=challenger_run_id,
-        challenger_samples=[float(v) for v in (challenger_run.get("outcome_samples") or [])],
-    )
-
     try:
+        history_fn = _get_loadtest_history_fn()
+        history = history_fn(limit=200)
+        by_id = {run.get("id"): run for run in history}
+
+        current_run = by_id.get(current_run_id)
+        challenger_run = by_id.get(challenger_run_id)
+        if current_run is None:
+            return JSONResponse({"error": f"Run '{current_run_id}' not found."}, status_code=422)
+        if challenger_run is None:
+            return JSONResponse({"error": f"Run '{challenger_run_id}' not found."}, status_code=422)
+
+        request_obj = ComparisonRequest(
+            model_type=model_type,
+            current_run_id=current_run_id,
+            current_samples=[float(v) for v in (current_run.get("outcome_samples") or [])],
+            challenger_run_id=challenger_run_id,
+            challenger_samples=[float(v) for v in (challenger_run.get("outcome_samples") or [])],
+        )
+
         result = run_comparison(request_obj)
     except InsufficientSamplesError as exc:
         return JSONResponse({"error": str(exc), "reason": "insufficient_samples"}, status_code=422)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("compare_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
 
     return JSONResponse({
         # Source attribution (FR-10) — plain factual labeling.
@@ -294,6 +309,9 @@ async def promote_handler(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": str(exc), "reason": "not_recommended"}, status_code=422
         )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("promote_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
 
     return JSONResponse({
         "model_type": result.model_type,
