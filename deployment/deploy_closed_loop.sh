@@ -266,6 +266,25 @@ KMS_KEY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "KMSKeyArn")"
 [[ -n "${KMS_KEY_ARN}" ]] || fail "Could not retrieve KMS Key ARN from feedback pipeline stack"
 log "  KMS Key: ${KMS_KEY_ARN}"
 
+# Attach the FeedbackCollectorPolicy (kinesis:PutRecord/PutRecords, scoped to
+# the BidOutcomeStream) to the EKS node role, so orchestrator pods running
+# there can actually emit bid outcome events. Without this, deploy.sh's
+# FEEDBACK_STREAM_NAME env var points at a real stream the pod has no
+# permission to write to, and emit_bid_outcome()/emit_load_test_bid_outcome()
+# fail silently on every call (FeedbackCollector's documented "log + drop"
+# contract) -- so this attach step is required, not optional, for the
+# feedback pipeline to actually deliver data downstream (Glue ETL, training).
+FEEDBACK_COLLECTOR_POLICY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "FeedbackCollectorPolicyArn")"
+if [[ -n "${FEEDBACK_COLLECTOR_POLICY_ARN}" ]]; then
+  EKS_NODE_ROLE_NAME="$(basename "${EKS_NODE_ROLE}")"
+  aws iam attach-role-policy --role-name "${EKS_NODE_ROLE_NAME}" \
+    --policy-arn "${FEEDBACK_COLLECTOR_POLICY_ARN}" 2>/dev/null || \
+    warn "  Could not attach FeedbackCollectorPolicy to ${EKS_NODE_ROLE_NAME} -- bid outcome emission will fail silently until attached."
+  log "  Attached FeedbackCollectorPolicy to node role: ${EKS_NODE_ROLE_NAME}"
+else
+  warn "  Could not resolve FeedbackCollectorPolicyArn from ${FEEDBACK_STACK} -- feedback emission permissions not attached."
+fi
+
 # =========================================================================
 # Step 2: Glue ETL (Feature engineering + training data bucket)
 # =========================================================================

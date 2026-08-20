@@ -105,6 +105,14 @@ spec:
               value: "__TRAINING_DATA_BUCKET__"
             - name: TRAINING_IMAGE_REGISTRY
               value: "__TRAINING_IMAGE_REGISTRY__"
+            # Feedback pipeline (source/orchestrator/feedback_integration.py):
+            # emits real BidOutcomeEvents (live traffic + load-test outcome
+            # capture) to the Kinesis stream created by feedback_pipeline_cfn.yaml
+            # / deploy_closed_loop.sh Step 1. Left empty (--with-retraining not
+            # used) means emission is a documented no-op, not a fabricated
+            # success — see FeedbackCollector's own "unset -> disabled" contract.
+            - name: FEEDBACK_STREAM_NAME
+              value: "__FEEDBACK_STREAM_NAME__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.
