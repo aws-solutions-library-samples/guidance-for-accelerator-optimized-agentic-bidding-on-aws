@@ -111,6 +111,7 @@ def emit_load_test_outcome(
     run_id: str,
     request_index: int,
     model_version: str,
+    model_type: str,
 ) -> float:
     """Construct and emit exactly one load-test-origin BidOutcomeEvent.
 
@@ -140,6 +141,7 @@ def emit_load_test_outcome(
     emit_load_test_bid_outcome(
         request_id=request_id,
         model_version=model_version,
+        model_type=model_type,
         won=sample.won,
         shaded_price=sample.shaded_price,
         original_price=original_price,

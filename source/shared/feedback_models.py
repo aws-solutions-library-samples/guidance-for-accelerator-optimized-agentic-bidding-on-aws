@@ -62,6 +62,13 @@ class BidOutcomeEvent(BaseModel):
     timestamp: float
     model_version: str
     source: OutcomeSource
+    # None for live traffic: a single bid response can fan out across
+    # multiple containers/model types (see orchestrator/app.py's
+    # all_mutations aggregation), so there is no single model_type to
+    # attribute a live event to at this call site -- a real "unknown", never
+    # fabricated. Always set for load-test traffic, where the target model
+    # type is known (see orchestrator/loadtest_instrumentation.py).
+    model_type: Optional[str] = None
 
     # Bid details
     original_price: float

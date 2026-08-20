@@ -53,7 +53,7 @@ class TestLoadTestToComparisonIntegration:
                 current_samples = []
                 for i in range(30):
                     version = "dlrm_bid_shader_stable:v1"
-                    sample = emit_load_test_outcome("lt-current-run", i, version)
+                    sample = emit_load_test_outcome("lt-current-run", i, version, "dlrm_bid_shader")
                     current_versions.append(version)
                     current_samples.append(sample)
 
@@ -61,7 +61,7 @@ class TestLoadTestToComparisonIntegration:
                 challenger_samples = []
                 for i in range(30):
                     version = "dlrm_bid_shader_canary:v2"
-                    sample = emit_load_test_outcome("lt-challenger-run", i, version)
+                    sample = emit_load_test_outcome("lt-challenger-run", i, version, "dlrm_bid_shader")
                     challenger_versions.append(version)
                     challenger_samples.append(sample)
 

@@ -104,6 +104,21 @@ class TestBidOutcomeEventValid:
         assert event.won is True
         assert event.price_paid == 3.5
 
+    def test_model_type_defaults_to_none(self):
+        """model_type defaults to None when omitted (live traffic can span
+        multiple model types in one response -- no single attributable
+        value, a real 'unknown', never fabricated)."""
+        event = BidOutcomeEvent(**_valid_event_kwargs())
+        assert event.model_type is None
+
+    def test_model_type_set_for_load_test(self):
+        """model_type is preserved when explicitly set (load-test path,
+        where the target model type is known)."""
+        kwargs = _valid_event_kwargs()
+        kwargs["model_type"] = "dlrm_bid_shader"
+        event = BidOutcomeEvent(**kwargs)
+        assert event.model_type == "dlrm_bid_shader"
+
     def test_lost_bid_no_price_paid(self):
         """Lost bid with null price_paid passes validation."""
         kwargs = _valid_event_kwargs()

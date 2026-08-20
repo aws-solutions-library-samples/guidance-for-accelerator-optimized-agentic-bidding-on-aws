@@ -5,8 +5,19 @@ de-duplicates by request_id (keeping the latest by event_timestamp), engineers t
 features, and writes labeled Parquet datasets for model retraining.
 
 Job Parameters:
-    --window_start: ISO 8601 timestamp for the start of the processing window (inclusive)
-    --window_end:   ISO 8601 timestamp for the end of the processing window (exclusive)
+    --window_start: Optional. ISO 8601 timestamp for the start of the processing
+                    window (inclusive). Use for an explicit, one-off window (e.g.
+                    manual backfill runs).
+    --window_end:   Optional. ISO 8601 timestamp for the end of the processing
+                    window (exclusive). Must be provided together with
+                    --window_start, or not at all.
+    --window_hours: Optional (default: 6). When --window_start/--window_end are
+                    NOT both provided, the job self-computes a rolling window of
+                    [now - window_hours, now) at execution time. This is what the
+                    scheduled trigger (glue_etl_cfn.yaml's FeatureEngineeringSchedule)
+                    uses — CloudFormation cannot compute a relative "now" at
+                    template-render time, only a static duration, so the window
+                    itself must be computed here, at run time, not in the trigger.
     --output_bucket: S3 bucket for labeled training output
     --database_name: Glue catalog database name (default: feedback_pipeline)
     --table_name:    Glue catalog table name (default: raw_bid_outcomes)
@@ -17,7 +28,7 @@ Requirements: 2.2, 2.3, 2.4, 2.6
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
@@ -40,8 +51,12 @@ _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 # Matches potential raw user IDs that are NOT hex hashes (hashes are 32+ hex chars)
 _RAW_ID_RE = re.compile(r"^(?![\da-fA-F]{32,}$).+$")
 
-# Columns that should only contain hashed values (hex strings of sufficient length)
-_HASH_COLUMNS = ("user_id_hash", "site_domain_hash")
+# Columns that should only contain hashed values (hex strings of sufficient
+# length). site_domain is intentionally excluded: it's a literal domain name
+# (e.g. "espn.com"), not a hash -- see shared/feedback_models.py's
+# BidOutcomeEvent.site_domain. Checking it against _is_plausible_hash would
+# misclassify every real record as suspected PII and drop it.
+_HASH_COLUMNS = ("user_id_hash",)
 _MIN_HASH_LENGTH = 8  # Minimum length for a value to be considered a plausible hash
 
 
@@ -77,13 +92,15 @@ def _contains_pii_pattern(value: str) -> bool:
 
 
 def deduplicate_by_request_id(df: DataFrame) -> DataFrame:
-    """De-duplicate records by request_id, keeping the latest by event_timestamp.
+    """De-duplicate records by request_id, keeping the latest by timestamp.
 
     When the same request_id appears multiple times (e.g., re-emitted with
     signal updates like impression/click/conversion arriving later), we keep
-    only the record with the highest event_timestamp.
+    only the record with the highest timestamp (Unix seconds -- see
+    shared/feedback_models.py's BidOutcomeEvent.timestamp, the field this
+    column is actually populated from).
     """
-    window = Window.partitionBy("request_id").orderBy(F.col("event_timestamp").desc())
+    window = Window.partitionBy("request_id").orderBy(F.col("timestamp").desc())
     return (
         df.withColumn("_row_num", F.row_number().over(window))
         .filter(F.col("_row_num") == 1)
@@ -204,6 +221,38 @@ def validate_no_raw_pii(df: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_window(
+    window_start: str | None, window_end: str | None, window_hours: str | None
+) -> tuple[datetime, datetime]:
+    """Resolve the [start, end) processing window.
+
+    If both window_start and window_end are provided (explicit, one-off run —
+    e.g. a manual backfill), use them as-is. Otherwise self-compute a rolling
+    window [now - window_hours, now) at execution time — this is the path the
+    scheduled trigger uses, since CloudFormation can only pass a static
+    window_hours duration, not a computed "now" or "N hours ago" timestamp.
+    """
+    if window_start and window_end:
+        start_dt = datetime.fromisoformat(window_start)
+        end_dt = datetime.fromisoformat(window_end)
+    elif window_start or window_end:
+        raise ValueError(
+            "window_start and window_end must be provided together, or not at all "
+            f"(got window_start={window_start!r}, window_end={window_end!r})"
+        )
+    else:
+        hours = float(window_hours) if window_hours else 6.0
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(hours=hours)
+
+    if end_dt <= start_dt:
+        raise ValueError(
+            f"window_end ({end_dt.isoformat()}) must be after "
+            f"window_start ({start_dt.isoformat()})"
+        )
+    return start_dt, end_dt
+
+
 def main():
     """Entry point for the AWS Glue ETL job."""
     # Import Glue-specific modules only at runtime (not needed for unit tests)
@@ -212,25 +261,28 @@ def main():
     from awsglue.utils import getResolvedOptions
     from pyspark.context import SparkContext
 
-    # Parse job arguments
-    args = getResolvedOptions(
-        sys.argv,
-        [
-            "JOB_NAME",
-            "window_start",
-            "window_end",
-            "output_bucket",
-            "database_name",
-            "table_name",
-        ],
-    )
+    # Only JOB_NAME and output_bucket are required; window_start/window_end/
+    # window_hours/database_name/table_name are all optional (see module
+    # docstring and _resolve_window()). getResolvedOptions treats every name
+    # in this list as required, so optional args are parsed separately below.
+    args = getResolvedOptions(sys.argv, ["JOB_NAME", "output_bucket"])
+
+    def _optional_arg(name: str) -> str | None:
+        flag = f"--{name}"
+        if flag in sys.argv:
+            return sys.argv[sys.argv.index(flag) + 1]
+        return None
 
     job_name = args["JOB_NAME"]
-    window_start = args["window_start"]
-    window_end = args["window_end"]
     output_bucket = args["output_bucket"]
-    database_name = args.get("database_name", "feedback_pipeline")
-    table_name = args.get("table_name", "raw_bid_outcomes")
+    database_name = _optional_arg("database_name") or "feedback_pipeline"
+    table_name = _optional_arg("table_name") or "raw_bid_outcomes"
+
+    start_dt, end_dt = _resolve_window(
+        _optional_arg("window_start"), _optional_arg("window_end"), _optional_arg("window_hours")
+    )
+    window_start = start_dt.isoformat()
+    window_end = end_dt.isoformat()
 
     logger.info(
         "Starting ETL job %s: window=[%s, %s), database=%s, table=%s",
@@ -240,16 +292,6 @@ def main():
         database_name,
         table_name,
     )
-
-    # Parse timestamps for partition filtering
-    start_dt = datetime.fromisoformat(window_start)
-    end_dt = datetime.fromisoformat(window_end)
-
-    # Validate window
-    if end_dt <= start_dt:
-        raise ValueError(
-            f"window_end ({window_end}) must be after window_start ({window_start})"
-        )
 
     # Initialize Glue context
     sc = SparkContext()
@@ -262,19 +304,22 @@ def main():
         # ------------------------------------------------------------------
         # Step 1: Read from Glue catalog with push-down predicate
         # ------------------------------------------------------------------
-        # Convert window to event_timestamp millis for filtering
-        window_start_millis = int(start_dt.timestamp() * 1000)
-        window_end_millis = int(end_dt.timestamp() * 1000)
+        # Window bounds as Unix seconds -- matches BidOutcomeEvent.timestamp,
+        # the real column this table's "timestamp" field is populated from
+        # (a prior version of this filter used a non-existent
+        # "event_timestamp" millis column, which was always null).
+        window_start_epoch = start_dt.timestamp()
+        window_end_epoch = end_dt.timestamp()
 
         logger.info("Reading from catalog: %s.%s", database_name, table_name)
 
         # Read as Spark DataFrame for more control over filtering
         df = spark.read.format("parquet").table(f"{database_name}.{table_name}")
 
-        # Filter by event_timestamp window
+        # Filter by timestamp window
         df = df.filter(
-            (F.col("event_timestamp") >= window_start_millis)
-            & (F.col("event_timestamp") < window_end_millis)
+            (F.col("timestamp") >= window_start_epoch)
+            & (F.col("timestamp") < window_end_epoch)
         )
 
         record_count = df.count()

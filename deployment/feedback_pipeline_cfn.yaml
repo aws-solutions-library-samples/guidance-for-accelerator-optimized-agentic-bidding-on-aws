@@ -196,18 +196,24 @@ Resources:
         Parameters:
           classification: parquet
         StorageDescriptor:
+          # Columns match shared/feedback_models.py's BidOutcomeEvent field
+          # names/types exactly -- Firehose's JSON->Parquet conversion maps
+          # by field name, so any mismatch here silently produces a null
+          # column (confirmed live: a prior mismatched schema left
+          # event_timestamp, model_type, and other columns permanently null,
+          # even though the pipeline appeared to be delivering data
+          # successfully). If BidOutcomeEvent's fields change, this schema
+          # must be updated in the same change.
           Columns:
             - Name: request_id
               Type: string
-            - Name: event_timestamp
-              Type: bigint
-            - Name: model_type
-              Type: string
+            - Name: timestamp
+              Type: double
             - Name: model_version
               Type: string
             - Name: source
               Type: string
-            - Name: intent
+            - Name: model_type
               Type: string
             - Name: original_price
               Type: double
@@ -215,10 +221,10 @@ Resources:
               Type: double
             - Name: bid_floor
               Type: double
-            - Name: price_paid
-              Type: double
             - Name: won
               Type: boolean
+            - Name: price_paid
+              Type: double
             - Name: impression
               Type: boolean
             - Name: click
@@ -229,23 +235,15 @@ Resources:
               Type: double
             - Name: user_id_hash
               Type: string
-            - Name: site_domain_hash
+            - Name: site_domain
               Type: string
             - Name: device_type
               Type: string
-            - Name: geo_country
-              Type: string
             - Name: hour_of_day
               Type: int
-            - Name: day_of_week
-              Type: int
-            - Name: has_video
-              Type: boolean
-            - Name: iab_categories
-              Type: array<string>
             - Name: shade_factor_used
               Type: double
-            - Name: conversion_value_estimate
+            - Name: conversion_value_estimate_used
               Type: double
           Location: !Sub 's3://${RawOutcomesBucket}/raw-outcomes/'
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
