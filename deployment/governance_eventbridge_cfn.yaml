@@ -364,6 +364,14 @@ Resources:
               ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf"),
           ]
 
+          def _job_name_prefix(model_type):
+              # SageMaker's TrainingJobName only accepts [a-zA-Z0-9\-]+ (no
+              # underscores) -- model_type values like "dlrm_bid_shader" are
+              # rejected with a ValidationException if used as-is. Translate to
+              # hyphens for the job name only; model_type itself (HyperParameters,
+              # Model Package Group lookup) is untouched.
+              return model_type.replace("_", "-")
+
           def _latest_approved_version(sm, package_group):
               # Newest first: SortBy=CreationTime, SortOrder=Descending.
               resp = sm.list_model_packages(
@@ -398,7 +406,7 @@ Resources:
                       skipped[model_type] = 'no_approved_version'
                       continue
 
-                  job_name = f"{model_type}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                  job_name = f"{_job_name_prefix(model_type)}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
                   training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
                   output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
 
@@ -459,8 +467,8 @@ Resources:
                 Action:
                   - 'sagemaker:CreateTrainingJob'
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm_bid_shader-*'
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf_deal_manager-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
               - Effect: Allow
                 Action:
                   - 'sagemaker:ListModelPackages'
@@ -547,15 +555,21 @@ Resources:
         ZipFile: |
           import boto3, json, os
 
+          # Job names use the hyphenated form (SageMaker's TrainingJobName only
+          # accepts [a-zA-Z0-9\-]+ -- see RetrainingTriggerFunction's
+          # _job_name_prefix). model_type itself (used downstream for the
+          # ModelPackageGroupChanged event detail and audit trail) stays the
+          # underscore form everywhere else in this pipeline.
           _PACKAGE_GROUP_BY_PREFIX = {
-              'dlrm_bid_shader-': ('DLRM_PACKAGE_GROUP', 'dlrm'),
-              'ncf_deal_manager-': ('NCF_PACKAGE_GROUP', 'ncf'),
+              'dlrm-bid-shader-': ('dlrm_bid_shader', 'DLRM_PACKAGE_GROUP', 'dlrm'),
+              'ncf-deal-manager-': ('ncf_deal_manager', 'NCF_PACKAGE_GROUP', 'ncf'),
           }
 
           def _resolve_model_type(job_name):
               for prefix, cfg in _PACKAGE_GROUP_BY_PREFIX.items():
                   if job_name.startswith(prefix):
-                      return prefix.rstrip('-'), cfg
+                      model_type, group_env, image_tag = cfg
+                      return model_type, (group_env, image_tag)
               return None, None
 
           def handler(event, context):
@@ -652,8 +666,8 @@ Resources:
                 Action:
                   - 'sagemaker:DescribeTrainingJob'
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm_bid_shader-*'
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf_deal_manager-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
               - Effect: Allow
                 Action:
                   - 'sagemaker:CreateModelPackage'
@@ -689,8 +703,8 @@ Resources:
           TrainingJobStatus:
             - 'Completed'
           TrainingJobName:
-            - prefix: 'dlrm_bid_shader-'
-            - prefix: 'ncf_deal_manager-'
+            - prefix: 'dlrm-bid-shader-'
+            - prefix: 'ncf-deal-manager-'
       Targets:
         - Id: RetrainingRegistrationTarget
           Arn: !GetAtt RetrainingRegistrationFunction.Arn
