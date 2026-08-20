@@ -56,7 +56,14 @@ if _FEEDBACK_STREAM_NAME:
 # ---------------------------------------------------------------------------
 
 
-def emit_bid_outcome(req: RTBRequest, resp: RTBResponse, start_time: float) -> None:
+def emit_bid_outcome(
+    req: RTBRequest,
+    resp: RTBResponse,
+    start_time: float,
+    *,
+    source: str = "live",
+    model_version: str | None = None,
+) -> None:
     """Fire-and-forget: build and emit a BidOutcomeEvent via asyncio.create_task.
 
     Emits exactly one event per served bid. The ``asyncio.create_task`` call
@@ -75,12 +82,23 @@ def emit_bid_outcome(req: RTBRequest, resp: RTBResponse, start_time: float) -> N
         The ``time.monotonic()`` value captured at the start of request
         processing (retained for future latency telemetry; not used for
         the event timestamp which uses wall-clock ``time.time()``).
+    source : str
+        "live" (default) for real auction traffic, "load_test" for
+        orchestrator-initiated load-test traffic. Never set by any caller on
+        the real bid-serving path other than the default.
+    model_version : str | None
+        The resolved served model version for this request (e.g. from the
+        container's response metadata). Falls back to a static placeholder
+        if not provided, so this call never fails when the caller doesn't
+        have a resolved version available.
     """
     if _feedback_collector is None:
         return
 
     try:
-        event = _build_bid_outcome_event(req, resp, start_time)
+        event = _build_bid_outcome_event(
+            req, resp, start_time, source=source, model_version=model_version
+        )
         asyncio.create_task(_feedback_collector.emit(event))
     except Exception:
         # Never impact the bid response path
@@ -92,8 +110,71 @@ def emit_bid_outcome(req: RTBRequest, resp: RTBResponse, start_time: float) -> N
 # ---------------------------------------------------------------------------
 
 
+def emit_load_test_bid_outcome(
+    *,
+    request_id: str,
+    model_version: str,
+    won: bool,
+    shaded_price: float,
+    original_price: float,
+    bid_floor: float,
+    price_paid: float | None,
+    impression: bool,
+    click: bool,
+    conversion: bool,
+    conversion_value: float | None,
+    shade_factor_used: float,
+    conversion_value_estimate_used: float,
+) -> None:
+    """Fire-and-forget: emit a real, load-test-origin BidOutcomeEvent.
+
+    Unlike emit_bid_outcome() (which derives win/impression/click/conversion
+    as False, to be filled in later by downstream live signals — there ARE
+    no live signals for a load test), this constructs the event directly
+    from a load test's already-known synthetic outcome (generated via
+    source/closed_loop_demo's existing scenario patterns — see
+    orchestrator/loadtest_instrumentation.py). Uses the SAME
+    FeedbackCollector/Kinesis fire-and-forget path emit_bid_outcome() uses
+    (BR-7 — exactly once per targeted request) and NEVER raises, matching
+    emit_bid_outcome()'s error-swallowing contract.
+    """
+    if _feedback_collector is None:
+        return
+
+    try:
+        event = BidOutcomeEvent(
+            request_id=request_id,
+            timestamp=time.time(),
+            model_version=model_version,
+            source="load_test",
+            original_price=original_price,
+            shaded_price=shaded_price,
+            bid_floor=bid_floor,
+            won=won,
+            price_paid=price_paid,
+            impression=impression,
+            click=click,
+            conversion=conversion,
+            conversion_value=conversion_value,
+            user_id_hash="load-test",
+            site_domain="load-test",
+            device_type="load-test",
+            hour_of_day=datetime.now(timezone.utc).hour,
+            shade_factor_used=shade_factor_used,
+            conversion_value_estimate_used=conversion_value_estimate_used,
+        )
+        asyncio.create_task(_feedback_collector.emit(event))
+    except Exception:
+        logger.warning("Failed to emit load-test bid outcome event", exc_info=True)
+
+
 def _build_bid_outcome_event(
-    req: RTBRequest, resp: RTBResponse, start_time: float
+    req: RTBRequest,
+    resp: RTBResponse,
+    start_time: float,
+    *,
+    source: str = "live",
+    model_version: str | None = None,
 ) -> BidOutcomeEvent:
     """Construct a BidOutcomeEvent from the RTBRequest/RTBResponse data.
 
@@ -103,6 +184,14 @@ def _build_bid_outcome_event(
 
     ``start_time`` is ignored for the timestamp field (we use wall-clock
     time.time() instead) but retained in the signature for future use.
+
+    ``model_version``, when provided, is the caller's resolved served model
+    version (e.g. read from the container's response metadata, which itself
+    resolves it from the Triton router's served_variant/served_model_version
+    outputs — see source/containers/*/app.py and
+    source/triton/router/model.py). Falls back to a static placeholder if
+    not provided, so this never fails for callers that don't have a
+    resolved version available yet.
     """
     bid_request = req.bid_request or {}
     imp_list = bid_request.get("imp", [{}])
@@ -168,7 +257,8 @@ def _build_bid_outcome_event(
     return BidOutcomeEvent(
         request_id=request_id,
         timestamp=time.time(),
-        model_version="orchestrator-v1",
+        model_version=model_version or "orchestrator-v1",
+        source=source,
         original_price=original_price,
         shaded_price=shaded_price,
         bid_floor=bid_floor,

@@ -23,7 +23,7 @@ Requirements: 1.4, 1.6, 2.5
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +31,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+# Distinguishes real auction traffic from orchestrator-initiated load-test
+# traffic. Every BidOutcomeEvent/BidOutcomeRecord carries this so downstream
+# consumers (Glue ETL, training data, governance comparisons) never confuse
+# the two. Required, immutable once set (see model_config frozen=True below).
+OutcomeSource = Literal["live", "load_test"]
 
 _VALID_MODEL_TYPES = frozenset(
     {"dlrm_bid_shader", "ncf_deal_manager", "widedeep_segment_activator"}
@@ -55,6 +61,7 @@ class BidOutcomeEvent(BaseModel):
     request_id: str
     timestamp: float
     model_version: str
+    source: OutcomeSource
 
     # Bid details
     original_price: float
@@ -115,6 +122,7 @@ class BidOutcomeRecord(BaseModel):
     # Bid context
     model_type: str
     model_version: str
+    source: OutcomeSource
     intent: str
 
     # Pricing

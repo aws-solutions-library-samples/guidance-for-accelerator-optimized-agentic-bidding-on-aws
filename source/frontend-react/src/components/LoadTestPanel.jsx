@@ -17,6 +17,16 @@ const DURATIONS = [
   { value: 120, label: "2m" },
 ];
 
+// Model types selectable for outcome/version capture (target_model_type).
+// Internal keys match the orchestrator's model-architecture naming (RENAME_MAP.md);
+// labels are the same job-oriented display names used elsewhere in the UI.
+const TARGET_MODEL_TYPES = [
+  { value: "dlrm_bid_shader", label: "Bid Pricer" },
+  { value: "widedeep_segment_activator", label: "Audience Activator" },
+  { value: "ncf_deal_manager", label: "Deal Scorer" },
+  { value: "metrics_enricher", label: "Signals Enricher" },
+];
+
 /**
  * LoadTestPanel — UI for running server-side load tests against the ARTF pipeline.
  *
@@ -35,6 +45,12 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [elapsedDisplay, setElapsedDisplay] = useState(0);
+  // Outcome-capture targeting (FR-2/FR-3). "" means no target selected — the
+  // run behaves exactly as before (no BidOutcomeEvent emission, no version
+  // capture). Selecting a model type + "challenger" forces that container's
+  // traffic onto its canary variant for this run only.
+  const [targetModelType, setTargetModelType] = useState("");
+  const [targetVariant, setTargetVariant] = useState("current");
 
   // Notify parent of result/progress changes for main area display
   useEffect(() => {
@@ -147,12 +163,24 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       const resp = await authFetch("/api/v1/loadtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ preset, seed: 42, duration_s: duration }),
+        body: JSON.stringify({
+          preset,
+          seed: 42,
+          duration_s: duration,
+          ...(targetModelType ? { target_model_type: targetModelType, target_variant: targetVariant } : {}),
+        }),
       });
 
       if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(resp.status === 409 ? "A load test is already running" : `HTTP ${resp.status}: ${body}`);
+        const body = await resp.json().catch(() => ({}));
+        if (resp.status === 409) throw new Error("A load test is already running");
+        if (resp.status === 422 && body.reason === "no_canary_supported") {
+          throw new Error(body.error || "No canary supported for this model type");
+        }
+        if (resp.status === 422 && body.reason === "no_canary_staged") {
+          throw new Error(body.error || "No canary is currently staged for this model type");
+        }
+        throw new Error(`HTTP ${resp.status}: ${body.error || JSON.stringify(body)}`);
       }
 
       const { id } = await resp.json();
@@ -222,7 +250,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       setError(err.message);
       resetToIdle();
     }
-  }, [preset, duration, stopTest, resetToIdle, startPolling]);
+  }, [preset, duration, targetModelType, targetVariant, stopTest, resetToIdle, startPolling]);
 
   const totalRequests = PRESETS.find((p) => p.value === preset)?.requests || 0;
   const completedPct = progress ? ((progress.completed / progress.total) * 100).toFixed(1) : 0;
@@ -279,6 +307,47 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
             {d.label}
           </label>
         ))}
+      </div>
+
+      {/* Outcome-capture targeting (FR-2/FR-3) — optional. Selecting a model
+          type enables real BidOutcomeEvent emission + model-version capture
+          for this run; "Challenger" additionally forces that container's
+          traffic onto its canary variant for this run only. */}
+      <div className="loadtest-target" aria-label="Outcome capture targeting">
+        <label className="loadtest-target-label">
+          Capture outcomes for:
+          <select
+            className="loadtest-target-select"
+            value={targetModelType}
+            onChange={(e) => setTargetModelType(e.target.value)}
+            disabled={running}
+            aria-label="Target model type for outcome capture"
+            data-testid="loadtest-target-model-select"
+          >
+            <option value="">None (latency/throughput only)</option>
+            {TARGET_MODEL_TYPES.map((m) => (
+              <option key={m.value} value={m.value}>{m.label}</option>
+            ))}
+          </select>
+        </label>
+        {targetModelType && (
+          <div className="loadtest-target-variant" role="radiogroup" aria-label="Target variant">
+            {["current", "challenger"].map((v) => (
+              <label key={v} className={`loadtest-target-variant-option ${targetVariant === v ? "active" : ""}`}>
+                <input
+                  type="radio"
+                  name="loadtest-target-variant"
+                  value={v}
+                  checked={targetVariant === v}
+                  onChange={() => setTargetVariant(v)}
+                  disabled={running}
+                  data-testid={`loadtest-target-variant-${v}`}
+                />
+                {v === "current" ? "Current (stable)" : "Challenger (canary)"}
+              </label>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Run / Stop buttons */}
@@ -556,9 +625,9 @@ function ContainerBreakdown({ containers }) {
 
   const CONTAINER_LOGOS = {
     "dlrm-bid-shader": nvidiaLogo,
-    "widedeep-segment-activator": nvidiaLogo,
+    "widedeep-segment-activator": null,
     "ncf-deal-manager": nvidiaLogo,
-    "metrics-enricher": nvidiaLogo,
+    "metrics-enricher": null,
   };
 
   // Job-oriented display labels shown instead of the raw internal name.

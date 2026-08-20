@@ -205,6 +205,8 @@ Resources:
               Type: string
             - Name: model_version
               Type: string
+            - Name: source
+              Type: string
             - Name: intent
               Type: string
             - Name: original_price

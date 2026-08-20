@@ -52,6 +52,7 @@ def _make_bid_event(
         request_id=request_id,
         timestamp=1718000000.0,
         model_version="v1.0.0",
+        source="live",
         original_price=5.0,
         shaded_price=4.0,
         bid_floor=2.0,

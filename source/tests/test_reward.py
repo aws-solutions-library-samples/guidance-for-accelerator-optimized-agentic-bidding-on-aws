@@ -29,6 +29,7 @@ def _make_record(**overrides) -> BidOutcomeRecord:
         "event_timestamp": 1718000000000,
         "model_type": "dlrm_bid_shader",
         "model_version": "v1.2.3",
+        "source": "live",
         "intent": "bid",
         "original_price": 5.0,
         "shaded_price": 4.0,

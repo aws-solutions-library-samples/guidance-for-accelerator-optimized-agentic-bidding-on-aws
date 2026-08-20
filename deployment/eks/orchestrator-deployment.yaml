@@ -92,6 +92,19 @@ spec:
               value: "__DLRM_MODEL_GROUP__"
             - name: CLOSED_LOOP_MODEL_GROUP_NCF_DEAL_MANAGER
               value: "__NCF_MODEL_GROUP__"
+            # Governance panel on-demand training trigger (Train-from-Load-Test
+            # feature, Unit 2). Reuses the SageMaker training execution role
+            # and buckets closed_loop_cfn.yaml already provisions (Condition:
+            # HasTrainingBuckets) — same infra the scheduled retraining Lambda
+            # uses, not a new/parallel setup.
+            - name: SAGEMAKER_TRAINING_ROLE_ARN
+              value: "__SAGEMAKER_TRAINING_ROLE_ARN__"
+            - name: MODEL_BUCKET
+              value: "__MODEL_BUCKET__"
+            - name: TRAINING_DATA_BUCKET
+              value: "__TRAINING_DATA_BUCKET__"
+            - name: TRAINING_IMAGE_REGISTRY
+              value: "__TRAINING_IMAGE_REGISTRY__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.

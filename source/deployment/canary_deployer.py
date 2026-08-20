@@ -44,6 +44,8 @@ class DeploymentState:
     canary_engine_uri: Optional[str] = None
     canary_traffic_pct: float = 0.0  # 0.0-100.0
     status: str = "stable"  # "stable" | "canary_active" | "promoting" | "rolling_back"
+    canary_version_arn: Optional[str] = None
+    stable_version_arn: Optional[str] = None
 
     @property
     def control_traffic_pct(self) -> float:
@@ -126,6 +128,8 @@ class CanaryDeployer:
         model_name: str,
         artifact_uri: str,
         initial_traffic_pct: float = 5.0,
+        *,
+        canary_version_arn: str | None = None,
     ) -> DeploymentState:
         """Deploy a new model version as a canary with initial traffic split.
 
@@ -137,6 +141,12 @@ class CanaryDeployer:
             artifact_uri: URI of the optimized model artifact.
             initial_traffic_pct: Initial percentage of traffic for the canary
                 (default 5%). Must be in [0, 100].
+            canary_version_arn: The SageMaker Model Package version/ARN this
+                canary corresponds to. Written to the router's
+                canary_version_arn config parameter so per-request
+                served_model_version resolution (FR-2) can report it. Omitted
+                (None) leaves the router's existing value unchanged — never
+                fabricated when the caller doesn't have a real ARN yet.
 
         Returns:
             Updated DeploymentState with status="canary_active".
@@ -171,12 +181,16 @@ class CanaryDeployer:
         # Route the initial slice of live traffic via the router's in-memory split
         # (control-plane config change; no per-request external dependency).
         await self._triton_loader.set_router_split(
-            model_name, initial_traffic_pct, canary_model=canary_model
+            model_name,
+            initial_traffic_pct,
+            canary_model=canary_model,
+            canary_version_arn=canary_version_arn,
         )
 
         state.canary_model = canary_model
         state.canary_engine_uri = artifact_uri
         state.canary_traffic_pct = initial_traffic_pct
+        state.canary_version_arn = canary_version_arn
         state.status = "canary_active"
         self._states[model_name] = state
 
@@ -231,7 +245,7 @@ class CanaryDeployer:
 
         return state
 
-    async def promote(self, model_name: str) -> DeploymentState:
+    async def promote(self, model_name: str, *, new_stable_version_arn: str | None = None) -> DeploymentState:
         """Promote the canary to become the new stable version.
 
         Steps:
@@ -246,6 +260,12 @@ class CanaryDeployer:
 
         Args:
             model_name: Logical model name.
+            new_stable_version_arn: The SageMaker Model Package version/ARN
+                the promoted engine corresponds to. Written to the router's
+                stable_version_arn config parameter. Defaults to the
+                canary's own version_arn (state.canary_version_arn) when
+                omitted, since promoting a canary to stable means the
+                canary's version IS the new stable version.
 
         Returns:
             Updated DeploymentState with status="stable".
@@ -258,6 +278,7 @@ class CanaryDeployer:
             raise NoActiveCanaryError(model_name)
 
         state.status = "promoting"
+        resolved_stable_version_arn = new_stable_version_arn or state.canary_version_arn
 
         # Step 1: Publish the validated canary engine as a NEW stable version.
         # Triton serves the highest version by default, so once poll-loaded the
@@ -274,14 +295,24 @@ class CanaryDeployer:
             raise CanaryLoadError(stable_model, new_version)
 
         # Step 2: Route 100% back to stable (which now serves the promoted engine)
-        # and remove the canary model.
-        await self._triton_loader.set_router_split(model_name, 0.0)
+        # and remove the canary model. Also update the version-ARN parameters
+        # so served_model_version resolution (FR-2) reflects the promotion:
+        # the promoted version becomes stable_version_arn; canary_version_arn
+        # is cleared since there is no longer an active canary.
+        await self._triton_loader.set_router_split(
+            model_name,
+            0.0,
+            stable_version_arn=resolved_stable_version_arn,
+            canary_version_arn="",
+        )
         await self._triton_loader.remove_canary(model_name)
 
         state.current_version = new_version
         state.canary_model = None
         state.canary_engine_uri = None
         state.canary_traffic_pct = 0.0
+        state.stable_version_arn = resolved_stable_version_arn
+        state.canary_version_arn = None
         state.status = "stable"
 
         logger.info(

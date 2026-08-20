@@ -40,6 +40,7 @@ def _make_event(user_id_hash: str = "user_abc123", request_id_suffix: str = "0")
         request_id=f"a1b2c3d4-e5f6-7890-abcd-ef123456789{request_id_suffix}",
         timestamp=1718000000.0,
         model_version="v1.0.0",
+        source="live",
         original_price=5.0,
         shaded_price=4.0,
         bid_floor=2.0,

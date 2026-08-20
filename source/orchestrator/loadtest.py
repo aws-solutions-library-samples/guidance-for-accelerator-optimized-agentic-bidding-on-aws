@@ -28,6 +28,19 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
+from orchestrator.loadtest_instrumentation import (
+    aggregate_run_model_version,
+    emit_load_test_outcome,
+)
+from orchestrator.loadtest_targeting import (
+    CanaryNotStagedError,
+    CanaryNotSupportedError,
+    build_override_headers,
+    canary_supported,
+    is_canary_staged,
+    validate_challenger_target,
+)
+
 
 def _get_app_deps():
     """Lazy import to avoid circular dependency with orchestrator.app."""
@@ -42,10 +55,44 @@ def _get_app_deps():
 # Models
 # ---------------------------------------------------------------------------
 
+# Model types eligible for target_model_type selection (Governance panel's
+# model-type selector today covers these two Triton-backed types plus the
+# two rule-based ones — per Q4=B, all 4 stay selectable so a future
+# Triton/canary rollout for the rule-based ones needs no API change).
+_TARGET_MODEL_TYPES = (
+    "dlrm_bid_shader",
+    "widedeep_segment_activator",
+    "ncf_deal_manager",
+    "metrics_enricher",
+)
+
+# Maps a target_model_type to the CONTAINERS registry entry name it
+# corresponds to (see orchestrator/app.py's CONTAINERS list — display names
+# use hyphens per the deployment-redesign rename, internal keys stay as the
+# model-architecture name per that feature's Q B1 decision).
+_MODEL_TYPE_TO_CONTAINER_NAME = {
+    "dlrm_bid_shader": "dlrm-bid-shader",
+    "widedeep_segment_activator": "widedeep-segment-activator",
+    "ncf_deal_manager": "ncf-deal-manager",
+    "metrics_enricher": "metrics-enricher",
+}
+
+
 class LoadTestRequest(BaseModel):
     preset: Literal["100", "1k", "10k", "100k"]
     seed: int = 42
     duration_s: int = 30  # max duration in seconds; test stops after this even if not all requests sent
+    # target_model_type/target_variant: optional (default preserves the
+    # pre-existing behavior of not capturing outcome/version data at all).
+    # When target_model_type is set, that container's responses are used for
+    # BidOutcomeEvent emission (source="load_test") and model_version
+    # aggregation; the other containers are still called for fan-out
+    # realism but ignored for outcome/version purposes (Q3=A).
+    target_model_type: Literal[
+        "dlrm_bid_shader", "widedeep_segment_activator",
+        "ncf_deal_manager", "metrics_enricher",
+    ] | None = None
+    target_variant: Literal["current", "challenger"] = "current"
 
 
 class LoadTestStatus(BaseModel):
@@ -70,6 +117,28 @@ class LoadTestStatus(BaseModel):
     steady_state_avg_ms: float = 0.0  # avg latency of last 50% of requests
     scaled_replicas: int = 1  # how many replicas were used during the test
     total_mutations: int = 0  # total mutations produced across all containers
+    # FR-2/FR-7 fields (Train-from-Load-Test feature). model_version is the
+    # majority/only version observed across target_model_type's requests in
+    # this run ("" if no target_model_type was set, or no requests reached
+    # it — a real "unknown", never fabricated).
+    model_version: str = ""
+    target_model_type: str = ""
+    target_variant: str = "current"
+    canary_supported: bool = False
+    canary_staged: bool = False
+    # outcome_sample_count: how many BidOutcomeEvents were actually emitted
+    # for target_model_type during this run. Used by
+    # LoadTestRunEligibilityService (Unit 3) to filter eligible runs without
+    # re-deriving eligibility from raw sample data.
+    outcome_sample_count: int = 0
+    # outcome_samples: the real per-request primary-metric values (revenue
+    # per bid: price_paid if won, else 0.0) for target_model_type's emitted
+    # outcomes — real per-sample data for ComparisonService's ABEvaluator
+    # call (FR-8), not a summary statistic. Capped at _MAX_STORED_SAMPLES
+    # per run to keep the DynamoDB item within its size limit; this is a
+    # disclosed bound (outcome_sample_count may exceed len(outcome_samples)
+    # for large presets), not a silent truncation.
+    outcome_samples: list[float] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +423,14 @@ async def _scale_down_after_delay(delay_s: int = 120) -> None:
 
 # ---------------------------------------------------------------------------
 
-async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) -> None:
+async def _run_load_test(
+    test_id: str,
+    preset: str,
+    seed: int,
+    duration_s: int,
+    target_model_type: str | None = None,
+    target_variant: str = "current",
+) -> None:
     """Execute the load test asynchronously.
 
     Pre-scales containers to handle load, runs the test, then schedules
@@ -362,6 +438,14 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
 
     Progress data is written to shared dicts so the SSE handler can compute
     real-time stats without blocking the runner.
+
+    When target_model_type is set (FR-1/FR-2/FR-3, Story 1-2), the matching
+    container's per-request responses are additionally used to emit real,
+    origin-labeled BidOutcomeEvents and to aggregate the run's observed
+    model_version — the other containers in the fan-out are unaffected
+    (Q3=A). When target_variant="challenger", the target container's calls
+    carry the out-of-band challenger-targeting header (Q2=B) — validated
+    BEFORE this function is even scheduled, in start_loadtest().
     """
     global _active_task
 
@@ -395,7 +479,25 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
     # Get all containers (full fan-out since applicable_intents includes all)
     active_containers = _filter_containers(ALL_INTENTS)
 
-    async def _execute_single(payload: dict, client: httpx.AsyncClient) -> None:  # nosemgrep: useless-inner-function
+    # Resolve which CONTAINERS entry (by internal registry name) corresponds
+    # to target_model_type, and the load-test-only headers for its calls
+    # (BR-4 — only this run's calls to this specific container ever carry
+    # the override; other containers/requests never do).
+    target_container_name = (
+        _MODEL_TYPE_TO_CONTAINER_NAME.get(target_model_type) if target_model_type else None
+    )
+    target_headers = build_override_headers(target_variant) if target_model_type else {}
+    per_request_versions: list[str] = []
+    outcome_sample_count = 0
+    # Bounded to keep the persisted LoadTestStatus item within DynamoDB's
+    # per-item size limit — outcome_sample_count (unbounded) still reports
+    # the true total; outcome_samples is disclosed as capped, not silently
+    # truncated (see LoadTestStatus.outcome_samples docstring).
+    _MAX_STORED_SAMPLES = 2000
+    outcome_samples: list[float] = []
+
+    async def _execute_single(request_index: int, payload: dict, client: httpx.AsyncClient) -> None:  # nosemgrep: useless-inner-function
+        nonlocal outcome_sample_count
         if _cancel_flags.get(test_id, False):
             return
         # Check deadline within batch to avoid blocking past duration
@@ -407,10 +509,15 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
 
         req_start = time.monotonic()
         try:
-            tasks = [
-                _call_container_timed(client, c, payload, payload_bytes, timeout_s)
-                for c in active_containers
-            ]
+            tasks = []
+            for c in active_containers:
+                # Only the target_model_type container's calls carry the
+                # load-test-only override header — every other container in
+                # this run's fan-out is called exactly as before (BR-4/Q3=A).
+                headers = target_headers if c["name"] == target_container_name else None
+                tasks.append(
+                    _call_container_timed(client, c, payload, payload_bytes, timeout_s, headers=headers)
+                )
             invocations = await asyncio.gather(*tasks)
 
             req_latency = (time.monotonic() - req_start) * 1000.0
@@ -421,6 +528,16 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
                 _progress_per_container_mutations[test_id][inv.name] += len(inv.mutations)
                 if inv.status == "failed" or inv.status == "timeout":
                     _progress_errors[test_id] += 1
+                if (
+                    target_container_name
+                    and inv.name == target_container_name
+                    and inv.status == "ok"
+                ):
+                    per_request_versions.append(inv.model_version)
+                    sample_value = emit_load_test_outcome(test_id, request_index, inv.model_version)
+                    outcome_sample_count += 1
+                    if len(outcome_samples) < _MAX_STORED_SAMPLES:
+                        outcome_samples.append(sample_value)
 
             _progress_completed[test_id] += 1
         except Exception:
@@ -444,7 +561,9 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
                     break
 
                 batch = payloads[i:i + batch_size]
-                await asyncio.gather(*[_execute_single(p, client) for p in batch])
+                await asyncio.gather(*[
+                    _execute_single(i + offset, p, client) for offset, p in enumerate(batch)
+                ])
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -489,6 +608,12 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
     # Total mutations across all containers
     total_muts = sum(c.get("total_mutations", 0) for c in per_container)
 
+    # Aggregate this run's observed model_version from the target
+    # container's per-request resolutions (FR-2). "" if target_model_type
+    # wasn't set, or no requests reached it — a real "unknown", never
+    # fabricated (see aggregate_run_model_version's docstring).
+    aggregated_model_version = aggregate_run_model_version(per_request_versions)
+
     # Update the stored status
     _active_tests[test_id] = LoadTestStatus(
         id=test_id,
@@ -511,6 +636,17 @@ async def _run_load_test(test_id: str, preset: str, seed: int, duration_s: int) 
         steady_state_avg_ms=steady_avg,
         scaled_replicas=scale_replicas,
         total_mutations=total_muts,
+        model_version=aggregated_model_version,
+        target_model_type=target_model_type or "",
+        target_variant=target_variant,
+        canary_supported=canary_supported(target_model_type) if target_model_type else False,
+        canary_staged=(
+            await is_canary_staged(target_model_type)
+            if target_model_type and canary_supported(target_model_type)
+            else False
+        ),
+        outcome_sample_count=outcome_sample_count,
+        outcome_samples=outcome_samples,
     )
 
     # Set expiry time
@@ -602,9 +738,15 @@ def _get_history_from_dynamodb(limit: int = 20) -> list[dict]:
 async def start_loadtest(request: Request) -> JSONResponse:
     """POST /v1/loadtest — Start a load test.
 
-    Accepts {preset: "1k"|"100k"|"1m", seed: int}.
+    Accepts {preset: "1k"|"100k"|"1m", seed: int, target_model_type?: str,
+    target_variant?: "current"|"challenger"}.
     Returns {id: string} with HTTP 202.
     Returns HTTP 409 if a test is already running.
+    Returns HTTP 422 for a malformed request, OR for a challenger-targeted
+    request when the target model type has no canary infrastructure at all
+    ("no canary supported") or no canary currently staged ("no canary
+    staged") — reported plainly BEFORE the run starts, never silently
+    falling back to testing stable (BR-5/FR-3).
     """
     global _active_task
 
@@ -622,6 +764,14 @@ async def start_loadtest(request: Request) -> JSONResponse:
         req = LoadTestRequest(**body)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=422)
+
+    if req.target_model_type and req.target_variant == "challenger":
+        try:
+            await validate_challenger_target(req.target_model_type)
+        except CanaryNotSupportedError as exc:
+            return JSONResponse({"error": str(exc), "reason": "no_canary_supported"}, status_code=422)
+        except CanaryNotStagedError as exc:
+            return JSONResponse({"error": str(exc), "reason": "no_canary_staged"}, status_code=422)
 
     test_id = f"lt-{uuid.uuid4().hex[:12]}"
     config = PRESET_CONFIG[req.preset]
@@ -644,11 +794,19 @@ async def start_loadtest(request: Request) -> JSONResponse:
         latency_max=0.0,
         histogram={"lt_10ms": 0, "10_30ms": 0, "30_50ms": 0, "gt_50ms": 0},
         per_container=[],
+        target_model_type=req.target_model_type or "",
+        target_variant=req.target_variant,
     )
     _cancel_flags[test_id] = False
 
     # Start the async load test
-    _active_task = asyncio.create_task(_run_load_test(test_id, req.preset, req.seed, req.duration_s))
+    _active_task = asyncio.create_task(
+        _run_load_test(
+            test_id, req.preset, req.seed, req.duration_s,
+            target_model_type=req.target_model_type,
+            target_variant=req.target_variant,
+        )
+    )
 
     return JSONResponse({"id": test_id}, status_code=202)
 

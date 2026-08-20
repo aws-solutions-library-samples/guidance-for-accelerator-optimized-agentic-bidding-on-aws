@@ -83,7 +83,7 @@ Parameters:
 
   RetrainingScheduleRate:
     Type: String
-    Default: 'rate(6 hours)'
+    Default: 'rate(24 hours)'
     Description: EventBridge Scheduler rate expression for scheduled retraining.
 
 Conditions:

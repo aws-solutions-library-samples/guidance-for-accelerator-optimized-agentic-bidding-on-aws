@@ -65,6 +65,7 @@ def _make_bid_outcome_event() -> BidOutcomeEvent:
         request_id=FIXTURE_REQUEST_ID,
         timestamp=FIXTURE_TIMESTAMP,
         model_version=FIXTURE_MODEL_VERSION,
+        source="live",
         original_price=5.0,
         shaded_price=4.0,
         bid_floor=2.0,
