@@ -38,6 +38,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from shared.artf_types import RTBRequest, RTBResponse
+from shared.load_test_context import HEADER_NAME, target_variant_scope
 
 logger = logging.getLogger("artf.server")
 
@@ -260,11 +261,21 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
         return JSONResponse({"status": "ok"})
 
     async def mutate_rest(request: Request) -> JSONResponse:
-        """Simple REST endpoint — POST RTBRequest JSON, get RTBResponse JSON."""
+        """Simple REST endpoint — POST RTBRequest JSON, get RTBResponse JSON.
+
+        Reads the out-of-band X-Load-Test-Target-Variant header (set only by
+        the orchestrator's load-test invocation path — see
+        source/orchestrator/loadtest_targeting.py) and scopes it to this
+        request's mutate_fn call via target_variant_scope. Any other value
+        (including absent) leaves the container's normal routing unaffected.
+        """
         try:
             body = await request.json()
             req = RTBRequest(**body)
-            resp = mutate_fn(req)
+            raw_variant = request.headers.get(HEADER_NAME.lower())
+            variant = raw_variant if raw_variant in ("stable", "canary") else None
+            with target_variant_scope(variant):
+                resp = mutate_fn(req)
             return JSONResponse(resp.model_dump())
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

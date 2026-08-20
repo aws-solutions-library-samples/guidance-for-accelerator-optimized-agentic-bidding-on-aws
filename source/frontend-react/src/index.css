@@ -2255,6 +2255,73 @@ body {
   height: 0;
 }
 
+/* ── Load Test Outcome-Capture Targeting (FR-2/FR-3) ── */
+.loadtest-target {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.loadtest-target-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.loadtest-target-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-solid);
+  color: var(--text);
+  font-size: clamp(10px, 0.9vw, 12px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.loadtest-target-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0px 0px 0px 3px var(--accent-glow);
+}
+
+.loadtest-target-variant {
+  display: flex;
+  gap: 6px;
+}
+
+.loadtest-target-variant-option {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.loadtest-target-variant-option:hover:not(:has(input:disabled)) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.loadtest-target-variant-option.active {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+.loadtest-target-variant-option input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
 /* ── Load Test Extra Stats ── */
 .loadtest-extra-stats {
   margin-top: 12px;
@@ -3046,6 +3113,48 @@ h1, h2, h3, .sg-display {
   display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;
 }
 @media (max-width: 780px) { .cl-mutation-grid { grid-template-columns: 1fr; } }
+
+/* ── Train from load test (FR-4/FR-5) ── */
+.cl-train-estimate {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: clamp(11px, 0.95vw, 13px);
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.cl-train-result {
+  font-size: 12px;
+  color: var(--text);
+  background: var(--glow-brand-success);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.cl-train-confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: clamp(11px, 0.95vw, 13px);
+  color: var(--text);
+}
+
+/* ── Compare load-test outcomes + Promote (FR-7..FR-10) ── */
+.cl-compare-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cl-compare-source {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
 
 /* ── Generic card (verdict / bidstream-impact / session audit) ── */
 .cl-card { padding: 14px 16px; }

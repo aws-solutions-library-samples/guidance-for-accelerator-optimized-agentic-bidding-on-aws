@@ -264,6 +264,7 @@ class SignalAssociator:
             request_id=original.request_id,
             timestamp=original.timestamp,
             model_version=original.model_version,
+            source=original.source,
             original_price=original.original_price,
             shaded_price=original.shaded_price,
             bid_floor=original.bid_floor,

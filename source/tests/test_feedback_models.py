@@ -37,6 +37,7 @@ def _valid_event_kwargs() -> dict:
         "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "timestamp": 1718000000.0,
         "model_version": "v1.2.3",
+        "source": "live",
         "original_price": 5.0,
         "shaded_price": 4.0,
         "bid_floor": 2.0,
@@ -62,6 +63,7 @@ def _valid_record_kwargs() -> dict:
         "event_timestamp": 1718000000000,
         "model_type": "dlrm_bid_shader",
         "model_version": "v1.2.3",
+        "source": "live",
         "intent": "BID_SHADE",
         "original_price": 5.0,
         "shaded_price": 4.0,
@@ -124,6 +126,40 @@ class TestBidOutcomeEventValid:
         kwargs["conversion_value"] = 25.0
         event = BidOutcomeEvent(**kwargs)
         assert event.conversion_value == 25.0
+
+    def test_source_live(self):
+        """source='live' is accepted and preserved."""
+        kwargs = _valid_event_kwargs()
+        kwargs["source"] = "live"
+        event = BidOutcomeEvent(**kwargs)
+        assert event.source == "live"
+
+    def test_source_load_test(self):
+        """source='load_test' is accepted and preserved."""
+        kwargs = _valid_event_kwargs()
+        kwargs["source"] = "load_test"
+        event = BidOutcomeEvent(**kwargs)
+        assert event.source == "load_test"
+
+    def test_source_required(self):
+        """Omitting source raises a validation error (no default)."""
+        kwargs = _valid_event_kwargs()
+        del kwargs["source"]
+        with pytest.raises(ValueError):
+            BidOutcomeEvent(**kwargs)
+
+    def test_source_invalid_value_rejected(self):
+        """An unrecognized source value raises a validation error."""
+        kwargs = _valid_event_kwargs()
+        kwargs["source"] = "synthetic"
+        with pytest.raises(ValueError):
+            BidOutcomeEvent(**kwargs)
+
+    def test_source_immutable(self):
+        """source cannot be reassigned after construction (model is frozen)."""
+        event = BidOutcomeEvent(**_valid_event_kwargs())
+        with pytest.raises(Exception):
+            event.source = "load_test"
 
 
 # ---------------------------------------------------------------------------

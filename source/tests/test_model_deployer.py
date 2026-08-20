@@ -343,6 +343,16 @@ class TestTritonModelLoader:
     def _key(self, *parts: str) -> str:
         return "/".join(["triton-models", *parts])
 
+    def test_canary_engine_uri_matches_stage_canary_write_path(self):
+        """canary_engine_uri() must return exactly the path stage_canary()
+        writes the engine to — this is what PromotionService relies on to
+        reconstruct a staged canary's engine location cross-process,
+        without depending on CanaryDeployer's in-memory DeploymentState."""
+        s3 = FakeS3()
+        loader = self._make_loader(s3)
+        expected = f"s3://{MODEL_BUCKET}/{self._key(f'{BASE_MODEL}_canary', '1', 'model.plan')}"
+        assert loader.canary_engine_uri(BASE_MODEL) == expected
+
     @pytest.mark.asyncio
     async def test_stage_canary_derives_config_and_copies_engine(self):
         s3 = FakeS3({self._key(f"{BASE_MODEL}_stable", "config.pbtxt"): _STABLE_CONFIG.encode()})

@@ -94,6 +94,7 @@ def _bid_outcome_strategy():
             event_timestamp=event_timestamp,
             model_type=model_type,
             model_version="v1.0.0",
+            source="live",
             intent="BID_SHADE",
             original_price=original_price,
             shaded_price=shaded_price,

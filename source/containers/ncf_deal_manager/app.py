@@ -37,17 +37,29 @@ if USE_TRITON:
     import numpy as np
     from container.triton_inference import predict_relevance as _triton_predict_relevance
 
+    # Static placeholder — used ONLY as a fallback when the router hasn't
+    # resolved a served_model_version. Per-request accurate value comes from
+    # _score_deals's served_model_version return value (see FR-2 / Q1=A).
     MODEL_VERSION = "ncf-neumf-triton-v1"
 
     def _score_deals(uid_hash: int, deal_ids: list[str],
                      activate_threshold: float = ACTIVATE_THRESHOLD,
-                     suppress_threshold: float = SUPPRESS_THRESHOLD) -> tuple[list[str], list[str]]:
+                     suppress_threshold: float = SUPPRESS_THRESHOLD) -> tuple[list[str], list[str], str, str]:
+        """Returns (to_activate, to_suppress, served_variant, served_model_version).
+
+        Reads the load-test-only target-variant override from
+        shared.load_test_context, which is None for all live traffic.
+        """
+        from shared.load_test_context import get_target_variant
+
         user_arr = np.array([uid_hash] * len(deal_ids), dtype=np.int64)
         deal_arr = np.array([_h(d) for d in deal_ids], dtype=np.int64)
-        scores = _triton_predict_relevance(user_arr, deal_arr)
+        scores, served_variant, served_model_version = _triton_predict_relevance(
+            user_arr, deal_arr, target_variant=get_target_variant()
+        )
         to_act = [deal_ids[j] for j in range(len(deal_ids)) if scores[j] >= activate_threshold]
         to_sup = [deal_ids[j] for j in range(len(deal_ids)) if scores[j] < suppress_threshold]
-        return to_act, to_sup
+        return to_act, to_sup, served_variant, served_model_version
 
 else:
     import torch
@@ -101,14 +113,20 @@ else:
 
     def _score_deals(uid_hash: int, deal_ids: list[str],
                      activate_threshold: float = ACTIVATE_THRESHOLD,
-                     suppress_threshold: float = SUPPRESS_THRESHOLD) -> tuple[list[str], list[str]]:
+                     suppress_threshold: float = SUPPRESS_THRESHOLD) -> tuple[list[str], list[str], str, str]:
+        """Returns (to_activate, to_suppress, served_variant, served_model_version).
+
+        The non-Triton (inline PyTorch) path has no canary/variant concept —
+        served_variant/served_model_version are always "" (a real "unknown"),
+        matching this container's static MODEL_VERSION.
+        """
         deal_hashes = torch.tensor([_h(d) for d in deal_ids])
         user_tensor = torch.tensor([uid_hash] * len(deal_ids))
         with torch.no_grad():
             scores = _model(user_tensor, deal_hashes)
         to_act = [deal_ids[j] for j in range(len(deal_ids)) if scores[j].item() >= activate_threshold]
         to_sup = [deal_ids[j] for j in range(len(deal_ids)) if scores[j].item() < suppress_threshold]
-        return to_act, to_sup
+        return to_act, to_sup, "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +154,11 @@ def mutate(req: RTBRequest) -> RTBResponse:
 
     uid = _h(req.bid_request.get("user", {}).get("id", "unknown"))
     mutations: list[Mutation] = []
+    # Per-request resolved model_version, updated as imps with deals are
+    # scored (applies to ALL traffic per Q1=A). Starts at the static
+    # constant so an imp-less/deal-less request still reports something
+    # real rather than an undefined value.
+    resolved_model_version = MODEL_VERSION
 
     for imp in req.bid_request.get("imp", []):
         imp_id = imp.get("id", "")
@@ -144,9 +167,13 @@ def mutate(req: RTBRequest) -> RTBResponse:
             continue
 
         deal_ids = [d.get("id", f"deal-{i}") for i, d in enumerate(deals)]
-        to_act, to_sup = _score_deals(uid, deal_ids,
-                                      activate_threshold=activate_threshold,
-                                      suppress_threshold=suppress_threshold)
+        to_act, to_sup, served_variant, served_model_version = _score_deals(
+            uid, deal_ids,
+            activate_threshold=activate_threshold,
+            suppress_threshold=suppress_threshold,
+        )
+        if served_model_version:
+            resolved_model_version = served_model_version
 
         if to_act and act_ok:
             mutations.append(Mutation(
@@ -160,7 +187,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
             ))
 
     return RTBResponse(id=req.id, mutations=mutations,
-                       metadata=Metadata(api_version="1.0", model_version=MODEL_VERSION))
+                       metadata=Metadata(api_version="1.0", model_version=resolved_model_version))
 
 
 if __name__ == "__main__":

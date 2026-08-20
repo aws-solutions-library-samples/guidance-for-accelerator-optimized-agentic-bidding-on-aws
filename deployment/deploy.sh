@@ -301,6 +301,13 @@ STACK_UID="$(${PYTHON} -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:$
 
 CLUSTER_NAME="${STACK_NAME}-triton"
 MODEL_BUCKET="${STACK_NAME}-triton-models-${STACK_UID}"
+# Deterministic names matching deploy_closed_loop.sh's own conventions
+# (TRAINING_DATA_BUCKET mirrors its glue_etl_cfn.yaml TrainingDataBucketName
+# naming; these only resolve to real resources if --with-retraining was
+# used, but the orchestrator's governance_api.py already reports a clear
+# 503 rather than fabricating success if the underlying bucket/role
+# doesn't exist).
+TRAINING_DATA_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}training-data-${ACCOUNT_ID}-${AWS_REGION}"
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 
 log "Account=${ACCOUNT_ID}  Region=${AWS_REGION}  Stack=${STACK_NAME}  Tag=${IMAGE_TAG}"
@@ -1177,6 +1184,15 @@ fi
 # These stores are created by deploy_closed_loop.sh; the policy is scoped by
 # name/ARN patterns so it is valid whether or not a stack prefix is used.
 log "Step 7.7: Ensuring closed-loop (Part 2) access for orchestrator"
+# Matches closed_loop_cfn.yaml's SageMakerTrainingExecutionRole naming
+# (prefixed if STACK_PREFIX is set, unprefixed otherwise) — the role the
+# governance UI's on-demand training trigger must be allowed to pass to
+# SageMaker's CreateTrainingJob RoleArn.
+if [[ -n "${STACK_PREFIX}" ]]; then
+  SAGEMAKER_TRAINING_ROLE_NAME="${STACK_PREFIX}-sagemaker-training-execution-role"
+else
+  SAGEMAKER_TRAINING_ROLE_NAME="sagemaker-training-execution-role"
+fi
 CLOSED_LOOP_POLICY_NAME="${STACK_NAME}-closed-loop-${STACK_UID}"
 CLOSED_LOOP_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLOSED_LOOP_POLICY_NAME}"
 CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
@@ -1185,6 +1201,10 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"ParameterStoreAndAudit\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:BatchGetItem\",\"dynamodb:DescribeTable\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]},\
 {\"Sid\":\"SchedulerToggle\",\"Effect\":\"Allow\",\"Action\":[\"scheduler:GetSchedule\",\"scheduler:UpdateSchedule\"],\"Resource\":[\"arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/default/*\"]},\
 {\"Sid\":\"ModelRegistryRead\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListModelPackages\",\"sagemaker:DescribeModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package-group/*artf-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
+{\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:ListTrainingJobs\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm_bid_shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf_deal_manager-*\"]},\
+{\"Sid\":\"PassSageMakerTrainingRole\",\"Effect\":\"Allow\",\"Action\":[\"iam:PassRole\"],\"Resource\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}\",\"Condition\":{\"StringEquals\":{\"iam:PassedToService\":\"sagemaker.amazonaws.com\"}}},\
+{\"Sid\":\"PromoteFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:UpdateModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
+{\"Sid\":\"TritonModelRepoReadWrite\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::${MODEL_BUCKET}\",\"arn:aws:s3:::${MODEL_BUCKET}/triton-models/*\"]},\
 {\"Sid\":\"KmsForDynamoDb\",\"Effect\":\"Allow\",\"Action\":[\"kms:Decrypt\",\"kms:GenerateDataKey\",\"kms:DescribeKey\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":[\"dynamodb.${AWS_REGION}.amazonaws.com\"]}}}\
 ]}"
 
@@ -1373,6 +1393,9 @@ for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-
       -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
       -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
       -e "s|__NCF_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager|g" \
+      -e "s|__SAGEMAKER_TRAINING_ROLE_ARN__|arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}|g" \
+      -e "s|__TRAINING_DATA_BUCKET__|${TRAINING_DATA_BUCKET}|g" \
+      -e "s|__TRAINING_IMAGE_REGISTRY__|${REGISTRY}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
   kubectl apply -f "${PROCESSED}"
 done

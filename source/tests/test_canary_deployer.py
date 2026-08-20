@@ -48,6 +48,7 @@ class FakeTritonLoader:
         self.ready = ready
         self.calls: list[tuple] = []
         self.router_splits: list[tuple[str, float, str | None]] = []
+        self.version_arn_updates: list[tuple[str, str | None, str | None]] = []
         self.staged: list[str] = []
         self.removed: list[str] = []
         self.promoted: list[tuple[str, str, int]] = []
@@ -72,10 +73,17 @@ class FakeTritonLoader:
         return self.ready
 
     async def set_router_split(
-        self, router_model: str, canary_traffic_pct: float, canary_model: str | None = None
+        self,
+        router_model: str,
+        canary_traffic_pct: float,
+        canary_model: str | None = None,
+        *,
+        canary_version_arn: str | None = None,
+        stable_version_arn: str | None = None,
     ) -> None:
         self.calls.append(("set_router_split", router_model, canary_traffic_pct, canary_model))
         self.router_splits.append((router_model, canary_traffic_pct, canary_model))
+        self.version_arn_updates.append((router_model, canary_version_arn, stable_version_arn))
 
     async def promote_engine(self, base_model: str, engine_uri: str) -> int:
         self.calls.append(("promote_engine", base_model, engine_uri))
