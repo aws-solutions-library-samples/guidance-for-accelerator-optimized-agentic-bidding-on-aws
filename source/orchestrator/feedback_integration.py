@@ -158,7 +158,15 @@ def emit_load_test_bid_outcome(
             click=click,
             conversion=conversion,
             conversion_value=conversion_value,
-            user_id_hash="load-test",
+            # A real hash of the request_id (deterministic per request, no
+            # actual user identity involved) rather than the literal string
+            # "load-test" -- the ETL's validate_no_raw_pii() checks
+            # user_id_hash against a "looks like a hash" pattern and would
+            # otherwise drop every load-test record as suspected raw PII
+            # (confirmed live: 100% of load-test records were dropped before
+            # this fix). site_domain/device_type are not hash-checked columns,
+            # so the literal "load-test" marker is fine for those.
+            user_id_hash=hashlib.sha256(f"load-test-{request_id}".encode()).hexdigest()[:16],
             site_domain="load-test",
             device_type="load-test",
             hour_of_day=datetime.now(timezone.utc).hour,
