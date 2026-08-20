@@ -26,10 +26,12 @@ Requirements: 2.2, 2.3, 2.4, 2.6
 """
 
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+import boto3
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, DoubleType
@@ -302,7 +304,7 @@ def main():
 
     try:
         # ------------------------------------------------------------------
-        # Step 1: Read from Glue catalog with push-down predicate
+        # Step 1: Read directly from the table's S3 location
         # ------------------------------------------------------------------
         # Window bounds as Unix seconds -- matches BidOutcomeEvent.timestamp,
         # the real column this table's "timestamp" field is populated from
@@ -311,10 +313,28 @@ def main():
         window_start_epoch = start_dt.timestamp()
         window_end_epoch = end_dt.timestamp()
 
-        logger.info("Reading from catalog: %s.%s", database_name, table_name)
+        # Resolve the table's S3 location via the Glue API and read Parquet
+        # directly from it, rather than through spark.read.table(). The
+        # latter only returns rows for partitions actually REGISTERED in the
+        # Glue catalog (partition_date/partition_hour) -- nothing in this
+        # pipeline ever registers those partitions (no crawler, no MSCK
+        # REPAIR, no BatchCreatePartition call), so spark.read.table() always
+        # silently returned 0 rows regardless of how much real data existed
+        # in S3 (confirmed live). Reading the S3 location directly sidesteps
+        # partition metadata entirely; this script already does its own
+        # timestamp-based windowing below, so partition pruning was never
+        # required for correctness -- only for read efficiency, which an
+        # unpartitioned read still gets from Parquet's own predicate pushdown
+        # on the timestamp column.
+        boto3_glue = boto3.client("glue", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        table_location = boto3_glue.get_table(
+            DatabaseName=database_name, Name=table_name
+        )["Table"]["StorageDescriptor"]["Location"]
+
+        logger.info("Reading from S3 location: %s (table=%s.%s)", table_location, database_name, table_name)
 
         # Read as Spark DataFrame for more control over filtering
-        df = spark.read.format("parquet").table(f"{database_name}.{table_name}")
+        df = spark.read.format("parquet").load(table_location)
 
         # Filter by timestamp window
         df = df.filter(
