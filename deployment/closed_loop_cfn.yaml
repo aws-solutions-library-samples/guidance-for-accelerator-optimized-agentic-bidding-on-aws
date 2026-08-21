@@ -220,6 +220,22 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+        # The training-data bucket is SSE-KMS encrypted with KMSKeyArn (see
+        # glue_etl_cfn.yaml). Without Decrypt on that key, CreateTrainingJob's
+        # input-channel download fails with a KMS AccessDenied ClientError
+        # before training ever starts. GenerateDataKey is included so the role
+        # can also write encrypted objects if a future output path uses this
+        # same key (the model bucket is currently SSE-S3, not SSE-KMS).
+        - PolicyName: TrainingDataKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !Ref KMSKeyArn
         - PolicyName: ModelBucketReadWriteAccess
           PolicyDocument:
             Version: '2012-10-17'
