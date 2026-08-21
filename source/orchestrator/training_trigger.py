@@ -36,13 +36,36 @@ _HOURLY_RATE_USD = 1.515
 # ceiling the automated pipeline uses for the same instance type.
 _MAX_RUNTIME_SECONDS = 14400
 
-# The two model types with real training infrastructure today (same set as
-# CANARY_SUPPORTED_MODEL_TYPES in loadtest_targeting.py — training and
-# canary infrastructure exist for the same two Triton-backed model types).
-TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({"dlrm_bid_shader", "ncf_deal_manager"})
+# ncf_deal_manager is intentionally excluded from on-demand training. Its
+# ACTIVATE_DEALS/SUPPRESS_DEALS mutations disambiguate deals via
+# path + IDsPayload (a list of deal IDs per impression) per the real ARTF
+# proto (agenticrtbframework.proto) -- verified directly against
+# github.com/IABTechLab/agentic-real-time-framework's canonical proto and
+# reference-implementation handler (ProcessDeals in internal/handlers/
+# handlers.go), which builds exactly one Mutation per impression carrying a
+# list of deal IDs. BidShadingOutcomeEvent/Record (shared/feedback_models.py)
+# has no deal_id field and no per-deal fan-out, so there is no way to
+# attribute a training outcome to one specific deal today. Enabling this
+# requires a schema change (deal_id field + per-deal event fan-out in
+# feedback_integration.py, using OpenRTB's real BidResponse.SeatBid.Bid.dealid
+# to determine which activated deal actually won) -- tracked as a follow-up,
+# not implemented here. train.py's build_features() already raises a clear
+# ValueError for ncf_deal_manager rather than silently misbehaving; this
+# set is the earlier, UI-facing enforcement point so the option is never
+# offered in the first place.
+TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({"dlrm_bid_shader"})
+
+# Model types with real training infrastructure (container/pipeline
+# wiring exists) but temporarily excluded from TRAINABLE_MODEL_TYPES above.
+# Kept separate (rather than deleted) so the reason is documented in one
+# place and the set is trivial to restore once the deal_id schema work
+# lands.
+_PARKED_MODEL_TYPES: frozenset[str] = frozenset({"ncf_deal_manager"})
 
 # Same training image naming convention as source/training/pipeline.py's
 # _TRAINING_IMAGE_MAP and governance_eventbridge_cfn.yaml's image_tag.
+# Includes parked model types too -- this map describes image-naming
+# convention, not what's currently offered (that's TRAINABLE_MODEL_TYPES).
 _IMAGE_TAG = {"dlrm_bid_shader": "dlrm", "ncf_deal_manager": "ncf"}
 
 

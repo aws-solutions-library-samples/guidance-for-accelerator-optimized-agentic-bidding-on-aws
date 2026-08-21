@@ -23,9 +23,29 @@ const DEFAULT_PIPELINE_NODES = [
 // models (per DESIGN_BRIEF.md — Wide&Deep is rule-based, no canary/A-B loop).
 // The model selector filters the scenario list, so picking a model actually
 // changes which real scenario/decision can run — not just a display label.
+// NCF still has full scenario/compare/promote support (no training data
+// needed there), so it stays in this general selector even though it's
+// parked for the training section below (see TRAINING_MODEL_TYPES).
 const MODEL_TYPES = [
   { key: "dlrm_bid_shader", label: "DLRM Bid Shader" },
   { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+];
+
+// Training-specific model selector for the "Train from load test" card,
+// decoupled from MODEL_TYPES above (which also drives scenario/compare/
+// promote — those work fine for NCF). ncf_deal_manager training is parked:
+// its ACTIVATE_DEALS/SUPPRESS_DEALS mutations disambiguate deals via
+// path + a list of deal IDs (verified against the real ARTF proto/reference
+// implementation — github.com/IABTechLab/agentic-real-time-framework), but
+// BidShadingOutcomeEvent/Record has no deal_id field and no per-deal
+// fan-out, so there's no way to attribute a training outcome to one
+// specific deal yet. Shown here, disabled, rather than removed, so it's
+// discoverable and trivial to re-enable once that schema work lands
+// (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES, the
+// authoritative backend enforcement).
+const TRAINING_MODEL_TYPES = [
+  { key: "dlrm_bid_shader", label: "DLRM Bid Shader", trainable: true },
+  { key: "ncf_deal_manager", label: "NCF Deal Manager (parked — coming in a future release)", trainable: false },
 ];
 
 /**
@@ -65,7 +85,11 @@ export default function GovernancePanel() {
 
   // Train-from-load-test (FR-4/FR-5, Story 3): cost/duration estimate shown
   // before confirming, and a live "is a job already running" check that
-  // disables the button while true.
+  // disables the button while true. Uses its own model selector
+  // (trainingModelType), decoupled from the general `modelType` above —
+  // ncf_deal_manager training is parked (see TRAINING_MODEL_TYPES), but
+  // NCF scenario/compare/promote above are unaffected.
+  const [trainingModelType, setTrainingModelType] = useState("dlrm_bid_shader");
   const [trainingEstimate, setTrainingEstimate] = useState(null);
   const [trainingEstimateError, setTrainingEstimateError] = useState(null);
   const [trainingInProgress, setTrainingInProgress] = useState(false);
@@ -131,13 +155,13 @@ export default function GovernancePanel() {
 
   useEffect(() => { refreshState(); }, [refreshState]);
 
-  // Fetch the real cost/duration estimate whenever the selected model type
-  // changes, and reset any prior training-in-progress/result state (it was
-  // scoped to the previous model type).
+  // Fetch the real cost/duration estimate whenever the selected training
+  // model type changes, and reset any prior training-in-progress/result
+  // state (it was scoped to the previous model type).
   const fetchTrainingEstimate = useCallback(async () => {
     setTrainingEstimateError(null);
     try {
-      const resp = await authFetch(`/api/v1/governance/training-estimate?model_type=${modelType}`);
+      const resp = await authFetch(`/api/v1/governance/training-estimate?model_type=${trainingModelType}`);
       const data = await resp.json();
       if (resp.ok) setTrainingEstimate(data);
       else { setTrainingEstimate(null); setTrainingEstimateError(data.error || `HTTP ${resp.status}`); }
@@ -145,7 +169,7 @@ export default function GovernancePanel() {
       setTrainingEstimate(null);
       setTrainingEstimateError(String(e));
     }
-  }, [modelType]);
+  }, [trainingModelType]);
 
   useEffect(() => {
     fetchTrainingEstimate();
@@ -153,7 +177,7 @@ export default function GovernancePanel() {
     setConfirmingTraining(false);
     setTrainingResult(null);
     setTrainingError(null);
-  }, [modelType, fetchTrainingEstimate]);
+  }, [trainingModelType, fetchTrainingEstimate]);
 
   const startTraining = useCallback(async () => {
     setTrainingSubmitting(true);
@@ -162,7 +186,7 @@ export default function GovernancePanel() {
       const resp = await authFetch("/api/v1/governance/train", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_type: modelType, confirmed: true }),
+        body: JSON.stringify({ model_type: trainingModelType, confirmed: true }),
       });
       const data = await resp.json();
       if (resp.ok) {
@@ -182,7 +206,7 @@ export default function GovernancePanel() {
     } finally {
       setTrainingSubmitting(false);
     }
-  }, [modelType]);
+  }, [trainingModelType]);
 
   // Fetch eligible load-test runs whenever the model type changes, auto-
   // selecting the most recent per role (FR-7). Clears any prior
@@ -480,9 +504,27 @@ export default function GovernancePanel() {
       </div>
 
       {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
-          estimate + explicit confirmation + concurrency-guarded trigger. */}
+          estimate + explicit confirmation + concurrency-guarded trigger.
+          Has its own model selector (decoupled from the general one above)
+          since ncf_deal_manager training is parked while scenario/compare/
+          promote still work for it. */}
       <div className="cl-section-title">Train from load test</div>
       <div className="cl-card sg-elevated" data-testid="governance-train-card">
+        <div className="cl-control-group">
+          <label htmlFor="cl-gov-train-model">Model:</label>
+          <select
+            id="cl-gov-train-model"
+            className="cl-select sg-interactive"
+            data-testid="governance-train-model-select"
+            value={trainingModelType}
+            onChange={(e) => setTrainingModelType(e.target.value)}
+            disabled={trainingSubmitting}
+          >
+            {TRAINING_MODEL_TYPES.map((m) => (
+              <option key={m.key} value={m.key} disabled={!m.trainable}>{m.label}</option>
+            ))}
+          </select>
+        </div>
         {trainingEstimateError && (
           <div className="cl-honest cl-honest-block">Cost estimate unavailable: {trainingEstimateError}</div>
         )}
@@ -514,7 +556,7 @@ export default function GovernancePanel() {
         ) : (
           <div className="cl-train-confirm">
             <span>
-              Start a real SageMaker training job for {modelType}? Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
+              Start a real SageMaker training job for {trainingModelType}? Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
             </span>
             <button
               className="btn btn-primary sg-interactive"
