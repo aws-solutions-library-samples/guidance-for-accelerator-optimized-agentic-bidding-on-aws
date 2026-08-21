@@ -25,8 +25,8 @@ export const INTENT_TO_STOP = Object.freeze({
   1: "widedeep",
   2: "ncf",
   3: "ncf",
-  4: "ncf",
-  5: "ncf",
+  4: "yield",
+  5: "yield",
   6: "dlrm",
   7: "metrics",
   8: "metrics",
@@ -38,6 +38,7 @@ export const STOP_MODEL_FAMILY = Object.freeze({
   widedeep: "WIDE_AND_DEEP",
   ncf: "NCF",
   metrics: "RULES",
+  yield: "XGBOOST_FIL",
   dsp: "NONE",
 });
 
@@ -46,6 +47,7 @@ export const CONTAINER_NAME_TO_STOP_ID = Object.freeze({
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
+  "deal-yield-manager": "yield",
 });
 
 export const DISPLAY_NAME_BY_STOP_ID = Object.freeze({
@@ -54,5 +56,6 @@ export const DISPLAY_NAME_BY_STOP_ID = Object.freeze({
   widedeep: "Wide & Deep",
   ncf: "NCF Deal Mgr",
   metrics: "Metrics Enricher",
+  yield: "Yield Optimizer",
   dsp: "DSP",
 });

@@ -36,6 +36,7 @@ from shared.feedback_collector import FeedbackCollector  # noqa: E402
 from shared.signal_associator import SignalAssociator  # noqa: E402
 from orchestrator.signal_receiver import receive_signal as _receive_signal_handler  # noqa: E402
 from orchestrator.feedback_integration import emit_bid_outcome  # noqa: E402
+from orchestrator.deal_yield_feedback import emit_deal_yield_outcome  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,12 @@ CONTAINERS = [
         "intents": {"ADD_METRICS"},
         "grpc": os.environ.get("METRICS_GRPC", os.environ.get("METRICS_URL", "http://localhost:50064")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("METRICS_MCP", os.environ.get("METRICS_URL", "http://localhost:8094")),
+    },
+    {
+        "name": "deal-yield-manager",
+        "intents": {"ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"},
+        "grpc": os.environ.get("YIELD_GRPC", os.environ.get("YIELD_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
+        "mcp": os.environ.get("YIELD_MCP", os.environ.get("YIELD_URL", "http://localhost:8095")),
     },
 
 ]
@@ -329,6 +336,9 @@ async def get_mutations(request: Request) -> JSONResponse:
 
     # Emit bid outcome event (fire-and-forget, non-blocking)
     emit_bid_outcome(req, resp, start)
+    # Emit deal yield outcome event(s) for any adjust_deal mutations
+    # (fire-and-forget, non-blocking, independent of emit_bid_outcome above)
+    emit_deal_yield_outcome(req, resp)
 
     return JSONResponse(resp_dict)
 
@@ -418,7 +428,7 @@ async def list_containers(request: Request) -> JSONResponse:
     # rules-based container as degraded.
     triton_models: dict[str, dict] = {}
     if triton_ready:
-        model_names = ["dlrm_bid_shader", "ncf_deal_manager"]
+        model_names = ["dlrm_bid_shader", "ncf_deal_manager", "deal_yield_manager"]
         async with httpx.AsyncClient(timeout=2.0) as tc:
             for model_name in model_names:
                 ev = await _probe_http(tc, f"http://{triton_url}/v2/models/{model_name}/ready")
@@ -434,6 +444,7 @@ async def list_containers(request: Request) -> JSONResponse:
         "widedeep-segment-activator": None,  # rules-based, no Triton model
         "ncf-deal-manager": "ncf_deal_manager",
         "metrics-enricher": None,  # rules-based, no Triton model
+        "deal-yield-manager": "deal_yield_manager",
     }
 
     async with httpx.AsyncClient(timeout=2.0) as client:
@@ -605,6 +616,8 @@ async def mcp_proxy(request: Request) -> JSONResponse:
             )
             # Emit bid outcome event (fire-and-forget, non-blocking)
             emit_bid_outcome(req, resp, start)
+            # Emit deal yield outcome event(s) for any adjust_deal mutations
+            emit_deal_yield_outcome(req, resp)
 
             return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {
                 "content": [{"type": "text", "text": json.dumps(resp.model_dump())}],

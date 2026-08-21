@@ -2,7 +2,7 @@
 
 Validates:
 - Registering bid contexts and associating downstream signals by request_id
-- Enriched BidOutcomeEvent emission with correct signal flags
+- Enriched BidShadingOutcomeEvent emission with correct signal flags
 - Monotonic signal chain enforcement (conversion → click → impression → won)
 - Out-of-order signal handling (e.g., conversion before click)
 - TTL-based cache expiration
@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 from shared.signal_associator import (
     SignalAssociator,
     SignalType,
@@ -46,9 +46,9 @@ def _make_bid_event(
     conversion: bool = False,
     conversion_value: float | None = None,
     price_paid: float | None = 3.5,
-) -> BidOutcomeEvent:
-    """Create a valid BidOutcomeEvent fixture."""
-    return BidOutcomeEvent(
+) -> BidShadingOutcomeEvent:
+    """Create a valid BidShadingOutcomeEvent fixture."""
+    return BidShadingOutcomeEvent(
         request_id=request_id,
         timestamp=1718000000.0,
         model_version="v1.0.0",
@@ -217,7 +217,7 @@ class TestSignalAssociatorRegistration:
 
         mock_collector.emit.assert_called_once()
         emitted_event = mock_collector.emit.call_args[0][0]
-        assert isinstance(emitted_event, BidOutcomeEvent)
+        assert isinstance(emitted_event, BidShadingOutcomeEvent)
         assert emitted_event.impression is True
         assert emitted_event.request_id == event.request_id
 

@@ -1,8 +1,9 @@
 """Idempotently register the "genesis" (v1, unretrained-starter) model version
 in each SageMaker Model Package Group.
 
-closed_loop_cfn.yaml creates the two Model Package Groups
-(artf-dlrm-bid-shader / artf-ncf-deal-manager) empty. Nothing else ever calls
+closed_loop_cfn.yaml creates the Model Package Groups (artf-dlrm-bid-shader /
+artf-ncf-deal-manager / artf-deal-yield-manager-floor /
+artf-deal-yield-manager-margin) empty. Nothing else ever calls
 CreateModelPackage, so without this script the registry starts with zero
 versions and TrainingJobConfig.base_model_version (a required field, no
 default) has nothing real to reference for the very first retraining job.
@@ -29,6 +30,8 @@ Usage:
         --region us-east-1 \
         --dlrm-package-group dv2-artf-dlrm-bid-shader \
         --ncf-package-group dv2-artf-ncf-deal-manager \
+        --yield-floor-package-group dv2-artf-deal-yield-manager-floor \
+        --yield-margin-package-group dv2-artf-deal-yield-manager-margin \
         --training-image-repository artf-nemo-rl-training
 """
 
@@ -47,10 +50,32 @@ _LOG = logging.getLogger("register_genesis_models")
 # model_type -> (Model Package Group CLI flag value, ECR image tag pushed by
 # deploy_closed_loop.sh Step 4b). Must match RECOMMENDER_MODELS in deploy.sh
 # and ModelType in source/training/pipeline.py.
+#
+# deal_yield_manager_floor / deal_yield_manager_margin are trained via a
+# SEPARATE path (XGBoost via source/training/xgboost_pipeline.py, not
+# NeMo-RL) but their genesis artifacts are registered through this SAME
+# script/convention -- each genesis seed is converted to ONNX at export time
+# (onnx-source/deal_yield_manager_floor/model.onnx,
+# onnx-source/deal_yield_manager_margin/model.onnx) purely for Model
+# Registry bookkeeping consistency across all model types. Triton's FIL
+# backend does NOT read this ONNX form -- it loads a separate, native
+# XGBoost JSON artifact staged directly to each model's own Triton model
+# repository path (triton-models/deal_yield_manager_floor/1/xgboost.json,
+# .../deal_yield_manager_margin/1/xgboost.json), which this script does not
+# touch. See aidlc-docs/construction/deal-yield-training-pipeline/
+# functional-design/business-logic-model.md (Logic Flow 2) for the full
+# rationale, and business-rules.md BR-5/the FIL multi-output-limitation
+# correction note for why this is two independent model types, not one.
 _MODEL_TYPES: list[tuple[str, str]] = [
     ("dlrm_bid_shader", "dlrm"),
     ("ncf_deal_manager", "ncf"),
+    ("deal_yield_manager_floor", "yield-floor"),
+    ("deal_yield_manager_margin", "yield-margin"),
 ]
+
+# model_type values that use SageMaker's built-in XGBoost algorithm image
+# (not this project's own NeMo-RL ECR image).
+_XGBOOST_MODEL_TYPES = frozenset({"deal_yield_manager_floor", "deal_yield_manager_margin"})
 
 # SageMaker's CustomerMetadataProperties values must match
 # ([\p{L}\p{Z}\p{N}_.:\/=+\-@]*){1,256} - no semicolons, commas, or
@@ -108,6 +133,41 @@ def _training_image_exists(ecr_client, repository: str, tag: str) -> bool:
         if error_code in ("ImageNotFoundException", "RepositoryNotFoundException"):
             return False
         raise
+
+
+def _resolve_inference_image_uri(
+    model_type: str, *, account_id: str, region: str, training_image_repository: str, image_tag: str
+) -> str:
+    """Resolves the InferenceSpecification container image for this model
+    type's genesis registration.
+
+    deal_yield_manager_floor / deal_yield_manager_margin are trained via a
+    separate path (XGBoost, see source/training/xgboost_pipeline.py) that
+    does NOT build a custom image into this project's own NeMo-RL ECR repo
+    -- they use SageMaker's first-party built-in XGBoost algorithm
+    container instead, which always exists and is never subject to the "is
+    our own async CodeBuild image ready yet" check that applies to
+    dlrm_bid_shader/ncf_deal_manager.
+    """
+    if model_type in _XGBOOST_MODEL_TYPES:
+        try:
+            from sagemaker import image_uris  # type: ignore
+
+            return image_uris.retrieve(framework="xgboost", region=region, version="1.7-1")
+        except ImportError as exc:
+            # SageMaker's built-in XGBoost algorithm image is hosted in an
+            # AWS-owned account that differs per region (NOT this caller's
+            # own account_id, and not a value safe to guess/hardcode here).
+            # Fail honestly rather than fabricate a URI that would silently
+            # point at the wrong account.
+            raise RuntimeError(
+                f"The 'sagemaker' SDK is required to resolve the built-in "
+                f"XGBoost training image URI for {model_type} "
+                f"(sagemaker.image_uris.retrieve). Install it with "
+                f"'pip install sagemaker' and re-run this script."
+            ) from exc
+
+    return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{training_image_repository}:{image_tag}"
 
 
 def register_genesis_models(
@@ -180,7 +240,13 @@ def register_genesis_models(
             results[model_type] = "skipped:missing-artifact"
             continue
 
-        if not _training_image_exists(ecr_client, training_image_repository, image_tag):
+        # deal_yield_manager_floor/margin use SageMaker's first-party
+        # built-in XGBoost image (always exists) rather than this project's
+        # own async-built NeMo-RL ECR image -- the "is our CodeBuild image
+        # ready yet" check only applies to the NeMo-RL-trained model types.
+        if model_type not in _XGBOOST_MODEL_TYPES and not _training_image_exists(
+            ecr_client, training_image_repository, image_tag
+        ):
             _LOG.warning(
                 "  %s: training image %s:%s not found in ECR yet - the NeMo-RL "
                 "training container builds asynchronously (15-50 min) and this "
@@ -196,9 +262,12 @@ def register_genesis_models(
             continue
 
         model_data_url = f"s3://{model_bucket}/{onnx_key}"
-        training_image_uri = (
-            f"{account_id}.dkr.ecr.{region}.amazonaws.com/"
-            f"{training_image_repository}:{image_tag}"
+        training_image_uri = _resolve_inference_image_uri(
+            model_type,
+            account_id=account_id,
+            region=region,
+            training_image_repository=training_image_repository,
+            image_tag=image_tag,
         )
 
         create_params = {
@@ -248,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--dlrm-package-group", required=True, help="Model Package Group name for dlrm_bid_shader")
     parser.add_argument("--ncf-package-group", required=True, help="Model Package Group name for ncf_deal_manager")
+    parser.add_argument("--yield-floor-package-group", required=True, help="Model Package Group name for deal_yield_manager_floor")
+    parser.add_argument("--yield-margin-package-group", required=True, help="Model Package Group name for deal_yield_manager_margin")
     parser.add_argument(
         "--training-image-repository",
         default="artf-nemo-rl-training",
@@ -261,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
     package_groups = {
         "dlrm_bid_shader": args.dlrm_package_group,
         "ncf_deal_manager": args.ncf_package_group,
+        "deal_yield_manager_floor": args.yield_floor_package_group,
+        "deal_yield_manager_margin": args.yield_margin_package_group,
     }
 
     _LOG.info(

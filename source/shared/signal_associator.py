@@ -22,7 +22,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, model_validator
 
 from shared.feedback_collector import FeedbackCollector
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class _CacheEntry:
 
     __slots__ = ("event", "expires_at")
 
-    def __init__(self, event: BidOutcomeEvent, ttl_seconds: float) -> None:
+    def __init__(self, event: BidShadingOutcomeEvent, ttl_seconds: float) -> None:
         self.event = event
         self.expires_at = time.monotonic() + ttl_seconds
 
@@ -77,7 +77,7 @@ class SignalAssociator:
 
     Maintains an in-memory LRU cache of bid contexts keyed by request_id.
     When a downstream signal arrives, looks up the original bid context and
-    emits an enriched BidOutcomeEvent to Kinesis.
+    emits an enriched BidShadingOutcomeEvent to Kinesis.
 
     NOTE: This in-memory implementation is suitable for single-instance
     prototypes. Production deployments should use Redis or DynamoDB for:
@@ -111,7 +111,7 @@ class SignalAssociator:
     # Public API
     # ------------------------------------------------------------------
 
-    def register_bid(self, event: BidOutcomeEvent) -> None:
+    def register_bid(self, event: BidShadingOutcomeEvent) -> None:
         """Store a bid context for later signal association.
 
         Should be called when the initial bid outcome event is emitted,
@@ -129,7 +129,7 @@ class SignalAssociator:
         """Process a downstream signal and emit an enriched event.
 
         Associates the signal with the originating bid by request_id. If the
-        original bid context is found, emits an updated BidOutcomeEvent with
+        original bid context is found, emits an updated BidShadingOutcomeEvent with
         the enriched signal data. Handles out-of-order signals by filling in
         the signal chain (e.g., conversion implies click implies impression).
 
@@ -228,9 +228,9 @@ class SignalAssociator:
 
     @staticmethod
     def _enrich_event(
-        original: BidOutcomeEvent, signal: DownstreamSignal
-    ) -> BidOutcomeEvent:
-        """Create an enriched BidOutcomeEvent with the downstream signal applied.
+        original: BidShadingOutcomeEvent, signal: DownstreamSignal
+    ) -> BidShadingOutcomeEvent:
+        """Create an enriched BidShadingOutcomeEvent with the downstream signal applied.
 
         Handles out-of-order signals by filling in the monotonic chain:
         - conversion implies click implies impression implies won
@@ -259,8 +259,8 @@ class SignalAssociator:
         elif signal.signal_type == SignalType.IMPRESSION:
             impression = True
 
-        # BidOutcomeEvent is frozen, so we need to create a new instance
-        return BidOutcomeEvent(
+        # BidShadingOutcomeEvent is frozen, so we need to create a new instance
+        return BidShadingOutcomeEvent(
             request_id=original.request_id,
             timestamp=original.timestamp,
             model_version=original.model_version,

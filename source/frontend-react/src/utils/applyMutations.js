@@ -7,6 +7,24 @@
  * Returns an array of { path, before, after } objects representing each
  * mutation's effect on the original payload.
  */
+/**
+ * Look up a deal's original bidfloor from the submitted bid request by
+ * parsing a mutation path of the shape "/imp/{imp_id}/deals/{deal_id}"
+ * (ARTF proto convention -- see the deal-yield-model unit's functional
+ * design). Returns null (a real "unknown", not a fabricated value) if the
+ * path doesn't match this shape or the deal can't be found.
+ */
+function _findOriginalDealBidfloor(result, path) {
+  if (!path) return null;
+  const match = /^\/imp\/([^/]+)\/deals\/([^/]+)$/.exec(path);
+  if (!match) return null;
+  const [, impId, dealId] = match;
+  const imps = result?.submittedPayload?.bid_request?.imp || [];
+  const imp = imps.find((i) => i.id === impId);
+  const deal = imp?.pmp?.deals?.find((d) => d.id === dealId);
+  return deal?.bidfloor ?? null;
+}
+
 export function computeDiffRows(result) {
   if (!result || !result.stops) return [];
 
@@ -60,10 +78,28 @@ export function computeDiffRows(result) {
         type: "metric",
       });
     } else if (intent === "ADJUST_DEAL_FLOOR" && m.payload) {
+      // Real AdjustDealPayload shape is { bidfloor, margin } (ARTF proto),
+      // not { original, adjusted }. The "before" value comes from the
+      // deal's original bidfloor in the submitted bid request, matched by
+      // the mutation's path (/imp/{imp_id}/deals/{deal_id}).
+      const original = _findOriginalDealBidfloor(result, path);
+      const adjusted = m.payload.bidfloor;
       rows.push({
-        path: "deal.bidfloor",
-        before: m.payload.original != null ? `$${m.payload.original.toFixed(2)}` : "—",
-        after: m.payload.adjusted != null ? `$${m.payload.adjusted.toFixed(2)}` : "—",
+        path: path || "deal.bidfloor",
+        before: original != null ? `$${Number(original).toFixed(2)}` : "—",
+        after: adjusted != null ? `$${Number(adjusted).toFixed(2)}` : "—",
+        type: "deal",
+      });
+    } else if (intent === "ADJUST_DEAL_MARGIN" && m.payload) {
+      const margin = m.payload.margin;
+      const calcType = margin?.calculation_type === 0 ? "CPM" : "PERCENT";
+      const display = margin?.value != null
+        ? (calcType === "CPM" ? `$${Number(margin.value).toFixed(2)} CPM` : `${(Number(margin.value) * 100).toFixed(1)}%`)
+        : "—";
+      rows.push({
+        path: path || "deal.margin",
+        before: "—",
+        after: display,
         type: "deal",
       });
     } else {

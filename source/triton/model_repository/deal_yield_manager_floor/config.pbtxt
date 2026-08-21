@@ -1,0 +1,54 @@
+# Deal Yield Manager -- FLOOR sub-model. XGBoost regressor served via
+# Triton's FIL (Forest Inference Library) backend, for ADJUST_DEAL_FLOOR.
+# =============================================================================
+# CORRECTION (found during Unit 3 implementation): Triton's FIL backend does
+# NOT support multi-output regression models, and requires exactly one input
+# tensor named "input__0" and one output tensor named "output__0" (confirmed
+# against NVIDIA's official FIL backend docs -- see
+# aidlc-docs/construction/deal-yield-model/functional-design/business-logic-model.md
+# for the correction note). The originally-committed single
+# `deal_yield_manager` model (one input "features", two outputs
+# "floor_multiplier"/"margin_value") would fail to load in Triton. Split into
+# two independent single-target FIL models -- this one (floor) and the
+# sibling `deal_yield_manager_margin` -- each trained, registered, and
+# promoted independently, since ADJUST_DEAL_FLOOR and ADJUST_DEAL_MARGIN are
+# genuinely distinct intents (per business-rules.md BR-5: independent,
+# atomic, never gated on each other).
+#
+# Unit 1 scope: single-version, direct load (no canary router yet). Unit 3
+# adds the stable/canary router pattern already used by
+# dlrm_bid_shader/ncf_deal_manager.
+
+name: "deal_yield_manager_floor"
+backend: "fil"
+max_batch_size: 64
+
+input [
+  {
+    name: "input__0"
+    data_type: TYPE_FP32
+    dims: [ 7 ]
+  }
+]
+
+output [
+  {
+    name: "output__0"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+parameters [
+  { key: "model_type", value: { string_value: "xgboost_json" } },
+  { key: "output_class", value: { string_value: "false" } },
+  { key: "algo", value: { string_value: "ALGO_AUTO" } },
+  { key: "storage_type", value: { string_value: "AUTO" } }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]

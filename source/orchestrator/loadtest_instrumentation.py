@@ -113,7 +113,7 @@ def emit_load_test_outcome(
     model_version: str,
     model_type: str,
 ) -> float:
-    """Construct and emit exactly one load-test-origin BidOutcomeEvent.
+    """Construct and emit exactly one load-test-origin BidShadingOutcomeEvent.
 
     Uses the real emit_load_test_bid_outcome()/FeedbackCollector path with
     source="load_test" (never "live") and the resolved model_version for
@@ -130,7 +130,7 @@ def emit_load_test_outcome(
     request_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{run_id}-{request_index}"))
 
     # Price ordering (original_price >= shaded_price >= bid_floor) must hold
-    # per BidOutcomeEvent's validation rules. bid_floor is derived from the
+    # per BidShadingOutcomeEvent's validation rules. bid_floor is derived from the
     # sample's shaded_price (a plausible floor below it), and original_price
     # is derived from shaded_price/shade_factor — same relationship
     # dlrm_bid_shader/app.py's real mutate() uses.

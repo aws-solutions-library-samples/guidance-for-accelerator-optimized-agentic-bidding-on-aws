@@ -46,7 +46,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   const [error, setError] = useState(null);
   const [elapsedDisplay, setElapsedDisplay] = useState(0);
   // Outcome-capture targeting (FR-2/FR-3). "" means no target selected — the
-  // run behaves exactly as before (no BidOutcomeEvent emission, no version
+  // run behaves exactly as before (no BidShadingOutcomeEvent emission, no version
   // capture). Selecting a model type + "challenger" forces that container's
   // traffic onto its canary variant for this run only.
   const [targetModelType, setTargetModelType] = useState("");
@@ -310,7 +310,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       </div>
 
       {/* Outcome-capture targeting (FR-2/FR-3) — optional. Selecting a model
-          type enables real BidOutcomeEvent emission + model-version capture
+          type enables real BidShadingOutcomeEvent emission + model-version capture
           for this run; "Challenger" additionally forces that container's
           traffic onto its canary variant for this run only. */}
       <div className="loadtest-target" aria-label="Outcome capture targeting">
@@ -621,6 +621,7 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator",
     "ncf-deal-manager",
     "metrics-enricher",
+    "deal-yield-manager",
   ];
 
   const CONTAINER_LOGOS = {
@@ -628,6 +629,7 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator": null,
     "ncf-deal-manager": nvidiaLogo,
     "metrics-enricher": null,
+    "deal-yield-manager": nvidiaLogo,
   };
 
   // Job-oriented display labels shown instead of the raw internal name.
@@ -636,6 +638,7 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator": "Audience Activator",
     "ncf-deal-manager": "Deal Scorer",
     "metrics-enricher": "Signals Enricher",
+    "deal-yield-manager": "Yield Optimizer",
   };
 
   const rows = containers && containers.length > 0

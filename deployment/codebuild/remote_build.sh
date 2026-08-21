@@ -45,6 +45,7 @@ display_name() {
     widedeep-segment-activator)  echo "audience-activator" ;;
     ncf-deal-manager)            echo "deal-scorer" ;;
     metrics-enricher)            echo "signals-enricher" ;;
+    deal-yield-manager)          echo "yield-optimizer" ;;
     *)                           echo "$1" ;;
   esac
 }
@@ -201,6 +202,7 @@ REPOS=(
   "${STACK_NAME}-$(display_name widedeep-segment-activator)"
   "${STACK_NAME}-$(display_name ncf-deal-manager)"
   "${STACK_NAME}-$(display_name metrics-enricher)"
+  "${STACK_NAME}-$(display_name deal-yield-manager)"
   "${STACK_NAME}-orchestrator"
   "${STACK_NAME}-agentcore"
 )

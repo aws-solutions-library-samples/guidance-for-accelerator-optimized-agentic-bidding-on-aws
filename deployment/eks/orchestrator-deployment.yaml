@@ -61,6 +61,8 @@ spec:
               value: "http://deal-scorer:8081"
             - name: METRICS_URL
               value: "http://signals-enricher:8081"
+            - name: YIELD_URL
+              value: "http://yield-optimizer:8081"
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME
@@ -106,13 +108,21 @@ spec:
             - name: TRAINING_IMAGE_REGISTRY
               value: "__TRAINING_IMAGE_REGISTRY__"
             # Feedback pipeline (source/orchestrator/feedback_integration.py):
-            # emits real BidOutcomeEvents (live traffic + load-test outcome
+            # emits real BidShadingOutcomeEvents (live traffic + load-test outcome
             # capture) to the Kinesis stream created by feedback_pipeline_cfn.yaml
             # / deploy_closed_loop.sh Step 1. Left empty (--with-retraining not
             # used) means emission is a documented no-op, not a fabricated
             # success — see FeedbackCollector's own "unset -> disabled" contract.
             - name: FEEDBACK_STREAM_NAME
               value: "__FEEDBACK_STREAM_NAME__"
+            # Deal yield feedback pipeline (source/orchestrator/
+            # deal_yield_feedback.py): emits real DealYieldOutcomeEvents for
+            # ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN mutations. Separate stream
+            # from FEEDBACK_STREAM_NAME above -- see
+            # aidlc-docs/construction/deal-yield-outcome-capture/functional-design/
+            # for why. Same "unset -> disabled, not fabricated" contract.
+            - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
+              value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.

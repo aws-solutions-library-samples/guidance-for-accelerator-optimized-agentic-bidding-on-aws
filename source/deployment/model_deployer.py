@@ -246,6 +246,7 @@ class TritonModelLoader:
     """
 
     _MODEL_PLAN = "model.plan"
+    _MODEL_XGBOOST_JSON = "xgboost.json"
 
     def __init__(
         self,
@@ -459,6 +460,52 @@ class TritonModelLoader:
             engine_uri, self._key(stable, str(next_version), self._MODEL_PLAN)
         )
         logger.info("Promoted %s: published stable v%d", stable, next_version)
+        return next_version
+
+    async def stage_canary_fil(self, base_model: str, artifact_uri: str) -> str:
+        """FIL counterpart to stage_canary() for tree-model backends.
+
+        Triton's FIL backend (used by deal_yield_manager) loads a native
+        XGBoost artifact directly -- ``<canary>/1/xgboost.json`` -- instead
+        of a TensorRT ``model.plan`` engine. No ``ModelOptimizer.optimize()``
+        call exists in this path: FIL reads XGBoost's native format as-is,
+        there is no TensorRT compilation step for tree models. Otherwise
+        mirrors stage_canary() exactly (same config-derivation and
+        server-side-copy pattern). Raises TritonModelLoadError if the stable
+        config is missing.
+        """
+        stable = self.stable_name(base_model)
+        canary = self.canary_name(base_model)
+
+        stable_cfg = await self._get_text(self._key(stable, "config.pbtxt"))
+        if not stable_cfg:
+            raise TritonModelLoadError(
+                f"stable config not found for {stable}; cannot derive canary config",
+                model_name=canary,
+                version=1,
+            )
+        canary_cfg = stable_cfg.replace(f'"{stable}"', f'"{canary}"')
+
+        await self._put_text(self._key(canary, "config.pbtxt"), canary_cfg)
+        await self._copy_engine(artifact_uri, self._key(canary, "1", self._MODEL_XGBOOST_JSON))
+        logger.info("Staged FIL canary model %s from %s", canary, artifact_uri)
+        return canary
+
+    async def promote_fil(self, base_model: str, artifact_uri: str) -> int:
+        """FIL counterpart to promote_engine() for tree-model backends.
+
+        Publishes the native XGBoost artifact as a NEW version of
+        ``<base>_stable`` (``<stable>/<v>/xgboost.json``), same
+        version-numbering scheme as promote_engine(). Returns the new
+        version.
+        """
+        stable = self.stable_name(base_model)
+        versions = await self.list_versions(stable)
+        next_version = (max(versions) + 1) if versions else 1
+        await self._copy_engine(
+            artifact_uri, self._key(stable, str(next_version), self._MODEL_XGBOOST_JSON)
+        )
+        logger.info("Promoted %s: published stable v%d (FIL)", stable, next_version)
         return next_version
 
     async def set_router_split(

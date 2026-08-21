@@ -1,7 +1,7 @@
 """Feedback integration — emits BidOutcomeEvents from the orchestrator bid path.
 
 Provides a single public function ``emit_bid_outcome()`` that constructs a
-BidOutcomeEvent from the RTBRequest/RTBResponse and fires it to Kinesis via
+BidShadingOutcomeEvent from the RTBRequest/RTBResponse and fires it to Kinesis via
 ``asyncio.create_task`` (fire-and-forget, non-blocking, < 1 ms overhead).
 
 The FeedbackCollector instance is lazily initialized as a module-level
@@ -28,7 +28,7 @@ from typing import Optional
 
 from shared.artf_types import RTBRequest, RTBResponse
 from shared.feedback_collector import FeedbackCollector
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def emit_bid_outcome(
     source: str = "live",
     model_version: str | None = None,
 ) -> None:
-    """Fire-and-forget: build and emit a BidOutcomeEvent via asyncio.create_task.
+    """Fire-and-forget: build and emit a BidShadingOutcomeEvent via asyncio.create_task.
 
     Emits exactly one event per served bid. The ``asyncio.create_task`` call
     itself adds < 1 ms and never blocks the bid response path.
@@ -127,7 +127,7 @@ def emit_load_test_bid_outcome(
     shade_factor_used: float,
     conversion_value_estimate_used: float,
 ) -> None:
-    """Fire-and-forget: emit a real, load-test-origin BidOutcomeEvent.
+    """Fire-and-forget: emit a real, load-test-origin BidShadingOutcomeEvent.
 
     Unlike emit_bid_outcome() (which derives win/impression/click/conversion
     as False, to be filled in later by downstream live signals — there ARE
@@ -143,7 +143,7 @@ def emit_load_test_bid_outcome(
         return
 
     try:
-        event = BidOutcomeEvent(
+        event = BidShadingOutcomeEvent(
             request_id=request_id,
             timestamp=time.time(),
             model_version=model_version,
@@ -185,8 +185,8 @@ def _build_bid_outcome_event(
     *,
     source: str = "live",
     model_version: str | None = None,
-) -> BidOutcomeEvent:
-    """Construct a BidOutcomeEvent from the RTBRequest/RTBResponse data.
+) -> BidShadingOutcomeEvent:
+    """Construct a BidShadingOutcomeEvent from the RTBRequest/RTBResponse data.
 
     Extracts available context from the bid_request and model_params.
     Fields that arrive later (won, impression, click, conversion) default
@@ -257,14 +257,14 @@ def _build_bid_outcome_event(
 
     # Generate a proper UUID request_id
     request_id = req.id
-    # Ensure it's in UUID format for the BidOutcomeEvent validation
+    # Ensure it's in UUID format for the BidShadingOutcomeEvent validation
     try:
         uuid.UUID(request_id)
     except (ValueError, AttributeError):
         # If the original request id is not a UUID, create a deterministic one from it
         request_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(request_id)))
 
-    return BidOutcomeEvent(
+    return BidShadingOutcomeEvent(
         request_id=request_id,
         timestamp=time.time(),
         model_version=model_version or "orchestrator-v1",

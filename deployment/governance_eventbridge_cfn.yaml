@@ -81,6 +81,37 @@ Parameters:
     Default: ''
     Description: SageMaker Model Package Group name for ncf_deal_manager.
 
+  DealYieldManagerFloorModelPackageGroupName:
+    Type: String
+    Default: ''
+    Description: >-
+      SageMaker Model Package Group name for deal_yield_manager_floor (the
+      Yield Optimizer's FLOOR sub-model, trained via XGBoost -- see
+      source/training/xgboost_pipeline.py). Split from a single
+      deal_yield_manager model because Triton's FIL backend does not
+      support multi-output regression (see closed_loop_cfn.yaml's
+      correction note).
+
+  DealYieldManagerMarginModelPackageGroupName:
+    Type: String
+    Default: ''
+    Description: >-
+      SageMaker Model Package Group name for deal_yield_manager_margin (the
+      Yield Optimizer's MARGIN sub-model, trained via XGBoost).
+
+  XGBoostTrainingImageUri:
+    Type: String
+    Default: ''
+    Description: >-
+      Full ECR URI of SageMaker's built-in XGBoost algorithm image (region-
+      and account-specific; resolved at deploy time via
+      sagemaker.image_uris.retrieve("xgboost", region, version="1.7-1") --
+      see deployment/scripts/register_genesis_models.py's
+      _resolve_inference_image_uri()). Passed in rather than hardcoded here
+      because the per-region SageMaker-owned account IDs are not something
+      to guess. If empty, deal_yield_manager retraining is skipped
+      (Condition: HasRetrainingConfig).
+
   RetrainingScheduleRate:
     Type: String
     Default: 'rate(24 hours)'
@@ -94,6 +125,9 @@ Conditions:
     - !Not [!Equals [!Ref TrainingImageRegistry, '']]
     - !Not [!Equals [!Ref DLRMModelPackageGroupName, '']]
     - !Not [!Equals [!Ref NCFModelPackageGroupName, '']]
+    - !Not [!Equals [!Ref DealYieldManagerFloorModelPackageGroupName, '']]
+    - !Not [!Equals [!Ref DealYieldManagerMarginModelPackageGroupName, '']]
+    - !Not [!Equals [!Ref XGBoostTrainingImageUri, '']]
 
 # =============================================================================
 # Resources
@@ -354,14 +388,25 @@ Resources:
           TRAINING_IMAGE_REGISTRY: !Ref TrainingImageRegistry
           DLRM_PACKAGE_GROUP: !Ref DLRMModelPackageGroupName
           NCF_PACKAGE_GROUP: !Ref NCFModelPackageGroupName
+          YIELD_FLOOR_PACKAGE_GROUP: !Ref DealYieldManagerFloorModelPackageGroupName
+          YIELD_MARGIN_PACKAGE_GROUP: !Ref DealYieldManagerMarginModelPackageGroupName
+          XGBOOST_TRAINING_IMAGE_URI: !Ref XGBoostTrainingImageUri
       Code:
         ZipFile: |
           import boto3, json, os, time, uuid
 
-          # model_type -> (Model Package Group env var, training image tag)
+          # model_type -> (Model Package Group env var, training image tag,
+          # training shape). "nemo-rl" and "xgboost" have different
+          # AlgorithmSpecification/HyperParameters shapes -- see the branch
+          # in handler() below. deal_yield_manager_floor/margin are two
+          # independent single-target models (Triton's FIL backend does not
+          # support multi-output regression -- see closed_loop_cfn.yaml's
+          # correction note), each with its own Model Package Group.
           _MODEL_TYPES = [
-              ("dlrm_bid_shader", "DLRM_PACKAGE_GROUP", "dlrm"),
-              ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf"),
+              ("dlrm_bid_shader", "DLRM_PACKAGE_GROUP", "dlrm", "nemo-rl"),
+              ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf", "nemo-rl"),
+              ("deal_yield_manager_floor", "YIELD_FLOOR_PACKAGE_GROUP", "yield-floor", "xgboost"),
+              ("deal_yield_manager_margin", "YIELD_MARGIN_PACKAGE_GROUP", "yield-margin", "xgboost"),
           ]
 
           def _job_name_prefix(model_type):
@@ -396,7 +441,7 @@ Resources:
 
               started = {}
               skipped = {}
-              for model_type, group_env, image_tag in _MODEL_TYPES:
+              for model_type, group_env, image_tag, shape in _MODEL_TYPES:
                   package_group = os.environ[group_env]
                   base_version = _latest_approved_version(sm, package_group)
                   if not base_version:
@@ -407,8 +452,32 @@ Resources:
                       continue
 
                   job_name = f"{_job_name_prefix(model_type)}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-                  training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
                   output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
+
+                  if shape == "xgboost":
+                      # Built-in algorithm: no custom training entrypoint,
+                      # CSV/parquet input, tree-boosting hyperparameters. The
+                      # image URI is resolved at deploy time (see
+                      # XGBoostTrainingImageUri parameter) rather than
+                      # guessed here -- SageMaker-owned account IDs per
+                      # region are not something to hardcode.
+                      training_image = os.environ['XGBOOST_TRAINING_IMAGE_URI']
+                      hyperparameters = {
+                          'base_model_version': base_version,
+                          'max_depth': '6',
+                          'eta': '0.3',
+                          'num_round': '100',
+                          'objective': 'reg:squarederror',
+                      }
+                  else:
+                      # nemo-rl shape (dlrm_bid_shader, ncf_deal_manager).
+                      training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
+                      hyperparameters = {
+                          'model_type': model_type,
+                          'base_model_version': base_version,
+                          'window_days': '7',
+                          'cadence_hours': '6.0',
+                      }
 
                   sm.create_training_job(
                       TrainingJobName=job_name,
@@ -433,12 +502,7 @@ Resources:
                           'VolumeSizeInGB': 100,
                       },
                       StoppingCondition={'MaxRuntimeInSeconds': 14400},
-                      HyperParameters={
-                          'model_type': model_type,
-                          'base_model_version': base_version,
-                          'window_days': '7',
-                          'cadence_hours': '6.0',
-                      },
+                      HyperParameters=hyperparameters,
                   )
                   started[model_type] = job_name
 
@@ -469,12 +533,16 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-floor-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-margin-*'
               - Effect: Allow
                 Action:
                   - 'sagemaker:ListModelPackages'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DLRMModelPackageGroupName}'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerFloorModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerMarginModelPackageGroupName}'
               - Effect: Allow
                 Action:
                   - 'iam:PassRole'
@@ -551,6 +619,9 @@ Resources:
           TRAINING_IMAGE_REGISTRY: !Ref TrainingImageRegistry
           DLRM_PACKAGE_GROUP: !Ref DLRMModelPackageGroupName
           NCF_PACKAGE_GROUP: !Ref NCFModelPackageGroupName
+          YIELD_FLOOR_PACKAGE_GROUP: !Ref DealYieldManagerFloorModelPackageGroupName
+          YIELD_MARGIN_PACKAGE_GROUP: !Ref DealYieldManagerMarginModelPackageGroupName
+          XGBOOST_TRAINING_IMAGE_URI: !Ref XGBoostTrainingImageUri
       Code:
         ZipFile: |
           import boto3, json, os
@@ -559,17 +630,25 @@ Resources:
           # accepts [a-zA-Z0-9\-]+ -- see RetrainingTriggerFunction's
           # _job_name_prefix). model_type itself (used downstream for the
           # ModelPackageGroupChanged event detail and audit trail) stays the
-          # underscore form everywhere else in this pipeline.
+          # underscore form everywhere else in this pipeline. The 4th tuple
+          # element is the training shape ("nemo-rl" vs "xgboost"), same as
+          # RetrainingTriggerFunction's _MODEL_TYPES -- it determines which
+          # image URI to record on the registered model package below.
+          # deal_yield_manager_floor/margin are two independent
+          # single-target models (Triton's FIL backend does not support
+          # multi-output regression), each with its own prefix/package group.
           _PACKAGE_GROUP_BY_PREFIX = {
-              'dlrm-bid-shader-': ('dlrm_bid_shader', 'DLRM_PACKAGE_GROUP', 'dlrm'),
-              'ncf-deal-manager-': ('ncf_deal_manager', 'NCF_PACKAGE_GROUP', 'ncf'),
+              'dlrm-bid-shader-': ('dlrm_bid_shader', 'DLRM_PACKAGE_GROUP', 'dlrm', 'nemo-rl'),
+              'ncf-deal-manager-': ('ncf_deal_manager', 'NCF_PACKAGE_GROUP', 'ncf', 'nemo-rl'),
+              'deal-yield-manager-floor-': ('deal_yield_manager_floor', 'YIELD_FLOOR_PACKAGE_GROUP', 'yield-floor', 'xgboost'),
+              'deal-yield-manager-margin-': ('deal_yield_manager_margin', 'YIELD_MARGIN_PACKAGE_GROUP', 'yield-margin', 'xgboost'),
           }
 
           def _resolve_model_type(job_name):
               for prefix, cfg in _PACKAGE_GROUP_BY_PREFIX.items():
                   if job_name.startswith(prefix):
-                      model_type, group_env, image_tag = cfg
-                      return model_type, (group_env, image_tag)
+                      model_type, group_env, image_tag, shape = cfg
+                      return model_type, (group_env, image_tag, shape)
               return None, None
 
           def handler(event, context):
@@ -586,9 +665,8 @@ Resources:
               model_type, cfg = _resolve_model_type(job_name)
               if model_type is None:
                   return {'status': 'ignored', 'reason': f'unrecognized job name {job_name}'}
-              group_env, image_tag = cfg
+              group_env, image_tag, shape = cfg
               package_group = os.environ[group_env]
-              registry = os.environ['TRAINING_IMAGE_REGISTRY']
 
               sm = boto3.client('sagemaker', region_name=region)
               job = sm.describe_training_job(TrainingJobName=job_name)
@@ -610,7 +688,11 @@ Resources:
               for metric_name, value in metrics.items():
                   customer_metadata[f'metric_{metric_name}'] = str(value)
 
-              training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
+              if shape == "xgboost":
+                  training_image = os.environ['XGBOOST_TRAINING_IMAGE_URI']
+              else:
+                  registry = os.environ['TRAINING_IMAGE_REGISTRY']
+                  training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
 
               response = sm.create_model_package(
                   ModelPackageGroupName=package_group,
@@ -668,14 +750,20 @@ Resources:
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-floor-*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-margin-*'
               - Effect: Allow
                 Action:
                   - 'sagemaker:CreateModelPackage'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DLRMModelPackageGroupName}/*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${NCFModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DealYieldManagerFloorModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DealYieldManagerMarginModelPackageGroupName}/*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DLRMModelPackageGroupName}'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerFloorModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerMarginModelPackageGroupName}'
         - PolicyName: EmitModelPackageGroupChanged
           PolicyDocument:
             Version: '2012-10-17'
@@ -705,6 +793,8 @@ Resources:
           TrainingJobName:
             - prefix: 'dlrm-bid-shader-'
             - prefix: 'ncf-deal-manager-'
+            - prefix: 'deal-yield-manager-floor-'
+            - prefix: 'deal-yield-manager-margin-'
       Targets:
         - Id: RetrainingRegistrationTarget
           Arn: !GetAtt RetrainingRegistrationFunction.Arn

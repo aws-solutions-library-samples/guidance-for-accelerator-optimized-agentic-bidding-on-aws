@@ -89,7 +89,7 @@ class BidOutcomeMetrics:
         per-bid data behind this aggregate scenario preset. Instead this produces a
         small, fixed-seed sample of individual-record *shapes* (``won`` /
         ``price_paid`` / ``impression`` / ``click`` / ``conversion``, matching the
-        real ``BidOutcomeEvent`` schema in ``shared.feedback_models``) that are
+        real ``BidShadingOutcomeEvent`` schema in ``shared.feedback_models``) that are
         statistically consistent with this scenario's aggregate metrics (win_rate,
         avg prices). Same seed ⇒ same records on every call — reproducible and
         inspectable, not randomized per-request to "look real".
@@ -123,7 +123,7 @@ class BidOutcomeMetrics:
             price_paid = (
                 round(max(0.0, rng.gauss(self.avg_price_paid, paid_std)), 4) if won else None
             )
-            # Downstream signals are monotonic per the real BidOutcomeEvent contract
+            # Downstream signals are monotonic per the real BidShadingOutcomeEvent contract
             # (impression ⇒ won; click ⇒ impression; conversion ⇒ click). Click/
             # conversion rates below are illustrative assumptions, not scenario
             # inputs — they exist only to give the sample table realistic shape.
