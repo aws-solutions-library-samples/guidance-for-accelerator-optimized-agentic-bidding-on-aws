@@ -2,9 +2,25 @@ import { useState, useEffect, useCallback } from "react";
 import GpuControl from "./GpuControl";
 import { authFetch } from "../authFetch.js";
 
+// Job-oriented display labels, keyed by the unchanged internal container
+// name — see RENAME_MAP.md. Matches FlowPipeline.jsx/RawPanel.jsx/
+// LoadTestPanel.jsx's CONTAINER_LABELS/AGENT_LABELS convention.
+const CONTAINER_LABELS = {
+  "dlrm-bid-shader": "Bid Pricer",
+  "widedeep-segment-activator": "Audience Activator",
+  "ncf-deal-manager": "Deal Scorer",
+  "metrics-enricher": "Signals Enricher",
+};
+
+// widedeep-segment-activator no longer scores with the Wide & Deep model —
+// that model's ONNX graph couldn't compile to TensorRT (BatchNorm1d fusion
+// limitation), so it was replaced with deterministic rules over bid-request
+// signals (see containers/widedeep_segment_activator/app.py's docstring).
+// FlowPipeline.jsx/LoadTestPanel.jsx already reflect this ("Logic"/"Rules");
+// this lookup previously still named the retired model.
 const MODELS = {
   "dlrm-bid-shader": "DLRM · BID_SHADE",
-  "widedeep-segment-activator": "Wide & Deep · ACTIVATE_SEGMENTS",
+  "widedeep-segment-activator": "Rules · ACTIVATE_SEGMENTS",
   "ncf-deal-manager": "NCF · DEALS",
   "metrics-enricher": "Rules · ADD_METRICS",
 };
@@ -136,7 +152,9 @@ export default function ContainersPanel({ onClose }) {
                 <div key={c.name} className="container-item" style={{ flexDirection: "column", alignItems: "stretch" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                     <div>
-                      <strong>{c.name}</strong>
+                      <strong>{CONTAINER_LABELS[c.name] || c.name}</strong>
+                      <br />
+                      <span style={SUBTLER}>{c.name}</span>
                       <br />
                       <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
                         {MODELS[c.name] || ""}
