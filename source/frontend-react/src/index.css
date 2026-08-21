@@ -143,10 +143,6 @@ body {
   align-items: center;
   gap: 14px;
 }
-.header-logo {
-  height: 32px;
-  width: auto;
-}
 .header h1 { font-size: clamp(16px, 1.5vw, 20px); font-weight: 700; }
 .header h1 span {
   background: linear-gradient(135deg, var(--accent), #a855f7);
