@@ -80,3 +80,5 @@ source/triton/onnx_export
 gtm
 aidlc-docs
 deployment/guidance-for-accelerator-optimized-agentic-bidding-on-aws.code-workspace
+Triton Publisher Yield Models.md
+ARTF — SSP_Publisher Intents.md

@@ -21,19 +21,19 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.artf_types import AdjustBidPayload, Mutation, RTBRequest, RTBResponse, Metadata
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 
-class TestBuildBidOutcomeEvent:
+class TestBuildBidShadingOutcomeEvent:
     """Tests for _build_bid_outcome_event event construction."""
 
-    def _build(self, req: RTBRequest, resp: RTBResponse) -> BidOutcomeEvent:
+    def _build(self, req: RTBRequest, resp: RTBResponse) -> BidShadingOutcomeEvent:
         """Helper to import and call _build_bid_outcome_event."""
         from orchestrator.feedback_integration import _build_bid_outcome_event
         return _build_bid_outcome_event(req, resp, time.monotonic())
 
     def test_basic_event_construction(self):
-        """A minimal request/response produces a valid BidOutcomeEvent."""
+        """A minimal request/response produces a valid BidShadingOutcomeEvent."""
         req = RTBRequest(
             id="550e8400-e29b-41d4-a716-446655440000",
             bid_request={
@@ -234,9 +234,9 @@ class TestEmitBidOutcome:
 
             asyncio.run(_run())
             mock_collector.emit.assert_called_once()
-            # Verify the emitted event is a BidOutcomeEvent
+            # Verify the emitted event is a BidShadingOutcomeEvent
             emitted_event = mock_collector.emit.call_args[0][0]
-            assert isinstance(emitted_event, BidOutcomeEvent)
+            assert isinstance(emitted_event, BidShadingOutcomeEvent)
         finally:
             feedback_integration._feedback_collector = original
 

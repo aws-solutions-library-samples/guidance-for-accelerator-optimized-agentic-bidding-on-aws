@@ -28,7 +28,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.feedback_models import BidOutcomeEvent, SignalEvent
+from shared.feedback_models import BidShadingOutcomeEvent, SignalEvent
 from shared.feedback_collector import FeedbackCollector
 from shared.parameter_store import (
     ParameterStore,
@@ -59,9 +59,9 @@ FIXTURE_TIMESTAMP = 1718000000.0
 FIXTURE_MODEL_VERSION = "v2.1.0"
 
 
-def _make_bid_outcome_event() -> BidOutcomeEvent:
-    """Deterministic BidOutcomeEvent fixture for integration tests."""
-    return BidOutcomeEvent(
+def _make_bid_outcome_event() -> BidShadingOutcomeEvent:
+    """Deterministic BidShadingOutcomeEvent fixture for integration tests."""
+    return BidShadingOutcomeEvent(
         request_id=FIXTURE_REQUEST_ID,
         timestamp=FIXTURE_TIMESTAMP,
         model_version=FIXTURE_MODEL_VERSION,
@@ -140,7 +140,7 @@ def _ok_json(data: dict) -> HttpResponse:
 
 
 class TestFeedbackPipelineFlow:
-    """Integration test: BidOutcomeEvent and SignalEvent flow to Kinesis.
+    """Integration test: BidShadingOutcomeEvent and SignalEvent flow to Kinesis.
 
     Exercises:
     - FeedbackCollector.emit() with real serialization logic
@@ -177,7 +177,7 @@ class TestFeedbackPipelineFlow:
     def test_bid_outcome_flows_through_collector_to_kinesis(
         self, mock_boto3_clients
     ):
-        """BidOutcomeEvent → FeedbackCollector.emit() → Kinesis put_records.
+        """BidShadingOutcomeEvent → FeedbackCollector.emit() → Kinesis put_records.
 
         Verifies the full serialization chain: event creation, JSON encoding,
         partition key selection, and that the payload arrives intact at the

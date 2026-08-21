@@ -89,7 +89,8 @@ phases:
           # job-oriented ECR repo name (see RENAME_MAP.md).
           for entry in \
             "containers/dlrm_bid_shader:dlrm-bid-shader:${STACK_NAME}-bid-pricer" \
-            "containers/ncf_deal_manager:ncf-deal-manager:${STACK_NAME}-deal-scorer"; do
+            "containers/ncf_deal_manager:ncf-deal-manager:${STACK_NAME}-deal-scorer" \
+            "containers/deal_yield_manager:deal-yield-manager:${STACK_NAME}-yield-optimizer"; do
 
             CONTAINER_PATH="$(echo "${entry}" | cut -d: -f1)"
             KEY="$(echo "${entry}" | cut -d: -f2)"

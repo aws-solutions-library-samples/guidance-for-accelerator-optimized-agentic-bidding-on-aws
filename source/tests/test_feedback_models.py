@@ -1,4 +1,4 @@
-"""Tests for shared.feedback_models — BidOutcomeEvent, BidOutcomeRecord, and validation.
+"""Tests for shared.feedback_models — BidShadingOutcomeEvent, BidShadingOutcomeRecord, and validation.
 
 Validates the design's validation rules:
 1. request_id must be non-empty UUID format
@@ -20,8 +20,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.feedback_models import (
-    BidOutcomeEvent,
-    BidOutcomeRecord,
+    BidShadingOutcomeEvent,
+    BidShadingOutcomeRecord,
     validate_bid_outcome,
 )
 
@@ -32,7 +32,7 @@ from shared.feedback_models import (
 
 
 def _valid_event_kwargs() -> dict:
-    """Minimal valid BidOutcomeEvent keyword arguments."""
+    """Minimal valid BidShadingOutcomeEvent keyword arguments."""
     return {
         "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "timestamp": 1718000000.0,
@@ -57,7 +57,7 @@ def _valid_event_kwargs() -> dict:
 
 
 def _valid_record_kwargs() -> dict:
-    """Minimal valid BidOutcomeRecord keyword arguments."""
+    """Minimal valid BidShadingOutcomeRecord keyword arguments."""
     return {
         "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "event_timestamp": 1718000000000,
@@ -90,16 +90,16 @@ def _valid_record_kwargs() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeEvent — valid construction
+# BidShadingOutcomeEvent — valid construction
 # ---------------------------------------------------------------------------
 
 
 class TestBidOutcomeEventValid:
-    """BidOutcomeEvent valid construction tests."""
+    """BidShadingOutcomeEvent valid construction tests."""
 
     def test_create_valid_event(self):
         """A fully valid event is created without error."""
-        event = BidOutcomeEvent(**_valid_event_kwargs())
+        event = BidShadingOutcomeEvent(**_valid_event_kwargs())
         assert event.request_id == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         assert event.won is True
         assert event.price_paid == 3.5
@@ -108,7 +108,7 @@ class TestBidOutcomeEventValid:
         """model_type defaults to None when omitted (live traffic can span
         multiple model types in one response -- no single attributable
         value, a real 'unknown', never fabricated)."""
-        event = BidOutcomeEvent(**_valid_event_kwargs())
+        event = BidShadingOutcomeEvent(**_valid_event_kwargs())
         assert event.model_type is None
 
     def test_model_type_set_for_load_test(self):
@@ -116,7 +116,7 @@ class TestBidOutcomeEventValid:
         where the target model type is known)."""
         kwargs = _valid_event_kwargs()
         kwargs["model_type"] = "dlrm_bid_shader"
-        event = BidOutcomeEvent(**kwargs)
+        event = BidShadingOutcomeEvent(**kwargs)
         assert event.model_type == "dlrm_bid_shader"
 
     def test_lost_bid_no_price_paid(self):
@@ -127,7 +127,7 @@ class TestBidOutcomeEventValid:
         kwargs["impression"] = False
         kwargs["click"] = False
         kwargs["conversion"] = False
-        event = BidOutcomeEvent(**kwargs)
+        event = BidShadingOutcomeEvent(**kwargs)
         assert event.won is False
         assert event.price_paid is None
 
@@ -139,21 +139,21 @@ class TestBidOutcomeEventValid:
         kwargs["click"] = True
         kwargs["conversion"] = True
         kwargs["conversion_value"] = 25.0
-        event = BidOutcomeEvent(**kwargs)
+        event = BidShadingOutcomeEvent(**kwargs)
         assert event.conversion_value == 25.0
 
     def test_source_live(self):
         """source='live' is accepted and preserved."""
         kwargs = _valid_event_kwargs()
         kwargs["source"] = "live"
-        event = BidOutcomeEvent(**kwargs)
+        event = BidShadingOutcomeEvent(**kwargs)
         assert event.source == "live"
 
     def test_source_load_test(self):
         """source='load_test' is accepted and preserved."""
         kwargs = _valid_event_kwargs()
         kwargs["source"] = "load_test"
-        event = BidOutcomeEvent(**kwargs)
+        event = BidShadingOutcomeEvent(**kwargs)
         assert event.source == "load_test"
 
     def test_source_required(self):
@@ -161,43 +161,43 @@ class TestBidOutcomeEventValid:
         kwargs = _valid_event_kwargs()
         del kwargs["source"]
         with pytest.raises(ValueError):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_source_invalid_value_rejected(self):
         """An unrecognized source value raises a validation error."""
         kwargs = _valid_event_kwargs()
         kwargs["source"] = "synthetic"
         with pytest.raises(ValueError):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_source_immutable(self):
         """source cannot be reassigned after construction (model is frozen)."""
-        event = BidOutcomeEvent(**_valid_event_kwargs())
+        event = BidShadingOutcomeEvent(**_valid_event_kwargs())
         with pytest.raises(Exception):
             event.source = "load_test"
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeEvent — validation errors
+# BidShadingOutcomeEvent — validation errors
 # ---------------------------------------------------------------------------
 
 
 class TestBidOutcomeEventValidation:
-    """BidOutcomeEvent validation rule enforcement."""
+    """BidShadingOutcomeEvent validation rule enforcement."""
 
     def test_invalid_request_id_empty(self):
         """Empty request_id raises validation error."""
         kwargs = _valid_event_kwargs()
         kwargs["request_id"] = ""
         with pytest.raises(ValueError, match="request_id"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_invalid_request_id_not_uuid(self):
         """Non-UUID request_id raises validation error."""
         kwargs = _valid_event_kwargs()
         kwargs["request_id"] = "not-a-valid-uuid"
         with pytest.raises(ValueError, match="request_id"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_original_price_below_bid_floor(self):
         """original_price < bid_floor raises validation error."""
@@ -206,7 +206,7 @@ class TestBidOutcomeEventValidation:
         kwargs["bid_floor"] = 3.0
         kwargs["shaded_price"] = 2.0
         with pytest.raises(ValueError, match="original_price"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_negative_bid_floor(self):
         """Negative bid_floor raises validation error."""
@@ -214,7 +214,7 @@ class TestBidOutcomeEventValidation:
         kwargs["bid_floor"] = -1.0
         kwargs["shaded_price"] = 0.0
         with pytest.raises(ValueError, match="bid_floor"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_shaded_price_below_bid_floor(self):
         """shaded_price < bid_floor raises validation error."""
@@ -222,7 +222,7 @@ class TestBidOutcomeEventValidation:
         kwargs["shaded_price"] = 1.0
         kwargs["bid_floor"] = 2.0
         with pytest.raises(ValueError, match="shaded_price.*bid_floor"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_shaded_price_above_original(self):
         """shaded_price > original_price raises validation error."""
@@ -230,7 +230,7 @@ class TestBidOutcomeEventValidation:
         kwargs["shaded_price"] = 6.0
         kwargs["original_price"] = 5.0
         with pytest.raises(ValueError, match="shaded_price.*original_price"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_price_paid_not_null_on_loss(self):
         """price_paid set when won is false raises validation error."""
@@ -241,7 +241,7 @@ class TestBidOutcomeEventValidation:
         kwargs["click"] = False
         kwargs["conversion"] = False
         with pytest.raises(ValueError, match="price_paid must be null"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_conversion_value_not_null_when_no_conversion(self):
         """conversion_value set when conversion is false raises error."""
@@ -249,7 +249,7 @@ class TestBidOutcomeEventValidation:
         kwargs["conversion"] = False
         kwargs["conversion_value"] = 10.0
         with pytest.raises(ValueError, match="conversion_value must be null"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_monotonic_conversion_without_click(self):
         """conversion=True but click=False violates monotonic rule."""
@@ -260,7 +260,7 @@ class TestBidOutcomeEventValidation:
         kwargs["conversion"] = True
         kwargs["conversion_value"] = 5.0
         with pytest.raises(ValueError, match="[Mm]onotonic"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_monotonic_click_without_impression(self):
         """click=True but impression=False violates monotonic rule."""
@@ -270,7 +270,7 @@ class TestBidOutcomeEventValidation:
         kwargs["click"] = True
         kwargs["conversion"] = False
         with pytest.raises(ValueError, match="[Mm]onotonic"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_monotonic_impression_without_won(self):
         """impression=True but won=False violates monotonic rule."""
@@ -281,27 +281,27 @@ class TestBidOutcomeEventValidation:
         kwargs["click"] = False
         kwargs["conversion"] = False
         with pytest.raises(ValueError, match="[Mm]onotonic"):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
     def test_hour_of_day_out_of_range(self):
         """hour_of_day outside [0, 23] raises error."""
         kwargs = _valid_event_kwargs()
         kwargs["hour_of_day"] = 25
         with pytest.raises(ValueError):
-            BidOutcomeEvent(**kwargs)
+            BidShadingOutcomeEvent(**kwargs)
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeRecord — valid construction
+# BidShadingOutcomeRecord — valid construction
 # ---------------------------------------------------------------------------
 
 
 class TestBidOutcomeRecordValid:
-    """BidOutcomeRecord valid construction tests."""
+    """BidShadingOutcomeRecord valid construction tests."""
 
     def test_create_valid_record(self):
         """A fully valid record is created without error."""
-        record = BidOutcomeRecord(**_valid_record_kwargs())
+        record = BidShadingOutcomeRecord(**_valid_record_kwargs())
         assert record.model_type == "dlrm_bid_shader"
         assert record.partition_date == "2025-06-10"
 
@@ -314,24 +314,24 @@ class TestBidOutcomeRecordValid:
         ]:
             kwargs = _valid_record_kwargs()
             kwargs["model_type"] = model_type
-            record = BidOutcomeRecord(**kwargs)
+            record = BidShadingOutcomeRecord(**kwargs)
             assert record.model_type == model_type
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeRecord — validation errors
+# BidShadingOutcomeRecord — validation errors
 # ---------------------------------------------------------------------------
 
 
 class TestBidOutcomeRecordValidation:
-    """BidOutcomeRecord validation rule enforcement."""
+    """BidShadingOutcomeRecord validation rule enforcement."""
 
     def test_invalid_model_type(self):
         """Unknown model_type raises validation error."""
         kwargs = _valid_record_kwargs()
         kwargs["model_type"] = "unknown_model"
         with pytest.raises(ValueError, match="model_type"):
-            BidOutcomeRecord(**kwargs)
+            BidShadingOutcomeRecord(**kwargs)
 
     def test_price_ordering_violated(self):
         """original_price < bid_floor raises validation error."""
@@ -340,7 +340,7 @@ class TestBidOutcomeRecordValidation:
         kwargs["bid_floor"] = 3.0
         kwargs["shaded_price"] = 2.0
         with pytest.raises(ValueError, match="original_price"):
-            BidOutcomeRecord(**kwargs)
+            BidShadingOutcomeRecord(**kwargs)
 
     def test_monotonic_violation_in_record(self):
         """Monotonic violation detected in record."""
@@ -353,14 +353,14 @@ class TestBidOutcomeRecordValidation:
         # Now break monotonic: click without impression
         kwargs["impression"] = False
         with pytest.raises(ValueError, match="[Mm]onotonic"):
-            BidOutcomeRecord(**kwargs)
+            BidShadingOutcomeRecord(**kwargs)
 
     def test_day_of_week_out_of_range(self):
         """day_of_week outside [0, 6] raises error."""
         kwargs = _valid_record_kwargs()
         kwargs["day_of_week"] = 7
         with pytest.raises(ValueError):
-            BidOutcomeRecord(**kwargs)
+            BidShadingOutcomeRecord(**kwargs)
 
 
 # ---------------------------------------------------------------------------

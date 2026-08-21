@@ -85,7 +85,7 @@ class LoadTestRequest(BaseModel):
     # target_model_type/target_variant: optional (default preserves the
     # pre-existing behavior of not capturing outcome/version data at all).
     # When target_model_type is set, that container's responses are used for
-    # BidOutcomeEvent emission (source="load_test") and model_version
+    # BidShadingOutcomeEvent emission (source="load_test") and model_version
     # aggregation; the other containers are still called for fan-out
     # realism but ignored for outcome/version purposes (Q3=A).
     target_model_type: Literal[
@@ -126,7 +126,7 @@ class LoadTestStatus(BaseModel):
     target_variant: str = "current"
     canary_supported: bool = False
     canary_staged: bool = False
-    # outcome_sample_count: how many BidOutcomeEvents were actually emitted
+    # outcome_sample_count: how many BidShadingOutcomeEvents were actually emitted
     # for target_model_type during this run. Used by
     # LoadTestRunEligibilityService (Unit 3) to filter eligible runs without
     # re-deriving eligibility from raw sample data.
@@ -441,7 +441,7 @@ async def _run_load_test(
 
     When target_model_type is set (FR-1/FR-2/FR-3, Story 1-2), the matching
     container's per-request responses are additionally used to emit real,
-    origin-labeled BidOutcomeEvents and to aggregate the run's observed
+    origin-labeled BidShadingOutcomeEvents and to aggregate the run's observed
     model_version — the other containers in the fan-out are unaffected
     (Q3=A). When target_variant="challenger", the target container's calls
     carry the out-of-band challenger-targeting header (Q2=B) — validated

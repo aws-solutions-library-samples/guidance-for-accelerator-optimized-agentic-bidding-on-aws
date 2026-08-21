@@ -6,7 +6,7 @@ Validates:
 - aggregate_run_model_version() (pure function) always returns either ""
   (empty input) or one of the observed input values — property-tested per
   NFR-5's Partial PBT scope.
-- emit_load_test_outcome() constructs a BidOutcomeEvent with source="load_test"
+- emit_load_test_outcome() constructs a BidShadingOutcomeEvent with source="load_test"
   and never raises (matches emit_bid_outcome()'s error-swallowing contract).
 
 Maps to: FR-1, FR-2 (Story 1, load-test-outcome-capture unit).
@@ -30,7 +30,7 @@ from orchestrator.loadtest_instrumentation import (
     emit_load_test_outcome,
     generate_outcome_sample,
 )
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 
 class TestGenerateOutcomeSample:
@@ -58,7 +58,7 @@ class TestGenerateOutcomeSample:
             assert s.shaded_price >= 0.0
 
     def test_monotonic_signals_respected(self):
-        """Generated samples respect the same monotonic rule BidOutcomeEvent
+        """Generated samples respect the same monotonic rule BidShadingOutcomeEvent
         enforces: conversion -> click -> impression -> won."""
         for i in range(50):
             s = generate_outcome_sample("run-monotonic", i)
@@ -106,7 +106,7 @@ class TestAggregateRunModelVersion:
 
 class TestEmitLoadTestOutcome:
     def test_emits_event_with_source_load_test(self):
-        """The emitted BidOutcomeEvent has source='load_test'."""
+        """The emitted BidShadingOutcomeEvent has source='load_test'."""
         from orchestrator import feedback_integration
 
         mock_collector = MagicMock()
@@ -123,7 +123,7 @@ class TestEmitLoadTestOutcome:
             asyncio.run(_run())
             mock_collector.emit.assert_called_once()
             event = mock_collector.emit.call_args[0][0]
-            assert isinstance(event, BidOutcomeEvent)
+            assert isinstance(event, BidShadingOutcomeEvent)
             assert event.source == "load_test"
             assert event.model_version == "dlrm_bid_shader_stable:v1"
             assert event.model_type == "dlrm_bid_shader"

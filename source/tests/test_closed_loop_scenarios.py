@@ -299,7 +299,7 @@ def test_agentic_sample_outcomes_are_bid_outcome_records():
     records = out["records"]
     assert len(records) == 10
     for r in records:
-        # Monotonic outcome contract mirrors shared.feedback_models.BidOutcomeEvent
+        # Monotonic outcome contract mirrors shared.feedback_models.BidShadingOutcomeEvent
         assert not (r["conversion"] and not r["click"])
         assert not (r["click"] and not r["impression"])
         assert not (r["impression"] and not r["won"])

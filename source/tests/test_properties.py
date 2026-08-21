@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hypothesis import given, settings, assume
 import hypothesis.strategies as st
 
-from shared.feedback_models import BidOutcomeRecord
+from shared.feedback_models import BidShadingOutcomeRecord
 from training.reward import compute_rl_reward
 from agents.adaptive_bidding.agent import (
     AdaptiveBiddingStrategyAgent,
@@ -35,7 +35,7 @@ from deployment.canary_deployer import DeploymentState
 # Strategies
 # ---------------------------------------------------------------------------
 
-# Strategy for device_type (used in BidOutcomeRecord)
+# Strategy for device_type (used in BidShadingOutcomeRecord)
 device_types = st.sampled_from(["mobile", "desktop", "tablet"])
 
 # Strategy for model_type
@@ -89,7 +89,7 @@ def _bid_outcome_strategy():
         shade_factor_used = draw(st.floats(min_value=0.3, max_value=0.95, allow_nan=False, allow_infinity=False))
         conversion_value_estimate = draw(st.floats(min_value=0.01, max_value=500.0, allow_nan=False, allow_infinity=False))
 
-        return BidOutcomeRecord(
+        return BidShadingOutcomeRecord(
             request_id=request_id,
             event_timestamp=event_timestamp,
             model_type=model_type,
@@ -173,11 +173,11 @@ class _MockParameterState:
 
 
 class TestRewardBoundsProperty:
-    """For any valid BidOutcomeRecord, compute_rl_reward returns a value in [-1.0, 1.0]."""
+    """For any valid BidShadingOutcomeRecord, compute_rl_reward returns a value in [-1.0, 1.0]."""
 
     @given(record=_bid_outcome_strategy())
     @settings(max_examples=200)
-    def test_reward_always_in_bounds(self, record: BidOutcomeRecord):
+    def test_reward_always_in_bounds(self, record: BidShadingOutcomeRecord):
         """**Validates: Requirements 13.3**
 
         Property: For all valid BidOutcomeRecords, the reward function

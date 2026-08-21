@@ -59,6 +59,15 @@ const AGENT_NODES = [
     type: "agent",
   },
   {
+    id: "yield",
+    label: "Yield Optimizer",
+    intents: ["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+    model: "XGBoost (Triton FIL backend)",
+    logo: nvidiaLogo,
+    color: "#be185d",
+    type: "agent",
+  },
+  {
     id: "dsp",
     label: "DSP / Bidder",
     intents: [],
@@ -75,6 +84,7 @@ const STOP_ID_MAP = {
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
+  "deal-yield-manager": "yield",
 };
 
 /**

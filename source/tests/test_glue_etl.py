@@ -45,7 +45,7 @@ from etl.glue_feature_engineering import (
 # ---------------------------------------------------------------------------
 
 # Schema matching the Glue catalog table (raw_bid_outcomes) -- these columns
-# match shared/feedback_models.py's BidOutcomeEvent field names/types
+# match shared/feedback_models.py's BidShadingOutcomeEvent field names/types
 # exactly, since that's what Firehose's JSON->Parquet conversion actually
 # populates (see feedback_pipeline_cfn.yaml's raw_bid_outcomes table).
 _RAW_SCHEMA = StructType(

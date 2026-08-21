@@ -70,7 +70,7 @@ class TestLoadTestToComparisonIntegration:
 
             current_versions, current_samples, challenger_versions, challenger_samples = asyncio.run(_run())
 
-            # Real BidOutcomeEvents were actually emitted (not skipped).
+            # Real BidShadingOutcomeEvents were actually emitted (not skipped).
             assert mock_collector.emit.call_count == 60
 
             # Build the LoadTestStatus-shaped history dicts exactly as

@@ -56,7 +56,7 @@ _RAW_ID_RE = re.compile(r"^(?![\da-fA-F]{32,}$).+$")
 # Columns that should only contain hashed values (hex strings of sufficient
 # length). site_domain is intentionally excluded: it's a literal domain name
 # (e.g. "espn.com"), not a hash -- see shared/feedback_models.py's
-# BidOutcomeEvent.site_domain. Checking it against _is_plausible_hash would
+# BidShadingOutcomeEvent.site_domain. Checking it against _is_plausible_hash would
 # misclassify every real record as suspected PII and drop it.
 _HASH_COLUMNS = ("user_id_hash",)
 _MIN_HASH_LENGTH = 8  # Minimum length for a value to be considered a plausible hash
@@ -99,7 +99,7 @@ def deduplicate_by_request_id(df: DataFrame) -> DataFrame:
     When the same request_id appears multiple times (e.g., re-emitted with
     signal updates like impression/click/conversion arriving later), we keep
     only the record with the highest timestamp (Unix seconds -- see
-    shared/feedback_models.py's BidOutcomeEvent.timestamp, the field this
+    shared/feedback_models.py's BidShadingOutcomeEvent.timestamp, the field this
     column is actually populated from).
     """
     window = Window.partitionBy("request_id").orderBy(F.col("timestamp").desc())
@@ -306,7 +306,7 @@ def main():
         # ------------------------------------------------------------------
         # Step 1: Read directly from the table's S3 location
         # ------------------------------------------------------------------
-        # Window bounds as Unix seconds -- matches BidOutcomeEvent.timestamp,
+        # Window bounds as Unix seconds -- matches BidShadingOutcomeEvent.timestamp,
         # the real column this table's "timestamp" field is populated from
         # (a prior version of this filter used a non-existent
         # "event_timestamp" millis column, which was always null).

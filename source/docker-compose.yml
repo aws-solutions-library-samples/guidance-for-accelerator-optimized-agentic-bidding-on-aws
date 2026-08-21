@@ -19,6 +19,8 @@ services:
       NCF_MCP: http://deal-scorer:8081
       METRICS_GRPC: signals-enricher:50051
       METRICS_MCP: http://signals-enricher:8081
+      YIELD_GRPC: yield-optimizer:50051
+      YIELD_MCP: http://yield-optimizer:8081
     depends_on:
       bid-pricer:
         condition: service_healthy
@@ -27,6 +29,8 @@ services:
       deal-scorer:
         condition: service_healthy
       signals-enricher:
+        condition: service_healthy
+      yield-optimizer:
         condition: service_healthy
     networks:
       - artf
@@ -134,6 +138,36 @@ services:
     ports:
       - "50064:50051"
       - "8094:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # Yield Optimizer — ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN intents
+  # (Triton FIL-backend XGBoost model; see
+  # source/containers/deal_yield_manager/app.py)
+  # -----------------------------------------------------------------------
+  yield-optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/deal_yield_manager
+        AGENT_NAME: deal-yield-manager
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50065:50051"
+      - "8095:8081"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
       interval: 5s
