@@ -12,6 +12,12 @@ Validates:
   approved base version) BEFORE ever calling CreateTrainingJob.
 - A confirmed, unblocked trigger calls CreateTrainingJob with the real
   resolved base_model_version and returns a TrainingTriggerResult.
+- ncf_deal_manager is parked (TRAINABLE_MODEL_TYPES == {"dlrm_bid_shader"}):
+  its ACTIVATE_DEALS/SUPPRESS_DEALS mutations disambiguate deals via
+  path + a list of deal IDs (verified against the real ARTF proto/
+  reference implementation), but BidShadingOutcomeEvent/Record has no
+  deal_id field or per-deal fan-out yet, so there's no way to attribute a
+  training outcome to one specific deal today.
 
 Maps to: FR-4, FR-5 (Story 3, train-from-load-test unit).
 """
@@ -42,6 +48,16 @@ from orchestrator.training_trigger import (
 )
 
 
+class TestTrainableModelTypes:
+    def test_only_dlrm_is_trainable_today(self):
+        """ncf_deal_manager is parked pending a deal_id schema change (see
+        module docstring) -- must not silently become trainable again."""
+        assert TRAINABLE_MODEL_TYPES == frozenset({"dlrm_bid_shader"})
+
+    def test_ncf_deal_manager_is_not_trainable(self):
+        assert "ncf_deal_manager" not in TRAINABLE_MODEL_TYPES
+
+
 class TestEstimateCost:
     def test_returns_real_instance_type_and_rate(self):
         estimate = estimate_cost("dlrm_bid_shader")
@@ -63,8 +79,10 @@ class TestEstimateCost:
 
     @given(st.sampled_from(sorted(TRAINABLE_MODEL_TYPES)))
     def test_same_estimate_for_all_trainable_model_types(self, model_type):
-        """Property: both trainable model types use the same instance
-        type/rate/runtime today (both fine-tune on the same infra)."""
+        """Property: every currently-trainable model type uses the same
+        instance type/rate/runtime (holds trivially for today's single
+        trainable model type, and stays correct if a second one is
+        re-enabled later)."""
         estimate = estimate_cost(model_type)
         assert estimate.instance_type == "ml.g5.2xlarge"
         assert estimate.max_runtime_seconds == 14400
@@ -134,6 +152,17 @@ class TestTriggerTraining:
             trigger_training(
                 "widedeep_segment_activator", confirmed=True, **self._COMMON_KWARGS
             )
+
+    def test_rejects_ncf_deal_manager_as_parked(self):
+        """ncf_deal_manager training is parked (see module docstring) --
+        must be rejected the same way as a model type with no training
+        infrastructure at all, and must never call CreateTrainingJob."""
+        mock_client = MagicMock()
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            with pytest.raises(ModelTypeNotTrainableError) as exc_info:
+                trigger_training("ncf_deal_manager", confirmed=True, **self._COMMON_KWARGS)
+        assert exc_info.value.model_type == "ncf_deal_manager"
+        mock_client.create_training_job.assert_not_called()
 
     def test_rejects_unconfirmed_request(self):
         with pytest.raises(TrainingNotConfirmedError):
