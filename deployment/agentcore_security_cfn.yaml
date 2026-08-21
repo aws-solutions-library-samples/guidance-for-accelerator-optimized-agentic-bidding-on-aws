@@ -40,9 +40,29 @@ Parameters:
       agent stages/promotes/rolls back canary engines and edits the router config
       here (Option D). Leave empty to skip granting S3 access.
 
+  RuntimeNamePrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Prefix (with trailing underscore already applied, e.g. "nie_") deploy_closed_loop.sh
+      prepends to the AgentCore runtime base names (AdaptiveBiddingStrategyAgent /
+      ModelPromotionGovernanceAgent). Must exactly match the --runtime-name value
+      passed to deploy_to_agentcore.py, since AgentCore runtime names only allow
+      [a-zA-Z0-9_] (deploy_closed_loop.sh converts any hyphens in StackPrefix to
+      underscores before setting this). Leave empty for the unprefixed default.
+
 Conditions:
   HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
   HasModelBucket: !Not [!Equals [!Ref ModelBucketName, '']]
+
+# =============================================================================
+# Mappings
+# =============================================================================
+# AgentCore runtime names must start with a letter and only contain
+# [a-zA-Z0-9_] (no hyphens) — see deploy_closed_loop.sh's runtime-name
+# construction. The trust policy ArnLike below must match the SAME prefixed
+# name deploy_closed_loop.sh actually passes to --runtime-name, or the role
+# will reject AssumeRole from the real runtime.
 
 # =============================================================================
 # Resources
@@ -80,7 +100,7 @@ Resources:
               StringEquals:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
               ArnLike:
-                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/AdaptiveBiddingStrategyAgent-*'
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeNamePrefix}AdaptiveBiddingStrategyAgent-*'
       Policies:
         - PolicyName: DynamoDBParameterStoreAccess
           PolicyDocument:
@@ -225,7 +245,7 @@ Resources:
               StringEquals:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
               ArnLike:
-                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/ModelPromotionGovernanceAgent-*'
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeNamePrefix}ModelPromotionGovernanceAgent-*'
       Policies:
         - PolicyName: SageMakerModelRegistryAccess
           PolicyDocument:

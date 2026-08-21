@@ -11,31 +11,35 @@ services:
     ports:
       - "8080:8000"   # REST API for the frontend
     environment:
-      DLRM_GRPC: dlrm:50051
-      DLRM_MCP: http://dlrm:8081
-      WIDEDEEP_GRPC: widedeep:50051
-      WIDEDEEP_MCP: http://widedeep:8081
-      NCF_GRPC: ncf:50051
-      NCF_MCP: http://ncf:8081
-      METRICS_GRPC: metrics:50051
-      METRICS_MCP: http://metrics:8081
+      DLRM_GRPC: bid-pricer:50051
+      DLRM_MCP: http://bid-pricer:8081
+      WIDEDEEP_GRPC: audience-activator:50051
+      WIDEDEEP_MCP: http://audience-activator:8081
+      NCF_GRPC: deal-scorer:50051
+      NCF_MCP: http://deal-scorer:8081
+      METRICS_GRPC: signals-enricher:50051
+      METRICS_MCP: http://signals-enricher:8081
+      YIELD_GRPC: yield-optimizer:50051
+      YIELD_MCP: http://yield-optimizer:8081
     depends_on:
-      dlrm:
+      bid-pricer:
         condition: service_healthy
-      widedeep:
+      audience-activator:
         condition: service_healthy
-      ncf:
+      deal-scorer:
         condition: service_healthy
-      metrics:
+      signals-enricher:
+        condition: service_healthy
+      yield-optimizer:
         condition: service_healthy
     networks:
       - artf
 
   # -----------------------------------------------------------------------
-  # DLRM Bid Shader — BID_SHADE intent
+  # Bid Pricer — BID_SHADE intent
   # Ports: gRPC 50051, MCP 8081, Health 8080
   # -----------------------------------------------------------------------
-  dlrm:
+  bid-pricer:
     build:
       context: .
       dockerfile: Dockerfile
@@ -61,10 +65,10 @@ services:
       - artf
 
   # -----------------------------------------------------------------------
-  # Wide & Deep Segment Activator — ACTIVATE_SEGMENTS intent (rule-based, no
+  # Audience Activator — ACTIVATE_SEGMENTS intent (rule-based, no
   # Triton dependency; see source/containers/widedeep_segment_activator/app.py)
   # -----------------------------------------------------------------------
-  widedeep:
+  audience-activator:
     build:
       context: .
       dockerfile: Dockerfile
@@ -90,9 +94,9 @@ services:
       - artf
 
   # -----------------------------------------------------------------------
-  # NCF Deal Manager — ACTIVATE_DEALS / SUPPRESS_DEALS intents
+  # Deal Scorer — ACTIVATE_DEALS / SUPPRESS_DEALS intents
   # -----------------------------------------------------------------------
-  ncf:
+  deal-scorer:
     build:
       context: .
       dockerfile: Dockerfile
@@ -118,9 +122,9 @@ services:
       - artf
 
   # -----------------------------------------------------------------------
-  # Metrics Enricher — ADD_METRICS intent
+  # Signals Enricher — ADD_METRICS intent
   # -----------------------------------------------------------------------
-  metrics:
+  signals-enricher:
     build:
       context: .
       dockerfile: Dockerfile
@@ -134,6 +138,36 @@ services:
     ports:
       - "50064:50051"
       - "8094:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # Yield Optimizer — ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN intents
+  # (Triton FIL-backend XGBoost model; see
+  # source/containers/deal_yield_manager/app.py)
+  # -----------------------------------------------------------------------
+  yield-optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/deal_yield_manager
+        AGENT_NAME: deal-yield-manager
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50065:50051"
+      - "8095:8081"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
       interval: 5s

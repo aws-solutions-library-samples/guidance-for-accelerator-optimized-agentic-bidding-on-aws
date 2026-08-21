@@ -6,7 +6,7 @@ export const SCENARIOS = [
   {
     id: "banner-basic",
     name: "Banner Ad — Segment Activation",
-    desc: "ESPN sports page with a 300×250 banner. The Segment Activator activates audience segments via rules, Metrics adds viewability scores.",
+    desc: "ESPN sports page with a 300×250 banner. The audience activator activates audience segments via rules, the signals enricher adds viewability scores.",
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
       { cls: "metric", label: "ADD_METRICS" },
@@ -16,16 +16,16 @@ export const SCENARIOS = [
   },
   {
     id: "bid-shading",
-    name: "Bid Shading — DLRM Price Optimization",
-    desc: "Nike DSP bid response at $7.50. DLRM predicts CTR and shades the bid down to save budget without losing win rate.",
+    name: "Bid Shading — Bid Pricer Optimization",
+    desc: "Nike DSP bid response at $7.50. The bid pricer predicts CTR and shades the bid down to save budget without losing win rate.",
     tags: [{ cls: "shade", label: "BID_SHADE" }],
     file: "bid-shading.json",
     controls: ["shadeFactor", "convValue"],
   },
   {
     id: "video-deals",
-    name: "Video + PMP Deals — NCF Scoring",
-    desc: "Video impression with 3 private marketplace deals. NCF scores user-deal relevance, activates matches, suppresses poor fits.",
+    name: "Video + PMP Deals — Deal Scorer",
+    desc: "Video impression with 3 private marketplace deals. The deal scorer scores user-deal relevance, activates matches, suppresses poor fits.",
     tags: [
       { cls: "deal", label: "ACTIVATE_DEALS" },
       { cls: "deal", label: "SUPPRESS_DEALS" },
@@ -36,12 +36,11 @@ export const SCENARIOS = [
   },
   {
     id: "full-pipeline",
-    name: "Full Pipeline — All 4 Containers",
-    desc: "CNN sports page triggering all containers: segments, deals, bid shading, and metrics in one fan-out.",
+    name: "SSP Enrichment — 3 Containers",
+    desc: "CNN sports page triggering the SSP-side enrichment containers: segment activation, deal scoring, and signal enrichment in one fan-out. Bid shading is a DSP-side decision made downstream, not something the SSP would request.",
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
       { cls: "deal", label: "ACTIVATE_DEALS" },
-      { cls: "shade", label: "BID_SHADE" },
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "isv-ecosystem.json",

@@ -162,6 +162,18 @@ AGENTCORE_SECURITY_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}agentcore-security"
 VPC_PROXY_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}vpc-proxy"
 GOVERNANCE_EVENTBRIDGE_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}governance-eventbridge"
 
+# AgentCore runtime names only allow [a-zA-Z0-9_] (no hyphens), and must start
+# with a letter -- so a hyphenated STACK_PREFIX (e.g. "nie-2") is translated to
+# underscores here, the same way deploy.sh does for the MCP runtime name. Without
+# a per-prefix name, every environment would overwrite the same two runtimes
+# (AdaptiveBiddingStrategyAgent / ModelPromotionGovernanceAgent). deploy.sh's
+# --destroy path recomputes this same RUNTIME_NAME_PREFIX independently (it
+# calls this script but not this variable) to look up and delete the runtimes.
+RUNTIME_NAME_PREFIX=""
+[[ -n "${STACK_PREFIX}" ]] && RUNTIME_NAME_PREFIX="$(echo "${STACK_PREFIX}_" | tr '-' '_')"
+ADAPTIVE_BIDDING_RUNTIME_NAME="${RUNTIME_NAME_PREFIX}AdaptiveBiddingStrategyAgent"
+GOVERNANCE_RUNTIME_NAME="${RUNTIME_NAME_PREFIX}ModelPromotionGovernanceAgent"
+
 log "Account=${ACCOUNT_ID}  Region=${AWS_REGION}  Prefix=${STACK_PREFIX:-<none>}"
 log "Stacks: ${FEEDBACK_STACK} → ${GLUE_STACK} → ${CLOSED_LOOP_STACK} → ${AGENTCORE_SECURITY_STACK}"
 
@@ -266,6 +278,40 @@ KMS_KEY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "KMSKeyArn")"
 [[ -n "${KMS_KEY_ARN}" ]] || fail "Could not retrieve KMS Key ARN from feedback pipeline stack"
 log "  KMS Key: ${KMS_KEY_ARN}"
 
+# Attach the FeedbackCollectorPolicy (kinesis:PutRecord/PutRecords, scoped to
+# the BidOutcomeStream) to the EKS node role, so orchestrator pods running
+# there can actually emit bid outcome events. Without this, deploy.sh's
+# FEEDBACK_STREAM_NAME env var points at a real stream the pod has no
+# permission to write to, and emit_bid_outcome()/emit_load_test_bid_outcome()
+# fail silently on every call (FeedbackCollector's documented "log + drop"
+# contract) -- so this attach step is required, not optional, for the
+# feedback pipeline to actually deliver data downstream (Glue ETL, training).
+FEEDBACK_COLLECTOR_POLICY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "FeedbackCollectorPolicyArn")"
+if [[ -n "${FEEDBACK_COLLECTOR_POLICY_ARN}" ]]; then
+  EKS_NODE_ROLE_NAME="$(basename "${EKS_NODE_ROLE}")"
+  aws iam attach-role-policy --role-name "${EKS_NODE_ROLE_NAME}" \
+    --policy-arn "${FEEDBACK_COLLECTOR_POLICY_ARN}" 2>/dev/null || \
+    warn "  Could not attach FeedbackCollectorPolicy to ${EKS_NODE_ROLE_NAME} -- bid outcome emission will fail silently until attached."
+  log "  Attached FeedbackCollectorPolicy to node role: ${EKS_NODE_ROLE_NAME}"
+else
+  warn "  Could not resolve FeedbackCollectorPolicyArn from ${FEEDBACK_STACK} -- feedback emission permissions not attached."
+fi
+
+# Same attachment for the deal yield outcome stream's own scoped policy --
+# without this, emit_deal_yield_outcome() fails silently the same way
+# emit_bid_outcome() would above (source/orchestrator/deal_yield_feedback.py).
+DEAL_YIELD_KINESIS_STREAM_NAME="$(get_stack_output "${FEEDBACK_STACK}" "DealYieldKinesisStreamName")"
+DEAL_YIELD_FEEDBACK_COLLECTOR_POLICY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "DealYieldFeedbackCollectorPolicyArn")"
+if [[ -n "${DEAL_YIELD_FEEDBACK_COLLECTOR_POLICY_ARN}" ]]; then
+  EKS_NODE_ROLE_NAME="${EKS_NODE_ROLE_NAME:-$(basename "${EKS_NODE_ROLE}")}"
+  aws iam attach-role-policy --role-name "${EKS_NODE_ROLE_NAME}" \
+    --policy-arn "${DEAL_YIELD_FEEDBACK_COLLECTOR_POLICY_ARN}" 2>/dev/null || \
+    warn "  Could not attach DealYieldFeedbackCollectorPolicy to ${EKS_NODE_ROLE_NAME} -- deal yield outcome emission will fail silently until attached."
+  log "  Attached DealYieldFeedbackCollectorPolicy to node role: ${EKS_NODE_ROLE_NAME}"
+else
+  warn "  Could not resolve DealYieldFeedbackCollectorPolicyArn from ${FEEDBACK_STACK} -- deal yield feedback emission permissions not attached."
+fi
+
 # =========================================================================
 # Step 2: Glue ETL (Feature engineering + training data bucket)
 # =========================================================================
@@ -279,10 +325,19 @@ log "Step 2: Deploying Glue ETL"
 GLUE_SCRIPT_S3_PATH="${GLUE_SCRIPT_S3_PATH:-${STACK_PREFIX:+${STACK_PREFIX}-}artf-scripts-${ACCOUNT_ID}/etl/glue_feature_engineering.py}"
 TRAINING_DATA_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}training-data-${ACCOUNT_ID}-${AWS_REGION}"
 
+# The real Glue database name feedback_pipeline_cfn.yaml created in Step 1
+# (stack-prefix-aware — e.g. "nvd_feedback_pipeline", not the unprefixed
+# "feedback_pipeline" glue_etl_cfn.yaml previously hardcoded). Falls back to
+# the unprefixed default only if the output can't be resolved (e.g. Step 1
+# was skipped via --start-at=2), matching glue_etl_cfn.yaml's own default.
+RAW_OUTCOMES_GLUE_DATABASE="$(get_stack_output "${FEEDBACK_STACK}" "GlueDatabaseName" 2>/dev/null || echo '')"
+RAW_OUTCOMES_GLUE_DATABASE="${RAW_OUTCOMES_GLUE_DATABASE:-feedback_pipeline}"
+
 deploy_cfn_stack "${GLUE_STACK}" "${SCRIPT_DIR}/glue_etl_cfn.yaml" \
   "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
   "ParameterKey=GlueScriptS3Path,ParameterValue=${GLUE_SCRIPT_S3_PATH}" \
-  "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}"
+  "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}" \
+  "ParameterKey=RawOutcomesGlueDatabaseName,ParameterValue=${RAW_OUTCOMES_GLUE_DATABASE}"
 
 # =========================================================================
 # Step 3: Closed-Loop Core (DynamoDB/DAX/SageMaker Model Registry/SNS)
@@ -310,6 +365,8 @@ SNS_TOPIC_ARN="$(get_stack_output "${CLOSED_LOOP_STACK}" "TrainingAlertsTopicArn
 SAGEMAKER_TRAINING_ROLE_ARN="$(get_stack_output "${CLOSED_LOOP_STACK}" "SageMakerTrainingExecutionRoleArn")"
 DLRM_PACKAGE_GROUP="$(get_stack_output "${CLOSED_LOOP_STACK}" "DLRMModelPackageGroupName")"
 NCF_PACKAGE_GROUP="$(get_stack_output "${CLOSED_LOOP_STACK}" "NCFModelPackageGroupName")"
+YIELD_FLOOR_PACKAGE_GROUP="$(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerFloorModelPackageGroupName")"
+YIELD_MARGIN_PACKAGE_GROUP="$(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerMarginModelPackageGroupName")"
 
 log "  Parameter Store Table: ${PARAM_TABLE_ARN}"
 log "  Audit Trail Table: ${AUDIT_TABLE_ARN}"
@@ -328,6 +385,8 @@ if [[ -n "${MODEL_BUCKET:-}" ]]; then
     --region "${AWS_REGION}" \
     --dlrm-package-group "${DLRM_PACKAGE_GROUP}" \
     --ncf-package-group "${NCF_PACKAGE_GROUP}" \
+    --yield-floor-package-group "${YIELD_FLOOR_PACKAGE_GROUP}" \
+    --yield-margin-package-group "${YIELD_MARGIN_PACKAGE_GROUP}" \
     --training-image-repository "artf-nemo-rl-training" \
     || warn "  Genesis model registration failed - Model Registry may be empty until it is re-run."
 else
@@ -379,7 +438,8 @@ deploy_cfn_stack "${AGENTCORE_SECURITY_STACK}" "${SCRIPT_DIR}/agentcore_security
   "ParameterKey=ParameterStoreTableArn,ParameterValue=${PARAM_TABLE_ARN}" \
   "ParameterKey=AuditTrailTableArn,ParameterValue=${AUDIT_TABLE_ARN}" \
   "ParameterKey=KMSKeyArn,ParameterValue=${KMS_KEY_ARN}" \
-  "ParameterKey=ModelBucketName,ParameterValue=${MODEL_BUCKET:-}"
+  "ParameterKey=ModelBucketName,ParameterValue=${MODEL_BUCKET:-}" \
+  "ParameterKey=RuntimeNamePrefix,ParameterValue=${RUNTIME_NAME_PREFIX}"
 
 ADAPTIVE_BIDDING_ROLE_ARN="$(get_stack_output "${AGENTCORE_SECURITY_STACK}" "AdaptiveBiddingAgentRoleArn")"
 GOVERNANCE_ROLE_ARN="$(get_stack_output "${AGENTCORE_SECURITY_STACK}" "ModelPromotionGovernanceAgentRoleArn")"
@@ -535,20 +595,21 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   docker push "${ADAPTIVE_BIDDING_IMAGE}"
   log "  Pushed: ${ADAPTIVE_BIDDING_IMAGE}"
 
-  log "  Deploying AdaptiveBiddingStrategyAgent (HTTP)..."
+  log "  Deploying ${ADAPTIVE_BIDDING_RUNTIME_NAME} (HTTP)..."
   ADAPTIVE_BIDDING_RUNTIME_ARN="$(python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
     --action deploy \
-    --runtime-name "AdaptiveBiddingStrategyAgent" \
+    --runtime-name "${ADAPTIVE_BIDDING_RUNTIME_NAME}" \
     --role-arn "${ADAPTIVE_BIDDING_ROLE_ARN}" \
     --container-uri "${ADAPTIVE_BIDDING_IMAGE}" \
     --protocol HTTP \
     --environment "PARAMETER_STORE_TABLE=${PARAM_TABLE_NAME}" \
+    --environment "AUDIT_TRAIL_TABLE=${AUDIT_TABLE_NAME}" \
     --environment "AWS_REGION=${AWS_REGION}" \
     --environment "ADAPTIVE_BIDDING_MODEL_ID=${ADAPTIVE_BIDDING_MODEL_ID}" \
     --description "Adaptive Bidding Strategy Agent — Bedrock reasoning agent for bid parameter tuning" \
     --region "${AWS_REGION}" \
     --print-arn)"
-  [[ -n "${ADAPTIVE_BIDDING_RUNTIME_ARN}" ]] || fail "AdaptiveBiddingStrategyAgent deploy did not return a runtime ARN"
+  [[ -n "${ADAPTIVE_BIDDING_RUNTIME_ARN}" ]] || fail "${ADAPTIVE_BIDDING_RUNTIME_NAME} deploy did not return a runtime ARN"
   export ADAPTIVE_BIDDING_RUNTIME_ARN
   log "  ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}"
 
@@ -648,10 +709,10 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     warn "  fail honestly until a cluster VPC is available (deploy via deploy.sh --with-retraining)."
   fi
 
-  log "  Deploying ModelPromotionGovernanceAgent (HTTP)..."
+  log "  Deploying ${GOVERNANCE_RUNTIME_NAME} (HTTP)..."
   GOVERNANCE_RUNTIME_ARN="$(python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
     --action deploy \
-    --runtime-name "ModelPromotionGovernanceAgent" \
+    --runtime-name "${GOVERNANCE_RUNTIME_NAME}" \
     --role-arn "${GOVERNANCE_ROLE_ARN}" \
     --container-uri "${GOVERNANCE_IMAGE}" \
     --protocol HTTP \
@@ -665,7 +726,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     --description "Model Promotion Governance Agent — deterministic A/B gate + Bedrock reasoning" \
     --region "${AWS_REGION}" \
     --print-arn)"
-  [[ -n "${GOVERNANCE_RUNTIME_ARN}" ]] || fail "ModelPromotionGovernanceAgent deploy did not return a runtime ARN"
+  [[ -n "${GOVERNANCE_RUNTIME_ARN}" ]] || fail "${GOVERNANCE_RUNTIME_NAME} deploy did not return a runtime ARN"
   export GOVERNANCE_RUNTIME_ARN
   log "  GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}"
 
@@ -686,11 +747,34 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   SAGEMAKER_TRAINING_ROLE_ARN="${SAGEMAKER_TRAINING_ROLE_ARN:-$(get_stack_output "${CLOSED_LOOP_STACK}" "SageMakerTrainingExecutionRoleArn")}"
   DLRM_PACKAGE_GROUP="${DLRM_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "DLRMModelPackageGroupName")}"
   NCF_PACKAGE_GROUP="${NCF_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "NCFModelPackageGroupName")}"
+  YIELD_FLOOR_PACKAGE_GROUP="${YIELD_FLOOR_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerFloorModelPackageGroupName")}"
+  YIELD_MARGIN_PACKAGE_GROUP="${YIELD_MARGIN_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerMarginModelPackageGroupName")}"
   TRAINING_DATA_BUCKET="${TRAINING_DATA_BUCKET:-$(get_stack_output "${GLUE_STACK}" "TrainingDataBucketName")}"
   TRAINING_IMAGE_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
   if [[ -z "${SAGEMAKER_TRAINING_ROLE_ARN}" || "${SAGEMAKER_TRAINING_ROLE_ARN}" == "None" ]]; then
     warn "  SageMakerTrainingExecutionRoleArn not resolved - scheduled retraining will be skipped (Step 3 needs TrainingDataBucketName/ModelBucketName set)."
+  fi
+
+  # SageMaker's built-in XGBoost algorithm image lives in an AWS-owned
+  # account that differs per region -- resolved via the sagemaker SDK
+  # (same call register_genesis_models.py uses), never hardcoded/guessed.
+  # If the SDK is unavailable, this resolves to empty and
+  # HasRetrainingConfig (which now requires it) disables scheduled
+  # retraining honestly rather than deploying with a fabricated image URI.
+  # Both deal_yield_manager_floor and deal_yield_manager_margin are
+  # SageMaker-built-in-XGBoost models (same version/framework), so this is
+  # resolved once and shared by both -- it does not need to be per-target.
+  XGBOOST_TRAINING_IMAGE_URI="$(python3 -c "
+import sys
+try:
+    from sagemaker import image_uris
+    print(image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1'))
+except Exception:
+    pass
+" 2>/dev/null || true)"
+  if [[ -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
+    warn "  Could not resolve the SageMaker built-in XGBoost image URI (sagemaker SDK not installed?) - deal_yield_manager_floor/margin scheduled retraining will be skipped until this is set."
   fi
 
   deploy_cfn_stack "${GOVERNANCE_EVENTBRIDGE_STACK}" "${SCRIPT_DIR}/governance_eventbridge_cfn.yaml" \
@@ -702,7 +786,10 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET:-}" \
     "ParameterKey=TrainingImageRegistry,ParameterValue=${TRAINING_IMAGE_REGISTRY}" \
     "ParameterKey=DLRMModelPackageGroupName,ParameterValue=${DLRM_PACKAGE_GROUP:-}" \
-    "ParameterKey=NCFModelPackageGroupName,ParameterValue=${NCF_PACKAGE_GROUP:-}"
+    "ParameterKey=NCFModelPackageGroupName,ParameterValue=${NCF_PACKAGE_GROUP:-}" \
+    "ParameterKey=DealYieldManagerFloorModelPackageGroupName,ParameterValue=${YIELD_FLOOR_PACKAGE_GROUP:-}" \
+    "ParameterKey=DealYieldManagerMarginModelPackageGroupName,ParameterValue=${YIELD_MARGIN_PACKAGE_GROUP:-}" \
+    "ParameterKey=XGBoostTrainingImageUri,ParameterValue=${XGBOOST_TRAINING_IMAGE_URI:-}"
   log "  Invocation stack deployed."
 
   RETRAINING_SCHEDULE_ARN="$(get_stack_output "${GOVERNANCE_EVENTBRIDGE_STACK}" "RetrainingScheduleArn")"
@@ -818,6 +905,8 @@ log ""
 log "Model Package Groups:"
 log "  DLRM Bid Shader:     $(get_stack_output "${CLOSED_LOOP_STACK}" "DLRMModelPackageGroupName")"
 log "  NCF Deal Manager:    $(get_stack_output "${CLOSED_LOOP_STACK}" "NCFModelPackageGroupName")"
+log "  Deal Yield (Floor):  $(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerFloorModelPackageGroupName")"
+log "  Deal Yield (Margin): $(get_stack_output "${CLOSED_LOOP_STACK}" "DealYieldManagerMarginModelPackageGroupName")"
 log "  (Wide & Deep Segment Activator is rule-based — no Model Package Group)"
 log ""
 log "Training Pipeline:"

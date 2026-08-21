@@ -24,7 +24,7 @@ const AGENT_NODES = [
   },
   {
     id: "dlrm",
-    label: "DLRM Bid Shader",
+    label: "Bid Pricer",
     intents: ["BID_SHADE"],
     model: "DLRM (Deep Learning Recommendation Model)",
     logo: nvidiaLogo,
@@ -33,7 +33,7 @@ const AGENT_NODES = [
   },
   {
     id: "ncf",
-    label: "NCF Deal Manager",
+    label: "Deal Scorer",
     intents: ["ACTIVATE_DEALS", "SUPPRESS_DEALS"],
     model: "Neural Collaborative Filtering (NeuMF)",
     logo: nvidiaLogo,
@@ -42,20 +42,29 @@ const AGENT_NODES = [
   },
   {
     id: "widedeep",
-    label: "Wide & Deep Activator",
+    label: "Audience Activator",
     intents: ["ACTIVATE_SEGMENTS"],
-    model: "Wide & Deep (Cheng et al. 2016)",
-    logo: nvidiaLogo,
+    model: "Logic",
+    logo: null,
     color: "#6366f1",
     type: "agent",
   },
   {
     id: "metrics",
-    label: "Metrics Enricher",
+    label: "Signals Enricher",
     intents: ["ADD_METRICS"],
     model: "Rule-based (viewability + brand safety)",
     logo: null,
     color: "#0891b2",
+    type: "agent",
+  },
+  {
+    id: "yield",
+    label: "Yield Optimizer",
+    intents: ["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+    model: "XGBoost (Triton FIL backend)",
+    logo: nvidiaLogo,
+    color: "#be185d",
     type: "agent",
   },
   {
@@ -75,6 +84,7 @@ const STOP_ID_MAP = {
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
+  "deal-yield-manager": "yield",
 };
 
 /**

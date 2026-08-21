@@ -38,15 +38,25 @@ def _get_client() -> httpclient.InferenceServerClient:
 def predict_relevance(
     user_ids: np.ndarray,
     item_ids: np.ndarray,
-) -> np.ndarray:
+    target_variant: str | None = None,
+) -> tuple[np.ndarray, str, str]:
     """Call Triton to predict user-deal relevance using NeuMF.
 
     Args:
         user_ids: shape [N] int64 — hashed user IDs (repeated for each deal)
         item_ids: shape [N] int64 — hashed deal IDs
+        target_variant: "stable" | "canary" | None. When set, forces the
+            router to use that specific variant for THIS request only. Only
+            ever passed by the orchestrator's load-test invocation path —
+            never by live bid-serving, which always passes None.
 
     Returns:
-        np.ndarray of shape [N] — relevance scores (0.0 to 1.0)
+        (scores, served_variant, served_model_version). ``scores`` is an
+        np.ndarray of shape [N] (0.0 to 1.0). ``served_variant`` /
+        ``served_model_version`` are the router's real per-request
+        resolution, or "" if unavailable (a real "unknown", never
+        fabricated). On any Triton error, falls back to a safe default
+        score array with empty variant/version — never raises.
     """
     client = _get_client()
 
@@ -61,14 +71,44 @@ def predict_relevance(
     inputs[0].set_data_from_numpy(u)
     inputs[1].set_data_from_numpy(d)
 
-    outputs = [httpclient.InferRequestedOutput("relevance_scores")]
+    if target_variant in ("stable", "canary"):
+        variant_input = httpclient.InferInput("target_variant", [1], "BYTES")
+        variant_input.set_data_from_numpy(
+            np.array([target_variant.encode("utf-8")], dtype=object)
+        )
+        inputs.append(variant_input)
+
+    outputs = [
+        httpclient.InferRequestedOutput("relevance_scores"),
+        httpclient.InferRequestedOutput("served_variant"),
+        httpclient.InferRequestedOutput("served_model_version"),
+    ]
 
     try:
         result = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
-        return result.as_numpy("relevance_scores").flatten()
+        scores = result.as_numpy("relevance_scores").flatten()
+        served_variant = _decode_str_output(result, "served_variant")
+        served_model_version = _decode_str_output(result, "served_model_version")
+        return scores, served_variant, served_model_version
     except InferenceServerException as e:
         print(f"[triton] NCF inference failed: {e.message()}")
-        return np.full(len(user_ids), 0.5, dtype=np.float32)
+        return np.full(len(user_ids), 0.5, dtype=np.float32), "", ""
+
+
+def _decode_str_output(result, name: str) -> str:
+    """Best-effort decode of an optional STRING/BYTES Triton output.
+
+    Returns "" (a real "unknown", not a fabricated value) if the output
+    isn't present on this router's config.
+    """
+    try:
+        arr = result.as_numpy(name)
+        if arr is None or arr.size == 0:
+            return ""
+        value = arr.flat[0]
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    except Exception:
+        return ""
 
 
 def is_triton_ready() -> bool:

@@ -43,7 +43,8 @@ def predict_ctr(
     sparse_user: np.ndarray,
     sparse_domain: np.ndarray,
     sparse_device: np.ndarray,
-) -> float:
+    target_variant: str | None = None,
+) -> tuple[float, str, str]:
     """Call Triton to predict CTR using the DLRM model.
 
     Args:
@@ -51,9 +52,23 @@ def predict_ctr(
         sparse_user:    shape [1, 1] int64   — hashed user ID
         sparse_domain:  shape [1, 1] int64   — hashed domain
         sparse_device:  shape [1, 1] int64   — hashed device UA
+        target_variant: "stable" | "canary" | None. When set, forces the
+            router to use that specific variant for THIS request only,
+            bypassing its normal random split. Only ever passed by the
+            orchestrator's load-test invocation path (see
+            source/orchestrator/loadtest_targeting.py) — never by live
+            bid-serving, which always passes None.
 
     Returns:
-        Predicted click-through rate (0.0 to 1.0)
+        (ctr, served_variant, served_model_version). ``served_variant`` is
+        "stable"/"canary" if the router declares that output, else "".
+        ``served_model_version`` is the router's resolved version-ARN for
+        the variant that served this request, or "" if the router doesn't
+        declare that output or hasn't been given a version-ARN yet (a real
+        "unknown" state, never a fabricated placeholder). On any Triton
+        error, falls back to a safe default CTR with empty variant/version
+        — this function never raises, matching the existing fallback
+        contract this call site already relies on.
     """
     client = _get_client()
 
@@ -68,14 +83,45 @@ def predict_ctr(
     inputs[2].set_data_from_numpy(sparse_domain.astype(np.int64))
     inputs[3].set_data_from_numpy(sparse_device.astype(np.int64))
 
-    outputs = [httpclient.InferRequestedOutput("ctr_prediction")]
+    if target_variant in ("stable", "canary"):
+        variant_input = httpclient.InferInput("target_variant", [1], "BYTES")
+        variant_input.set_data_from_numpy(
+            np.array([target_variant.encode("utf-8")], dtype=object)
+        )
+        inputs.append(variant_input)
+
+    outputs = [
+        httpclient.InferRequestedOutput("ctr_prediction"),
+        httpclient.InferRequestedOutput("served_variant"),
+        httpclient.InferRequestedOutput("served_model_version"),
+    ]
 
     try:
         result = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
-        return float(result.as_numpy("ctr_prediction").flat[0])
+        ctr = float(result.as_numpy("ctr_prediction").flat[0])
+        served_variant = _decode_str_output(result, "served_variant")
+        served_model_version = _decode_str_output(result, "served_model_version")
+        return ctr, served_variant, served_model_version
     except InferenceServerException as e:
         print(f"[triton] DLRM inference failed: {e.message()}")
-        return 0.5  # fallback CTR
+        return 0.5, "", ""  # fallback CTR; real "unknown" for variant/version
+
+
+def _decode_str_output(result, name: str) -> str:
+    """Best-effort decode of an optional STRING/BYTES Triton output.
+
+    Returns "" (a real "unknown", not a fabricated value) if the output
+    isn't present on this router's config — e.g. an older-generated
+    router config that doesn't declare served_variant/served_model_version.
+    """
+    try:
+        arr = result.as_numpy(name)
+        if arr is None or arr.size == 0:
+            return ""
+        value = arr.flat[0]
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    except Exception:
+        return ""
 
 
 def is_triton_ready() -> bool:

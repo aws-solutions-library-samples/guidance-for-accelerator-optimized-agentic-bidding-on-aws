@@ -2,10 +2,13 @@
 
 Defines the core event/record types used throughout the feedback pipeline:
 
-- ``BidOutcomeEvent``: The real-time event emitted by the Feedback Collector
-  after auction resolution (Kinesis ingest format).
-- ``BidOutcomeRecord``: The enriched Parquet/S3 record produced by Glue ETL
-  for training consumption.
+- ``BidShadingOutcomeEvent``: The real-time event emitted by the Feedback
+  Collector after auction resolution (Kinesis ingest format), for DSP-side
+  bid-shading outcomes (DLRM/NCF/Wide&Deep). Not applicable to SSP-side
+  containers (e.g. deal floor/margin adjustment), which have no bid price
+  to shade -- see a dedicated event type for those instead.
+- ``BidShadingOutcomeRecord``: The enriched Parquet/S3 record produced by
+  Glue ETL for training consumption.
 - ``SignalEvent``: A downstream signal (impression/click/conversion) emitted
   to Kinesis for later ETL joining with the originating bid by ``request_id``.
 
@@ -23,7 +26,7 @@ Requirements: 1.4, 1.6, 2.5
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,21 +35,31 @@ _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+# Distinguishes real auction traffic from orchestrator-initiated load-test
+# traffic. Every BidShadingOutcomeEvent/BidShadingOutcomeRecord carries this
+# so downstream consumers (Glue ETL, training data, governance comparisons)
+# never confuse the two. Required, immutable once set (see model_config
+# frozen=True below).
+OutcomeSource = Literal["live", "load_test"]
+
 _VALID_MODEL_TYPES = frozenset(
     {"dlrm_bid_shader", "ncf_deal_manager", "widedeep_segment_activator"}
 )
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeEvent – emitted by Feedback Collector to Kinesis
+# BidShadingOutcomeEvent – emitted by Feedback Collector to Kinesis
 # ---------------------------------------------------------------------------
 
 
-class BidOutcomeEvent(BaseModel):
-    """A single bid outcome emitted after auction resolution.
+class BidShadingOutcomeEvent(BaseModel):
+    """A single DSP-side bid-shading outcome emitted after auction resolution.
 
-    This is the canonical event format written to Kinesis by the
-    Feedback Collector.
+    This is the canonical event format written to Kinesis by the Feedback
+    Collector for bid-shading containers (DLRM/NCF/Wide&Deep). It is not
+    meaningful for SSP-side containers with no bid price to shade (e.g. a
+    deal floor/margin adjustment container) -- see a dedicated event type
+    for those instead of overloading this one.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -55,6 +68,14 @@ class BidOutcomeEvent(BaseModel):
     request_id: str
     timestamp: float
     model_version: str
+    source: OutcomeSource
+    # None for live traffic: a single bid response can fan out across
+    # multiple containers/model types (see orchestrator/app.py's
+    # all_mutations aggregation), so there is no single model_type to
+    # attribute a live event to at this call site -- a real "unknown", never
+    # fabricated. Always set for load-test traffic, where the target model
+    # type is known (see orchestrator/loadtest_instrumentation.py).
+    model_type: Optional[str] = None
 
     # Bid details
     original_price: float
@@ -82,7 +103,7 @@ class BidOutcomeEvent(BaseModel):
     conversion_value_estimate_used: float
 
     @model_validator(mode="after")
-    def _validate_bid_outcome_rules(self) -> "BidOutcomeEvent":
+    def _validate_bid_outcome_rules(self) -> "BidShadingOutcomeEvent":
         _validate_common_fields(
             request_id=self.request_id,
             original_price=self.original_price,
@@ -99,11 +120,11 @@ class BidOutcomeEvent(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# BidOutcomeRecord – Parquet/S3 schema for training
+# BidShadingOutcomeRecord – Parquet/S3 schema for training
 # ---------------------------------------------------------------------------
 
 
-class BidOutcomeRecord(BaseModel):
+class BidShadingOutcomeRecord(BaseModel):
     """Schema for enriched Parquet storage in S3 (produced by Glue ETL)."""
 
     model_config = ConfigDict(frozen=True, protected_namespaces=())
@@ -115,6 +136,7 @@ class BidOutcomeRecord(BaseModel):
     # Bid context
     model_type: str
     model_version: str
+    source: OutcomeSource
     intent: str
 
     # Pricing
@@ -149,7 +171,7 @@ class BidOutcomeRecord(BaseModel):
     partition_hour: int = Field(ge=0, le=23)
 
     @model_validator(mode="after")
-    def _validate_bid_outcome_rules(self) -> "BidOutcomeRecord":
+    def _validate_bid_outcome_rules(self) -> "BidShadingOutcomeRecord":
         # Validate model_type is one of the expected values
         if self.model_type not in _VALID_MODEL_TYPES:
             raise ValueError(
@@ -170,6 +192,89 @@ class BidOutcomeRecord(BaseModel):
             click=self.click,
         )
         return self
+
+
+# ---------------------------------------------------------------------------
+# DealYieldOutcomeEvent / DealYieldOutcomeRecord -- deal floor/margin outcomes
+#
+# Deliberately NOT an extension of BidShadingOutcomeEvent: this event has no
+# bid price to shade (it's an SSP-side floor/margin decision, not a DSP-side
+# bid-shading decision), so overloading BidShadingOutcomeEvent with these
+# fields would produce meaningless placeholder values for fields like
+# shade_factor_used. Travels through its own Kinesis stream/Firehose/Glue
+# table (see deployment/feedback_pipeline_cfn.yaml's DealYieldOutcomeStream)
+# rather than sharing BidOutcomeStream, since Firehose's Glue-schema-based
+# Parquet conversion silently drops fields absent from the target table's
+# column list.
+# ---------------------------------------------------------------------------
+
+DealYieldSource = Literal["live", "load_test"]
+DealYieldIntent = Literal["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"]
+
+
+class DealYieldOutcomeEvent(BaseModel):
+    """A single deal floor/margin adjustment outcome, emitted by the
+    orchestrator (never by deal_yield_manager itself -- a container only
+    proposes mutations and has no visibility into what happens after).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # Identity
+    request_id: str
+    timestamp: float
+    model_version: str
+    source: DealYieldSource
+
+    # Which deal, which intent
+    imp_id: str
+    deal_id: str
+    intent: DealYieldIntent
+
+    # Floor/margin decision
+    original_bidfloor: float
+    adjusted_bidfloor: Optional[float] = None  # set for ADJUST_DEAL_FLOOR
+    margin_value: Optional[float] = None  # set for ADJUST_DEAL_MARGIN
+    margin_calculation_type: Optional[int] = None  # set for ADJUST_DEAL_MARGIN
+
+    # Outcome -- unknown ("live") until a future downstream-signal path
+    # exists for deal-level outcomes; a real "unknown", never fabricated.
+    won: bool = False
+    price_paid: Optional[float] = None
+
+    # Context features (same signals build_feature_vector() reads)
+    auction_type: Optional[int] = None
+    category_tier: float = 0.0
+    hour_of_day: int = Field(ge=0, le=23)
+    day_of_week: int = Field(ge=0, le=6)
+
+
+class DealYieldOutcomeRecord(BaseModel):
+    """Schema for enriched Parquet storage in S3 (produced by Glue ETL),
+    mirroring BidShadingOutcomeRecord's pattern for this event's own
+    fields."""
+
+    model_config = ConfigDict(frozen=True, protected_namespaces=())
+
+    request_id: str
+    event_timestamp: int  # Unix millis
+    model_version: str
+    source: DealYieldSource
+    imp_id: str
+    deal_id: str
+    intent: str
+    original_bidfloor: float
+    adjusted_bidfloor: Optional[float] = None
+    margin_value: Optional[float] = None
+    margin_calculation_type: Optional[int] = None
+    won: bool
+    price_paid: Optional[float] = None
+    auction_type: Optional[int] = None
+    category_tier: float
+    hour_of_day: int = Field(ge=0, le=23)
+    day_of_week: int = Field(ge=0, le=6)
+    partition_date: str
+    partition_hour: int = Field(ge=0, le=23)
 
 
 # ---------------------------------------------------------------------------

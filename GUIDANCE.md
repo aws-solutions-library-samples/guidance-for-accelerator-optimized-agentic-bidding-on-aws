@@ -2,14 +2,14 @@
 
 **Category:** Advertising &amp; Marketing Technology  
 **Industry:** Advertising, Media &amp; Entertainment  
-**Products:** Amazon EKS, NVIDIA Triton Inference Server, Amazon Bedrock AgentCore, Amazon ECS Fargate  
+**Products:** Amazon EKS, NVIDIA Triton Inference Server, Amazon Bedrock AgentCore  
 **Published:** June 2026
 
 ## Overview
 
 In programmatic advertising, the bidder that evaluates more signals and responds fastest wins. This guidance shows how NVIDIA GPU-accelerated compute and deep learning with NVIDIA Triton Inference Server can reduce bid-response latency while increasing the breadth of features evaluated per impression. This contributes to higher win rates and improved return on ad spend (ROAS).
 
-The solution provides four production-ready ARTF-compliant containers, with two using GPU-accelerated inference served on NVIDIA Triton Inference Server and two using deterministic, rule-based logic on CPU. Future releases will include ISV (Independent Software Vendor) partner containers demonstrating the ecosystem extensibility — including a partner segment-activation model slated to replace the current rule-based Segment Activator. It also includes an orchestration layer for parallel fan-out using gRPC as the primary ARTF protocol for the production auction path. Optionally, Amazon Bedrock AgentCore with Model Context Protocol (MCP) support is available as a testing and simulation interface for AI agent integration.
+The solution provides five production-ready ARTF-compliant containers, each doing one job in the bidstream — pricing bids, activating audience segments, scoring private marketplace deals, enriching quality signals, and optimizing publisher yield. Three run GPU-accelerated inference on NVIDIA Triton Inference Server (two deep-learning models via ONNX/TensorRT, one tree model via Triton's Forest Inference Library backend); two use deterministic, rule-based logic on CPU. Future releases will include ISV (Independent Software Vendor) partner containers demonstrating the ecosystem extensibility — including a partner segment-activation model slated to replace the current rule-based audience activator. It also includes an orchestration layer for parallel fan-out using gRPC as the primary ARTF protocol for the production auction path. Optionally, Amazon Bedrock AgentCore with Model Context Protocol (MCP) support is available as a testing and simulation interface for AI agent integration.
 
 > **Note for the reader:** This Guidance is published in two parts. Part 1 (this edition) demonstrates how to implement ARTF-compliant containers that act as agents in a bidstream, determining ARTF intents to apply to a bid request while adhering to response-time SLAs. The containers leverage GPU-accelerated inference via NVIDIA Triton to meet sub-millisecond latency requirements.
 >
@@ -17,21 +17,22 @@ The solution provides four production-ready ARTF-compliant containers, with two 
 
 ## Use Cases
 
-1. **Bid price optimization:** Use deep learning CTR prediction (DLRM) to compute optimal shaded bid prices in real time, reducing overspend while maintaining win rates
-2. **Audience segment activation:** Activate high-value audience segments at the impression level from real bid-request signals (content category, demographics, existing DMP segments, contextual signals) via transparent rules — slated for a partner ISV neural-model implementation
-3. **Private marketplace deal management:** Predict user-deal relevance with Neural Collaborative Filtering to autonomously activate high-affinity deals and suppress poor matches
-4. **Quality metrics enrichment:** Add viewability and brand safety scores to bid requests before auction execution
-5. **[Future Version] Creative intelligence:** Score creative quality, visual attention, brand suitability, and fatigue signals (ISV container)
-6. **[Future Version] Identity resolution:** Resolve fragmented user/device signals into cross-device and household IDs (ISV container)
-7. **[Future Version] Location audience activation:** Activate location-derived audience segments from device geo and visitation patterns (ISV container)
-8. **Agentic advertising:** Enable AI agents to invoke real-time bidding decisions via MCP tool calls, supporting the transition to autonomous campaign optimization
+1. **Bid price optimization:** The bid pricer uses deep learning CTR prediction (a DLRM model) to compute optimal shaded bid prices in real time, reducing overspend while maintaining win rates
+2. **Audience segment activation:** The audience activator activates high-value audience segments at the impression level from real bid-request signals (content category, demographics, existing DMP segments, contextual signals) via transparent rules — slated for a partner ISV neural-model implementation
+3. **Private marketplace deal management:** The deal scorer predicts user-deal relevance with Neural Collaborative Filtering to autonomously activate high-affinity deals and suppress poor matches
+4. **Quality metrics enrichment:** The signals enricher adds viewability and brand safety scores to bid requests before auction execution
+5. **Publisher yield optimization:** The yield optimizer predicts a floor-price multiplier and margin adjustment per private marketplace deal from real deal/context signals, using an XGBoost model served by Triton's Forest Inference Library backend — an SSP/publisher-side example distinct from the buy-side bid pricer
+6. **[Future Version] Creative intelligence:** Score creative quality, visual attention, brand suitability, and fatigue signals (ISV container)
+7. **[Future Version] Identity resolution:** Resolve fragmented user/device signals into cross-device and household IDs (ISV container)
+8. **[Future Version] Location audience activation:** Activate location-derived audience segments from device geo and visitation patterns (ISV container)
+9. **Agentic advertising:** Enable AI agents to invoke real-time bidding decisions via MCP tool calls, supporting the transition to autonomous campaign optimization
 
 ## Business Benefits
 
 | Benefit | Description |
 |---------|-------------|
 | Reduced decision-making latency | Sub-millisecond inference increases conversion rates and improves Return on Ad Spend (ROAS) |
-| Expanded models improve optimization | Deep learning architectures (DLRM, NCF) outperform linear models and heuristic rules for the decisions they cover, delivering better advertising outcomes |
+| Expanded models improve optimization | Deep learning architectures (DLRM, NCF) and tree-based models (the yield optimizer's XGBoost) outperform linear models and heuristic rules for the decisions they cover, delivering better advertising outcomes |
 | ISV partner ecosystem [Future] | Pre-built ISV partner containers enable DSPs to obtain new functionality faster without custom development |
 | Agentic-ready platform | MCP interfaces enable AI agents to participate in bidding decisions, delivering a future-ready platform for autonomous advertising |
 
@@ -41,11 +42,11 @@ The solution provides four production-ready ARTF-compliant containers, with two 
 |---------|-------------|
 | Sub-millisecond inference | Dynamic batching on Triton with CUDA EP delivers GPU-accelerated inference well within OpenRTB timeout budgets |
 | GPU acceleration | NVIDIA A10G GPUs via Triton deliver significant throughput improvement over equivalent CPU-based inference for recommender models |
-| Deep learning CTR | DLRM and NCF architectures outperform linear models and heuristic rules for the advertising decisions they cover |
+| Deep learning CTR | The bid pricer and deal scorer's deep learning models (DLRM and NCF) outperform linear models and heuristic rules for the advertising decisions they cover |
+| Tree-model yield optimization | The yield optimizer's XGBoost model, served by Triton's FIL backend, follows the published approach for reserve-price optimization — a tree/regression problem, not a deep-embedding one |
 | Dynamic batching | Triton's preferred batch sizes (8, 16, 32) and max queue delay (500μs) maximize GPU utilization under concurrent load |
 | Modular and extensible | ARTF container specification allows DSPs to add, swap, or update models independently without pipeline changes |
 | ISV ecosystem ready [Future] | Three ISV partner containers demonstrate how third-party data providers plug into the same pipeline |
-| Dual deployment paths | ECS Fargate for rapid demos (no GPU required) and EKS with Triton for production GPU inference |
 | Agentic-ready | MCP interfaces (optional) enable AI agents to participate in bidding decisions via the extend_rtb tool |
 
 ## How It Works
@@ -56,7 +57,7 @@ The solution provides four production-ready ARTF-compliant containers, with two 
 
 2. **Orchestration:** The orchestrator (Starlette/Python) receives the request and fans it out in parallel to all registered ARTF containers.
 
-   **GPU-accelerated inference:** The two GPU-backed containers (DLRM, NCF) extract features from the bid request, invoke their assigned model on NVIDIA Triton Inference Server via tritonclient.http, and receive predictions from the GPU (A10G). The Wide & Deep Segment Activator and Metrics Enricher apply rule-based logic on CPU.
+   **GPU-accelerated inference:** The three GPU-backed containers — the bid pricer, the deal scorer, and the yield optimizer — extract features from the bid request, invoke their assigned model (DLRM, NCF, and XGBoost via FIL, respectively) on NVIDIA Triton Inference Server via tritonclient.http, and receive predictions from the GPU (A10G). The audience activator and signals enricher apply rule-based logic on CPU.
 
 3. **Mutation generation:** Each container translates model predictions into typed ARTF mutations (bid price adjustments, segment activations, deal decisions, quality metrics).
 
@@ -79,50 +80,127 @@ Each ARTF container exposes three interfaces per the IAB Tech Lab ARTF v1.0 spec
 | 8080 | HTTP | /health/live, /health/ready | Kubernetes liveness and readiness probes |
 
 
-### Model Inference with NVIDIA Triton Inference Server
+### The Five Containers
 
-This Guidance implements two GPU-accelerated deep learning models, each chosen for its suitability to a specific advertising decision, plus two rule-based containers demonstrating ARTF flexibility.
+Each container does one job in the bidstream. Three are GPU-accelerated on
+NVIDIA Triton Inference Server (two deep-learning models, one tree model); two
+are rule-based on CPU. The model architecture behind each GPU-accelerated
+container is implementation detail, noted below for reference — see
+[Container → Model → Intent Mapping](#container--model--intent-mapping)
+for the full picture.
 
-#### DLRM: Bid Shading (BID_SHADE)
+#### Bid Pricer: bid pricing (BID_SHADE)
 
-**Architecture:** The Deep Learning Recommendation Model processes sparse categorical features (user IDs, site categories, device types) and dense numerical features (bid floors, time of day, user age, video presence). Bottom MLPs (4→32→16) transform dense features into embedding space; 3 EmbeddingBag tables (vocab=1000, dim=16) encode sparse features; dot-product interaction layers capture feature crosses; a top MLP (22→64→32→1→sigmoid) produces a CTR prediction.
+**What it does:** Prices every bid at the lowest amount still likely to win —
+shading down from the maximum bid based on how likely the impression is to
+convert, so the platform doesn't overpay for impressions it would have won at a
+lower price.
 
-**Triton config:** Model `dlrm_bid_shader`, ONNX backend, max batch size 64, 2× GPU instances, dynamic batching with preferred sizes [8, 16, 32] and 500μs max queue delay.
+**How:** Predicts click-through rate (CTR) from sparse categorical features (user
+IDs, site categories, device types) and dense numerical features (bid floors,
+time of day, user age, video presence), then converts that prediction into a
+shaded price: `shaded_price = min(original_bid, predicted_CTR × $12
+conversion_value × 0.65 shade_factor)`, floored at the publisher's bidfloor.
 
-**Decision logic:** `shaded_price = min(original_bid, predicted_CTR × $12 conversion_value × 0.65 shade_factor)`, floored at the publisher's bidfloor.
+**Model (implementation detail):** A Deep Learning Recommendation Model (DLRM).
+Bottom MLPs (4→32→16) transform dense features into embedding space; 3
+EmbeddingBag tables (vocab=1000, dim=16) encode sparse features; dot-product
+interaction layers capture feature crosses; a top MLP (22→64→32→1→sigmoid)
+produces the CTR prediction. Served by Triton as model `dlrm_bid_shader` (ONNX
+backend, max batch size 64, 2× GPU instances, dynamic batching with preferred
+sizes [8, 16, 32] and 500μs max queue delay).
 
-#### Segment Activator: Segment Activation (ACTIVATE_SEGMENTS)
+#### Audience Activator: audience segment activation (ACTIVATE_SEGMENTS)
 
-**Architecture:** Deterministic rule engine (no GPU, no Triton). This container previously scored 15 audience segments with a Wide & Deep neural network — a wide linear model (8→15) combined with a deep network (6→64→32→15 with BatchNorm) — served on Triton. That model's ONNX graph could not be compiled to a TensorRT engine (the `BatchNorm1d` fusion is unsupported for this shape by TensorRT 10.3.0's builder), so it was replaced with transparent rules over real bid-request signals: IAB content-category mapping, age bucketing from year of birth, keyword matching against existing first/third-party DMP segments already on the request, and contextual signals (bid floor tier, video inventory, mobile user agent). This container is slated to be replaced by a partner ISV implementation.
+**What it does:** Activates high-value audience segments on an impression from
+signals already on the bid request — content category, demographics, existing
+first/third-party DMP segments, and contextual signals (bid floor tier, video
+inventory, device type) — so downstream targeting can act on segments the buy
+side cares about.
 
-**Decision logic:** Score candidate segments from the rules above (fixed point values per matched rule, clamped to [0, 1]); activate those exceeding a 0.55 confidence threshold (same threshold and `segment_threshold` override as before).
+**How:** A deterministic rule engine (no GPU, no Triton) scores candidate
+segments against the signals above, and activates those exceeding a 0.55
+confidence threshold (overridable via `segment_threshold`).
 
-#### NCF: Deal Management (ACTIVATE_DEALS / SUPPRESS_DEALS)
+**Model (implementation detail):** This container previously scored segments
+with a Wide & Deep neural network on Triton — a wide linear model (8→15)
+combined with a deep network (6→64→32→15 with BatchNorm). That model's ONNX
+graph could not be compiled to a TensorRT engine (the `BatchNorm1d` fusion is
+unsupported for this shape by TensorRT 10.3.0's builder), so it was replaced
+with the transparent rules described above, and this container is slated to be
+replaced by a partner ISV neural-model implementation.
 
-**Architecture:** Neural Collaborative Filtering replaces traditional matrix factorization with a neural network, learning non-linear user-item interactions. In the RTB context, "items" are private marketplace deals and "users" are bidstream profiles. GMF path (user_embed × deal_embed, dim=64) captures linear interactions; MLP path (concat → 256→128→64) captures non-linear patterns; NeuMF fusion layer (128→1→sigmoid) produces relevance scores.
+#### Deal Scorer: private marketplace deal management (ACTIVATE_DEALS / SUPPRESS_DEALS)
 
-**Triton config:** Model `ncf_deal_manager`, ONNX backend, dynamic batching, GPU instances.
+**What it does:** Scores how well each private marketplace (PMP) deal fits the
+current impression, autonomously activating high-affinity deals and suppressing
+poor matches — so PMP inventory converts at a higher rate without a human
+reviewing every deal on every impression.
 
-**Decision logic:** Per-deal relevance score; activate deals ≥0.499, suppress deals <0.497.
+**How:** Produces a per-deal relevance score from the bid-request profile and
+each candidate deal; activates deals scoring ≥0.499, suppresses deals scoring
+<0.497.
 
+**Model (implementation detail):** Neural Collaborative Filtering (NCF/NeuMF),
+which learns non-linear user-item interactions rather than relying on
+traditional matrix factorization. In the RTB context, "items" are PMP deals and
+"users" are bidstream profiles. A GMF path (user_embed × deal_embed, dim=64)
+captures linear interactions; an MLP path (concat → 256→128→64) captures
+non-linear patterns; a NeuMF fusion layer (128→1→sigmoid) produces the relevance
+score. Served by Triton as model `ncf_deal_manager` (ONNX backend, dynamic
+batching, GPU instances).
 
-#### Metrics Enricher: Quality Scores (ADD_METRICS)
+#### Signals Enricher: quality signal enrichment (ADD_METRICS)
 
-**Architecture:** Rule-based container (no GPU required). Unlike DLRM and NCF, which are powered by NVIDIA Triton Inference Server with GPU acceleration, the Metrics Enricher uses deterministic rules on CPU — the same pattern used by the Segment Activator. This demonstrates that ARTF's container model is flexible enough to mix ML and deterministic logic in the same pipeline.
+**What it does:** Adds viewability and brand-safety scores to the bid request
+before auction execution, so downstream bidding logic (including the bid
+pricer) can factor real quality signals into the decision rather than treating
+every impression as equally brand-safe and viewable.
 
-**Decision logic:** Viewability = f(ad position, banner dimensions, video presence); Brand safety = 0.60 + 0.40 × (safe_categories / total_categories).
+**How:** A rule-based container (no GPU required) — the same pattern used by the
+audience activator, demonstrating that ARTF's container model mixes ML and
+deterministic logic in one pipeline. Viewability = f(ad position, banner
+dimensions, video presence); brand safety = 0.60 + 0.40 × (safe_categories /
+total_categories).
+
+#### Yield Optimizer: publisher deal floor & margin adjustment (ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN)
+
+**What it does:** An SSP/publisher-side example — predicts a floor-price
+multiplier and margin adjustment per private marketplace deal, so a publisher
+can raise floors on high-demand inventory and lower them on remnant inventory
+without manual deal management, and set margins appropriately for the deal's
+auction type. Distinct from the (buy-side) bid pricer: this container adjusts
+what the *seller* will accept, not what the buyer bids.
+
+**How:** Builds a 7-feature vector per deal from real signals already on the
+bid request (auction type, existing bidfloor, IAB content-category tier,
+hour-of-day, day-of-week — no fabricated signals), sends it to a Triton-served
+XGBoost model, and emits `ADJUST_DEAL_FLOOR`/`ADJUST_DEAL_MARGIN` mutations
+independently per deal when the model recommends a real change.
+
+**Model (implementation detail):** An XGBoost tree ensemble, served by
+NVIDIA Triton's Forest Inference Library (FIL) backend rather than the
+ONNX/TensorRT path DLRM/NCF use — FIL is purpose-built for GPU-accelerated
+tree-model inference and is already bundled in the same
+`nvcr.io/nvidia/tritonserver:24.08-py3` image this Guidance uses, so no
+additional Triton image is required. Tree/regression models are the approach
+used in the published literature for reserve-price optimization, unlike the
+deep embedding architectures (DLRM, NCF) used for CTR prediction and
+relevance scoring. Served by Triton as model `deal_yield_manager` (FIL
+backend, GPU instance).
 
 ### Container → Model → Intent Mapping
 
-| Container | Model Architecture | Triton Model Name | ARTF Intent | Output |
-|-----------|-------------------|-------------------|-------------|--------|
-| DLRM Bid Shader | DLRM | dlrm_bid_shader | BID_SHADE | Optimal shaded bid price |
-| Segment Activator | Rule engine (CPU) — slated for a partner ISV neural model | N/A | ACTIVATE_SEGMENTS | Audience segments |
-| NCF Deal Manager | NCF / NeuMF | ncf_deal_manager | ACTIVATE_DEALS / SUPPRESS_DEALS | Deal activations / suppressions |
-| Metrics Enricher | Rule engine (CPU) | N/A | ADD_METRICS | Viewability + brand safety |
-| [Future] Creative Enricher (ISV) | ViT/CLIP mock (CPU) | N/A | ADD_METRICS | Creative quality, attention, suitability, fatigue |
-| [Future] Identity Resolver (ISV) | Graph NN mock (CPU) | N/A | ADD_CIDS | Cross-device + household IDs |
-| [Future] Location Activator (ISV) | Blueprints™ mock (CPU) | N/A | ACTIVATE_SEGMENTS | Location-derived audience segments |
+| Container | What it does | Model (implementation detail) | Triton Model Name | ARTF Intent | Output |
+|-----------|--------------|-------------------------------|-------------------|-------------|--------|
+| Bid Pricer | Prices bids by shading down from a CTR prediction | DLRM | dlrm_bid_shader | BID_SHADE | Optimal shaded bid price |
+| Audience Activator | Activates audience segments from bid-request signals | Rule engine (CPU) — slated for a partner ISV neural model | N/A | ACTIVATE_SEGMENTS | Audience segments |
+| Deal Scorer | Scores and activates/suppresses PMP deals | NCF / NeuMF | ncf_deal_manager | ACTIVATE_DEALS / SUPPRESS_DEALS | Deal activations / suppressions |
+| Signals Enricher | Adds viewability + brand-safety quality signals | Rule engine (CPU) | N/A | ADD_METRICS | Viewability + brand safety |
+| Yield Optimizer | Predicts deal floor/margin adjustments | XGBoost (Triton FIL backend) | deal_yield_manager | ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN | Floor multiplier + margin value |
+| [Future] Creative Enricher (ISV) | Scores creative quality signals | ViT/CLIP mock (CPU) | N/A | ADD_METRICS | Creative quality, attention, suitability, fatigue |
+| [Future] Identity Resolver (ISV) | Resolves cross-device identity | Graph NN mock (CPU) | N/A | ADD_CIDS | Cross-device + household IDs |
+| [Future] Location Activator (ISV) | Activates location-derived segments | Blueprints™ mock (CPU) | N/A | ACTIVATE_SEGMENTS | Location-derived audience segments |
 
 
 ### AWS Services in This Guidance
@@ -131,14 +209,12 @@ This Guidance implements two GPU-accelerated deep learning models, each chosen f
 |-------------|----------------------|
 | Amazon Elastic Kubernetes Service (EKS) | Orchestrates GPU and CPU node groups; manages container lifecycle, scaling, and health |
 | Amazon EC2 (g5.xlarge) | Provides NVIDIA A10G GPU instances for Triton Inference Server |
-| Amazon EC2 (c5.xlarge) | Runs ARTF containers, orchestrator, and metrics enricher on CPU |
-| Amazon ECS Fargate | Alternative serverless deployment for demos without GPU (CPU-only inference) |
+| Amazon EC2 (c5.xlarge) | Runs ARTF containers, orchestrator, and the signals enricher on CPU |
 | Amazon S3 | Stores ONNX model repository (Triton) and static frontend assets |
 | Amazon CloudFront | HTTPS edge delivery for testing frontend; proxies API requests to the cluster |
 | Amazon ECR | Stores container images for all ARTF containers, orchestrator, and AgentCore bundle |
-| Elastic Load Balancing (NLB/ALB) | NLB for EKS path (TCP pass-through); ALB for ECS path (HTTP routing) |
+| Elastic Load Balancing (NLB) | TCP pass-through in front of the orchestrator |
 | AWS IAM (IRSA) | IAM Roles for Service Accounts grants Triton S3 read access without long-lived credentials |
-| AWS CloudMap | Service discovery for ECS Fargate containers (internal DNS) |
 | Amazon Bedrock AgentCore | Hosts the MCP runtime for AI agent integration via the extend_rtb tool |
 
 
@@ -148,6 +224,7 @@ This Guidance implements two GPU-accelerated deep learning models, each chosen f
 |-----------|---------|---------|
 | NVIDIA Triton Inference Server | nvcr.io/nvidia/tritonserver:24.08-py3 | Multi-model serving with dynamic batching on GPU |
 | ONNX Runtime | Built into Triton | Part 1 backend for ONNX-exported models (Part 2 upgrades serving to `tensorrt_plan`) |
+| Triton FIL (Forest Inference Library) backend | Built into Triton | GPU-accelerated serving backend for the yield optimizer's XGBoost tree model — no ONNX/TensorRT conversion step |
 | NVIDIA TensorRT (`tensorrt_plan`) | trtexec 24.08 | Part 2 serving backend — compiled TensorRT engine plans on Triton |
 | Model Optimizer microservice | nvcr.io/nvidia/tensorrt:24.08-py3 | In-cluster ONNX→TensorRT engine compilation (FP16 default); a TensorRT optimizer, **not** a stock NVIDIA NIM |
 | CUDA Execution Provider | CUDA 12.x | GPU-accelerated inference |
@@ -159,7 +236,7 @@ This Guidance implements two GPU-accelerated deep learning models, each chosen f
 
 Part 2 extends the NVIDIA software stack with components that build on the Triton inference path established in Part 1, and upgrades that path from ONNX Runtime to compiled TensorRT engines:
 
-- **NVIDIA NeMo-RL** supports reinforcement-learning workflows that use auction-outcome signals to improve bidding behavior over time. Training runs offline on GPU clusters; the resulting DLRM or NCF artifacts are exported to ONNX and registered for promotion. (The Segment Activator is rule-based and has no trainable artifact.)
+- **NVIDIA NeMo-RL** supports reinforcement-learning workflows that use auction-outcome signals to improve bidding behavior over time. Training runs offline on GPU clusters; the resulting DLRM or NCF artifacts are exported to ONNX and registered for promotion. (The audience activator is rule-based and has no trainable artifact.)
 
 - **NVIDIA TensorRT (Model Optimizer).** Part 2 upgrades Triton serving to `tensorrt_plan`: an in-cluster **Model Optimizer** microservice (built on `nvcr.io/nvidia/tensorrt:24.08-py3`) compiles each ONNX artifact into an optimized TensorRT engine (FP16 by default; INT8 only with a real calibration cache, else an honest `400`). This is a TensorRT optimizer, **not** a stock NVIDIA NIM — no stock NIM exists for these custom recommender architectures, and TensorRT is the same engine a NIM is built on. Model versioning and zero-downtime A/B rollout are handled by the Model Governance Agent driving a **Triton-side canary router**: an in-memory `<model>_stable`↔`<model>_canary` split set at model load/reload (control-plane), never a per-request lookup, so the real-time ARTF bidstream stays dependency-free and the ARTF containers are never modified.
 
@@ -178,7 +255,7 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 - **Least privilege:** IAM Roles for Service Accounts (IRSA) grant only S3 read access to the Triton pod; no long-lived credentials in containers
 - **Non-root execution:** All ARTF containers run as appuser (non-root) per the ARTF specification
 - **Security hardening:** no-new-privileges security option and read-only filesystem in container runtime
-- **Network isolation:** ARTF containers communicate only within the cluster; external traffic enters exclusively through CloudFront → NLB/ALB
+- **Network isolation:** ARTF containers communicate only within the cluster; external traffic enters exclusively through CloudFront → NLB
 - **Image provenance:** Base images sourced from NVIDIA NGC (authenticated registry) and Python official images; application containers stored in private ECR
 
 ### Reliability
@@ -199,7 +276,6 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 
 - **Right-sized instances:** GPU nodes (g5.xlarge) run only Triton; lightweight ARTF containers run on cost-effective CPU nodes (c5.xlarge)
 - **Horizontal Pod Autoscaler:** Kubernetes HPA scales pods based on actual request load, avoiding over-provisioning
-- **Dual deployment model:** ECS Fargate path enables cost-effective demos (~$0/hr when idle) without provisioning GPU infrastructure
 - **Deterministic naming:** Resource names include sha256(stack:account:region)[:8] suffix enabling multiple isolated stacks in one account without collision
 
 ### Sustainability
@@ -348,16 +424,6 @@ The default deployment (1 GPU node) is designed for demos and development. Produ
 
 GPU costs dominate. For demos: deploy, test, then `./deploy.sh --destroy` immediately. A 2-hour demo session costs approximately $3.
 
-### ECS Fargate Demo Path (No GPU)
-
-| Resource | Configuration | Est. Monthly Cost |
-|----------|---------------|-------------------|
-| ECS Fargate | 5 tasks (0.25 vCPU, 512 MB each) | ~$45 |
-| ALB | 1 load balancer | ~$25 |
-| NAT Gateway | 1 gateway | ~$32 |
-| S3 + CloudFront | Frontend hosting | <$5 |
-| **Estimated Total** | | **~$107/month** |
-
 ## Amazon Bedrock AgentCore Integration
 
 The AgentCore deployment is an optional component for testing and AI agent simulation. It bundles all ARTF containers into a single ARM64 image that runs inside an AgentCore microVM, exposing the `extend_rtb` MCP tool on port 8000 at `/mcp`. AgentCore is not required for the core production bidding stack, which uses gRPC exclusively for real-time auction integration.
@@ -475,12 +541,11 @@ The complete source code for this Guidance is available at:
 
 ### Includes
 
-- ARTF container implementations (DLRM, Wide & Deep, NCF, Metrics Enricher)
+- ARTF container implementations: bid pricer, audience activator, deal scorer, signals enricher, yield optimizer
 - Orchestrator with parallel fan-out (gRPC primary, HTTP fallback)
 - Model export scripts (PyTorch → ONNX via triton/export_models.py)
 - Triton model repository with config.pbtxt configurations
 - Kubernetes manifests with HPA (EKS deployment)
-- ECS Fargate deployment with CloudMap service discovery
 - Testing frontend (CloudFront + S3)
 - Amazon Bedrock AgentCore MCP runtime (ARM64)
 - Single-command deployment script (deploy.sh)

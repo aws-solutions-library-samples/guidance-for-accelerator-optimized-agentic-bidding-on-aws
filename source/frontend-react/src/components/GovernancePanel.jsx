@@ -6,7 +6,7 @@ import {
   IconRegistry, IconChip, IconSplit, IconGavel, IconAudit,
   ScenarioDetailCard, SampleOutcomesModal, PipelineBar, StepByStepLog,
   ModelsView, MutationIntentCard, BidstreamImpactCard,
-  GovernanceVerdictCard, SessionAuditTrail,
+  GovernanceVerdictCard, SessionAuditTrail, RecommendationBadge,
 } from "./closedLoopUi.jsx";
 
 // Default pipeline stages shown (all "done"/grey) before any scenario has run,
@@ -23,9 +23,29 @@ const DEFAULT_PIPELINE_NODES = [
 // models (per DESIGN_BRIEF.md — Wide&Deep is rule-based, no canary/A-B loop).
 // The model selector filters the scenario list, so picking a model actually
 // changes which real scenario/decision can run — not just a display label.
+// NCF still has full scenario/compare/promote support (no training data
+// needed there), so it stays in this general selector even though it's
+// parked for the training section below (see TRAINING_MODEL_TYPES).
 const MODEL_TYPES = [
   { key: "dlrm_bid_shader", label: "DLRM Bid Shader" },
   { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+];
+
+// Training-specific model selector for the "Train from load test" card,
+// decoupled from MODEL_TYPES above (which also drives scenario/compare/
+// promote — those work fine for NCF). ncf_deal_manager training is parked:
+// its ACTIVATE_DEALS/SUPPRESS_DEALS mutations disambiguate deals via
+// path + a list of deal IDs (verified against the real ARTF proto/reference
+// implementation — github.com/IABTechLab/agentic-real-time-framework), but
+// BidShadingOutcomeEvent/Record has no deal_id field and no per-deal
+// fan-out, so there's no way to attribute a training outcome to one
+// specific deal yet. Shown here, disabled, rather than removed, so it's
+// discoverable and trivial to re-enable once that schema work lands
+// (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES, the
+// authoritative backend enforcement).
+const TRAINING_MODEL_TYPES = [
+  { key: "dlrm_bid_shader", label: "DLRM Bid Shader", trainable: true },
+  { key: "ncf_deal_manager", label: "NCF Deal Manager (parked — coming in a future release)", trainable: false },
 ];
 
 /**
@@ -62,6 +82,34 @@ export default function GovernancePanel() {
   const [lastRationale, setLastRationale] = useState(null);
   const [lastModelType, setLastModelType] = useState(null);
   const [sessionAudit, setSessionAudit] = useState([]);
+
+  // Train-from-load-test (FR-4/FR-5, Story 3): cost/duration estimate shown
+  // before confirming, and a live "is a job already running" check that
+  // disables the button while true. Uses its own model selector
+  // (trainingModelType), decoupled from the general `modelType` above —
+  // ncf_deal_manager training is parked (see TRAINING_MODEL_TYPES), but
+  // NCF scenario/compare/promote above are unaffected.
+  const [trainingModelType, setTrainingModelType] = useState("dlrm_bid_shader");
+  const [trainingEstimate, setTrainingEstimate] = useState(null);
+  const [trainingEstimateError, setTrainingEstimateError] = useState(null);
+  const [trainingInProgress, setTrainingInProgress] = useState(false);
+  const [confirmingTraining, setConfirmingTraining] = useState(false);
+  const [trainingSubmitting, setTrainingSubmitting] = useState(false);
+  const [trainingResult, setTrainingResult] = useState(null);
+  const [trainingError, setTrainingError] = useState(null);
+
+  // Load-test-based comparison (FR-7/FR-8, Story 5) and Promote (FR-9/FR-10, Story 6).
+  const [currentRuns, setCurrentRuns] = useState([]);
+  const [challengerRuns, setChallengerRuns] = useState([]);
+  const [selectedCurrentRun, setSelectedCurrentRun] = useState("");
+  const [selectedChallengerRun, setSelectedChallengerRun] = useState("");
+  const [eligibleRunsError, setEligibleRunsError] = useState(null);
+  const [comparing, setComparing] = useState(false);
+  const [comparisonResult, setComparisonResult] = useState(null);
+  const [comparisonError, setComparisonError] = useState(null);
+  const [promoting, setPromoting] = useState(false);
+  const [promotionResult, setPromotionResult] = useState(null);
+  const [promotionError, setPromotionError] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -106,6 +154,144 @@ export default function GovernancePanel() {
   }, [modelType]);
 
   useEffect(() => { refreshState(); }, [refreshState]);
+
+  // Fetch the real cost/duration estimate whenever the selected training
+  // model type changes, and reset any prior training-in-progress/result
+  // state (it was scoped to the previous model type).
+  const fetchTrainingEstimate = useCallback(async () => {
+    setTrainingEstimateError(null);
+    try {
+      const resp = await authFetch(`/api/v1/governance/training-estimate?model_type=${trainingModelType}`);
+      const data = await resp.json();
+      if (resp.ok) setTrainingEstimate(data);
+      else { setTrainingEstimate(null); setTrainingEstimateError(data.error || `HTTP ${resp.status}`); }
+    } catch (e) {
+      setTrainingEstimate(null);
+      setTrainingEstimateError(String(e));
+    }
+  }, [trainingModelType]);
+
+  useEffect(() => {
+    fetchTrainingEstimate();
+    setTrainingInProgress(false);
+    setConfirmingTraining(false);
+    setTrainingResult(null);
+    setTrainingError(null);
+  }, [trainingModelType, fetchTrainingEstimate]);
+
+  const startTraining = useCallback(async () => {
+    setTrainingSubmitting(true);
+    setTrainingError(null);
+    try {
+      const resp = await authFetch("/api/v1/governance/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_type: trainingModelType, confirmed: true }),
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setTrainingResult(data);
+        setConfirmingTraining(false);
+      } else if (data.reason === "already_in_progress") {
+        setTrainingInProgress(true);
+        setConfirmingTraining(false);
+        setTrainingError(data.error);
+      } else {
+        setTrainingError(data.error || `HTTP ${resp.status}`);
+        setConfirmingTraining(false);
+      }
+    } catch (e) {
+      setTrainingError(String(e));
+      setConfirmingTraining(false);
+    } finally {
+      setTrainingSubmitting(false);
+    }
+  }, [trainingModelType]);
+
+  // Fetch eligible load-test runs whenever the model type changes, auto-
+  // selecting the most recent per role (FR-7). Clears any prior
+  // comparison/promotion result — it was scoped to the previous model type.
+  const fetchEligibleRuns = useCallback(async () => {
+    setEligibleRunsError(null);
+    try {
+      const [curResp, chalResp] = await Promise.all([
+        authFetch(`/api/v1/governance/eligible-runs?model_type=${modelType}&role=current`),
+        authFetch(`/api/v1/governance/eligible-runs?model_type=${modelType}&role=challenger`),
+      ]);
+      const curData = await curResp.json();
+      const chalData = await chalResp.json();
+      if (curResp.ok && chalResp.ok) {
+        setCurrentRuns(curData.runs || []);
+        setChallengerRuns(chalData.runs || []);
+        setSelectedCurrentRun(curData.most_recent?.id || "");
+        setSelectedChallengerRun(chalData.most_recent?.id || "");
+      } else {
+        setEligibleRunsError(curData.error || chalData.error || "Could not load eligible runs.");
+      }
+    } catch (e) {
+      setEligibleRunsError(String(e));
+    }
+  }, [modelType]);
+
+  useEffect(() => {
+    fetchEligibleRuns();
+    setComparisonResult(null);
+    setComparisonError(null);
+    setPromotionResult(null);
+    setPromotionError(null);
+  }, [modelType, fetchEligibleRuns]);
+
+  const compareRuns = useCallback(async () => {
+    if (!selectedCurrentRun || !selectedChallengerRun) return;
+    setComparing(true);
+    setComparisonError(null);
+    setPromotionResult(null);
+    setPromotionError(null);
+    try {
+      const resp = await authFetch("/api/v1/governance/compare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_type: modelType,
+          current_run_id: selectedCurrentRun,
+          challenger_run_id: selectedChallengerRun,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok) setComparisonResult(data);
+      else { setComparisonResult(null); setComparisonError(data.error || `HTTP ${resp.status}`); }
+    } catch (e) {
+      setComparisonResult(null);
+      setComparisonError(String(e));
+    } finally {
+      setComparing(false);
+    }
+  }, [modelType, selectedCurrentRun, selectedChallengerRun]);
+
+  const promoteChallenger = useCallback(async () => {
+    if (!comparisonResult || comparisonResult.recommendation !== "promote") return;
+    setPromoting(true);
+    setPromotionError(null);
+    try {
+      const resp = await authFetch("/api/v1/governance/promote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_type: modelType,
+          version_arn: comparisonResult.challenger_run_model_version,
+          recommendation: comparisonResult.recommendation,
+          reason: `Load-test comparison: lift=${fmt(comparisonResult.relative_lift)}, p=${fmt(comparisonResult.p_value, 5)}`,
+        }),
+      });
+      const data = await resp.json();
+      if (resp.ok) setPromotionResult(data);
+      else setPromotionError(data.error || `HTTP ${resp.status}`);
+    } catch (e) {
+      setPromotionError(String(e));
+    } finally {
+      setPromoting(false);
+    }
+  }, [modelType, comparisonResult]);
 
   useEffect(() => {
     if (revealTimer.current) clearInterval(revealTimer.current);
@@ -315,6 +501,178 @@ export default function GovernancePanel() {
           <span className="cl-card-title">Session decision history</span>
         </div>
         <SessionAuditTrail entries={sessionAudit} />
+      </div>
+
+      {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
+          estimate + explicit confirmation + concurrency-guarded trigger.
+          Has its own model selector (decoupled from the general one above)
+          since ncf_deal_manager training is parked while scenario/compare/
+          promote still work for it. */}
+      <div className="cl-section-title">Train from load test</div>
+      <div className="cl-card sg-elevated" data-testid="governance-train-card">
+        <div className="cl-control-group">
+          <label htmlFor="cl-gov-train-model">Model:</label>
+          <select
+            id="cl-gov-train-model"
+            className="cl-select sg-interactive"
+            data-testid="governance-train-model-select"
+            value={trainingModelType}
+            onChange={(e) => setTrainingModelType(e.target.value)}
+            disabled={trainingSubmitting}
+          >
+            {TRAINING_MODEL_TYPES.map((m) => (
+              <option key={m.key} value={m.key} disabled={!m.trainable}>{m.label}</option>
+            ))}
+          </select>
+        </div>
+        {trainingEstimateError && (
+          <div className="cl-honest cl-honest-block">Cost estimate unavailable: {trainingEstimateError}</div>
+        )}
+        {trainingEstimate && (
+          <div className="cl-train-estimate">
+            <span>Instance: {trainingEstimate.instance_type}</span>
+            <span>Rate: ${trainingEstimate.hourly_rate_usd.toFixed(3)}/hr</span>
+            <span>Max duration: {Math.round(trainingEstimate.max_runtime_seconds / 60)} min</span>
+            <span>Max cost: ${trainingEstimate.estimated_max_cost_usd.toFixed(2)}</span>
+          </div>
+        )}
+        {trainingResult && (
+          <div className="cl-train-result" data-testid="governance-train-result">
+            Training started — job {trainingResult.job_name}, base version {trainingResult.base_model_version}.
+          </div>
+        )}
+        {trainingError && !confirmingTraining && (
+          <div className="cl-honest cl-honest-block">{trainingError}</div>
+        )}
+        {!confirmingTraining ? (
+          <button
+            className="btn btn-primary sg-interactive"
+            data-testid="governance-train-trigger-button"
+            onClick={() => setConfirmingTraining(true)}
+            disabled={!trainingEstimate || trainingInProgress || trainingSubmitting}
+          >
+            {trainingInProgress ? "Training in progress\u2026" : "Train from load test"}
+          </button>
+        ) : (
+          <div className="cl-train-confirm">
+            <span>
+              Start a real SageMaker training job for {trainingModelType}? Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
+            </span>
+            <button
+              className="btn btn-primary sg-interactive"
+              data-testid="governance-train-confirm-button"
+              onClick={startTraining}
+              disabled={trainingSubmitting}
+            >
+              {trainingSubmitting ? <><span className="spinner" /> Starting…</> : "Confirm"}
+            </button>
+            <button
+              className="btn-secondary sg-interactive"
+              data-testid="governance-train-cancel-button"
+              onClick={() => setConfirmingTraining(false)}
+              disabled={trainingSubmitting}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Compare load-test outcomes (FR-7/FR-8, Story 5) + Promote
+          (FR-9/FR-10, Story 6). Every result below is labeled by source —
+          load-test-derived, distinct from the automated pipeline's
+          live-canary-CloudWatch-derived decisions above. */}
+      <div className="cl-section-title">Compare load-test outcomes</div>
+      <div className="cl-card sg-elevated" data-testid="governance-compare-card">
+        {eligibleRunsError && (
+          <div className="cl-honest cl-honest-block">Could not load eligible runs: {eligibleRunsError}</div>
+        )}
+        <div className="cl-controls-bar">
+          <div className="cl-control-group">
+            <label htmlFor="cl-gov-current-run">Current version run:</label>
+            <select
+              id="cl-gov-current-run"
+              className="cl-select sg-interactive"
+              data-testid="governance-current-run-select"
+              value={selectedCurrentRun}
+              onChange={(e) => setSelectedCurrentRun(e.target.value)}
+            >
+              <option value="">— select a run —</option>
+              {currentRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.id} ({r.timestamp ? new Date(r.timestamp).toLocaleString() : "unknown time"})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="cl-control-group">
+            <label htmlFor="cl-gov-challenger-run">Challenger version run:</label>
+            <select
+              id="cl-gov-challenger-run"
+              className="cl-select sg-interactive"
+              data-testid="governance-challenger-run-select"
+              value={selectedChallengerRun}
+              onChange={(e) => setSelectedChallengerRun(e.target.value)}
+            >
+              <option value="">— select a run —</option>
+              {challengerRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.id} ({r.timestamp ? new Date(r.timestamp).toLocaleString() : "unknown time"})
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            className="btn btn-primary sg-interactive"
+            data-testid="governance-compare-button"
+            onClick={compareRuns}
+            disabled={!selectedCurrentRun || !selectedChallengerRun || comparing}
+          >
+            {comparing ? <><span className="spinner" /> Comparing…</> : "Compare & Assess"}
+          </button>
+        </div>
+
+        {comparisonError && (
+          <div className="cl-honest cl-honest-block">{comparisonError}</div>
+        )}
+
+        {comparisonResult && (
+          <div className="cl-compare-result" data-testid="governance-compare-result">
+            <div className="cl-compare-source">
+              Source: load test runs — current {comparisonResult.current_run_id}
+              {comparisonResult.current_run_timestamp && ` (${new Date(comparisonResult.current_run_timestamp).toLocaleString()})`},
+              {" "}challenger {comparisonResult.challenger_run_id}
+              {comparisonResult.challenger_run_timestamp && ` (${new Date(comparisonResult.challenger_run_timestamp).toLocaleString()})`}
+            </div>
+            <div className="cl-train-estimate">
+              <span>Current: {fmt(comparisonResult.control_metric)}</span>
+              <span>Challenger: {fmt(comparisonResult.treatment_metric)}</span>
+              <span>Lift: {fmt(comparisonResult.relative_lift)}</span>
+              <span>p-value: {fmt(comparisonResult.p_value, 5)}</span>
+              <span>n: {comparisonResult.samples_control}/{comparisonResult.samples_treatment}</span>
+            </div>
+            <RecommendationBadge rec={comparisonResult.recommendation} />
+
+            {comparisonResult.recommendation === "promote" && !promotionResult && (
+              <button
+                className="btn btn-primary sg-interactive"
+                data-testid="governance-promote-button"
+                onClick={promoteChallenger}
+                disabled={promoting}
+              >
+                {promoting ? <><span className="spinner" /> Promoting…</> : "Promote"}
+              </button>
+            )}
+            {promotionResult && (
+              <div className="cl-train-result" data-testid="governance-promote-result">
+                Promoted — version {promotionResult.version_arn}, audit record {promotionResult.audit_record_id}.
+              </div>
+            )}
+            {promotionError && (
+              <div className="cl-honest cl-honest-block">{promotionError}</div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="cl-section-title">Model registry</div>

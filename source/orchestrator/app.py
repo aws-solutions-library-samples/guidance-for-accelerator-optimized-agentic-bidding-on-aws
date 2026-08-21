@@ -36,6 +36,7 @@ from shared.feedback_collector import FeedbackCollector  # noqa: E402
 from shared.signal_associator import SignalAssociator  # noqa: E402
 from orchestrator.signal_receiver import receive_signal as _receive_signal_handler  # noqa: E402
 from orchestrator.feedback_integration import emit_bid_outcome  # noqa: E402
+from orchestrator.deal_yield_feedback import emit_deal_yield_outcome  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,12 @@ CONTAINERS = [
         "intents": {"ADD_METRICS"},
         "grpc": os.environ.get("METRICS_GRPC", os.environ.get("METRICS_URL", "http://localhost:50064")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("METRICS_MCP", os.environ.get("METRICS_URL", "http://localhost:8094")),
+    },
+    {
+        "name": "deal-yield-manager",
+        "intents": {"ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"},
+        "grpc": os.environ.get("YIELD_GRPC", os.environ.get("YIELD_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
+        "mcp": os.environ.get("YIELD_MCP", os.environ.get("YIELD_URL", "http://localhost:8095")),
     },
 
 ]
@@ -158,20 +165,46 @@ async def _call_http(client: httpx.AsyncClient, base_url: str, payload: dict, ti
 # Dispatch to a single container (gRPC first, MCP fallback)
 # ---------------------------------------------------------------------------
 
-async def _call_container(client: httpx.AsyncClient, container: dict, payload: dict, payload_bytes: bytes, timeout_s: float) -> list[Mutation]:
+async def _call_container(
+    client: httpx.AsyncClient,
+    container: dict,
+    payload: dict,
+    payload_bytes: bytes,
+    timeout_s: float,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[list[Mutation], str]:
+    """Call a container's /mutate REST endpoint (MCP fallback).
+
+    ``headers``, when provided, are forwarded on the REST call only — used
+    exclusively by the orchestrator's load-test invocation path to set the
+    out-of-band X-Load-Test-Target-Variant header (see
+    orchestrator/loadtest_targeting.py). Never set by this function's other
+    callers (get_mutations / real bid-serving).
+
+    Returns (mutations, model_version). model_version is the container's
+    per-request-resolved served model version (from RTBResponse.metadata),
+    or "" if the container didn't return one — never fabricated.
+    """
     # Try simple REST /mutate first (most reliable)
     try:
-        resp = await client.post(f"{container['mcp']}/mutate", json=payload, timeout=timeout_s)
+        resp = await client.post(
+            f"{container['mcp']}/mutate", json=payload, timeout=timeout_s, headers=headers
+        )
         if resp.status_code == 200:
             data = resp.json()
             mutations = [Mutation(**m) for m in data.get("mutations", [])]
+            model_version = (data.get("metadata") or {}).get("model_version", "")
             if mutations:
-                return mutations
+                return mutations, model_version
     except Exception as exc:
         print(f"[orchestrator] REST /mutate to {container['mcp']} failed: {exc}")
 
-    # Fallback to MCP JSON-RPC
-    return await _call_mcp(client, container["mcp"], payload, timeout_s)
+    # Fallback to MCP JSON-RPC (no header support on this path today — the
+    # load-test-only override only needs to work on the REST path, which is
+    # the one load test's container calls exercise).
+    mutations = await _call_mcp(client, container["mcp"], payload, timeout_s)
+    return mutations, ""
 
 
 async def _call_container_timed(
@@ -180,6 +213,8 @@ async def _call_container_timed(
     payload: dict,
     payload_bytes: bytes,
     timeout_s: float,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> ContainerInvocationModel:
     """Wrap ``_call_container`` with a wall-clock timer and outcome status.
 
@@ -189,11 +224,14 @@ async def _call_container_timed(
     - ``status="ok"`` and the produced mutations on success,
     - ``status="timeout"`` and ``mutations=[]`` on ``asyncio.TimeoutError``,
     - ``status="failed"`` and ``mutations=[]`` on any other exception.
+
+    ``headers`` is forwarded to ``_call_container`` unchanged — see its
+    docstring for the load-test-only usage.
     """
     start = time.monotonic()
     try:
-        mutations = await asyncio.wait_for(
-            _call_container(client, container, payload, payload_bytes, timeout_s),
+        mutations, model_version = await asyncio.wait_for(
+            _call_container(client, container, payload, payload_bytes, timeout_s, headers=headers),
             timeout=timeout_s,
         )
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -202,6 +240,7 @@ async def _call_container_timed(
             status="ok",
             latency_ms=latency_ms,
             mutations=mutations,
+            model_version=model_version,
         )
     except asyncio.TimeoutError:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -297,6 +336,9 @@ async def get_mutations(request: Request) -> JSONResponse:
 
     # Emit bid outcome event (fire-and-forget, non-blocking)
     emit_bid_outcome(req, resp, start)
+    # Emit deal yield outcome event(s) for any adjust_deal mutations
+    # (fire-and-forget, non-blocking, independent of emit_bid_outcome above)
+    emit_deal_yield_outcome(req, resp)
 
     return JSONResponse(resp_dict)
 
@@ -386,7 +428,7 @@ async def list_containers(request: Request) -> JSONResponse:
     # rules-based container as degraded.
     triton_models: dict[str, dict] = {}
     if triton_ready:
-        model_names = ["dlrm_bid_shader", "ncf_deal_manager"]
+        model_names = ["dlrm_bid_shader", "ncf_deal_manager", "deal_yield_manager"]
         async with httpx.AsyncClient(timeout=2.0) as tc:
             for model_name in model_names:
                 ev = await _probe_http(tc, f"http://{triton_url}/v2/models/{model_name}/ready")
@@ -402,6 +444,7 @@ async def list_containers(request: Request) -> JSONResponse:
         "widedeep-segment-activator": None,  # rules-based, no Triton model
         "ncf-deal-manager": "ncf_deal_manager",
         "metrics-enricher": None,  # rules-based, no Triton model
+        "deal-yield-manager": "deal_yield_manager",
     }
 
     async with httpx.AsyncClient(timeout=2.0) as client:
@@ -573,6 +616,8 @@ async def mcp_proxy(request: Request) -> JSONResponse:
             )
             # Emit bid outcome event (fire-and-forget, non-blocking)
             emit_bid_outcome(req, resp, start)
+            # Emit deal yield outcome event(s) for any adjust_deal mutations
+            emit_deal_yield_outcome(req, resp)
 
             return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "result": {
                 "content": [{"type": "text", "text": json.dumps(resp.model_dump())}],
@@ -696,6 +741,47 @@ try:
 except ImportError:
     from container.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest  # noqa: E402
 
+# Governance panel API (Train-from-Load-Test + Governance Outcome Comparison
+# feature, Unit 2: train-from-load-test). Imported defensively like the
+# closed-loop API below — if unavailable, these routes are simply not
+# registered and the rest of the orchestrator is unaffected.
+_GOVERNANCE_API_AVAILABLE = False
+try:
+    try:
+        from orchestrator.governance_api import (  # noqa: E402
+            training_estimate_handler as gov_training_estimate,
+            train_handler as gov_train,
+            eligible_runs_handler as gov_eligible_runs,
+            compare_handler as gov_compare,
+            promote_handler as gov_promote,
+        )
+    except ImportError:
+        from governance_api import (  # noqa: E402
+            training_estimate_handler as gov_training_estimate,
+            train_handler as gov_train,
+            eligible_runs_handler as gov_eligible_runs,
+            compare_handler as gov_compare,
+            promote_handler as gov_promote,
+        )
+    _GOVERNANCE_API_AVAILABLE = True
+except Exception as _gov_exc:  # pragma: no cover - depends on image contents
+    logging.getLogger(__name__).warning(
+        "Governance training-trigger API unavailable (routes disabled): %s", _gov_exc
+    )
+
+
+def _governance_routes(prefix: str) -> list:
+    """Build the governance routes (training trigger + comparison/promotion) under a given prefix."""
+    if not _GOVERNANCE_API_AVAILABLE:
+        return []
+    return [
+        Route(f"{prefix}/v1/governance/training-estimate", gov_training_estimate, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
+        Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
+        Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
+    ]
+
 # Closed-loop demo API (Part 2 visualization + controllable synthetic input).
 # Imported defensively: it depends on the closed_loop_demo + agents packages,
 # which must be present in the image. If they are not, the closed-loop routes
@@ -789,6 +875,10 @@ routes = [
 # Closed-loop demo routes on both the direct ('/v1/...') and CloudFront ('/api/v1/...') prefixes.
 routes += _closed_loop_routes("")
 routes += _closed_loop_routes("/api")
+
+# Governance training-trigger routes (Train-from-Load-Test feature, Unit 2).
+routes += _governance_routes("")
+routes += _governance_routes("/api")
 
 app = Starlette(routes=routes)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])

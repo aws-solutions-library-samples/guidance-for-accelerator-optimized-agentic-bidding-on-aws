@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 from shared.feedback_collector import (
     FeedbackCollector,
     _MAX_RECORDS_PER_PUT,
@@ -34,12 +34,13 @@ from shared.feedback_collector import (
 # ---------------------------------------------------------------------------
 
 
-def _make_event(user_id_hash: str = "user_abc123", request_id_suffix: str = "0") -> BidOutcomeEvent:
-    """Create a valid BidOutcomeEvent with a given user_id_hash."""
-    return BidOutcomeEvent(
+def _make_event(user_id_hash: str = "user_abc123", request_id_suffix: str = "0") -> BidShadingOutcomeEvent:
+    """Create a valid BidShadingOutcomeEvent with a given user_id_hash."""
+    return BidShadingOutcomeEvent(
         request_id=f"a1b2c3d4-e5f6-7890-abcd-ef123456789{request_id_suffix}",
         timestamp=1718000000.0,
         model_version="v1.0.0",
+        source="live",
         original_price=5.0,
         shaded_price=4.0,
         bid_floor=2.0,
@@ -58,7 +59,7 @@ def _make_event(user_id_hash: str = "user_abc123", request_id_suffix: str = "0")
     )
 
 
-def _make_events(count: int, user_id_hash: str = "user_abc123") -> list[BidOutcomeEvent]:
+def _make_events(count: int, user_id_hash: str = "user_abc123") -> list[BidShadingOutcomeEvent]:
     """Create a list of valid BidOutcomeEvents."""
     events = []
     for i in range(count):

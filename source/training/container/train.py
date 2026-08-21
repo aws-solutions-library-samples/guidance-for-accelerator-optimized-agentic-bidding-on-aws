@@ -9,10 +9,20 @@ Environment (SageMaker convention):
     /opt/ml/input/data/training/  — Parquet training data
     /opt/ml/input/config/hyperparameters.json — Job hyperparameters
     /opt/ml/model/ — Output directory for trained ONNX model
+
+Supported model types: dlrm_bid_shader only. ncf_deal_manager is registered
+in MODEL_REGISTRY (matches the serving container split) but cannot be
+trained yet: NCFModel.forward() requires user_ids/item_ids (a per-deal
+identifier), and BidShadingOutcomeEvent/BidShadingOutcomeRecord
+(shared/feedback_models.py) never captures a deal_id anywhere in the
+schema. Adding NCF training support requires adding deal_id to that event
+schema and threading it through the Feedback Collector -> Glue ETL path
+first, not a change local to this file.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +52,69 @@ MODEL_REGISTRY = {
     "dlrm_bid_shader": "models.dlrm",
     "ncf_deal_manager": "models.ncf",
 }
+
+# DLRM dense/sparse feature columns, drawn from the real Glue ETL output
+# schema (glue_feature_engineering.py's engineer_features()/
+# compute_win_rate_buckets()) rather than a "feature_*" naming convention
+# that ETL never produces. Chosen to be known at bid time only —
+# shaded_price/shade_ratio (the model's own past decision) and roi (computed
+# from post-bid outcomes) are excluded as target leakage. Mirrors the
+# dense-feature ordering the serving container already uses
+# (source/containers/dlrm_bid_shader/app.py's _extract_features_torch:
+# [bidfloor, hour_normalized, ..., ...]) so training and serving stay
+# consistent in shape (NUM_DENSE=4, NUM_SPARSE=3 — models/__init__.py).
+_DLRM_DENSE_COLUMNS = ["bid_floor", "hour_of_day", "shade_factor_used", "conversion_value_estimate_used"]
+_DLRM_SPARSE_COLUMNS = ["device_type", "site_domain", "win_rate_bucket"]
+_DLRM_VOCAB_SIZE = 1000  # Matches models/__init__.py's DLRMModel VOCAB_SIZE.
+
+# Real outcome columns for the RL phase, in the order reward.py's
+# compute_reward() expects ([win, price_paid, revenue]). The dataframe has
+# "won" (not "win") and "conversion_value" (not "revenue") — see
+# shared/feedback_models.py's BidShadingOutcomeEvent/Record.
+_OUTCOME_COLUMNS = ["won", "price_paid", "conversion_value"]
+
+
+def _hash_to_idx(value: str, vocab: int = _DLRM_VOCAB_SIZE) -> int:
+    """Hash a categorical string to an embedding index.
+
+    Same convention as source/containers/dlrm_bid_shader/app.py's
+    _hash_to_idx, so a category maps to the same embedding slot whether
+    computed at training time or serving time.
+    """
+    return int(hashlib.md5(str(value).encode(), usedforsecurity=False).hexdigest(), 16) % vocab  # nosec B324
+
+
+def build_dlrm_features(df: pd.DataFrame) -> torch.Tensor:
+    """Build the DLRM input tensor: [dense (4) | sparse indices (3)].
+
+    Matches DLRMModel.forward()'s expected layout (models/__init__.py):
+    columns [:NUM_DENSE] are continuous features, columns
+    [NUM_DENSE:NUM_DENSE+NUM_SPARSE] are embedding indices (as floats,
+    cast to long inside the model).
+    """
+    dense = df[_DLRM_DENSE_COLUMNS].astype(float).copy()
+    # hour_of_day (0-23) normalized to [0, 1), matching the serving
+    # container's dense-feature convention (app.py: hour/24.0).
+    dense["hour_of_day"] = dense["hour_of_day"] / 24.0
+
+    sparse = pd.DataFrame({
+        col: df[col].apply(_hash_to_idx) for col in _DLRM_SPARSE_COLUMNS
+    }).astype(float)
+
+    combined = pd.concat([dense[_DLRM_DENSE_COLUMNS], sparse[_DLRM_SPARSE_COLUMNS]], axis=1)
+    return torch.tensor(combined.values, dtype=torch.float32)
+
+
+def build_features(df: pd.DataFrame, model_type: str) -> torch.Tensor:
+    """Build the model-specific input feature tensor from real ETL columns."""
+    if model_type == "dlrm_bid_shader":
+        return build_dlrm_features(df)
+    raise ValueError(
+        f"No feature-building logic for model_type '{model_type}'. "
+        "ncf_deal_manager training requires a deal_id column that "
+        "BidShadingOutcomeEvent/Record does not currently capture — see "
+        "training/container/train.py module docstring."
+    )
 
 
 def load_hyperparameters() -> dict:
@@ -80,11 +153,18 @@ def _parse_hp_value(v):
 
 
 def load_training_data(data_dir: str, model_type: str) -> pd.DataFrame:
-    """Load Parquet training data from the SageMaker training channel."""
+    """Load Parquet training data from the SageMaker training channel.
+
+    The Glue ETL job (glue_etl_cfn.yaml) writes Hive-style partitioned output
+    (window_start=.../window_end=.../*.parquet), and SageMaker preserves that
+    directory structure when it downloads the S3 training-data prefix. A
+    non-recursive glob therefore finds nothing even when the channel has
+    real data, so this must search subdirectories.
+    """
     data_path = Path(data_dir)
-    parquet_files = list(data_path.glob("*.parquet"))
+    parquet_files = list(data_path.rglob("*.parquet"))
     if not parquet_files:
-        raise FileNotFoundError(f"No .parquet files found in {data_dir}")
+        raise FileNotFoundError(f"No .parquet files found under {data_dir} (searched recursively)")
 
     logger.info("Loading %d parquet files from %s", len(parquet_files), data_dir)
     df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
@@ -247,10 +327,16 @@ def export_to_onnx(model: nn.Module, model_type: str, output_dir: str) -> str:
 
     output_path = os.path.join(output_dir, "model.onnx")
 
-    # Create dummy input matching the model's expected input shape
+    # Create dummy input matching the model's expected input shape.
+    # DLRMModel.forward() (models/__init__.py) slices a single combined
+    # tensor into dense [:NUM_DENSE] and sparse [NUM_DENSE:NUM_DENSE+NUM_SPARSE]
+    # — width 4+3=7, not 4. A width-4 dummy previously went unnoticed because
+    # earlier bugs (empty parquet glob, then an empty feature tensor) meant
+    # training always failed before reaching export.
     if model_type == "dlrm_bid_shader":
-        dummy = torch.randn(1, 4)  # dense_features
-        input_names = ["dense_features"]
+        from models import NUM_DENSE, NUM_SPARSE
+        dummy = torch.randn(1, NUM_DENSE + NUM_SPARSE)
+        input_names = ["features"]
     elif model_type == "ncf_deal_manager":
         dummy = torch.randn(1, 2)  # [user_id, item_id] as floats for export
         input_names = ["features"]
@@ -292,12 +378,20 @@ def main():
     logger.info("Model parameters: %d (%.2f MB)", param_count, param_count * 4 / 1e6)
 
     # Prepare data loaders
-    features = torch.tensor(df.filter(like="feature_").values, dtype=torch.float32)
+    features = build_features(df, model_type)
     labels = torch.tensor(df["label"].values, dtype=torch.float32)
 
-    # Optional outcome columns for RL
-    outcome_cols = [c for c in df.columns if c in ("win", "price_paid", "revenue")]
-    outcomes = torch.tensor(df[outcome_cols].values, dtype=torch.float32) if outcome_cols else None
+    # Optional outcome columns for RL: [won, price_paid, conversion_value],
+    # matching reward.py's compute_reward() column order ([win, price_paid,
+    # revenue]). Missing conversion_value (no conversion) becomes 0.0 —
+    # compute_reward() already treats revenue=0 as "no revenue", not a
+    # fabricated outcome.
+    outcome_cols = [c for c in _OUTCOME_COLUMNS if c in df.columns]
+    outcomes = (
+        torch.tensor(df[outcome_cols].fillna(0).astype(float).values, dtype=torch.float32)
+        if len(outcome_cols) == len(_OUTCOME_COLUMNS)
+        else None
+    )
 
     # Train/val split
     n = len(features)

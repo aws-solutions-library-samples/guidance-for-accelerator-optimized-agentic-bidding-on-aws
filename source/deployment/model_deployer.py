@@ -246,6 +246,7 @@ class TritonModelLoader:
     """
 
     _MODEL_PLAN = "model.plan"
+    _MODEL_XGBOOST_JSON = "xgboost.json"
 
     def __init__(
         self,
@@ -401,6 +402,20 @@ class TritonModelLoader:
     def canary_name(base_model: str) -> str:
         return f"{base_model}_canary"
 
+    def canary_engine_uri(self, base_model: str) -> str:
+        """Return the deterministic S3 URI of a staged canary's engine file.
+
+        Follows this class's own documented repo layout
+        (``<repo_prefix>/<m>_canary/1/model.plan``) — the same path
+        stage_canary() writes to. Useful for callers that need to reference
+        an already-staged canary's engine without holding onto
+        CanaryDeployer's in-process DeploymentState (e.g. a promotion flow
+        running in a different process than the one that called
+        deploy_canary()).
+        """
+        canary = self.canary_name(base_model)
+        return f"s3://{self._model_bucket}/{self._key(canary, '1', self._MODEL_PLAN)}"
+
     async def stage_canary(self, base_model: str, engine_uri: str) -> str:
         """Create the ``<base>_canary`` model in the S3 repo from an engine.
 
@@ -447,14 +462,74 @@ class TritonModelLoader:
         logger.info("Promoted %s: published stable v%d", stable, next_version)
         return next_version
 
+    async def stage_canary_fil(self, base_model: str, artifact_uri: str) -> str:
+        """FIL counterpart to stage_canary() for tree-model backends.
+
+        Triton's FIL backend (used by deal_yield_manager) loads a native
+        XGBoost artifact directly -- ``<canary>/1/xgboost.json`` -- instead
+        of a TensorRT ``model.plan`` engine. No ``ModelOptimizer.optimize()``
+        call exists in this path: FIL reads XGBoost's native format as-is,
+        there is no TensorRT compilation step for tree models. Otherwise
+        mirrors stage_canary() exactly (same config-derivation and
+        server-side-copy pattern). Raises TritonModelLoadError if the stable
+        config is missing.
+        """
+        stable = self.stable_name(base_model)
+        canary = self.canary_name(base_model)
+
+        stable_cfg = await self._get_text(self._key(stable, "config.pbtxt"))
+        if not stable_cfg:
+            raise TritonModelLoadError(
+                f"stable config not found for {stable}; cannot derive canary config",
+                model_name=canary,
+                version=1,
+            )
+        canary_cfg = stable_cfg.replace(f'"{stable}"', f'"{canary}"')
+
+        await self._put_text(self._key(canary, "config.pbtxt"), canary_cfg)
+        await self._copy_engine(artifact_uri, self._key(canary, "1", self._MODEL_XGBOOST_JSON))
+        logger.info("Staged FIL canary model %s from %s", canary, artifact_uri)
+        return canary
+
+    async def promote_fil(self, base_model: str, artifact_uri: str) -> int:
+        """FIL counterpart to promote_engine() for tree-model backends.
+
+        Publishes the native XGBoost artifact as a NEW version of
+        ``<base>_stable`` (``<stable>/<v>/xgboost.json``), same
+        version-numbering scheme as promote_engine(). Returns the new
+        version.
+        """
+        stable = self.stable_name(base_model)
+        versions = await self.list_versions(stable)
+        next_version = (max(versions) + 1) if versions else 1
+        await self._copy_engine(
+            artifact_uri, self._key(stable, str(next_version), self._MODEL_XGBOOST_JSON)
+        )
+        logger.info("Promoted %s: published stable v%d (FIL)", stable, next_version)
+        return next_version
+
     async def set_router_split(
-        self, router_model: str, canary_traffic_pct: float, canary_model: str | None = None
+        self,
+        router_model: str,
+        canary_traffic_pct: float,
+        canary_model: str | None = None,
+        *,
+        canary_version_arn: str | None = None,
+        stable_version_arn: str | None = None,
     ) -> None:
         """Set the router's in-memory canary split by editing its config in S3.
 
         Rewrites the ``canary_traffic_pct`` (and optionally ``canary_model``) config
         parameter and writes the config back; Triton poll mode reloads the router.
         This is a control-plane change — never a per-request lookup.
+
+        ``canary_version_arn``/``stable_version_arn``, when provided, also update
+        the router's version-ARN parameters (read by the router at execute()
+        time to populate the additive ``served_model_version`` output — see
+        source/triton/router/model.py). Omitted (None) leaves the existing
+        parameter unchanged; the router config gracefully tolerates the
+        parameter being absent entirely on older-generated configs (routers
+        without ``served_model_version`` declared simply never read it).
         """
         key = self._key(router_model, "config.pbtxt")
         cfg = await self._get_text(key)
@@ -467,6 +542,10 @@ class TritonModelLoader:
         cfg = self._set_param(cfg, "canary_traffic_pct", str(canary_traffic_pct))
         if canary_model is not None:
             cfg = self._set_param(cfg, "canary_model", canary_model)
+        if canary_version_arn is not None:
+            cfg = self._set_param(cfg, "canary_version_arn", canary_version_arn)
+        if stable_version_arn is not None:
+            cfg = self._set_param(cfg, "stable_version_arn", stable_version_arn)
         await self._put_text(key, cfg)
         logger.info(
             "Router %s split set to %.1f%% (canary_model=%s)",

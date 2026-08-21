@@ -54,6 +54,7 @@ REMOTE_CONTAINERS = [
     {"name": "widedeep-segment-activator", "url": os.environ.get("WIDEDEEP_URL", "http://localhost:50062/mutate")},
     {"name": "ncf-deal-manager", "url": os.environ.get("NCF_URL", "http://localhost:50063/mutate")},
     {"name": "metrics-enricher", "url": os.environ.get("METRICS_URL", "http://localhost:50064/mutate")},
+    {"name": "deal-yield-manager", "url": os.environ.get("YIELD_URL", "http://localhost:50065/mutate")},
 ]
 
 # Local mutate functions (loaded lazily)
@@ -85,6 +86,11 @@ def _load_local_mutators():
         _local_mutators.append(("metrics-enricher", metrics))
     except ImportError as e:
         logger.warning("Metrics container not available locally: %s", e)
+    try:
+        from containers.deal_yield_manager.app import mutate as yield_mgr
+        _local_mutators.append(("deal-yield-manager", yield_mgr))
+    except ImportError as e:
+        logger.warning("Deal Yield Manager container not available locally: %s", e)
     return _local_mutators
 
 

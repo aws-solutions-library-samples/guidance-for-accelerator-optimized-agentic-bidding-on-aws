@@ -21,19 +21,19 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.artf_types import AdjustBidPayload, Mutation, RTBRequest, RTBResponse, Metadata
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 
-class TestBuildBidOutcomeEvent:
+class TestBuildBidShadingOutcomeEvent:
     """Tests for _build_bid_outcome_event event construction."""
 
-    def _build(self, req: RTBRequest, resp: RTBResponse) -> BidOutcomeEvent:
+    def _build(self, req: RTBRequest, resp: RTBResponse) -> BidShadingOutcomeEvent:
         """Helper to import and call _build_bid_outcome_event."""
         from orchestrator.feedback_integration import _build_bid_outcome_event
         return _build_bid_outcome_event(req, resp, time.monotonic())
 
     def test_basic_event_construction(self):
-        """A minimal request/response produces a valid BidOutcomeEvent."""
+        """A minimal request/response produces a valid BidShadingOutcomeEvent."""
         req = RTBRequest(
             id="550e8400-e29b-41d4-a716-446655440000",
             bid_request={
@@ -137,6 +137,58 @@ class TestBuildBidOutcomeEvent:
         assert event.shaded_price == 1.5
         assert event.bid_floor == 1.5
 
+    def test_source_defaults_to_live(self):
+        """When no source kwarg is passed, the event's source defaults to 'live'."""
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 1.0}]},
+        )
+        resp = RTBResponse(id=req.id, mutations=[])
+
+        event = self._build(req, resp)
+        assert event.source == "live"
+
+    def test_source_load_test_propagated(self):
+        """Passing source='load_test' produces an event labeled accordingly."""
+        from orchestrator.feedback_integration import _build_bid_outcome_event
+
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 1.0}]},
+        )
+        resp = RTBResponse(id=req.id, mutations=[])
+
+        event = _build_bid_outcome_event(
+            req, resp, time.monotonic(), source="load_test"
+        )
+        assert event.source == "load_test"
+
+    def test_model_version_default_placeholder(self):
+        """Without an explicit model_version, the placeholder is used."""
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 1.0}]},
+        )
+        resp = RTBResponse(id=req.id, mutations=[])
+
+        event = self._build(req, resp)
+        assert event.model_version == "orchestrator-v1"
+
+    def test_model_version_resolved_value_used(self):
+        """A caller-supplied model_version overrides the placeholder."""
+        from orchestrator.feedback_integration import _build_bid_outcome_event
+
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 1.0}]},
+        )
+        resp = RTBResponse(id=req.id, mutations=[])
+
+        event = _build_bid_outcome_event(
+            req, resp, time.monotonic(), model_version="dlrm_bid_shader_canary:arn:aws:sagemaker:...:2"
+        )
+        assert event.model_version == "dlrm_bid_shader_canary:arn:aws:sagemaker:...:2"
+
 
 class TestEmitBidOutcome:
     """Tests for emit_bid_outcome fire-and-forget behavior."""
@@ -182,9 +234,9 @@ class TestEmitBidOutcome:
 
             asyncio.run(_run())
             mock_collector.emit.assert_called_once()
-            # Verify the emitted event is a BidOutcomeEvent
+            # Verify the emitted event is a BidShadingOutcomeEvent
             emitted_event = mock_collector.emit.call_args[0][0]
-            assert isinstance(emitted_event, BidOutcomeEvent)
+            assert isinstance(emitted_event, BidShadingOutcomeEvent)
         finally:
             feedback_integration._feedback_collector = original
 

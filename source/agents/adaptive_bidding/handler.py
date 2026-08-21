@@ -42,6 +42,13 @@ logger = logging.getLogger("agentcore.adaptive_bidding")
 # ---------------------------------------------------------------------------
 
 PARAMETER_STORE_TABLE = os.environ.get("PARAMETER_STORE_TABLE", "parameter-store")
+# Must match the table the orchestrator's /v1/closed-loop/audit endpoint reads
+# (AUDIT_TRAIL_TABLE, see orchestrator-deployment.yaml / closed_loop_cfn.yaml).
+# Without this, ParameterStore defaults audit_table_name to "{table}-audit" — a
+# table CloudFormation never creates — so every write here would silently miss
+# the real audit table the UI displays (ParameterStore's audit-write failure
+# is caught and swallowed, so this failed with no visible error).
+AUDIT_TRAIL_TABLE = os.environ.get("AUDIT_TRAIL_TABLE", "audit-trail")
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 ADAPTIVE_BIDDING_MODEL_ID = os.environ.get("ADAPTIVE_BIDDING_MODEL_ID", "")
 
@@ -82,6 +89,7 @@ async def handle_invocation(request: Request) -> JSONResponse:
         parameter_store = ParameterStore(
             table_name=PARAMETER_STORE_TABLE,
             region=AWS_REGION,
+            audit_table_name=AUDIT_TRAIL_TABLE,
         )
         cloudwatch_client = boto3.client("cloudwatch", region_name=AWS_REGION)
 
