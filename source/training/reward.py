@@ -20,7 +20,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.feedback_models import BidOutcomeRecord
+from shared.feedback_models import BidShadingOutcomeRecord
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ _DEVICE_CTR: dict[str, float] = {
 _DEFAULT_CTR: float = 0.02
 
 
-def _estimate_ctr(outcome: BidOutcomeRecord) -> float:
+def _estimate_ctr(outcome: BidShadingOutcomeRecord) -> float:
     """Estimate click-through rate based on device type.
 
     Uses a simple device-type-based baseline CTR heuristic. In production
@@ -54,14 +54,14 @@ def _estimate_ctr(outcome: BidOutcomeRecord) -> float:
 # ---------------------------------------------------------------------------
 
 
-def compute_rl_reward(outcome: BidOutcomeRecord) -> float:
+def compute_rl_reward(outcome: BidShadingOutcomeRecord) -> float:
     """Compute reinforcement learning reward for a bid outcome.
 
     Used by NeMo-RL during SageMaker training to shape the policy towards
     profitable bidding: maximizing revenue while minimizing cost.
 
     Args:
-        outcome: A validated BidOutcomeRecord from the training dataset.
+        outcome: A validated BidShadingOutcomeRecord from the training dataset.
 
     Returns:
         A scalar reward in [-1.0, 1.0].

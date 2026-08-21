@@ -146,6 +146,7 @@ class ContainerInvocationModel(BaseModel):
     status: str
     latency_ms: float
     mutations: list[Mutation] = []
+    model_version: str = ""
 
 
 class Metadata(BaseModel):

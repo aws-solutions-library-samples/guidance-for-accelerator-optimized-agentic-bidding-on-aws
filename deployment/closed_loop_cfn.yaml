@@ -168,6 +168,52 @@ Resources:
         Model versions for the NCF Deal Manager - trained on deal activation outcomes.
         Governed by the Model Governance Agent with A/B testing and guardrail checks.
 
+  # ---------------------------------------------------------------------------
+  # 3c. Deal Yield Manager (Yield Optimizer) Model Package Groups
+  #
+  # Trained via a SEPARATE path (XGBoost, source/training/xgboost_pipeline.py)
+  # from DLRM/NCF's NeMo-RL path -- see
+  # aidlc-docs/construction/deal-yield-training-pipeline/. Registered through
+  # the same genesis-registration script/convention for cross-model-type
+  # consistency.
+  #
+  # CORRECTION (found during Unit 3 implementation): Triton's FIL backend
+  # does not support multi-output regression models (confirmed against
+  # NVIDIA's official FIL backend docs) and requires exactly one
+  # input__0/output__0 tensor pair per model. The originally-designed single
+  # "deal_yield_manager" model/Model Package Group has been split into two
+  # independent single-target models -- FLOOR and MARGIN -- each with its
+  # own Model Package Group, since ADJUST_DEAL_FLOOR and ADJUST_DEAL_MARGIN
+  # are genuinely distinct intents (business-rules.md BR-5).
+  # ---------------------------------------------------------------------------
+  DealYieldManagerFloorModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-deal-yield-manager-floor'
+        - 'artf-deal-yield-manager-floor'
+      ModelPackageGroupDescription: >-
+        Model versions for the Yield Optimizer's FLOOR sub-model - trained
+        via XGBoost (Triton FIL backend, single-target regression) on deal
+        floor-multiplier outcomes for ADJUST_DEAL_FLOOR. Governed by the
+        Model Governance Agent with A/B testing and guardrail checks, same
+        as DLRM/NCF.
+
+  DealYieldManagerMarginModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-deal-yield-manager-margin'
+        - 'artf-deal-yield-manager-margin'
+      ModelPackageGroupDescription: >-
+        Model versions for the Yield Optimizer's MARGIN sub-model - trained
+        via XGBoost (Triton FIL backend, single-target regression) on deal
+        margin-value outcomes for ADJUST_DEAL_MARGIN. Governed by the Model
+        Governance Agent with A/B testing and guardrail checks, same as
+        DLRM/NCF.
+
   # NOTE: There is intentionally no Wide&Deep Segment Activator Model Package
   # Group. Segment activation was switched from a Triton Wide & Deep model to
   # deterministic rule-based logic (its ONNX graph could not be compiled to a
@@ -220,6 +266,22 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+        # The training-data bucket is SSE-KMS encrypted with KMSKeyArn (see
+        # glue_etl_cfn.yaml). Without Decrypt on that key, CreateTrainingJob's
+        # input-channel download fails with a KMS AccessDenied ClientError
+        # before training ever starts. GenerateDataKey is included so the role
+        # can also write encrypted objects if a future output path uses this
+        # same key (the model bucket is currently SSE-S3, not SSE-KMS).
+        - PolicyName: TrainingDataKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !Ref KMSKeyArn
         - PolicyName: ModelBucketReadWriteAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -429,6 +491,30 @@ Outputs:
         - HasStackPrefix
         - !Sub '${StackPrefix}-NCFModelPackageGroupName'
         - 'NCFModelPackageGroupName'
+
+  DealYieldManagerFloorModelPackageGroupName:
+    Description: SageMaker Model Package Group for the Yield Optimizer's FLOOR sub-model (deal_yield_manager_floor)
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-deal-yield-manager-floor'
+      - 'artf-deal-yield-manager-floor'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldManagerFloorModelPackageGroupName'
+        - 'DealYieldManagerFloorModelPackageGroupName'
+
+  DealYieldManagerMarginModelPackageGroupName:
+    Description: SageMaker Model Package Group for the Yield Optimizer's MARGIN sub-model (deal_yield_manager_margin)
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-deal-yield-manager-margin'
+      - 'artf-deal-yield-manager-margin'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldManagerMarginModelPackageGroupName'
+        - 'DealYieldManagerMarginModelPackageGroupName'
 
   SageMakerTrainingExecutionRoleArn:
     Description: >-

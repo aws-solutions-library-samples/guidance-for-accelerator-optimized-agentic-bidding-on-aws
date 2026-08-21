@@ -323,6 +323,19 @@ TRITON_URL = "http://triton-internal:8000"
 BASE_MODEL = "dlrm_bid_shader"
 ENGINE_URI = f"s3://{MODEL_BUCKET}/optimized-models/dlrm_bid_shader/model.engine"
 
+# FIL backend (deal_yield_manager_floor) — native XGBoost artifact, not a
+# TensorRT engine. stage_canary_fil()/promote_fil() are generic over
+# base_model, so this single-target name exercises them identically to how
+# deal_yield_manager_margin (the sibling single-target model -- see
+# aidlc-docs/construction/deal-yield-training-pipeline/tasks.md Group 1's
+# FIL multi-output-limitation correction) would.
+FIL_BASE_MODEL = "deal_yield_manager_floor"
+FIL_ARTIFACT_URI = f"s3://{MODEL_BUCKET}/training-output/deal_yield_manager_floor/xgboost.json"
+_FIL_STABLE_CONFIG = (
+    'name: "deal_yield_manager_floor_stable"\nbackend: "fil"\n'
+    'parameters { key: "model_type" value: { string_value: "xgboost_json" } }\n'
+)
+
 
 class TestTritonModelLoader:
     def _make_loader(
@@ -342,6 +355,16 @@ class TestTritonModelLoader:
 
     def _key(self, *parts: str) -> str:
         return "/".join(["triton-models", *parts])
+
+    def test_canary_engine_uri_matches_stage_canary_write_path(self):
+        """canary_engine_uri() must return exactly the path stage_canary()
+        writes the engine to — this is what PromotionService relies on to
+        reconstruct a staged canary's engine location cross-process,
+        without depending on CanaryDeployer's in-memory DeploymentState."""
+        s3 = FakeS3()
+        loader = self._make_loader(s3)
+        expected = f"s3://{MODEL_BUCKET}/{self._key(f'{BASE_MODEL}_canary', '1', 'model.plan')}"
+        assert loader.canary_engine_uri(BASE_MODEL) == expected
 
     @pytest.mark.asyncio
     async def test_stage_canary_derives_config_and_copies_engine(self):
@@ -398,6 +421,56 @@ class TestTritonModelLoader:
 
         assert new_version == 1
         assert self._key(f"{BASE_MODEL}_stable", "1", "model.plan") in s3.objects
+
+    # ------------------------------------------------------------------
+    # FIL backend variants (deal_yield_manager) — native XGBoost artifact,
+    # no TensorRT engine, no ModelOptimizer.optimize() call in this path.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_stage_canary_fil_derives_config_and_copies_artifact(self):
+        s3 = FakeS3({
+            self._key(f"{FIL_BASE_MODEL}_stable", "config.pbtxt"): _FIL_STABLE_CONFIG.encode()
+        })
+        loader = self._make_loader(s3)
+
+        canary = await loader.stage_canary_fil(FIL_BASE_MODEL, FIL_ARTIFACT_URI)
+
+        assert canary == f"{FIL_BASE_MODEL}_canary"
+        canary_cfg = s3.objects[self._key(f"{FIL_BASE_MODEL}_canary", "config.pbtxt")].decode()
+        assert f'name: "{FIL_BASE_MODEL}_canary"' in canary_cfg
+        assert f"{FIL_BASE_MODEL}_stable" not in canary_cfg
+        # Native XGBoost JSON copied to the canary version dir (not model.plan).
+        assert self._key(f"{FIL_BASE_MODEL}_canary", "1", "xgboost.json") in s3.objects
+        assert self._key(f"{FIL_BASE_MODEL}_canary", "1", "model.plan") not in s3.objects
+
+    @pytest.mark.asyncio
+    async def test_stage_canary_fil_missing_stable_config_raises(self):
+        s3 = FakeS3()  # no stable config present
+        loader = self._make_loader(s3)
+
+        with pytest.raises(TritonModelLoadError):
+            await loader.stage_canary_fil(FIL_BASE_MODEL, FIL_ARTIFACT_URI)
+
+    @pytest.mark.asyncio
+    async def test_promote_fil_publishes_next_version(self):
+        s3 = FakeS3({self._key(f"{FIL_BASE_MODEL}_stable", "1", "xgboost.json"): b"v1-artifact"})
+        loader = self._make_loader(s3)
+
+        new_version = await loader.promote_fil(FIL_BASE_MODEL, FIL_ARTIFACT_URI)
+
+        assert new_version == 2
+        assert self._key(f"{FIL_BASE_MODEL}_stable", "2", "xgboost.json") in s3.objects
+
+    @pytest.mark.asyncio
+    async def test_promote_fil_first_version_when_none(self):
+        s3 = FakeS3()  # no existing stable versions
+        loader = self._make_loader(s3)
+
+        new_version = await loader.promote_fil(FIL_BASE_MODEL, FIL_ARTIFACT_URI)
+
+        assert new_version == 1
+        assert self._key(f"{FIL_BASE_MODEL}_stable", "1", "xgboost.json") in s3.objects
 
     @pytest.mark.asyncio
     async def test_list_versions_returns_sorted_numeric_dirs(self):

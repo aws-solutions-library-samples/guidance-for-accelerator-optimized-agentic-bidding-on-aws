@@ -20,6 +20,15 @@ spec:
         app: artf
         component: orchestrator
     spec:
+      # Pin to the CPU/services node group. The orchestrator is a lightweight
+      # always-on router with no GPU workload — without this it can schedule
+      # onto the GPU/inference node, whose node role never gets the
+      # closed-loop IAM policy attached (deploy.sh Step 7.7 attaches it only
+      # to the services node group), causing every DynamoDB
+      # parameter-store/audit-trail read from that pod to fail with
+      # AccessDeniedException.
+      nodeSelector:
+        role: services
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -40,14 +49,20 @@ spec:
             - containerPort: 8000
               name: http
           env:
+            # Service DNS names below match the k8s Service names in
+            # artf-containers-deployment.yaml (job-oriented display names — see
+            # RENAME_MAP.md). Env var names are unchanged internal identifiers
+            # read by source/orchestrator/app.py.
             - name: DLRM_URL
-              value: "http://dlrm-bid-shader:8081"
+              value: "http://bid-pricer:8081"
             - name: WIDEDEEP_URL
-              value: "http://widedeep-segment-activator:8081"
+              value: "http://audience-activator:8081"
             - name: NCF_URL
-              value: "http://ncf-deal-manager:8081"
+              value: "http://deal-scorer:8081"
             - name: METRICS_URL
-              value: "http://metrics-enricher:8081"
+              value: "http://signals-enricher:8081"
+            - name: YIELD_URL
+              value: "http://yield-optimizer:8081"
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME
@@ -68,6 +83,46 @@ spec:
               value: "__PARAMETER_STORE_TABLE__"
             - name: AUDIT_TRAIL_TABLE
               value: "__AUDIT_TRAIL_TABLE__"
+            # SageMaker Model Package Group names, stack-prefix-aware to match
+            # closed_loop_cfn.yaml's HasStackPrefix naming (e.g.
+            # "dv2-artf-dlrm-bid-shader"). Without these, closed_loop_api.py's
+            # _model_group() falls back to the unprefixed default
+            # ("artf-dlrm-bid-shader"), which does not exist when a stack
+            # prefix is in use — the Governance page's model registry list
+            # would query a group name that was never created.
+            - name: CLOSED_LOOP_MODEL_GROUP_DLRM_BID_SHADER
+              value: "__DLRM_MODEL_GROUP__"
+            - name: CLOSED_LOOP_MODEL_GROUP_NCF_DEAL_MANAGER
+              value: "__NCF_MODEL_GROUP__"
+            # Governance panel on-demand training trigger (Train-from-Load-Test
+            # feature, Unit 2). Reuses the SageMaker training execution role
+            # and buckets closed_loop_cfn.yaml already provisions (Condition:
+            # HasTrainingBuckets) — same infra the scheduled retraining Lambda
+            # uses, not a new/parallel setup.
+            - name: SAGEMAKER_TRAINING_ROLE_ARN
+              value: "__SAGEMAKER_TRAINING_ROLE_ARN__"
+            - name: MODEL_BUCKET
+              value: "__MODEL_BUCKET__"
+            - name: TRAINING_DATA_BUCKET
+              value: "__TRAINING_DATA_BUCKET__"
+            - name: TRAINING_IMAGE_REGISTRY
+              value: "__TRAINING_IMAGE_REGISTRY__"
+            # Feedback pipeline (source/orchestrator/feedback_integration.py):
+            # emits real BidShadingOutcomeEvents (live traffic + load-test outcome
+            # capture) to the Kinesis stream created by feedback_pipeline_cfn.yaml
+            # / deploy_closed_loop.sh Step 1. Left empty (--with-retraining not
+            # used) means emission is a documented no-op, not a fabricated
+            # success — see FeedbackCollector's own "unset -> disabled" contract.
+            - name: FEEDBACK_STREAM_NAME
+              value: "__FEEDBACK_STREAM_NAME__"
+            # Deal yield feedback pipeline (source/orchestrator/
+            # deal_yield_feedback.py): emits real DealYieldOutcomeEvents for
+            # ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN mutations. Separate stream
+            # from FEEDBACK_STREAM_NAME above -- see
+            # aidlc-docs/construction/deal-yield-outcome-capture/functional-design/
+            # for why. Same "unset -> disabled, not fabricated" contract.
+            - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
+              value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.

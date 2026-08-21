@@ -18,6 +18,12 @@ input [
     name: "item_ids"
     data_type: TYPE_INT64
     dims: [ 1 ]
+  },
+  {
+    name: "target_variant"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
   }
 ]
 
@@ -26,13 +32,25 @@ output [
     name: "relevance_scores"
     data_type: TYPE_FP32
     dims: [ 1 ]
+  },
+  {
+    name: "served_variant"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "served_model_version"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
   }
 ]
 
 parameters [
   { key: "stable_model", value: { string_value: "ncf_deal_manager_stable" } },
   { key: "canary_model", value: { string_value: "ncf_deal_manager_canary" } },
-  { key: "canary_traffic_pct", value: { string_value: "0" } }
+  { key: "canary_traffic_pct", value: { string_value: "0" } },
+  { key: "stable_version_arn", value: { string_value: "" } },
+  { key: "canary_version_arn", value: { string_value: "" } }
 ]
 
 instance_group [

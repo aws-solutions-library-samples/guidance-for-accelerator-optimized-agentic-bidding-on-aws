@@ -1,4 +1,3 @@
-import NvidiaLogo from "../logos/Nvidia_logo.svg";
 import { isAuthConfigured, signOut, getCurrentUserEmail } from "../auth";
 import { useState, useEffect } from "react";
 
@@ -16,7 +15,6 @@ export default function Header({ loading, error, onContainersClick, view, onView
   return (
     <header className="header">
       <div className="header-brand">
-        <img src={NvidiaLogo} alt="NVIDIA" className="header-logo" />
         <div>
           <h1>ARTF Containers on AWS</h1>
           <div className="subtitle">Low Latency Agentic Bidstream Mutations</div>

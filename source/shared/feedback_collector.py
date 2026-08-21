@@ -1,6 +1,6 @@
 """Feedback Collector — emits bid outcome events to Kinesis Data Streams.
 
-Writes BidOutcomeEvent records to Amazon Kinesis without blocking the
+Writes BidShadingOutcomeEvent records to Amazon Kinesis without blocking the
 real-time bid path. Implements:
 
 - Partitioning by ``user_id_hash`` for per-user ordering
@@ -21,7 +21,7 @@ from typing import Optional
 
 import boto3
 
-from shared.feedback_models import BidOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class FeedbackCollector:
         self._max_queue_size = max_queue_size
 
         # Bounded deque for drop-oldest backpressure
-        self._queue: deque[BidOutcomeEvent] = deque(maxlen=max_queue_size)
+        self._queue: deque[BidShadingOutcomeEvent] = deque(maxlen=max_queue_size)
 
         # boto3 clients (sync — run in executor for async)
         self._kinesis_client = boto3.client(
@@ -70,7 +70,7 @@ class FeedbackCollector:
     # Public API
     # ------------------------------------------------------------------
 
-    async def emit(self, event: BidOutcomeEvent) -> None:
+    async def emit(self, event: BidShadingOutcomeEvent) -> None:
         """Write a single outcome event to Kinesis (async, fire-and-forget).
 
         The event is enqueued internally with drop-oldest backpressure, then
@@ -79,7 +79,7 @@ class FeedbackCollector:
         self._enqueue(event)
         await self._flush_queue(batch_size=1)
 
-    async def emit_batch(self, events: list[BidOutcomeEvent]) -> None:
+    async def emit_batch(self, events: list[BidShadingOutcomeEvent]) -> None:
         """Batch-write outcome events to Kinesis (up to 500 per PutRecords call).
 
         Events are enqueued with drop-oldest backpressure and flushed in
@@ -94,7 +94,7 @@ class FeedbackCollector:
     # Internal queue management
     # ------------------------------------------------------------------
 
-    def _enqueue(self, event: BidOutcomeEvent) -> None:
+    def _enqueue(self, event: BidShadingOutcomeEvent) -> None:
         """Add event to bounded queue. Oldest events are dropped when full."""
         # deque(maxlen=N) automatically drops the oldest item on append
         # when at capacity — this implements drop-oldest backpressure.
@@ -103,7 +103,7 @@ class FeedbackCollector:
     async def _flush_queue(self, batch_size: int) -> None:
         """Drain the internal queue in batches and write to Kinesis."""
         while self._queue:
-            batch: list[BidOutcomeEvent] = []
+            batch: list[BidShadingOutcomeEvent] = []
             for _ in range(min(batch_size, len(self._queue))):
                 batch.append(self._queue.popleft())
 
@@ -113,7 +113,7 @@ class FeedbackCollector:
     # Kinesis write
     # ------------------------------------------------------------------
 
-    async def _put_records(self, events: list[BidOutcomeEvent]) -> None:
+    async def _put_records(self, events: list[BidShadingOutcomeEvent]) -> None:
         """Write a batch of events to Kinesis via PutRecords.
 
         On any failure: logs, increments CloudWatch metric, drops events.
@@ -164,8 +164,8 @@ class FeedbackCollector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _serialize_event(event: BidOutcomeEvent) -> bytes:
-        """Serialize a BidOutcomeEvent to JSON bytes for Kinesis."""
+    def _serialize_event(event: BidShadingOutcomeEvent) -> bytes:
+        """Serialize a BidShadingOutcomeEvent to JSON bytes for Kinesis."""
         return json.dumps(event.model_dump(), default=str).encode("utf-8")
 
     # ------------------------------------------------------------------

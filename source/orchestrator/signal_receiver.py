@@ -9,7 +9,7 @@ and conversion signals and associates them with the originating bid by
    (fire-and-forget, same pattern as bid outcomes)
 3. Passed to the in-memory ``SignalAssociator`` for immediate enrichment
 
-The Glue ETL job joins SignalEvents with their originating BidOutcomeEvents
+The Glue ETL job joins SignalEvents with their originating BidShadingOutcomeEvents
 by ``request_id`` to produce complete training records.
 
 Requirements: 1.4

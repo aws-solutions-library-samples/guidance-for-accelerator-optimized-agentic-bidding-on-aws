@@ -1,0 +1,39 @@
+# Deal Yield Manager -- MARGIN sub-model. XGBoost regressor served via
+# Triton's FIL (Forest Inference Library) backend, for ADJUST_DEAL_MARGIN.
+# =============================================================================
+# See deal_yield_manager_floor/config.pbtxt for the full correction note --
+# this is the sibling single-target FIL model for the margin-value target.
+
+name: "deal_yield_manager_margin"
+backend: "fil"
+max_batch_size: 64
+
+input [
+  {
+    name: "input__0"
+    data_type: TYPE_FP32
+    dims: [ 7 ]
+  }
+]
+
+output [
+  {
+    name: "output__0"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+parameters [
+  { key: "model_type", value: { string_value: "xgboost_json" } },
+  { key: "output_class", value: { string_value: "false" } },
+  { key: "algo", value: { string_value: "ALGO_AUTO" } },
+  { key: "storage_type", value: { string_value: "AUTO" } }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]

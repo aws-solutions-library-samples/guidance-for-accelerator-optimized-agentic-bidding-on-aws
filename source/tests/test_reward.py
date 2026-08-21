@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.feedback_models import BidOutcomeRecord
+from shared.feedback_models import BidShadingOutcomeRecord
 from training.reward import compute_rl_reward, _estimate_ctr
 
 
@@ -22,13 +22,14 @@ from training.reward import compute_rl_reward, _estimate_ctr
 # ---------------------------------------------------------------------------
 
 
-def _make_record(**overrides) -> BidOutcomeRecord:
-    """Create a valid BidOutcomeRecord with sensible defaults, applying overrides."""
+def _make_record(**overrides) -> BidShadingOutcomeRecord:
+    """Create a valid BidShadingOutcomeRecord with sensible defaults, applying overrides."""
     defaults = {
         "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "event_timestamp": 1718000000000,
         "model_type": "dlrm_bid_shader",
         "model_version": "v1.2.3",
+        "source": "live",
         "intent": "bid",
         "original_price": 5.0,
         "shaded_price": 4.0,
@@ -53,7 +54,7 @@ def _make_record(**overrides) -> BidOutcomeRecord:
         "partition_hour": 14,
     }
     defaults.update(overrides)
-    return BidOutcomeRecord(**defaults)
+    return BidShadingOutcomeRecord(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +370,7 @@ class TestEdgeCases:
     def test_price_paid_none_uses_shaded_price(self):
         """When price_paid is None (won=True possible only if it's set,
         but if somehow None), falls back to shaded_price."""
-        # Note: BidOutcomeRecord allows price_paid=None even when won=True
+        # Note: BidShadingOutcomeRecord allows price_paid=None even when won=True
         # (the model doesn't enforce it), so we test fallback behavior.
         # Actually, looking at the model, price_paid can be None when won is True
         # since there's no validator preventing that combination.

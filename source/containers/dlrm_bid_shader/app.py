@@ -95,15 +95,31 @@ if USE_TRITON:
     import numpy as np
     from container.triton_inference import predict_ctr as _triton_predict_ctr
 
+    # Static placeholder — used ONLY as a fallback when the Triton router
+    # hasn't returned a resolved served_model_version (e.g. router config
+    # predates this field, or CanaryDeployer hasn't written a version-ARN
+    # yet). The per-request accurate value now comes from
+    # _predict_ctr_from_request's third return value; see FR-2 / Q1=A in
+    # the load-test-outcome-capture unit's functional design.
     MODEL_VERSION = "dlrm-nvidia-triton-v1"
 
-    def _predict_ctr_from_request(bid_request: dict) -> float:
+    def _predict_ctr_from_request(bid_request: dict) -> tuple[float, str, str]:
+        """Returns (ctr, served_variant, served_model_version).
+
+        served_variant/served_model_version are the router's real per-request
+        resolution ("" if unavailable — a real "unknown", not fabricated).
+        Reads the load-test-only target-variant override from
+        shared.load_test_context, which is None for all live traffic.
+        """
+        from shared.load_test_context import get_target_variant
+
         dense, s_user, s_domain, s_device = _extract_features_np(bid_request)
         return _triton_predict_ctr(
             dense_features=dense,
             sparse_user=s_user,
             sparse_domain=s_domain,
             sparse_device=s_device,
+            target_variant=get_target_variant(),
         )
 
     def _extract_features_np(bid_request: dict):
@@ -175,10 +191,16 @@ else:
     _model.eval()
     MODEL_VERSION = "dlrm-nvidia-arch-v1"
 
-    def _predict_ctr_from_request(bid_request: dict) -> float:
+    def _predict_ctr_from_request(bid_request: dict) -> tuple[float, str, str]:
+        """Returns (ctr, served_variant, served_model_version).
+
+        The non-Triton (inline PyTorch) path has no canary/variant concept —
+        served_variant/served_model_version are always "" (a real "unknown",
+        not fabricated), matching this container's static MODEL_VERSION.
+        """
         dense, sparse = _extract_features_torch(bid_request)
         with torch.no_grad():
-            return _model(dense, sparse).item()
+            return _model(dense, sparse).item(), "", ""
 
     def _extract_features_torch(bid_request: dict):
         imps = bid_request.get("imp", [{}])
@@ -239,7 +261,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
         cache = _get_parameter_cache()
         conversion_value = cache.get_conversion_value() if cache else EST_CONVERSION_VALUE
 
-    predicted_ctr = _predict_ctr_from_request(req.bid_request)
+    predicted_ctr, served_variant, served_model_version = _predict_ctr_from_request(req.bid_request)
 
     mutations: list[Mutation] = []
     for seatbid in bid_response.get("seatbid", []):
@@ -264,7 +286,21 @@ def mutate(req: RTBRequest) -> RTBResponse:
                     adjust_bid=AdjustBidPayload(price=round(shaded, 4)),
                 ))
 
-    return RTBResponse(id=req.id, mutations=mutations, metadata=Metadata(api_version="1.0", model_version=MODEL_VERSION))
+    # Per-request resolved model_version replaces the static MODEL_VERSION
+    # constant whenever the Triton router returned a real one (this applies
+    # to ALL traffic, live and load-test alike — see Q1=A in the
+    # load-test-outcome-capture unit's functional design). Falls back to the
+    # static constant when the router hasn't resolved a version yet (e.g.
+    # no version-ARN written by CanaryDeployer) — never blocks the response.
+    resolved_model_version = served_model_version or MODEL_VERSION
+    return RTBResponse(
+        id=req.id,
+        mutations=mutations,
+        metadata=Metadata(
+            api_version="1.0",
+            model_version=resolved_model_version,
+        ),
+    )
 
 
 if __name__ == "__main__":

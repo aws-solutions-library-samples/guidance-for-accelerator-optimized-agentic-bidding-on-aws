@@ -372,6 +372,8 @@ class TestMainCli:
                 "--region", "us-east-1",
                 "--dlrm-package-group", "artf-dlrm-bid-shader",
                 "--ncf-package-group", "artf-ncf-deal-manager",
+                "--yield-floor-package-group", "artf-deal-yield-manager-floor",
+                "--yield-margin-package-group", "artf-deal-yield-manager-margin",
             ]
         )
         assert exit_code == 0
@@ -388,6 +390,8 @@ class TestMainCli:
                 "--region", "us-east-1",
                 "--dlrm-package-group", "artf-dlrm-bid-shader",
                 "--ncf-package-group", "artf-ncf-deal-manager",
+                "--yield-floor-package-group", "artf-deal-yield-manager-floor",
+                "--yield-margin-package-group", "artf-deal-yield-manager-margin",
             ]
         )
         assert exit_code == 1

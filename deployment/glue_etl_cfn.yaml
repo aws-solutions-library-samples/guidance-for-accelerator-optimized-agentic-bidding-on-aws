@@ -24,6 +24,15 @@ Parameters:
     Description: >-
       Name of the S3 bucket where labeled training data will be written
 
+  RawOutcomesGlueDatabaseName:
+    Type: String
+    Default: feedback_pipeline
+    Description: >-
+      Name of the Glue Data Catalog database created by feedback_pipeline_cfn.yaml
+      (its GlueDatabaseName output — e.g. "feedback_pipeline" unprefixed, or
+      "<prefix>_feedback_pipeline" when a stack prefix is used). Must match
+      exactly, or the ETL job's "Table or view not found" error will occur.
+
   GlueWorkerType:
     Type: String
     Default: G.1X
@@ -204,8 +213,18 @@ Resources:
                   - glue:BatchGetPartition
                 Resource:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/feedback_pipeline'
-                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/feedback_pipeline/raw_bid_outcomes'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${RawOutcomesGlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${RawOutcomesGlueDatabaseName}/raw_bid_outcomes'
+              - Effect: Allow
+                # --enable-glue-datacatalog requires glue:CreateDatabase per
+                # AWS docs ("a database called 'default' is created in the
+                # Data Catalog if it does not exist") -- scoped to the
+                # account's default database only, not a broad grant.
+                Action:
+                  - glue:CreateDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
         - PolicyName: CloudWatchLogsAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -242,9 +261,16 @@ Resources:
         '--job-bookmark-option': job-bookmark-enable
         '--enable-metrics': 'true'
         '--enable-continuous-cloudwatch-log': 'true'
-        '--database_name': feedback_pipeline
+        # Required for spark.read.table("<db>.<table>") to resolve against the
+        # Glue Data Catalog as an external Hive metastore -- without it Spark
+        # SQL has no metastore at all and raises "Table or view not found"
+        # even when the table genuinely exists and IAM permissions are correct
+        # (confirmed live). See AWS docs: "AWS Glue Data Catalog support for
+        # Spark SQL jobs".
+        '--enable-glue-datacatalog': ''
+        '--database_name': !Ref RawOutcomesGlueDatabaseName
         '--table_name': raw_bid_outcomes
-        '--output_path': !Sub 's3://${TrainingDataBucket}/training-data/'
+        '--output_bucket': !Ref TrainingDataBucket
         '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp/'
       GlueVersion: '4.0'
       WorkerType: !Ref GlueWorkerType
@@ -271,8 +297,15 @@ Resources:
       Actions:
         - JobName: !Ref FeatureEngineeringJob
           Arguments:
-            '--start_timestamp': !Sub '${ScheduleIntervalHours}h_ago_epoch_millis'
-            '--end_timestamp': 'now_epoch_millis'
+            # No window_start/window_end here: CloudFormation can only render
+            # static values at template time, not a computed "now" or "N
+            # hours ago" timestamp. window_hours is a static duration the
+            # script uses to self-compute its own rolling window at
+            # execution time (see glue_feature_engineering.py's
+            # _resolve_window()) — this is what actually makes the schedule
+            # work, unlike the previous --start_timestamp/--end_timestamp
+            # arguments which passed literal placeholder text.
+            '--window_hours': !Ref WindowDurationHours
 
 # =============================================================================
 # Outputs

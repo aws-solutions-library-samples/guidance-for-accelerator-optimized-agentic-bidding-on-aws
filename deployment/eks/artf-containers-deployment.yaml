@@ -1,30 +1,34 @@
 # ARTF container deployments.
 #
-# This guidance has four NVIDIA containers. Two model containers (DLRM, NCF)
-# delegate inference to Triton over the cluster network and hold NO GPU
+# This guidance has four NVIDIA containers. Two model containers (Bid Pricer, Deal
+# Scorer) delegate inference to Triton over the cluster network and hold NO GPU
 # themselves, so their node placement is parameterized via __ARTF_NODE_ROLE__
 # (set by deploy.sh --artf-node-role):
 #   - services (DEFAULT): run on CPU nodes — keeps load-test scale-out off the
 #     scarce GPU nodes; they reach Triton via its ClusterIP Service DNS.
 #   - inference: co-locate on the GPU node (role=inference) for minimal hop.
 # The GPU toleration is kept in both cases (harmless on CPU nodes, required on the
-# GPU node). The other two containers, the Wide & Deep Segment Activator and the
-# Metrics Enricher, are rule-based and always run on CPU nodes (role=services, no
-# GPU dependency, no Triton call). Segment activation was switched from a Triton
+# GPU node). The other two containers, the Audience Activator and the
+# Signals Enricher, are rule-based and always run on CPU nodes (role=services, no
+# GPU dependency, no Triton call). Audience activation was switched from a Triton
 # Wide & Deep model to deterministic rules (its ONNX graph could not be compiled
 # to a TensorRT engine, and it is slated to be replaced by a partner ISV
 # implementation) — see source/containers/widedeep_segment_activator/app.py.
 #
+# See RENAME_MAP.md for the display-name -> internal-identifier mapping (these
+# resource names are the new job-oriented display names; the container source
+# directories, Triton model names, and orchestrator internal keys are unchanged).
+#
 # Architecture:
-#   [DLRM / NCF] --tritonclient.http--> [Triton Server (GPU node)]
-#   [Wide & Deep Segment Activator / Metrics Enricher] (CPU node) -- rule-based, no Triton -->
+#   [Bid Pricer / Deal Scorer] --tritonclient.http--> [Triton Server (GPU node)]
+#   [Audience Activator / Signals Enricher] (CPU node) -- rule-based, no Triton -->
 
 ---
-# DLRM Bid Shader — runs on GPU node for co-location with Triton
+# Bid Pricer — runs on GPU node for co-location with Triton
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dlrm-bid-shader
+  name: bid-pricer
   labels:
     app: artf
     model: dlrm
@@ -48,7 +52,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: dlrm
-          image: __REGISTRY__/__STACK_NAME__-dlrm-bid-shader:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-bid-pricer:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
@@ -86,7 +90,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: dlrm-bid-shader
+  name: bid-pricer
 spec:
   type: ClusterIP
   ports:
@@ -104,14 +108,14 @@ spec:
     model: dlrm
 
 ---
-# Wide & Deep Segment Activator — rule-based (no Triton, no GPU); always runs
-# on CPU nodes. Segment activation was switched from a Triton Wide & Deep model
+# Audience Activator — rule-based (no Triton, no GPU); always runs
+# on CPU nodes. Audience activation was switched from a Triton Wide & Deep model
 # to deterministic rules — see
 # source/containers/widedeep_segment_activator/app.py.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: widedeep-segment-activator
+  name: audience-activator
   labels:
     app: artf
     model: widedeep
@@ -131,7 +135,7 @@ spec:
         role: services
       containers:
         - name: widedeep
-          image: __REGISTRY__/__STACK_NAME__-widedeep-segment-activator:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-audience-activator:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
@@ -158,7 +162,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: widedeep-segment-activator
+  name: audience-activator
 spec:
   type: ClusterIP
   ports:
@@ -176,11 +180,11 @@ spec:
     model: widedeep
 
 ---
-# NCF Deal Manager — runs on GPU node for co-location with Triton
+# Deal Scorer — runs on GPU node for co-location with Triton
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ncf-deal-manager
+  name: deal-scorer
   labels:
     app: artf
     model: ncf
@@ -204,7 +208,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: ncf
-          image: __REGISTRY__/__STACK_NAME__-ncf-deal-manager:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-deal-scorer:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
@@ -236,7 +240,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ncf-deal-manager
+  name: deal-scorer
 spec:
   type: ClusterIP
   ports:
@@ -254,11 +258,11 @@ spec:
     model: ncf
 
 ---
-# Metrics Enricher (no Triton — rule-based, CPU only)
+# Signals Enricher (no Triton — rule-based, CPU only)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: metrics-enricher
+  name: signals-enricher
   labels:
     app: artf
     model: metrics
@@ -278,7 +282,7 @@ spec:
         role: services
       containers:
         - name: metrics
-          image: __REGISTRY__/__STACK_NAME__-metrics-enricher:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-signals-enricher:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
@@ -305,7 +309,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: metrics-enricher
+  name: signals-enricher
 spec:
   type: ClusterIP
   ports:
@@ -332,7 +336,7 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: dlrm-bid-shader
+    name: bid-pricer
   minReplicas: 1
   maxReplicas: 5
   metrics:
@@ -352,7 +356,7 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: widedeep-segment-activator
+    name: audience-activator
   minReplicas: 1
   maxReplicas: 5
   metrics:
@@ -372,7 +376,7 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: ncf-deal-manager
+    name: deal-scorer
   minReplicas: 1
   maxReplicas: 5
   metrics:
@@ -392,7 +396,106 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: metrics-enricher
+    name: signals-enricher
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Yield Optimizer — runs on GPU node for co-location with Triton
+# (ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN via Triton FIL-backend XGBoost model)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yield-optimizer
+  labels:
+    app: artf
+    model: yield
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artf
+      model: yield
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: yield
+    spec:
+      nodeSelector:
+        role: __ARTF_NODE_ROLE__
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: yield
+          image: __REGISTRY__/__STACK_NAME__-yield-optimizer:__IMAGE_TAG__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: TRITON_URL
+              value: "triton-inference-server:8000"
+            - name: USE_TRITON
+              value: "true"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yield-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yield-optimizer
   minReplicas: 1
   maxReplicas: 5
   metrics:

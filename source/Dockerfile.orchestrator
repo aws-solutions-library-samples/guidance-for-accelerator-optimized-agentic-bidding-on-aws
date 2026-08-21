@@ -42,6 +42,13 @@ COPY shared/ /app/shared/
 COPY agents/ /app/agents/
 COPY closed_loop_demo/ /app/closed_loop_demo/
 COPY orchestrator/ /app/orchestrator/
+# deployment/: TritonModelLoader + ModelOptimizer (governance_api.py's
+# PromotionService needs TritonModelLoader for the real Promote action;
+# ModelOptimizer is imported transitively by agents.governance.integrations
+# but never invoked from the orchestrator — see promotion_service.py).
+COPY deployment/model_deployer.py /app/deployment/model_deployer.py
+COPY deployment/canary_deployer.py /app/deployment/canary_deployer.py
+COPY deployment/__init__.py /app/deployment/__init__.py
 
 RUN adduser --disabled-password --no-create-home appuser
 USER appuser

@@ -34,6 +34,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Job-oriented display names for the 4 ARTF containers — used ONLY for the ECR
+# repository name. The "key" tokens passed via --only (dlrm-bid-shader, etc.)
+# stay unchanged, matching buildspec.yml's derivation of its own KEY from the
+# (also-translated) repo name — see RENAME_MAP.md.
+display_name() {
+  case "$1" in
+    dlrm-bid-shader)             echo "bid-pricer" ;;
+    widedeep-segment-activator)  echo "audience-activator" ;;
+    ncf-deal-manager)            echo "deal-scorer" ;;
+    metrics-enricher)            echo "signals-enricher" ;;
+    deal-yield-manager)          echo "yield-optimizer" ;;
+    *)                           echo "$1" ;;
+  esac
+}
+
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 STACK_NAME=""
@@ -121,6 +137,17 @@ if [[ -n "${BUILD_ONLY}" ]]; then
 elif [[ "${BUILD_TARGET}" == "all" || "${BUILD_TARGET}" == "nemo" ]]; then
   _BUILDS_NEMO=1
 fi
+# If neither --ngc-key nor --ngc-secret was passed on THIS invocation, check
+# whether a secret already exists from a prior run before prompting — a
+# re-run (e.g. deploy.sh --start-at) should not re-prompt for credentials
+# that are already stored in Secrets Manager for this stack.
+if [[ -z "${NGC_SECRET}" && "${_BUILDS_NEMO}" -eq 1 ]]; then
+  _EXISTING_NGC_SECRET="${STACK_NAME}-ngc-api-key"
+  if aws secretsmanager describe-secret --secret-id "${_EXISTING_NGC_SECRET}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log "Found existing NGC secret for this stack: ${_EXISTING_NGC_SECRET} (reusing, no prompt)"
+    NGC_SECRET="${_EXISTING_NGC_SECRET}"
+  fi
+fi
 if [[ -z "${NGC_SECRET}" && "${_BUILDS_NEMO}" -eq 1 ]]; then
   # NOTE: the 'optimizer' target builds on the PUBLIC nvcr.io/nvidia/tensorrt image,
   # which needs no NGC auth — so it is intentionally NOT in this prompt condition
@@ -171,10 +198,11 @@ log "CodeBuild stack ready"
 # =========================================================================
 log "Ensuring ECR repositories exist..."
 REPOS=(
-  "${STACK_NAME}-dlrm-bid-shader"
-  "${STACK_NAME}-widedeep-segment-activator"
-  "${STACK_NAME}-ncf-deal-manager"
-  "${STACK_NAME}-metrics-enricher"
+  "${STACK_NAME}-$(display_name dlrm-bid-shader)"
+  "${STACK_NAME}-$(display_name widedeep-segment-activator)"
+  "${STACK_NAME}-$(display_name ncf-deal-manager)"
+  "${STACK_NAME}-$(display_name metrics-enricher)"
+  "${STACK_NAME}-$(display_name deal-yield-manager)"
   "${STACK_NAME}-orchestrator"
   "${STACK_NAME}-agentcore"
 )
