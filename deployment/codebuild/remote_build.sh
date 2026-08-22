@@ -367,6 +367,7 @@ fi
 log "Waiting for build to complete (Ctrl+C to detach; build continues remotely)..."
 
 POLL_INTERVAL=15
+POLL_START=$(date +%s)
 while true; do
   BUILD_STATUS=$(aws codebuild batch-get-builds \
     --ids "${BUILD_ID}" \
@@ -378,6 +379,8 @@ while true; do
     --region "${AWS_REGION}" \
     --query 'builds[0].currentPhase' --output text 2>/dev/null || echo "UNKNOWN")
 
+  ELAPSED=$(( $(date +%s) - POLL_START ))
+
   case "${BUILD_STATUS}" in
     SUCCEEDED)
       log "Build SUCCEEDED"
@@ -387,21 +390,32 @@ while true; do
       fail "Build ${BUILD_STATUS}. Check logs: https://${AWS_REGION}.console.aws.amazon.com/codesuite/codebuild/projects/${CB_PROJECT}/build/${BUILD_ID}?region=${AWS_REGION}"
       ;;
     IN_PROGRESS)
-      printf '\r\033[0;32m[remote-build]\033[0m Status: IN_PROGRESS  Phase: %-20s' "${PHASE}"
+      printf '\r\033[0;32m[remote-build]\033[0m Status: IN_PROGRESS  Phase: %-20s  Elapsed: %dm%02ds\n' "${PHASE}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
       sleep "${POLL_INTERVAL}"
       ;;
     *)
-      printf '\r\033[0;32m[remote-build]\033[0m Status: %-15s Phase: %-20s' "${BUILD_STATUS}" "${PHASE}"
+      printf '\r\033[0;32m[remote-build]\033[0m Status: %-15s Phase: %-20s  Elapsed: %dm%02ds\n' "${BUILD_STATUS}" "${PHASE}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
       sleep "${POLL_INTERVAL}"
       ;;
   esac
 done
 
-# Print final build duration
-DURATION=$(aws codebuild batch-get-builds \
+# Print final build duration. The `COMPLETED` phase is a terminal sentinel
+# CodeBuild appends to mark "build is done" — it never carries a
+# durationInSeconds value (always null), so querying it directly always
+# yielded the literal text "None" here. Compute the real duration instead
+# from startTime/endTime (both are populated once a build finishes).
+BUILD_TIMES=$(aws codebuild batch-get-builds \
   --ids "${BUILD_ID}" \
   --region "${AWS_REGION}" \
-  --query 'builds[0].phases[?phaseType==`COMPLETED`].durationInSeconds | [0]' --output text 2>/dev/null || echo "unknown")
+  --query 'builds[0].[startTime,endTime]' --output text 2>/dev/null || echo "")
+START_TS=$(echo "${BUILD_TIMES}" | awk '{print $1}')
+END_TS=$(echo "${BUILD_TIMES}" | awk '{print $2}')
+if [[ -n "${START_TS}" && -n "${END_TS}" && "${START_TS}" != "None" && "${END_TS}" != "None" ]]; then
+  DURATION=$(awk -v s="${START_TS}" -v e="${END_TS}" 'BEGIN{printf "%d", e-s}')
+else
+  DURATION="unknown"
+fi
 log "Build duration: ${DURATION}s"
 
 # Cleanup source from S3 (optional, keep for debugging)

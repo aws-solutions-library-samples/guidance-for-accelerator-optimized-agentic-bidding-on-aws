@@ -151,7 +151,9 @@ Resources:
         orchestrator, metrics enricher, and NeMo-RL training container.
         Also cross-compiles ARM64 images via buildx.
       ServiceRole: !GetAtt CodeBuildRole.Arn
-      TimeoutInMinutes: 60
+      # 120 min: the newer model's build (larger export/compile step) runs past
+      # the previous 60 min limit — bumped by an hour of headroom.
+      TimeoutInMinutes: 120
       Source:
         Type: NO_SOURCE
         BuildSpec: |

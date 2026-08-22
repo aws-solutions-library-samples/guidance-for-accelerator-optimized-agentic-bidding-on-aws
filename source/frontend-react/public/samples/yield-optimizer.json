@@ -1,0 +1,45 @@
+{
+  "id": "sample-yield-optimizer-001",
+  "tmax": 100,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-yield-demo-001"},
+  "applicable_intents": ["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+  "bid_request": {
+    "id": "auction-yield-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "video": {
+          "mimes": ["video/mp4"],
+          "minduration": 15,
+          "maxduration": 30,
+          "w": 1280,
+          "h": 720
+        },
+        "bidfloor": 6.00,
+        "pmp": {
+          "private_auction": true,
+          "deals": [
+            {"id": "deal-guaranteed-premium", "bidfloor": 12.00, "at": 1},
+            {"id": "deal-open-midtier", "bidfloor": 3.25, "at": 2},
+            {"id": "deal-open-remnant", "bidfloor": 0.75, "at": 2}
+          ]
+        }
+      }
+    ],
+    "site": {
+      "id": "site-sportsnetwork",
+      "domain": "sportsnetwork.example.com",
+      "cat": ["IAB17"]
+    },
+    "user": {
+      "id": "user-yield-303",
+      "yob": 1988,
+      "gender": "F"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "geo": {"country": "USA", "region": "CA"}
+    }
+  }
+}

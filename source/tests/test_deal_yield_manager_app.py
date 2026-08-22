@@ -143,3 +143,66 @@ class TestMutateNeverRaises:
         req = _req(_SAMPLE_BID_REQUEST)
         resp = deal_yield_app.mutate(req)  # must not raise
         assert resp.id == "req-1"
+
+
+class TestMutateExploration:
+    """Exercises the cold-start exploration wiring: with epsilon disabled
+    (the default), behavior is completely unchanged from before exploration
+    existed; with epsilon enabled, the genesis model's constant "no
+    change" prediction can be perturbed into a real mutation, and that
+    perturbation is disclosed via the ":explore" model_version suffix
+    (never presented as a confident model recommendation)."""
+
+    def test_epsilon_zero_default_produces_no_mutations_for_genesis_model(self, monkeypatch):
+        """Default (epsilon=0.0) behavior for a genesis-style constant
+        no-op model must be identical to pre-exploration behavior: zero
+        mutations, unsuffixed model_version."""
+        monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 0.0)
+        req = _req(_SAMPLE_BID_REQUEST)
+        resp = deal_yield_app.mutate(req)
+        assert resp.mutations == []
+        assert resp.metadata.model_version == deal_yield_app.MODEL_VERSION
+        assert not resp.metadata.model_version.endswith(":explore")
+
+    def test_epsilon_one_breaks_genesis_constant_output_into_a_real_mutation(self, monkeypatch):
+        """With exploration forced on, the genesis model's constant
+        floor_multiplier==1.0/margin_value==0.0 output can be perturbed
+        into a real, non-no-op value -- this is the actual cold-start fix:
+        real mutations get emitted, which is what lets
+        DealYieldOutcomeEvents (and therefore training data) exist at
+        all."""
+        monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 1.0)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_FLOOR_BOUND", 0.1)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_MARGIN_BOUND", 0.05)
+        monkeypatch.setattr(deal_yield_app, "_exploration_rng", __import__("random").Random(1))
+        req = _req(_SAMPLE_BID_REQUEST)
+        resp = deal_yield_app.mutate(req)
+        assert len(resp.mutations) > 0
+
+    def test_explored_response_discloses_via_model_version_suffix(self, monkeypatch):
+        """An explored response must never look like a confident model
+        recommendation -- the ':explore' suffix is the disclosure contract
+        DealYieldOutcomeEvents and any downstream training data rely on to
+        distinguish exploration from a real prediction."""
+        monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 1.0)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_FLOOR_BOUND", 0.1)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_MARGIN_BOUND", 0.05)
+        monkeypatch.setattr(deal_yield_app, "_exploration_rng", __import__("random").Random(1))
+        req = _req(_SAMPLE_BID_REQUEST)
+        resp = deal_yield_app.mutate(req)
+        assert resp.metadata.model_version.endswith(":explore")
+
+    def test_unexplored_response_never_carries_explore_suffix(self, monkeypatch):
+        """A resolved (non-genesis) model_version must not gain the
+        ':explore' suffix when exploration didn't actually fire."""
+        monkeypatch.setattr(
+            deal_yield_app, "_predict_yield",
+            lambda fv, target_variant=None: (1.0, 0.0, "stable", "arn:aws:sagemaker:...:model-package/v3"),
+        )
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 0.0)
+        req = _req(_SAMPLE_BID_REQUEST)
+        resp = deal_yield_app.mutate(req)
+        assert resp.metadata.model_version == "arn:aws:sagemaker:...:model-package/v3"
