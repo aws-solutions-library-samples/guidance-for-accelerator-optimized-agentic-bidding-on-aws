@@ -4,6 +4,17 @@ const AGE_RANGES = ["18–24", "25–34", "35–44", "45–54", "55–64", "65+"
 
 export const SCENARIOS = [
   {
+    id: "yield-optimizer",
+    name: "PMP Deals — Yield Optimizer",
+    desc: "Sports video impression with 3 private marketplace deals (guaranteed, open mid-tier, open remnant). The yield optimizer predicts a floor-price multiplier and margin adjustment per deal via an XGBoost model on Triton's FIL backend.",
+    tags: [
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
+    ],
+    file: "yield-optimizer.json",
+    controls: ["bidFloor"],
+  },
+  {
     id: "banner-basic",
     name: "Banner Ad — Segment Activation",
     desc: "ESPN sports page with a 300×250 banner. The audience activator activates audience segments via rules, the signals enricher adds viewability scores.",
@@ -44,17 +55,6 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "isv-ecosystem.json",
-    controls: ["bidFloor"],
-  },
-  {
-    id: "yield-optimizer",
-    name: "PMP Deals — Yield Optimizer",
-    desc: "Sports video impression with 3 private marketplace deals (guaranteed, open mid-tier, open remnant). The yield optimizer predicts a floor-price multiplier and margin adjustment per deal via an XGBoost model on Triton's FIL backend.",
-    tags: [
-      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
-      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
-    ],
-    file: "yield-optimizer.json",
     controls: ["bidFloor"],
   },
 ];

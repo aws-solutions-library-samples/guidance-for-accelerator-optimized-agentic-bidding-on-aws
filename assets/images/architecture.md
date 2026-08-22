@@ -8,8 +8,8 @@ the same picture in a maintainable, text-authored form.
 
 ## Solution overview
 
-The solution implements **four** ARTF-compliant (IAB Tech Lab Agentic RTB Framework)
-containers, each doing one job in the bidstream. Two run GPU-accelerated inference
+The solution implements **five** ARTF-compliant (IAB Tech Lab Agentic RTB Framework)
+containers, each doing one job in the bidstream. Three run GPU-accelerated inference
 on **NVIDIA Triton Inference Server**; two are deterministic and rule-based on CPU:
 
 | Container | What it does | ARTF intent(s) | Model (implementation detail) |
@@ -18,17 +18,20 @@ on **NVIDIA Triton Inference Server**; two are deterministic and rule-based on C
 | **Audience Activator** (`audience-activator`) | Activates audience segments from bid-request signals | `ACTIVATE_SEGMENTS` | Rule-based (no Triton) |
 | **Deal Scorer** (`deal-scorer`) | Scores and activates/suppresses PMP deals | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | NCF / NeuMF (Triton) |
 | **Signals Enricher** (`signals-enricher`) | Adds viewability + brand-safety quality signals | `ADD_METRICS` | Rule-based (no Triton) |
+| **Yield Optimizer** (`yield-optimizer`) | SSP/publisher-side: adjusts deal floors and margins | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | XGBoost via Triton FIL (Triton) |
 
-Triton serves **two models** (DLRM for the bid pricer, NCF for the deal scorer) on
-a single NVIDIA **A10G GPU** (`g5.xlarge`) with the CUDA Execution Provider; for
-higher throughput, the more powerful Amazon EC2 **G7e** instances are an
-alternative. The audience activator and signals enricher are rule-based and need
-no GPU model. The audience activator previously scored segments with a Wide & Deep
-neural network on Triton — that model's ONNX graph could not be compiled to a
-TensorRT engine (a `BatchNorm1d` fusion limitation), so it was replaced with
-transparent rules over real bid-request signals, and is slated to be replaced by a
-partner ISV implementation. See [RENAME_MAP.md](../../RENAME_MAP.md) for the full
-old-name → new-name mapping.
+Triton serves **two deep-learning models** (DLRM for the bid pricer, NCF for the
+deal scorer) plus **two independent XGBoost tree models** for the yield optimizer
+(one for floor, one for margin — Triton's Forest Inference Library backend doesn't
+support multi-output regression) on a single NVIDIA **A10G GPU** (`g5.xlarge`) with
+the CUDA Execution Provider; for higher throughput, the more powerful Amazon EC2
+**G7e** instances are an alternative. The audience activator and signals enricher
+are rule-based and need no GPU model. The audience activator previously scored
+segments with a Wide & Deep neural network on Triton — that model's ONNX graph
+could not be compiled to a TensorRT engine (a `BatchNorm1d` fusion limitation), so
+it was replaced with transparent rules over real bid-request signals, and is
+slated to be replaced by a partner ISV implementation. See
+[RENAME_MAP.md](../../RENAME_MAP.md) for the full old-name → new-name mapping.
 
 > **Serving backend.** The Part 1 baseline serves the exported ONNX models via ONNX
 > Runtime. Part 2 is a progression that upgrades Triton serving to compiled **TensorRT
@@ -47,7 +50,7 @@ old-name → new-name mapping.
 > container.
 
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
-Amazon Cognito JWT, and **fans out in parallel** to the four containers over gRPC
+Amazon Cognito JWT, and **fans out in parallel** to the five containers over gRPC
 (primary ARTF protocol) with an MCP/REST path for AI-agent and tool interoperability.
 It merges the per-container mutations into a single `RTBResponse`.
 
@@ -75,9 +78,10 @@ graph TB
         ORCH["Orchestrator (Starlette)<br/>JWT verify + parallel fan-out<br/>gRPC primary · MCP/REST"]
 
         subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G (or Amazon EC2 G7e)"]
-            TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + CUDA EP<br/>2 models on GPU"]
+            TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + FIL + CUDA EP<br/>4 models on GPU"]
             DLRM_C["Bid Pricer<br/>BID_SHADE"]
             NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
+            YIELD_C["Yield Optimizer<br/>ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN"]
         end
 
         WD_C["Audience Activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
@@ -85,7 +89,7 @@ graph TB
     end
 
     subgraph Models["Model Storage"]
-        S3M["Amazon S3 model repository<br/>dlrm_bid_shader · ncf_deal_manager<br/>(model.onnx each)"]
+        S3M["Amazon S3 model repository<br/>dlrm_bid_shader · ncf_deal_manager<br/>deal_yield_manager_floor · deal_yield_manager_margin<br/>(model.onnx / xgboost.json)"]
     end
 
     subgraph Bedrock["Amazon Bedrock AgentCore"]
@@ -103,8 +107,10 @@ graph TB
     ORCH -->|"gRPC / MCP fan-out"| WD_C
     ORCH -->|"gRPC / MCP fan-out"| NCF_C
     ORCH -->|"gRPC / MCP fan-out"| MET_C
+    ORCH -->|"gRPC / MCP fan-out"| YIELD_C
     DLRM_C -->|"tritonclient"| TRITON
     NCF_C -->|"tritonclient"| TRITON
+    YIELD_C -->|"tritonclient"| TRITON
     TRITON -.->|"load models at startup"| S3M
     AC -.->|"extend_rtb → orchestrator"| ORCH
 
@@ -113,6 +119,7 @@ graph TB
     style WD_C fill:#6366f1,color:#fff
     style NCF_C fill:#d97706,color:#fff
     style MET_C fill:#0891b2,color:#fff
+    style YIELD_C fill:#be185d,color:#fff
     style CF fill:#f59e0b,color:#000
     style S3F fill:#f59e0b,color:#000
     style COG fill:#dd6b20,color:#fff
@@ -128,13 +135,14 @@ graph TB
    **Network Load Balancer**.
 3. The **orchestrator** verifies the JWT (RS256, JWKS cached from Cognito) and rejects
    unauthenticated requests.
-4. The orchestrator **fans out the OpenRTB request in parallel** to the four
+4. The orchestrator **fans out the OpenRTB request in parallel** to the five
    containers, respecting the OpenRTB `tmax` timeout.
-5. The bid pricer and deal scorer call **Triton** via `tritonclient` for GPU
-   inference; the audience activator and signals enricher return rule-based
-   mutations.
-6. **Triton** loads the two ONNX models from the **S3 model repository** at startup
-   and runs inference on the A10G GPU (or the more powerful Amazon EC2 G7e).
+5. The bid pricer, deal scorer, and yield optimizer call **Triton** via
+   `tritonclient` for GPU inference; the audience activator and signals enricher
+   return rule-based mutations.
+6. **Triton** loads the DLRM/NCF ONNX models and the two yield optimizer XGBoost
+   models from the **S3 model repository** at startup and runs inference on the
+   A10G GPU (or the more powerful Amazon EC2 G7e).
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
    it through the NLB and CloudFront to the caller.
 
