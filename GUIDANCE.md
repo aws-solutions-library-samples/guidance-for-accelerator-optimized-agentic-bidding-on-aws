@@ -409,20 +409,30 @@ The default deployment (1 GPU node) is designed for demos and development. Produ
 
 ## Cost Estimation
 
-### EKS Production Path (GPU)
+### EKS Production Path (GPU) — Part 1 only
 
-| Resource | Configuration | Est. Monthly Cost |
-|----------|---------------|-------------------|
-| EKS Cluster | 1 cluster | $73 |
-| GPU Node (g5.xlarge) | 1 instance (On-Demand) | ~$727 |
-| CPU Nodes (c5.xlarge) | 2 instances (On-Demand) | ~$245 |
-| NAT Gateway | 1 gateway + data transfer | ~$32 |
-| S3 (Models + Frontend) | ~50 MB storage | <$1 |
-| CloudFront | Low-traffic demo | <$1 |
-| ECR | Image storage | <$1 |
-| **Estimated Total** | | **~$1,080/month** |
+All line items below are Part 1 (the real-time bidding path). This table
+assumes the GPU node runs 24/7; see [README.md](README.md#cost) for the
+lower-cost default (scheduled GPU shutdown) and the combined Part 1 + Part 2
+total, since `deploy.sh` deploys both parts by default.
+
+| Resource | Configuration | Part | Est. Monthly Cost |
+|----------|---------------|------|-------------------|
+| EKS Cluster | 1 cluster | Part 1 | $73 |
+| GPU Node (g5.xlarge) | 1 instance (On-Demand) | Part 1 | ~$727 |
+| CPU Nodes (c5.xlarge) | 2 instances (On-Demand) | Part 1 | ~$245 |
+| NAT Gateway | 1 gateway + data transfer | Part 1 | ~$32 |
+| S3 (Models + Frontend) | ~50 MB storage | Part 1 | <$1 |
+| CloudFront | Low-traffic demo | Part 1 | <$1 |
+| ECR | Image storage | Part 1 | <$1 |
+| **Part 1 total (estimate)** | | | **~$1,080/month** |
 
 GPU costs dominate. For demos: deploy, test, then `./deploy.sh --destroy` immediately. A 2-hour demo session costs approximately $3.
+
+Part 2 (closed-loop learning, deployed by default alongside Part 1) adds
+roughly $170–200/month on top of this — see
+[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for its line items, or
+[README.md](README.md#cost) for both parts combined in one table.
 
 ## Amazon Bedrock AgentCore Integration
 

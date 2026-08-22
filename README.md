@@ -95,13 +95,15 @@ Browser (React UI)
 | **Audience Activator** | Activates audience segments from bid-request signals |
 | **Deal Scorer** | Scores and activates/suppresses private marketplace deals |
 | **Signals Enricher** | Adds viewability and brand-safety quality signals |
-| **Yield Optimizer** | Publisher/SSP-side counterpart — adjusts deal floors and margins using an XGBoost model on Triton |
+| **Yield Optimizer** | Publisher/SSP-side counterpart — adjusts deal floors and margins using two independent XGBoost models (floor, margin) on Triton |
 
 See [Architecture](#architecture) for the full picture, including which containers run GPU inference on Triton and which run rule-based logic on CPU.
 
 The orchestrator fans out every incoming bid request to all five containers in parallel, merges their mutations, and returns a single response — the same fan-out list includes the yield optimizer, so it's exercised whenever a scenario carries a deal with a floor/margin-adjustable intent. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
 
 > **Note on the models.** The bundled models (DLRM, NCF, XGBoost) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
+
+> **How the Yield Optimizer breaks its own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Right inside `source/containers/deal_yield_manager/app.py`, after the model returns its prediction, an optional exploration step (`exploration.py`, off by default — set `YIELD_EXPLORATION_EPSILON` to enable) nudges the floor/margin recommendation by a small, bounded random amount instead of always returning the same answer. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what actually produces the variation the Yield Optimizer's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
 
 ### The 5 deployment phases
 
@@ -115,7 +117,7 @@ The orchestrator fans out every incoming bid request to all five containers in p
 | **4/5 — Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
 | **5/5 — Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime, then — unless you passed `--no-retraining` — deploys the entire Part 2 closed-loop stack: the bid-outcome feedback pipeline, the Glue ETL job, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously — this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
 
-**Cost while it's running:** approximately **$592/month** with the included daytime-only GPU schedule (about **$1,080/month** if the GPU node runs 24/7). See [Cost](#cost) for the breakdown. Deploy, try it, and [tear it down](#cleanup) when you're done — a short session costs a few dollars.
+**Cost while it's running:** approximately **$762/month** with the included daytime-only GPU schedule (about **$1,250/month** if the GPU node runs 24/7) — this includes Part 2 (closed-loop learning), which deploys by default. See [Cost](#cost) for the breakdown. Deploy, try it, and [tear it down](#cleanup) when you're done — a short session costs a few dollars.
 
 **Confirm everything is healthy:**
 
@@ -148,12 +150,15 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
    | Bid Shading — Price Optimization | Bid Pricer |
    | Video + PMP Deals — Deal Scoring | Deal Scorer, Signals Enricher, Yield Optimizer |
    | SSP Enrichment — 3 Containers | Audience Activator, Deal Scorer, Signals Enricher |
+   | PMP Deals — Yield Optimizer | Yield Optimizer (floor + margin adjustment) |
 
    <img src="assets/images/scenario-result.png" alt="Scenario result" height="350">
 
    The result view shows the mutated bid request, a per-container latency breakdown, and the individual mutations each container proposed.
 
 4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
+
+5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any container, including the Yield Optimizer. This isn't only a throughput demo — for the Yield Optimizer specifically, load-test traffic is the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how its training data actually gets bootstrapped before real auction outcomes accumulate. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
 
 ## Go deeper
 
@@ -167,17 +172,23 @@ Full component-by-component detail, model specifications, and a request-flow dia
 
 ### Cost
 
-Sample estimate for the default settings in `us-east-1`, assuming the included scheduled GPU shutdown (~260 GPU-hours/month):
+Sample estimate for the default settings in `us-east-1`, assuming the included scheduled GPU shutdown (~260 GPU-hours/month). `deploy.sh` deploys Part 2 (closed-loop learning) by default, so this table includes both parts, tagged by which part each line item belongs to:
 
-| AWS service | Cost [USD/month] |
-| ----------- | ----------------- |
-| Amazon EKS | $73 |
-| Amazon EC2 (GPU, ~260 hrs/mo) | $262 |
-| Amazon EC2 (CPU) | $248 |
-| Everything else (S3, CloudFront, Cognito, DynamoDB, AgentCore) | ~$9 |
-| **Total** | **~$592** |
+| AWS service | Part | Cost [USD/month] |
+| ----------- | ---- | ----------------- |
+| Amazon EKS | Part 1 | $73 |
+| Amazon EC2 (GPU, ~260 hrs/mo) | Part 1 | $262 |
+| Amazon EC2 (CPU) | Part 1 | $248 |
+| Everything else (S3, CloudFront, Cognito, DynamoDB, AgentCore) | Part 1 | ~$9 |
+| Amazon DynamoDB (parameter store, audit trail, user features) | Part 2 | ~$5 |
+| Amazon Bedrock AgentCore (Adaptive Bidding Agent) | Part 2 | ~$15 |
+| Amazon Bedrock AgentCore (Governance Agent) | Part 2 | ~$2 |
+| Amazon SageMaker Training | Part 2 | ~$60 |
+| AWS Glue (2 scheduled ETL jobs — bid outcomes, deal-yield outcomes) | Part 2 | ~$88 |
+| Amazon EventBridge Scheduler | Part 2 | <$1 |
+| **Total** | | **~$762** |
 
-Running the GPU node 24/7 instead of on the included schedule raises the total to roughly **$1,080/month**. The `g5.xlarge` line item can be swapped for the more powerful Amazon EC2 G7e instances at higher cost. Full breakdown and Part 2's additional cost: [GUIDANCE.md](GUIDANCE.md#cost-estimation) and [CLOSED_LOOP.md](CLOSED_LOOP.md#cost).
+Running the GPU node 24/7 instead of on the included schedule raises the total to roughly **$1,250/month**. The `g5.xlarge` line item can be swapped for the more powerful Amazon EC2 G7e instances at higher cost. Skip Part 2 entirely with `--no-retraining` to drop the Part 2 rows above. Full line-item detail: [GUIDANCE.md](GUIDANCE.md#cost-estimation) (Part 1) and [GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) / [CLOSED_LOOP.md](CLOSED_LOOP.md#cost) (Part 2, including the optional DAX add-on not counted above).
 
 ### Prerequisites
 
