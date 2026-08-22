@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
+from orchestrator.deal_yield_feedback import emit_load_test_deal_yield_outcome
 from orchestrator.loadtest_instrumentation import (
     aggregate_run_model_version,
     emit_load_test_outcome,
@@ -40,6 +41,7 @@ from orchestrator.loadtest_targeting import (
     is_canary_staged,
     validate_challenger_target,
 )
+from shared.artf_types import Metadata, RTBRequest, RTBResponse
 
 
 def _get_app_deps():
@@ -59,11 +61,18 @@ def _get_app_deps():
 # model-type selector today covers these two Triton-backed types plus the
 # two rule-based ones — per Q4=B, all 4 stay selectable so a future
 # Triton/canary rollout for the rule-based ones needs no API change).
+# deal_yield_manager added so the Yield Optimizer's genesis (constant-
+# output) model can accumulate real, disclosed load-test-origin outcome
+# data -- without this, ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN never had a
+# route to real training data at all (the genesis model never emits a
+# mutation on its own, so live traffic alone can never produce a signal to
+# learn from either -- see deal_yield_feedback.emit_load_test_deal_yield_outcome()).
 _TARGET_MODEL_TYPES = (
     "dlrm_bid_shader",
     "widedeep_segment_activator",
     "ncf_deal_manager",
     "metrics_enricher",
+    "deal_yield_manager",
 )
 
 # Maps a target_model_type to the CONTAINERS registry entry name it
@@ -75,6 +84,7 @@ _MODEL_TYPE_TO_CONTAINER_NAME = {
     "widedeep_segment_activator": "widedeep-segment-activator",
     "ncf_deal_manager": "ncf-deal-manager",
     "metrics_enricher": "metrics-enricher",
+    "deal_yield_manager": "deal-yield-manager",
 }
 
 
@@ -90,7 +100,7 @@ class LoadTestRequest(BaseModel):
     # realism but ignored for outcome/version purposes (Q3=A).
     target_model_type: Literal[
         "dlrm_bid_shader", "widedeep_segment_activator",
-        "ncf_deal_manager", "metrics_enricher",
+        "ncf_deal_manager", "metrics_enricher", "deal_yield_manager",
     ] | None = None
     target_variant: Literal["current", "challenger"] = "current"
 
@@ -152,13 +162,19 @@ PRESET_CONFIG = {
     "100k": {"total": 100_000, "concurrency": 100},
 }
 
-# Intents that trigger a full fan-out across all four containers
+# Intents that trigger a full fan-out across all containers. Includes
+# ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN so deal_yield_manager is actually
+# included in _filter_containers()'s fan-out below -- without these, load
+# test traffic never reached deal_yield_manager at all, regardless of
+# target_model_type targeting.
 ALL_INTENTS = [
     "ACTIVATE_SEGMENTS",
     "ACTIVATE_DEALS",
     "BID_SHADE",
     "ADD_METRICS",
     "ADD_CIDS",
+    "ADJUST_DEAL_FLOOR",
+    "ADJUST_DEAL_MARGIN",
 ]
 
 # ---------------------------------------------------------------------------
@@ -534,12 +550,33 @@ async def _run_load_test(
                     and inv.status == "ok"
                 ):
                     per_request_versions.append(inv.model_version)
-                    sample_value = emit_load_test_outcome(
-                        test_id, request_index, inv.model_version, target_model_type
-                    )
-                    outcome_sample_count += 1
-                    if len(outcome_samples) < _MAX_STORED_SAMPLES:
-                        outcome_samples.append(sample_value)
+                    if target_model_type == "deal_yield_manager":
+                        # deal_yield_manager can emit 0, 1, or 2 mutations
+                        # per request (ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN
+                        # are independent per BR-5) -- reconstruct the
+                        # RTBRequest/RTBResponse this container actually saw
+                        # and let emit_load_test_deal_yield_outcome() build
+                        # one DealYieldOutcomeEvent per adjust_deal mutation.
+                        req_model = RTBRequest(**payload)
+                        resp_model = RTBResponse(
+                            id=req_model.id,
+                            mutations=inv.mutations,
+                            metadata=Metadata(model_version=inv.model_version),
+                        )
+                        sample_values = emit_load_test_deal_yield_outcome(
+                            req_model, resp_model, run_id=test_id, request_index=request_index,
+                        )
+                        outcome_sample_count += len(sample_values)
+                        for sample_value in sample_values:
+                            if len(outcome_samples) < _MAX_STORED_SAMPLES:
+                                outcome_samples.append(sample_value)
+                    else:
+                        sample_value = emit_load_test_outcome(
+                            test_id, request_index, inv.model_version, target_model_type
+                        )
+                        outcome_sample_count += 1
+                        if len(outcome_samples) < _MAX_STORED_SAMPLES:
+                            outcome_samples.append(sample_value)
 
             _progress_completed[test_id] += 1
         except Exception:

@@ -364,9 +364,24 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # FR-12: --destroy's UX stays exactly as it was — its progress narration
   # uses say() (always-visible), not log() (verbose-gated), so teardown
   # doesn't go silent by default and look hung.
-  say "Deleting Kubernetes resources..."
-  kubectl delete -f "${SCRIPT_DIR}/eks/" --ignore-not-found 2>/dev/null || true
-  kubectl delete namespace artf --ignore-not-found 2>/dev/null || true
+  #
+  # CRITICAL: kubectl has no implicit cluster scoping — it always operates on
+  # whatever context is "current" in the shared ~/.kube/config. Running this
+  # script concurrently with ANY other deploy.sh/kubectl invocation (including
+  # against a completely different stack) races on that shared file. If another
+  # process's `aws eks update-kubeconfig` wins the race, these deletes silently
+  # wipe THAT cluster's live workloads instead of this one's — confirmed live:
+  # a concurrent deploy left another environment's Triton/orchestrator/ARTF pods
+  # deleted while its CloudFormation stacks stayed intact. Always pin --context
+  # explicitly derived from THIS run's CLUSTER_NAME; never rely on ambient state.
+  KUBE_CONTEXT="arn:aws:eks:${AWS_REGION}:${ACCOUNT_ID}:cluster/${CLUSTER_NAME}"
+  if kubectl config get-contexts "${KUBE_CONTEXT}" >/dev/null 2>&1; then
+    say "Deleting Kubernetes resources (context: ${KUBE_CONTEXT})..."
+    kubectl --context "${KUBE_CONTEXT}" delete -f "${SCRIPT_DIR}/eks/" --ignore-not-found 2>/dev/null || true
+    kubectl --context "${KUBE_CONTEXT}" delete namespace artf --ignore-not-found 2>/dev/null || true
+  else
+    warn "  No kubeconfig context for ${CLUSTER_NAME} — skipping in-cluster resource deletion (cluster likely already gone or never had kubeconfig fetched; eksctl will still tear down the cluster itself below)."
+  fi
 
   # --- VPC proxy stack FIRST: its Lambda's ENIs live in the EKS cluster's
   # private subnets. If the cluster is deleted first, those ENIs are left
@@ -751,18 +766,55 @@ ${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
 # packages are available, using the exact same known bucket path/env vars
 # (MODEL_BUCKET, AWS_REGION) the rest of this script already uses -- no new
 # environment variables introduced for this step.
-log "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
-if ! ${PYTHON} -c "import xgboost, onnxmltools" 2>/dev/null; then
-  log "  Installing xgboost/onnxmltools (best-effort, non-blocking)..."
-  ${PYTHON} -m pip install --quiet xgboost onnxmltools 2>/dev/null || true
+#
+# xgboost is pinned to 1.7.6 (not "latest") because save_model()'s JSON
+# output format changed in a later minor version to add a "cats"
+# (categorical-feature) field under gradient_booster.model -- present even
+# for models with zero categorical features. Triton 24.08's bundled FIL/
+# treelite backend predates that field and hard-fails to load the model
+# ("Error: key \"cats\" is not recognized!"), taking deal_yield_manager_floor/
+# margin down even though the exported model is otherwise valid. 1.7.6
+# matches the SageMaker training-side pin (see xgboost_pipeline.py's
+# image_uris.retrieve(..., version="1.7-1")) and the FIL backend's
+# documented support matrix (Triton 24.03-24.09 -> XGBoost JSON 1.7+,
+# no "cats" field). If a system already has a newer xgboost installed,
+# force-reinstall the pinned version rather than trusting the existing one.
+XGBOOST_PIN="xgboost==1.7.6"
+XGBOOST_OK=0
+if ${PYTHON} -c "
+import sys
+try:
+    import onnxmltools, xgboost
+except ImportError:
+    sys.exit(1)
+sys.exit(0 if xgboost.__version__ == '1.7.6' else 1)
+" 2>/dev/null; then
+  XGBOOST_OK=1
 fi
-if ${PYTHON} -c "import xgboost, onnxmltools" 2>/dev/null; then
+
+log "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
+if [[ "${XGBOOST_OK}" -ne 1 ]]; then
+  log "  Installing ${XGBOOST_PIN}/onnxmltools (best-effort, non-blocking)..."
+  ${PYTHON} -m pip install --quiet "${XGBOOST_PIN}" onnxmltools 2>/dev/null || true
+  if ${PYTHON} -c "
+import sys
+try:
+    import onnxmltools, xgboost
+except ImportError:
+    sys.exit(1)
+sys.exit(0 if xgboost.__version__ == '1.7.6' else 1)
+" 2>/dev/null; then
+    XGBOOST_OK=1
+  fi
+fi
+
+if [[ "${XGBOOST_OK}" -eq 1 ]]; then
   ${PYTHON} "${SCRIPT_DIR}/../source/training/export_xgboost_genesis.py" \
     --output-dir "${ONNX_STAGING}" \
     && log "  Genesis XGBoost artifacts exported to ${ONNX_STAGING}/" \
     || warn "  Genesis XGBoost export failed - deal_yield_manager_floor/margin genesis registration will be skipped honestly until this is re-run (see Step 3's register_genesis_models.py)."
 else
-  warn "  Could not install xgboost/onnxmltools - skipping genesis XGBoost export (deal_yield_manager_floor/margin genesis registration will be skipped honestly). Install manually with: ${PYTHON} -m pip install xgboost onnxmltools"
+  warn "  Could not install ${XGBOOST_PIN}/onnxmltools - skipping genesis XGBoost export (deal_yield_manager_floor/margin genesis registration will be skipped honestly). Install manually with: ${PYTHON} -m pip install ${XGBOOST_PIN} onnxmltools"
 fi
 
 if [[ "${EXPORT_ONLY}" -eq 1 ]]; then
@@ -1286,7 +1338,30 @@ eksctl create iamserviceaccount \
   --approve \
   --override-existing-serviceaccounts 2>/dev/null || true
 
-TRITON_ROLE_ARN="$(kubectl get sa triton-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+# eksctl returns before the ServiceAccount's IRSA annotation is guaranteed to
+# be readable back from the API server. Reading it immediately after create
+# was racing that propagation and sometimes returning empty, which then got
+# baked into triton-deployment.yaml via sed -- leaving triton-sa with
+# eks.amazonaws.com/role-arn: "" and Triton unable to reach its S3 model repo.
+# Poll instead of reading once.
+TRITON_ROLE_ARN=""
+for attempt in $(seq 1 10); do
+  TRITON_ROLE_ARN="$(kubectl get sa triton-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+  [[ -n "${TRITON_ROLE_ARN}" ]] && break
+  sleep 3
+done
+if [[ -z "${TRITON_ROLE_ARN}" ]]; then
+  # FATAL, not a warning: an empty value here gets sed'd into
+  # triton-deployment.yaml's ServiceAccount manifest in Step 8 and applied —
+  # silently shipping a triton-sa with eks.amazonaws.com/role-arn: "" that can
+  # never reach its S3 model repo. This has happened live when triton-sa's
+  # eksctl CFN stack survives (e.g. after a partial destroy or manual
+  # `kubectl delete`) but the ServiceAccount object itself doesn't: eksctl
+  # sees the CFN stack and treats the ServiceAccount as already provisioned,
+  # skipping recreation, so it never appears for this poll to find. Stop here
+  # instead of deploying a broken Triton.
+  fail "Triton IRSA role annotation did not populate after 30s. If triton-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-triton-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa triton-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite (find the role ARN via: aws cloudformation describe-stacks --stack-name eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-triton-sa --query 'Stacks[0].Outputs')"
+fi
 log "  Triton IRSA role: ${TRITON_ROLE_ARN}"
 
 # =========================================================================
@@ -1318,7 +1393,21 @@ eksctl create iamserviceaccount \
   --approve \
   --override-existing-serviceaccounts 2>/dev/null || true
 
-OPTIMIZER_ROLE_ARN="$(kubectl get sa model-optimizer-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+# Same eksctl/kubectl propagation race as triton-sa above -- poll instead of
+# reading the annotation once.
+OPTIMIZER_ROLE_ARN=""
+for attempt in $(seq 1 10); do
+  OPTIMIZER_ROLE_ARN="$(kubectl get sa model-optimizer-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+  [[ -n "${OPTIMIZER_ROLE_ARN}" ]] && break
+  sleep 3
+done
+if [[ -z "${OPTIMIZER_ROLE_ARN}" ]]; then
+  # FATAL, not a warning — same reasoning as triton-sa above: an empty value
+  # here gets baked into applied manifests (model-optimizer-bootstrap-job.yaml,
+  # the on-demand optimize Jobs) and silently ships a ServiceAccount that can
+  # never reach S3.
+  fail "Model Optimizer IRSA role annotation did not populate after 30s. If model-optimizer-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa model-optimizer-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite (find the role ARN via: aws cloudformation describe-stacks --stack-name eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa --query 'Stacks[0].Outputs')"
+fi
 log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
 
 # =========================================================================

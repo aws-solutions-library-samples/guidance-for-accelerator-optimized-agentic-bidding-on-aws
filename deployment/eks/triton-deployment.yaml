@@ -64,6 +64,14 @@ spec:
             # are built at deploy time; canary + promoted versions appear later).
             - --model-control-mode=poll
             - --repository-poll-secs=30
+            # strict-readiness defaults to true, which makes /v2/health/ready
+            # (and therefore this Deployment's readinessProbe) fail if ANY one
+            # model in the repository fails to load -- one bad model takes down
+            # every other already-serving model's traffic via the k8s Service.
+            # false: ready as soon as the server itself is responsive; per-model
+            # availability is still queryable via /v2/repository/index and each
+            # model's own /v2/models/<name>/ready.
+            - --strict-readiness=false
           env:
             - name: AWS_DEFAULT_REGION
               value: "__REGION__"

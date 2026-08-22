@@ -396,17 +396,26 @@ Resources:
           import boto3, json, os, time, uuid
 
           # model_type -> (Model Package Group env var, training image tag,
-          # training shape). "nemo-rl" and "xgboost" have different
-          # AlgorithmSpecification/HyperParameters shapes -- see the branch
-          # in handler() below. deal_yield_manager_floor/margin are two
-          # independent single-target models (Triton's FIL backend does not
-          # support multi-output regression -- see closed_loop_cfn.yaml's
-          # correction note), each with its own Model Package Group.
+          # training shape, training-data S3 prefix). "nemo-rl" and
+          # "xgboost" have different AlgorithmSpecification/HyperParameters
+          # shapes -- see the branch in handler() below.
+          # deal_yield_manager_floor/margin are two independent single-target
+          # models (Triton's FIL backend does not support multi-output
+          # regression -- see closed_loop_cfn.yaml's correction note), each
+          # with its own Model Package Group AND its own training-data
+          # prefix: glue_deal_yield_feature_engineering.py (a distinct ETL
+          # job from the nemo-rl models' glue_feature_engineering.py) writes
+          # floor-labeled and margin-labeled rows to two SEPARATE prefixes
+          # (training-data-deal-yield-floor/, training-data-deal-yield-margin/)
+          # since they are different regression targets with different
+          # label columns -- neither is the shared "training-data/" prefix
+          # the nemo-rl models use, which the Yield Optimizer's ETL job
+          # never writes to at all.
           _MODEL_TYPES = [
-              ("dlrm_bid_shader", "DLRM_PACKAGE_GROUP", "dlrm", "nemo-rl"),
-              ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf", "nemo-rl"),
-              ("deal_yield_manager_floor", "YIELD_FLOOR_PACKAGE_GROUP", "yield-floor", "xgboost"),
-              ("deal_yield_manager_margin", "YIELD_MARGIN_PACKAGE_GROUP", "yield-margin", "xgboost"),
+              ("dlrm_bid_shader", "DLRM_PACKAGE_GROUP", "dlrm", "nemo-rl", "training-data"),
+              ("ncf_deal_manager", "NCF_PACKAGE_GROUP", "ncf", "nemo-rl", "training-data"),
+              ("deal_yield_manager_floor", "YIELD_FLOOR_PACKAGE_GROUP", "yield-floor", "xgboost", "training-data-deal-yield-floor"),
+              ("deal_yield_manager_margin", "YIELD_MARGIN_PACKAGE_GROUP", "yield-margin", "xgboost", "training-data-deal-yield-margin"),
           ]
 
           def _job_name_prefix(model_type):
@@ -441,7 +450,7 @@ Resources:
 
               started = {}
               skipped = {}
-              for model_type, group_env, image_tag, shape in _MODEL_TYPES:
+              for model_type, group_env, image_tag, shape, training_data_prefix in _MODEL_TYPES:
                   package_group = os.environ[group_env]
                   base_version = _latest_approved_version(sm, package_group)
                   if not base_version:
@@ -490,7 +499,7 @@ Resources:
                           'ChannelName': 'training',
                           'DataSource': {'S3DataSource': {
                               'S3DataType': 'S3Prefix',
-                              'S3Uri': f"s3://{training_data_bucket}/training-data/",
+                              'S3Uri': f"s3://{training_data_bucket}/{training_data_prefix}/",
                               'S3DataDistributionType': 'FullyReplicated',
                           }},
                           'ContentType': 'application/x-parquet',

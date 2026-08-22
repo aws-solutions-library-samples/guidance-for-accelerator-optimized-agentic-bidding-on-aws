@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import sys
 from datetime import datetime, timezone
 
@@ -32,6 +33,7 @@ from shared.artf_types import (
     Mutation, Operation, RTBRequest, RTBResponse, intent_applicable,
 )
 
+from .exploration import apply_exploration
 from .features import build_feature_vector
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,24 @@ logger = logging.getLogger(__name__)
 MODEL_VERSION = "deal-yield-xgboost-v1"
 
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
+
+# Bounded epsilon-greedy exploration (see exploration.py's module docstring
+# for the cold-start problem this solves: a model converged to "recommend
+# no change" -- true of the genesis model by construction -- never emits a
+# mutation, so it can never generate the outcome data needed to learn
+# anything else). Disabled by default (epsilon=0.0): this perturbs real
+# floor/margin values sent to real auctions once enabled, so it is an
+# explicit opt-in via env var, not a silent default. When exploring the
+# live path is desired (recommended: gate this to load-test traffic only
+# via target_variant, or start with a small epsilon in a controlled
+# environment), set YIELD_EXPLORATION_EPSILON > 0.
+_EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.0"))
+_EXPLORATION_FLOOR_BOUND = float(os.environ.get("YIELD_EXPLORATION_FLOOR_BOUND", "0.05"))
+_EXPLORATION_MARGIN_BOUND = float(os.environ.get("YIELD_EXPLORATION_MARGIN_BOUND", "0.02"))
+# Module-level so tests can monkeypatch a seeded random.Random() instance
+# for deterministic assertions, without a global monkeypatch of the
+# `random` module itself.
+_exploration_rng = random.Random()
 
 if USE_TRITON:
     from container.triton_inference import predict_yield_adjustment as _predict_yield
@@ -76,6 +96,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
 
     mutations: list[Mutation] = []
     served_model_version = ""
+    any_explored = False
 
     for imp in bid_request.get("imp", []):
         imp_id = imp.get("id", "")
@@ -91,6 +112,15 @@ def mutate(req: RTBRequest) -> RTBResponse:
             )
             if resolved_version:
                 served_model_version = resolved_version
+
+            floor_multiplier, margin_value, explored = apply_exploration(
+                floor_multiplier, margin_value,
+                rng=_exploration_rng,
+                epsilon=_EXPLORATION_EPSILON,
+                floor_bound=_EXPLORATION_FLOOR_BOUND,
+                margin_bound=_EXPLORATION_MARGIN_BOUND,
+            )
+            any_explored = any_explored or explored
 
             path = f"/imp/{imp_id}/deals/{deal_id}"
 
@@ -117,6 +147,12 @@ def mutate(req: RTBRequest) -> RTBResponse:
                 ))
 
     resolved_model_version = served_model_version or MODEL_VERSION
+    # Disclose exploration in the served model_version -- never let an
+    # exploratory probe look like a confident model recommendation to
+    # anything reading this response downstream (outcome events, training
+    # data, the demo UI). See exploration.py's module docstring.
+    if any_explored:
+        resolved_model_version = f"{resolved_model_version}:explore"
     return RTBResponse(
         id=req.id,
         mutations=mutations,

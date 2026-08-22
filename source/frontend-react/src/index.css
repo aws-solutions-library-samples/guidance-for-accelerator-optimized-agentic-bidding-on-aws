@@ -329,6 +329,7 @@ body {
 .tag.seg { background: rgba(99,102,241,.1); color: var(--accent); }
 .tag.deal { background: rgba(245,158,11,.1); color: #d97706; }
 .tag.metric { background: rgba(6,182,212,.1); color: #0891b2; }
+.tag.yield { background: rgba(190,24,93,.1); color: #be185d; }
 
 /* ── Info bar ── */
 .info-bar {

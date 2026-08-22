@@ -10,7 +10,7 @@ import {
   DISPLAY_NAME_BY_STOP_ID,
 } from "./intentMapping.js";
 
-const CONTAINER_STOP_IDS = Object.freeze(["dlrm", "widedeep", "ncf", "metrics"]);
+const CONTAINER_STOP_IDS = Object.freeze(["dlrm", "widedeep", "ncf", "metrics", "yield"]);
 
 function isFiniteNumber(n) {
   return typeof n === "number" && Number.isFinite(n);
@@ -178,7 +178,7 @@ function buildExplicitContainerStops(containers) {
 }
 
 function buildInferredContainerStops(mutations) {
-  const buckets = { dlrm: [], widedeep: [], ncf: [], metrics: [] };
+  const buckets = { dlrm: [], widedeep: [], ncf: [], metrics: [], yield: [] };
   for (const m of mutations) {
     const intentCode = m?.intent;
     const stopId = (typeof intentCode === "number" && INTENT_TO_STOP[intentCode]) || "metrics";
@@ -211,10 +211,7 @@ export function normalize(raw, transport, submittedPayload) {
       totalLatencyMs: 0,
       stops: [
         makeSspStop(),
-        makePlaceholderContainerStop("dlrm"),
-        makePlaceholderContainerStop("widedeep"),
-        makePlaceholderContainerStop("ncf"),
-        makePlaceholderContainerStop("metrics"),
+        ...CONTAINER_STOP_IDS.map((id) => makePlaceholderContainerStop(id)),
         makeDspStop(),
       ],
       packet: summarizePacket(safePayload, raw),

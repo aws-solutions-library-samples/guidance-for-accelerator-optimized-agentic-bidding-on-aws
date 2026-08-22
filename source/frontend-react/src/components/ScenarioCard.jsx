@@ -46,6 +46,17 @@ export const SCENARIOS = [
     file: "isv-ecosystem.json",
     controls: ["bidFloor"],
   },
+  {
+    id: "yield-optimizer",
+    name: "PMP Deals — Yield Optimizer",
+    desc: "Sports video impression with 3 private marketplace deals (guaranteed, open mid-tier, open remnant). The yield optimizer predicts a floor-price multiplier and margin adjustment per deal via an XGBoost model on Triton's FIL backend.",
+    tags: [
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
+    ],
+    file: "yield-optimizer.json",
+    controls: ["bidFloor"],
+  },
 ];
 
 export default function ScenarioCard({ scenario, isActive, isLoading, disabled, onSelect, onSend }) {
