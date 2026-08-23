@@ -123,6 +123,15 @@ spec:
             # for why. Same "unset -> disabled, not fabricated" contract.
             - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
               value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
+            # Glue ETL job names (source/orchestrator/governance_api.py's
+            # trainable_runs_handler) -- used to check whether a completed
+            # Glue job run has actually swept a load test's data into
+            # training-data/ before offering it in the "Train from load
+            # test" run picker.
+            - name: GLUE_JOB_NAME
+              value: "__GLUE_JOB_NAME__"
+            - name: DEAL_YIELD_GLUE_JOB_NAME
+              value: "__DEAL_YIELD_GLUE_JOB_NAME__"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.

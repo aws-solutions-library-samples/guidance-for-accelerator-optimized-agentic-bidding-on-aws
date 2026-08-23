@@ -278,6 +278,29 @@ KMS_KEY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "KMSKeyArn")"
 [[ -n "${KMS_KEY_ARN}" ]] || fail "Could not retrieve KMS Key ARN from feedback pipeline stack"
 log "  KMS Key: ${KMS_KEY_ARN}"
 
+# Pre-create the raw-outcomes prefixes Firehose delivers into. On a fresh
+# stack, glue_etl_cfn.yaml's FeatureEngineeringSchedule/
+# DealYieldFeatureEngineeringSchedule triggers (StartOnCreation: true) can
+# fire before Firehose's first buffered flush (up to
+# FirehoseBufferIntervalSeconds, default 300s) ever lands a file -- the
+# Glue job's spark.read.format("parquet").load(table_location) call then
+# fails outright with "AnalysisException: Path does not exist" (confirmed
+# live) rather than reading 0 rows, because the prefix itself doesn't exist
+# yet. An empty zero-byte marker object makes the prefix exist immediately,
+# so that first scheduled run reads 0 rows (a real, harmless no-op) instead
+# of failing. Firehose's own deliveries land as real objects under the same
+# prefixes afterward, unaffected by this marker.
+RAW_OUTCOMES_BUCKET="$(get_stack_output "${FEEDBACK_STACK}" "RawOutcomesBucketName")"
+if [[ -n "${RAW_OUTCOMES_BUCKET}" ]]; then
+  log "  Pre-creating raw-outcomes prefixes in ${RAW_OUTCOMES_BUCKET} (avoids a cold-start Glue failure on first scheduled run)"
+  aws s3api put-object --bucket "${RAW_OUTCOMES_BUCKET}" --key "raw-outcomes/.keep" --region "${AWS_REGION}" >/dev/null \
+    || warn "  Could not pre-create raw-outcomes/ prefix -- the first scheduled Glue run may fail until Firehose delivers its first file."
+  aws s3api put-object --bucket "${RAW_OUTCOMES_BUCKET}" --key "raw-deal-yield-outcomes/.keep" --region "${AWS_REGION}" >/dev/null \
+    || warn "  Could not pre-create raw-deal-yield-outcomes/ prefix -- the first scheduled Glue run may fail until Firehose delivers its first file."
+else
+  warn "  Could not resolve RawOutcomesBucketName from ${FEEDBACK_STACK} -- raw-outcomes prefixes not pre-created."
+fi
+
 # Attach the FeedbackCollectorPolicy (kinesis:PutRecord/PutRecords, scoped to
 # the BidOutcomeStream) to the EKS node role, so orchestrator pods running
 # there can actually emit bid outcome events. Without this, deploy.sh's

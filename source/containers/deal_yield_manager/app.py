@@ -46,13 +46,22 @@ USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 # for the cold-start problem this solves: a model converged to "recommend
 # no change" -- true of the genesis model by construction -- never emits a
 # mutation, so it can never generate the outcome data needed to learn
-# anything else). Disabled by default (epsilon=0.0): this perturbs real
-# floor/margin values sent to real auctions once enabled, so it is an
-# explicit opt-in via env var, not a silent default. When exploring the
-# live path is desired (recommended: gate this to load-test traffic only
-# via target_variant, or start with a small epsilon in a controlled
-# environment), set YIELD_EXPLORATION_EPSILON > 0.
-_EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.0"))
+# anything else).
+#
+# Enabled by default (epsilon=0.1 -- override via the YIELD_EXPLORATION_EPSILON
+# env var, e.g. in deployment/eks/artf-containers-deployment.yaml, if a
+# different rate is needed) -- but STRUCTURALLY SCOPED to load-test-originated
+# calls only, never live auction traffic. This is
+# enforced below in mutate() via shared.load_test_context.get_is_load_test()
+# (True only when the orchestrator's load-test invocation path set the
+# X-Load-Test header -- see that module's docstring), NOT by this epsilon
+# value alone. A prior version of this container read this epsilon
+# unconditionally with a disabled (0.0) default, which meant a freshly
+# deployed stack's Yield Optimizer could NEVER produce a mutation for the
+# genesis (constant no-op) model -- confirmed live: every load test against
+# it produced exactly 0 mutations, so no DealYieldOutcomeEvent was ever
+# emitted and the training pipeline had no real data to bootstrap from.
+_EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.1"))
 _EXPLORATION_FLOOR_BOUND = float(os.environ.get("YIELD_EXPLORATION_FLOOR_BOUND", "0.05"))
 _EXPLORATION_MARGIN_BOUND = float(os.environ.get("YIELD_EXPLORATION_MARGIN_BOUND", "0.02"))
 # Module-level so tests can monkeypatch a seeded random.Random() instance
@@ -89,10 +98,18 @@ def mutate(req: RTBRequest) -> RTBResponse:
     if not (floor_ok or margin_ok):
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
-    from shared.load_test_context import get_target_variant
+    from shared.load_test_context import get_is_load_test, get_target_variant
 
     request_time = datetime.now(timezone.utc)
     bid_request = req.bid_request or {}
+
+    # Structural gate (BR-4-style scoping, mirroring target_variant's own
+    # load-test exclusivity): exploration must only ever perturb
+    # load-test-originated calls, never real auction traffic. epsilon=0.0
+    # would already suppress everything, but that's a config value, not a
+    # guarantee -- this check makes "live traffic never explores" true
+    # regardless of how YIELD_EXPLORATION_EPSILON is configured.
+    effective_epsilon = _EXPLORATION_EPSILON if get_is_load_test() else 0.0
 
     mutations: list[Mutation] = []
     served_model_version = ""
@@ -116,7 +133,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
             floor_multiplier, margin_value, explored = apply_exploration(
                 floor_multiplier, margin_value,
                 rng=_exploration_rng,
-                epsilon=_EXPLORATION_EPSILON,
+                epsilon=effective_epsilon,
                 floor_bound=_EXPLORATION_FLOOR_BOUND,
                 margin_bound=_EXPLORATION_MARGIN_BOUND,
             )

@@ -46,12 +46,19 @@ managedNodeGroups:
         autoScaler: true
         cloudWatch: true
 
-  # CPU node group for orchestrator, ALB ingress controller, monitoring
+  # CPU node group for orchestrator, ARTF containers (default node placement —
+  # see deploy.sh --artf-node-role), ALB ingress controller, monitoring.
+  # Sized for load-test throughput: at c5.xlarge x2 (8 vCPU total), the ARTF
+  # container HPAs (dlrm/widedeep/ncf/metrics/yield, each maxReplicas 5) plus
+  # the orchestrator HPA (maxReplicas 10) have nowhere to schedule their scaled-up
+  # pods once CPU pressure hits — they sit Pending instead of actually serving
+  # load, which is what makes load tests crawl. c5.2xlarge x3 (24 vCPU total)
+  # gives real headroom for those HPAs to scale into.
   - name: cpu-services
-    instanceType: c5.xlarge
-    desiredCapacity: 2
-    minSize: 1
-    maxSize: 4
+    instanceType: c5.2xlarge
+    desiredCapacity: 3
+    minSize: 2
+    maxSize: 8
     volumeSize: 50
     labels:
       role: services

@@ -426,9 +426,24 @@ async def list_containers(request: Request) -> JSONResponse:
     # source/containers/widedeep_segment_activator/app.py). Probing for it
     # here would always report UNAVAILABLE and misrepresent a healthy
     # rules-based container as degraded.
+    #
+    # deal_yield_manager is served as TWO independent single-output FIL
+    # models, not one — Triton's FIL backend does not support multi-output
+    # regression (confirmed against NVIDIA's FIL backend docs; see
+    # aidlc-docs/construction/deal-yield-training-pipeline/tasks.md Group 1
+    # and source/triton/model_repository/deal_yield_manager_floor/config.pbtxt).
+    # A model literally named "deal_yield_manager" was never registered with
+    # Triton post-correction, so probing for it always 400s and the
+    # container health panel misreports the Yield Optimizer as
+    # model_unavailable even when both sub-models are actually ready.
     triton_models: dict[str, dict] = {}
     if triton_ready:
-        model_names = ["dlrm_bid_shader", "ncf_deal_manager", "deal_yield_manager"]
+        model_names = [
+            "dlrm_bid_shader",
+            "ncf_deal_manager",
+            "deal_yield_manager_floor",
+            "deal_yield_manager_margin",
+        ]
         async with httpx.AsyncClient(timeout=2.0) as tc:
             for model_name in model_names:
                 ev = await _probe_http(tc, f"http://{triton_url}/v2/models/{model_name}/ready")
@@ -437,14 +452,16 @@ async def list_containers(request: Request) -> JSONResponse:
                     "evidence": ev,
                 }
 
-    # Map container names to their Triton model names. widedeep-segment-activator
+    # Map container names to their Triton model name(s). widedeep-segment-activator
     # maps to None like metrics-enricher — both are rules-based, no Triton model.
+    # deal-yield-manager maps to a tuple of both sub-model names (see note above) —
+    # every other entry maps to a single model name string.
     container_to_model = {
         "dlrm-bid-shader": "dlrm_bid_shader",
         "widedeep-segment-activator": None,  # rules-based, no Triton model
         "ncf-deal-manager": "ncf_deal_manager",
         "metrics-enricher": None,  # rules-based, no Triton model
-        "deal-yield-manager": "deal_yield_manager",
+        "deal-yield-manager": ("deal_yield_manager_floor", "deal_yield_manager_margin"),
     }
 
     async with httpx.AsyncClient(timeout=2.0) as client:
@@ -470,14 +487,23 @@ async def list_containers(request: Request) -> JSONResponse:
                 else:
                     container_status = "unreachable"
 
-            # Determine inference readiness (depends on Triton for GPU containers)
+            # Determine inference readiness (depends on Triton for GPU containers).
+            # deal-yield-manager maps to a tuple of two sub-model names (floor +
+            # margin) — both must be READY for the container to be reported ready.
             model_name = container_to_model.get(c["name"])
+            model_names_for_container = (
+                model_name if isinstance(model_name, tuple)
+                else ((model_name,) if model_name is not None else ())
+            )
             if model_name is None:
                 # Rules-based container (metrics-enricher) — no Triton dependency
                 inference_status = "ready" if container_status == "ready" else "unavailable"
             elif not triton_ready:
                 inference_status = "gpu_offline"
-            elif triton_models.get(model_name, {}).get("state") == "READY":
+            elif all(
+                triton_models.get(name, {}).get("state") == "READY"
+                for name in model_names_for_container
+            ):
                 inference_status = "ready"
             else:
                 inference_status = "model_unavailable"
@@ -501,11 +527,19 @@ async def list_containers(request: Request) -> JSONResponse:
                 "containerStatus": container_status,
                 "inferenceStatus": inference_status,
                 "protocol": protocol,
-                "tritonModel": model_name,
+                # "+".join over a 1-tuple is just that model's name, so this is
+                # unchanged for every container except deal-yield-manager
+                # (which now shows "deal_yield_manager_floor+deal_yield_manager_margin").
+                "tritonModel": "+".join(model_names_for_container) or None,
                 "evidence": {
                     "httpProbe": http_probe,
                     "grpcProbe": grpc_probe,
-                    "tritonModelProbe": (triton_models.get(model_name, {}).get("evidence") if model_name else None),
+                    # One evidence entry per Triton sub-model probed for this
+                    # container (usually 0 or 1; 2 for deal-yield-manager).
+                    "tritonModelProbes": [
+                        {"model": name, **triton_models.get(name, {}).get("evidence", {})}
+                        for name in model_names_for_container
+                    ],
                 },
             }
             results.append(entry)
@@ -752,6 +786,7 @@ try:
             training_estimate_handler as gov_training_estimate,
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
+            trainable_runs_handler as gov_trainable_runs,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -760,6 +795,7 @@ try:
             training_estimate_handler as gov_training_estimate,
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
+            trainable_runs_handler as gov_trainable_runs,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -778,6 +814,7 @@ def _governance_routes(prefix: str) -> list:
         Route(f"{prefix}/v1/governance/training-estimate", gov_training_estimate, methods=["GET"]),
         Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
         Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/trainable-runs", gov_trainable_runs, methods=["GET"]),
         Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
         Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
     ]

@@ -42,6 +42,7 @@ from orchestrator.loadtest_targeting import (
     validate_challenger_target,
 )
 from shared.artf_types import Metadata, RTBRequest, RTBResponse
+from shared.load_test_context import IS_LOAD_TEST_HEADER_NAME
 
 
 def _get_app_deps():
@@ -503,6 +504,14 @@ async def _run_load_test(
         _MODEL_TYPE_TO_CONTAINER_NAME.get(target_model_type) if target_model_type else None
     )
     target_headers = build_override_headers(target_variant) if target_model_type else {}
+    # X-Load-Test is sent on EVERY container call this run makes (unlike
+    # target_headers above, which is scoped to only the one targeted
+    # container). This is the signal containers/deal_yield_manager's
+    # bounded exploration gates on (see shared/load_test_context.py's
+    # module docstring) -- exploration must fire for load-test traffic
+    # regardless of which container this run happens to be targeting for
+    # outcome capture, but must never fire for real bid-serving traffic.
+    load_test_headers = {IS_LOAD_TEST_HEADER_NAME: "1"}
     per_request_versions: list[str] = []
     outcome_sample_count = 0
     # Bounded to keep the persisted LoadTestStatus item within DynamoDB's
@@ -527,10 +536,15 @@ async def _run_load_test(
         try:
             tasks = []
             for c in active_containers:
-                # Only the target_model_type container's calls carry the
-                # load-test-only override header — every other container in
-                # this run's fan-out is called exactly as before (BR-4/Q3=A).
-                headers = target_headers if c["name"] == target_container_name else None
+                # Every container call in this run carries X-Load-Test: 1
+                # (load_test_headers). Only the target_model_type
+                # container's calls ALSO carry the target-variant override
+                # header (target_headers merged in) — every other
+                # container's calls are otherwise called exactly as before
+                # (BR-4/Q3=A), just now with the plain load-test signal too.
+                headers = dict(load_test_headers)
+                if c["name"] == target_container_name:
+                    headers.update(target_headers)
                 tasks.append(
                     _call_container_timed(client, c, payload, payload_bytes, timeout_s, headers=headers)
                 )

@@ -1,8 +1,9 @@
 """Unit tests for the NeMo-RL training container entrypoint (train.py).
 
-Covers three real production bugs found while diagnosing a live failed
-training job (dlrm-bid-shader-1787311543-72232191, base version
-nvd-artf-dlrm-bid-shader/1) and its predecessors:
+Covers real production bugs found while diagnosing live failed training
+jobs (dlrm-bid-shader-1787311543-72232191, base version
+nvd-artf-dlrm-bid-shader/1; dlrm-bid-shader-1787398867-e572c442) and their
+predecessors:
 
 1. load_training_data() used a non-recursive glob, but the Glue ETL job
    writes Hive-style partitioned Parquet (window_start=.../window_end=.../
@@ -12,10 +13,17 @@ nvd-artf-dlrm-bid-shader/1) and its predecessors:
    actual columns ("bid_floor", "won", "conversion_value", etc.).
 3. export_to_onnx()'s DLRM dummy input was width 4, but DLRMModel.forward()
    requires width NUM_DENSE+NUM_SPARSE=7.
+4. load_hyperparameters()'s JSON-file branch returned the caller's raw
+   HyperParameters verbatim with no defaults applied -- a real on-demand
+   "Train from load test" job (which only sends model_type/
+   base_model_version/window_days/cadence_hours/triggered_by) crashed with
+   KeyError: 'supervised_epochs' because that key was never sent and never
+   defaulted.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -28,12 +36,15 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "training", "container")
 )
 
+import train as train_module  # noqa: E402
 from train import (  # noqa: E402
     _DLRM_DENSE_COLUMNS,
     _DLRM_SPARSE_COLUMNS,
+    _HP_DEFAULTS,
     _hash_to_idx,
     build_dlrm_features,
     build_features,
+    load_hyperparameters,
     load_training_data,
 )
 
@@ -239,3 +250,102 @@ class TestExportToOnnxDummyInputShape:
         assert os.path.exists(onnx_path)
         assert captured["dummy_shape"] == (1, NUM_DENSE + NUM_SPARSE)
         assert captured["dummy_shape"][1] == 7
+
+
+class TestLoadHyperparametersDefaults:
+    """load_hyperparameters()'s JSON-file branch previously returned the
+    caller's raw HyperParameters verbatim with no defaults merged in.
+    SageMaker always writes SM_HP_FILE whenever HyperParameters is
+    non-empty, and none of this repo's three real CreateTrainingJob callers
+    (training_trigger.py's on-demand path, the scheduled
+    RetrainingTriggerFunction Lambda, TrainingPipeline) send a complete
+    hyperparameter set — reproduces the exact live failure
+    (dlrm-bid-shader-1787398867-e572c442: KeyError: 'supervised_epochs')."""
+
+    def test_partial_hyperparameters_file_gets_defaults_merged_in(self, tmp_path, monkeypatch):
+        """Reproduces training_trigger.py's real payload: only 5 keys, none
+        of the 4 phase-1/phase-2 keys train.py's supervised_train()/
+        rl_finetune() require."""
+        hp_file = tmp_path / "hyperparameters.json"
+        hp_file.write_text(json.dumps({
+            "model_type": "dlrm_bid_shader",
+            "base_model_version": "arn:aws:sagemaker:us-east-1:960328030835:model-package/nv5-artf-dlrm-bid-shader/1",
+            "window_days": "7",
+            "cadence_hours": "6.0",
+            "triggered_by": "governance_ui_on_demand",
+        }))
+        monkeypatch.setattr(train_module, "SM_HP_FILE", str(hp_file))
+
+        hp = load_hyperparameters()
+
+        # The exact key that crashed the real job must be present and usable.
+        assert hp["supervised_epochs"] == _HP_DEFAULTS["supervised_epochs"]
+        assert hp["learning_rate"] == _HP_DEFAULTS["learning_rate"]
+        assert hp["rl_epochs"] == _HP_DEFAULTS["rl_epochs"]
+        assert hp["reward_function"] == _HP_DEFAULTS["reward_function"]
+        assert hp["rl_learning_rate"] == _HP_DEFAULTS["rl_learning_rate"]
+        assert hp["batch_size"] == _HP_DEFAULTS["batch_size"]
+        assert hp["validation_split"] == _HP_DEFAULTS["validation_split"]
+        assert hp["use_reinforcement_learning"] == _HP_DEFAULTS["use_reinforcement_learning"]
+        # Caller-supplied values are preserved, not overwritten by defaults.
+        assert hp["model_type"] == "dlrm_bid_shader"
+        assert hp["window_days"] == 7
+        assert hp["cadence_hours"] == 6.0
+        assert hp["triggered_by"] == "governance_ui_on_demand"
+
+    def test_caller_supplied_value_overrides_default(self, tmp_path, monkeypatch):
+        hp_file = tmp_path / "hyperparameters.json"
+        hp_file.write_text(json.dumps({
+            "model_type": "dlrm_bid_shader",
+            "supervised_epochs": "20",
+        }))
+        monkeypatch.setattr(train_module, "SM_HP_FILE", str(hp_file))
+
+        hp = load_hyperparameters()
+
+        assert hp["supervised_epochs"] == 20
+
+    def test_full_hyperparameters_file_unaffected_by_defaults(self, tmp_path, monkeypatch):
+        """A caller sending every key (e.g. TrainingPipeline) must get its
+        own values back unchanged, not silently overridden."""
+        full_payload = {
+            "model_type": "dlrm_bid_shader",
+            "base_model_version": "v3",
+            "validation_split": "0.2",
+            "use_reinforcement_learning": "false",
+            "reward_function": "ctr",
+            "rl_learning_rate": "5e-5",
+            "rl_epochs": "8",
+            "supervised_epochs": "15",
+            "batch_size": "128",
+            "learning_rate": "2e-3",
+            "window_days": "7",
+            "cadence_hours": "6.0",
+        }
+        hp_file = tmp_path / "hyperparameters.json"
+        hp_file.write_text(json.dumps(full_payload))
+        monkeypatch.setattr(train_module, "SM_HP_FILE", str(hp_file))
+
+        hp = load_hyperparameters()
+
+        assert hp["validation_split"] == 0.2
+        assert hp["use_reinforcement_learning"] is False
+        assert hp["reward_function"] == "ctr"
+        assert hp["rl_learning_rate"] == 5e-5
+        assert hp["rl_epochs"] == 8
+        assert hp["supervised_epochs"] == 15
+        assert hp["batch_size"] == 128
+        assert hp["learning_rate"] == 2e-3
+
+    def test_env_var_fallback_path_unaffected(self, tmp_path, monkeypatch):
+        """When no hyperparameters.json exists at all (non-SageMaker local
+        run), the env-var fallback branch must still return every key with
+        its own defaults, matching pre-fix behavior exactly."""
+        missing_file = tmp_path / "does-not-exist.json"
+        monkeypatch.setattr(train_module, "SM_HP_FILE", str(missing_file))
+        monkeypatch.delenv("SM_HP_SUPERVISED_EPOCHS", raising=False)
+
+        hp = load_hyperparameters()
+
+        assert hp["supervised_epochs"] == _HP_DEFAULTS["supervised_epochs"]
+        assert hp["model_type"] == _HP_DEFAULTS["model_type"]
