@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.artf_types import Intent, RTBRequest
 
 import containers.deal_yield_manager.app as deal_yield_app
+from shared.load_test_context import load_test_scope
 
 
 def _req(bid_request: dict, applicable_intents=None) -> RTBRequest:
@@ -148,37 +149,44 @@ class TestMutateNeverRaises:
 class TestMutateExploration:
     """Exercises the cold-start exploration wiring: with epsilon disabled
     (the default), behavior is completely unchanged from before exploration
-    existed; with epsilon enabled, the genesis model's constant "no
-    change" prediction can be perturbed into a real mutation, and that
-    perturbation is disclosed via the ":explore" model_version suffix
-    (never presented as a confident model recommendation)."""
+    existed; with epsilon enabled AND the call scoped as load-test-origin,
+    the genesis model's constant "no change" prediction can be perturbed
+    into a real mutation, and that perturbation is disclosed via the
+    ":explore" model_version suffix (never presented as a confident model
+    recommendation). Exploration must never fire on a call NOT scoped as
+    load-test-origin, regardless of epsilon -- that's the structural gate
+    (get_is_load_test()) this class also verifies."""
 
     def test_epsilon_zero_default_produces_no_mutations_for_genesis_model(self, monkeypatch):
         """Default (epsilon=0.0) behavior for a genesis-style constant
         no-op model must be identical to pre-exploration behavior: zero
-        mutations, unsuffixed model_version."""
+        mutations, unsuffixed model_version. (Load-test-scoped here too,
+        to isolate epsilon=0 as the reason nothing explores, not the
+        load-test gate.)"""
         monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
         monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 0.0)
         req = _req(_SAMPLE_BID_REQUEST)
-        resp = deal_yield_app.mutate(req)
+        with load_test_scope(True):
+            resp = deal_yield_app.mutate(req)
         assert resp.mutations == []
         assert resp.metadata.model_version == deal_yield_app.MODEL_VERSION
         assert not resp.metadata.model_version.endswith(":explore")
 
     def test_epsilon_one_breaks_genesis_constant_output_into_a_real_mutation(self, monkeypatch):
-        """With exploration forced on, the genesis model's constant
-        floor_multiplier==1.0/margin_value==0.0 output can be perturbed
-        into a real, non-no-op value -- this is the actual cold-start fix:
-        real mutations get emitted, which is what lets
-        DealYieldOutcomeEvents (and therefore training data) exist at
-        all."""
+        """With exploration forced on AND the call scoped as load-test
+        traffic, the genesis model's constant floor_multiplier==1.0/
+        margin_value==0.0 output can be perturbed into a real, non-no-op
+        value -- this is the actual cold-start fix: real mutations get
+        emitted, which is what lets DealYieldOutcomeEvents (and therefore
+        training data) exist at all."""
         monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
         monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 1.0)
         monkeypatch.setattr(deal_yield_app, "_EXPLORATION_FLOOR_BOUND", 0.1)
         monkeypatch.setattr(deal_yield_app, "_EXPLORATION_MARGIN_BOUND", 0.05)
         monkeypatch.setattr(deal_yield_app, "_exploration_rng", __import__("random").Random(1))
         req = _req(_SAMPLE_BID_REQUEST)
-        resp = deal_yield_app.mutate(req)
+        with load_test_scope(True):
+            resp = deal_yield_app.mutate(req)
         assert len(resp.mutations) > 0
 
     def test_explored_response_discloses_via_model_version_suffix(self, monkeypatch):
@@ -192,7 +200,8 @@ class TestMutateExploration:
         monkeypatch.setattr(deal_yield_app, "_EXPLORATION_MARGIN_BOUND", 0.05)
         monkeypatch.setattr(deal_yield_app, "_exploration_rng", __import__("random").Random(1))
         req = _req(_SAMPLE_BID_REQUEST)
-        resp = deal_yield_app.mutate(req)
+        with load_test_scope(True):
+            resp = deal_yield_app.mutate(req)
         assert resp.metadata.model_version.endswith(":explore")
 
     def test_unexplored_response_never_carries_explore_suffix(self, monkeypatch):
@@ -206,3 +215,20 @@ class TestMutateExploration:
         req = _req(_SAMPLE_BID_REQUEST)
         resp = deal_yield_app.mutate(req)
         assert resp.metadata.model_version == "arn:aws:sagemaker:...:model-package/v3"
+
+    def test_exploration_never_fires_on_live_traffic_even_with_epsilon_enabled(self, monkeypatch):
+        """The structural gate: even with epsilon forced to 1.0 (always
+        explore), a call NOT scoped as load-test-origin (i.e. real
+        auction traffic, get_is_load_test()==False) must never explore.
+        This is what makes exploration safe to enable by default --
+        the epsilon value alone is not what protects live traffic."""
+        monkeypatch.setattr(deal_yield_app, "_predict_yield", lambda fv, target_variant=None: (1.0, 0.0, "", ""))
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_EPSILON", 1.0)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_FLOOR_BOUND", 0.1)
+        monkeypatch.setattr(deal_yield_app, "_EXPLORATION_MARGIN_BOUND", 0.05)
+        monkeypatch.setattr(deal_yield_app, "_exploration_rng", __import__("random").Random(1))
+        req = _req(_SAMPLE_BID_REQUEST)
+        # No load_test_scope(True) here -- simulates real bid-serving traffic.
+        resp = deal_yield_app.mutate(req)
+        assert resp.mutations == []
+        assert not resp.metadata.model_version.endswith(":explore")

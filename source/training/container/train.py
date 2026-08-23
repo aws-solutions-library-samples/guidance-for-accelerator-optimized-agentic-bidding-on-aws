@@ -117,22 +117,60 @@ def build_features(df: pd.DataFrame, model_type: str) -> torch.Tensor:
     )
 
 
+
+# Defaults for every hyperparameter this script reads. None of the three
+# real CreateTrainingJob callers (orchestrator/training_trigger.py's
+# on-demand "Train from load test" path, governance_eventbridge_cfn.yaml's
+# scheduled RetrainingTriggerFunction Lambda, and this repo's
+# TrainingPipeline._build_hyperparameters) send a complete set — e.g.
+# training_trigger.py only sends model_type/base_model_version/window_days/
+# cadence_hours/triggered_by. SageMaker always writes SM_HP_FILE verbatim
+# whenever ANY HyperParameters are passed to CreateTrainingJob, so the
+# JSON-file branch below previously returned exactly what the caller sent
+# with no defaults applied at all -- confirmed live: a real job
+# (dlrm-bid-shader-1787398867-e572c442) crashed with
+# `KeyError: 'supervised_epochs'` for exactly this reason. Every hp[...]
+# lookup in this file must be able to fall back to one of these, regardless
+# of which branch loaded the raw values.
+_HP_DEFAULTS: dict = {
+    "model_type": "dlrm_bid_shader",
+    "use_reinforcement_learning": True,
+    "reward_function": "roi",
+    "rl_learning_rate": 1e-4,
+    "rl_epochs": 5,
+    "supervised_epochs": 10,
+    "batch_size": 256,
+    "learning_rate": 1e-3,
+    "validation_split": 0.1,
+}
+
+
 def load_hyperparameters() -> dict:
-    """Load hyperparameters from SageMaker config or environment."""
+    """Load hyperparameters from SageMaker config or environment.
+
+    Whichever source supplies raw values (the JSON file SageMaker writes
+    when HyperParameters is non-empty, or the SM_HP_* env vars otherwise),
+    the result is merged over _HP_DEFAULTS so a caller sending only a
+    partial hyperparameter set (e.g. model_type/base_model_version/
+    window_days/cadence_hours/triggered_by) never crashes on a missing key
+    later in this script -- it just gets this file's documented defaults
+    for whatever it didn't specify.
+    """
     if os.path.exists(SM_HP_FILE):
         with open(SM_HP_FILE) as f:
-            return {k: _parse_hp_value(v) for k, v in json.load(f).items()}
+            raw = {k: _parse_hp_value(v) for k, v in json.load(f).items()}
+        return {**_HP_DEFAULTS, **raw}
     # Fallback: read from environment (SM_HP_* prefix)
     return {
-        "model_type": os.environ.get("SM_HP_MODEL_TYPE", "dlrm_bid_shader"),
+        "model_type": os.environ.get("SM_HP_MODEL_TYPE", _HP_DEFAULTS["model_type"]),
         "use_reinforcement_learning": os.environ.get("SM_HP_USE_REINFORCEMENT_LEARNING", "true"),
-        "reward_function": os.environ.get("SM_HP_REWARD_FUNCTION", "roi"),
-        "rl_learning_rate": float(os.environ.get("SM_HP_RL_LEARNING_RATE", "1e-4")),
-        "rl_epochs": int(os.environ.get("SM_HP_RL_EPOCHS", "5")),
-        "supervised_epochs": int(os.environ.get("SM_HP_SUPERVISED_EPOCHS", "10")),
-        "batch_size": int(os.environ.get("SM_HP_BATCH_SIZE", "256")),
-        "learning_rate": float(os.environ.get("SM_HP_LEARNING_RATE", "1e-3")),
-        "validation_split": float(os.environ.get("SM_HP_VALIDATION_SPLIT", "0.1")),
+        "reward_function": os.environ.get("SM_HP_REWARD_FUNCTION", _HP_DEFAULTS["reward_function"]),
+        "rl_learning_rate": float(os.environ.get("SM_HP_RL_LEARNING_RATE", str(_HP_DEFAULTS["rl_learning_rate"]))),
+        "rl_epochs": int(os.environ.get("SM_HP_RL_EPOCHS", str(_HP_DEFAULTS["rl_epochs"]))),
+        "supervised_epochs": int(os.environ.get("SM_HP_SUPERVISED_EPOCHS", str(_HP_DEFAULTS["supervised_epochs"]))),
+        "batch_size": int(os.environ.get("SM_HP_BATCH_SIZE", str(_HP_DEFAULTS["batch_size"]))),
+        "learning_rate": float(os.environ.get("SM_HP_LEARNING_RATE", str(_HP_DEFAULTS["learning_rate"]))),
+        "validation_split": float(os.environ.get("SM_HP_VALIDATION_SPLIT", str(_HP_DEFAULTS["validation_split"]))),
     }
 
 

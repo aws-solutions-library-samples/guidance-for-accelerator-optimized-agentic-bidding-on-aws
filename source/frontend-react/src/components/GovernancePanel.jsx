@@ -98,6 +98,15 @@ export default function GovernancePanel() {
   const [trainingResult, setTrainingResult] = useState(null);
   const [trainingError, setTrainingError] = useState(null);
 
+  // Trainable load-test runs (this fix): only runs whose outcome data has
+  // actually been swept into training-data/ by a completed Glue job run —
+  // see GET /v1/governance/trainable-runs. Shown so the user can see which
+  // load test (and its target model/test type) they're about to train from,
+  // instead of just a bare "Train from load test" button with no run context.
+  const [trainableRuns, setTrainableRuns] = useState([]);
+  const [selectedTrainingRun, setSelectedTrainingRun] = useState("");
+  const [trainableRunsError, setTrainableRunsError] = useState(null);
+
   // Load-test-based comparison (FR-7/FR-8, Story 5) and Promote (FR-9/FR-10, Story 6).
   const [currentRuns, setCurrentRuns] = useState([]);
   const [challengerRuns, setChallengerRuns] = useState([]);
@@ -171,13 +180,35 @@ export default function GovernancePanel() {
     }
   }, [trainingModelType]);
 
+  const fetchTrainableRuns = useCallback(async () => {
+    setTrainableRunsError(null);
+    try {
+      const resp = await authFetch(`/api/v1/governance/trainable-runs?model_type=${trainingModelType}`);
+      const data = await resp.json();
+      if (resp.ok) {
+        const runs = data.runs || [];
+        setTrainableRuns(runs);
+        setSelectedTrainingRun(runs[0]?.id || "");
+      } else {
+        setTrainableRuns([]);
+        setSelectedTrainingRun("");
+        setTrainableRunsError(data.error || `HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      setTrainableRuns([]);
+      setSelectedTrainingRun("");
+      setTrainableRunsError(String(e));
+    }
+  }, [trainingModelType]);
+
   useEffect(() => {
     fetchTrainingEstimate();
+    fetchTrainableRuns();
     setTrainingInProgress(false);
     setConfirmingTraining(false);
     setTrainingResult(null);
     setTrainingError(null);
-  }, [trainingModelType, fetchTrainingEstimate]);
+  }, [trainingModelType, fetchTrainingEstimate, fetchTrainableRuns]);
 
   const startTraining = useCallback(async () => {
     setTrainingSubmitting(true);
@@ -525,6 +556,38 @@ export default function GovernancePanel() {
             ))}
           </select>
         </div>
+        <div className="cl-control-group">
+          <label htmlFor="cl-gov-train-run">Load test run:</label>
+          <select
+            id="cl-gov-train-run"
+            className="cl-select sg-interactive"
+            data-testid="governance-train-run-select"
+            value={selectedTrainingRun}
+            onChange={(e) => setSelectedTrainingRun(e.target.value)}
+            disabled={trainingSubmitting || trainableRuns.length === 0}
+          >
+            {trainableRuns.length === 0 ? (
+              <option value="">No trainable load test runs yet</option>
+            ) : (
+              trainableRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.id} — {r.target_model_type} / {r.target_variant}
+                  {r.timestamp ? ` (${new Date(r.timestamp).toLocaleString()})` : ""}
+                </option>
+              ))
+            )}
+          </select>
+        </div>
+        {trainableRunsError && (
+          <div className="cl-honest cl-honest-block">Could not load trainable runs: {trainableRunsError}</div>
+        )}
+        {trainableRuns.length === 0 && !trainableRunsError && (
+          <div className="cl-honest cl-honest-block">
+            No load test run for {trainingModelType} has been processed by a completed Glue ETL job yet
+            — run a load test targeting this model, then wait for the next Glue run (or trigger it
+            manually) before training.
+          </div>
+        )}
         {trainingEstimateError && (
           <div className="cl-honest cl-honest-block">Cost estimate unavailable: {trainingEstimateError}</div>
         )}
@@ -549,14 +612,15 @@ export default function GovernancePanel() {
             className="btn btn-primary sg-interactive"
             data-testid="governance-train-trigger-button"
             onClick={() => setConfirmingTraining(true)}
-            disabled={!trainingEstimate || trainingInProgress || trainingSubmitting}
+            disabled={!trainingEstimate || !selectedTrainingRun || trainingInProgress || trainingSubmitting}
           >
             {trainingInProgress ? "Training in progress\u2026" : "Train from load test"}
           </button>
         ) : (
           <div className="cl-train-confirm">
             <span>
-              Start a real SageMaker training job for {trainingModelType}? Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
+              Start a real SageMaker training job for {trainingModelType}, using run {selectedTrainingRun}?
+              Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
             </span>
             <button
               className="btn btn-primary sg-interactive"

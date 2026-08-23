@@ -177,7 +177,9 @@ export default function ContainersPanel({ onClose }) {
                   </div>
                   {formatProbe("MCP /health/ready", c.evidence?.httpProbe)}
                   {formatProbe("gRPC channel_ready", c.evidence?.grpcProbe)}
-                  {formatProbe("Triton model probe", c.evidence?.tritonModelProbe)}
+                  {(c.evidence?.tritonModelProbes || []).map((p) => (
+                    <div key={p.model}>{formatProbe(`Triton model probe (${p.model})`, p)}</div>
+                  ))}
                 </div>
               );
             })}
