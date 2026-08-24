@@ -26,10 +26,10 @@ aws: "AWS Cloud" {
   style.bold: true
   grid-columns: 2
 
-  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 4 ARTF containers" {
+  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 5 ARTF containers" {
     style.fill: "#FDEBD0"
     style.stroke: "#ED7100"
-    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n3 ONNX models" {
+    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n3 ONNX models + 2 XGBoost (FIL)" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
@@ -42,7 +42,7 @@ aws: "AWS Cloud" {
     style.stroke: "#C925D1"
   }
 
-  feedback: "Feedback Data Pipeline" {
+  feedback: "Feedback Data Pipeline (Bid Pricer + Deal Scorer)" {
     style.stroke: "#8C4FFF"
     style.font-size: 20
     direction: right
@@ -62,7 +62,35 @@ aws: "AWS Cloud" {
     kds -> kdf -> s3raw -> glue -> s3train
   }
 
-  retrain: "Batch Retraining Loop (GPU)" {
+  yield_feedback: "Feedback Data Pipeline (Yield Optimizer)\nSeparate stream/table — different event shape" {
+    style.stroke: "#8C4FFF"
+    style.font-size: 20
+    direction: right
+    kds: "Kinesis Data Stream\nDeal Yield Outcomes"
+    kdf: "Kinesis Data Firehose\nBuffer + partition"
+    s3raw: "Amazon S3\nRaw Deal Yield Outcomes (Parquet)" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    glue: "AWS Glue ETL\nFloor + Margin Labeling"
+    s3train: "Amazon S3\nFloor + Margin Training Data" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    kds -> kdf -> s3raw -> glue -> s3train
+  }
+
+  bootstrap: "Yield Optimizer Bootstrap Sources\n(no live win/loss signal yet)" {
+    style.stroke: "#8C4FFF"
+    style.font-size: 18
+    style.stroke-dash: 3
+    loadtest: "Load Test traffic\nsource=load_test (disclosed, synthetic)"
+    explore: "Bounded Exploration (in-container)\nepsilon-greedy, disclosed via :explore suffix"
+  }
+
+  retrain: "Batch Retraining Loop (GPU) — Bid Pricer + Deal Scorer" {
     style.stroke: "#76b900"
     direction: down
     style.font-size: 20
@@ -75,6 +103,21 @@ aws: "AWS Cloud" {
       shape: cylinder
     }
     nemo -> registry: "register new version"
+  }
+
+  yield_retrain: "Batch Retraining Loop — Yield Optimizer" {
+    style.stroke: "#76b900"
+    direction: down
+    style.font-size: 20
+    xgb: "Amazon SageMaker\nBuilt-in XGBoost training (floor + margin)" {
+      style.fill: "#76b900"
+      style.stroke: "#5a8c00"
+      style.font-color: "#000000"
+    }
+    registry: "Model Registry\nFloor + margin package groups" {
+      shape: cylinder
+    }
+    xgb -> registry: "register new version"
   }
 
   agents: "Amazon Bedrock AgentCore Runtimes" {
@@ -111,10 +154,19 @@ aws.rtb -> exchange: "RTBResponse (mutations)"
 
 # Feedback collection
 aws.rtb -> aws.feedback.kds: "bid outcomes (win/loss, price, CTR)"
+aws.rtb -> aws.yield_feedback.kds: "deal yield outcomes (floor/margin)"
 
 # Batch retraining
 aws.feedback.s3train -> aws.retrain.nemo: "labeled training data"
 aws.retrain.registry -> aws.events: "new version registered"
+
+aws.yield_feedback.s3train -> aws.yield_retrain.xgb: "labeled floor + margin data"
+aws.yield_retrain.registry -> aws.events: "new version registered"
+
+# Bootstrap sources feed the yield feedback pipeline until a live
+# win/loss signal path exists
+aws.bootstrap.loadtest -> aws.yield_feedback.kds: "synthetic outcome"
+aws.bootstrap.explore -> aws.rtb.triton: "perturbed prediction"
 
 # Governance + deployment
 aws.events -> aws.agents.gov: "invoke (rule)"

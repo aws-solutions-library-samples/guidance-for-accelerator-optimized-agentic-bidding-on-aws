@@ -25,6 +25,7 @@ const TARGET_MODEL_TYPES = [
   { value: "widedeep_segment_activator", label: "Audience Activator" },
   { value: "ncf_deal_manager", label: "Deal Scorer" },
   { value: "metrics_enricher", label: "Signals Enricher" },
+  { value: "deal_yield_manager", label: "Yield Optimizer" },
 ];
 
 /**

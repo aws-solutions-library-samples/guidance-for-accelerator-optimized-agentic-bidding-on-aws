@@ -451,6 +451,16 @@ spec:
               value: "triton-inference-server:8000"
             - name: USE_TRITON
               value: "true"
+            # Bounded epsilon-greedy exploration (breaks the genesis
+            # model's cold-start deadlock -- see
+            # containers/deal_yield_manager/exploration.py and
+            # CLOSED_LOOP.md's "Yield Optimizer" section). Structurally
+            # scoped to load-test-originated calls only (see
+            # shared/load_test_context.py's get_is_load_test()) --
+            # this value has no effect on real auction traffic regardless
+            # of what it's set to.
+            - name: YIELD_EXPLORATION_EPSILON
+              value: "0.1"
           resources:
             requests:
               cpu: "250m"

@@ -4,7 +4,7 @@ import { SCENARIOS } from '../components/ScenarioCard.jsx';
  * DemoSequenceOrchestrator — Builds and manages the demo walkthrough sequence.
  *
  * Knows about SCENARIOS, submission logic, and focus-step ordering.
- * Cycles through all 8 scenarios, submitting each via the provided submitFn,
+ * Cycles through all scenarios (see SCENARIOS.length), submitting each via the provided submitFn,
  * building animation sequences from results, and feeding them to the engine.
  *
  * This is a plain class (not a React component) — instantiated by the hook/component.

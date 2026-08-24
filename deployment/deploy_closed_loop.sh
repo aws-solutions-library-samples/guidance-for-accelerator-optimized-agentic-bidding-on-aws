@@ -278,6 +278,29 @@ KMS_KEY_ARN="$(get_stack_output "${FEEDBACK_STACK}" "KMSKeyArn")"
 [[ -n "${KMS_KEY_ARN}" ]] || fail "Could not retrieve KMS Key ARN from feedback pipeline stack"
 log "  KMS Key: ${KMS_KEY_ARN}"
 
+# Pre-create the raw-outcomes prefixes Firehose delivers into. On a fresh
+# stack, glue_etl_cfn.yaml's FeatureEngineeringSchedule/
+# DealYieldFeatureEngineeringSchedule triggers (StartOnCreation: true) can
+# fire before Firehose's first buffered flush (up to
+# FirehoseBufferIntervalSeconds, default 300s) ever lands a file -- the
+# Glue job's spark.read.format("parquet").load(table_location) call then
+# fails outright with "AnalysisException: Path does not exist" (confirmed
+# live) rather than reading 0 rows, because the prefix itself doesn't exist
+# yet. An empty zero-byte marker object makes the prefix exist immediately,
+# so that first scheduled run reads 0 rows (a real, harmless no-op) instead
+# of failing. Firehose's own deliveries land as real objects under the same
+# prefixes afterward, unaffected by this marker.
+RAW_OUTCOMES_BUCKET="$(get_stack_output "${FEEDBACK_STACK}" "RawOutcomesBucketName")"
+if [[ -n "${RAW_OUTCOMES_BUCKET}" ]]; then
+  log "  Pre-creating raw-outcomes prefixes in ${RAW_OUTCOMES_BUCKET} (avoids a cold-start Glue failure on first scheduled run)"
+  aws s3api put-object --bucket "${RAW_OUTCOMES_BUCKET}" --key "raw-outcomes/.keep" --region "${AWS_REGION}" >/dev/null \
+    || warn "  Could not pre-create raw-outcomes/ prefix -- the first scheduled Glue run may fail until Firehose delivers its first file."
+  aws s3api put-object --bucket "${RAW_OUTCOMES_BUCKET}" --key "raw-deal-yield-outcomes/.keep" --region "${AWS_REGION}" >/dev/null \
+    || warn "  Could not pre-create raw-deal-yield-outcomes/ prefix -- the first scheduled Glue run may fail until Firehose delivers its first file."
+else
+  warn "  Could not resolve RawOutcomesBucketName from ${FEEDBACK_STACK} -- raw-outcomes prefixes not pre-created."
+fi
+
 # Attach the FeedbackCollectorPolicy (kinesis:PutRecord/PutRecords, scoped to
 # the BidOutcomeStream) to the EKS node role, so orchestrator pods running
 # there can actually emit bid outcome events. Without this, deploy.sh's
@@ -320,10 +343,59 @@ fi # step 1
 if [[ "${START_AT}" -le 2 ]]; then
 log "Step 2: Deploying Glue ETL"
 
-# Glue script bucket — user must pre-upload the script. Use a placeholder for
-# initial deploy; the actual script path should be set via GLUE_SCRIPT_S3_PATH env var.
-GLUE_SCRIPT_S3_PATH="${GLUE_SCRIPT_S3_PATH:-${STACK_PREFIX:+${STACK_PREFIX}-}artf-scripts-${ACCOUNT_ID}/etl/glue_feature_engineering.py}"
+# Glue script bucket. GLUE_SCRIPT_S3_PATH can still be overridden to point at
+# an already-existing script elsewhere, but the default path below is now
+# actually created and populated by this script (see the bucket
+# create+upload block immediately after) -- previously this only computed
+# the expected path and left creating the bucket/uploading the script as a
+# manual, easy-to-miss step (documented only in the "Next Steps" log output
+# at the end of this run). A fresh stack whose operator never did that step
+# had a Glue job pointing at a script location that was never created, so
+# every run failed at launch with "LAUNCH ERROR ... bucket does not exist" --
+# confirmed live on a freshly deployed stack.
+GLUE_SCRIPT_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}artf-scripts-${ACCOUNT_ID}"
+GLUE_SCRIPT_S3_PATH="${GLUE_SCRIPT_S3_PATH:-${GLUE_SCRIPT_BUCKET}/etl/glue_feature_engineering.py}"
+# Deal yield (Yield Optimizer floor/margin) ETL script -- a separate job from
+# the bid-shading one above (glue_deal_yield_feature_engineering.py reads
+# raw_deal_yield_outcomes, not raw_bid_outcomes, and writes two labeled
+# datasets instead of one). Uploaded to the SAME script bucket/prefix as
+# GLUE_SCRIPT_S3_PATH so glue_etl_cfn.yaml's DealYieldFeatureEngineeringJob
+# --extra-py-files argument (which references GLUE_SCRIPT_S3_PATH itself, for
+# the shared _resolve_window() helper) can find it alongside its own script.
+DEAL_YIELD_GLUE_SCRIPT_S3_PATH="${DEAL_YIELD_GLUE_SCRIPT_S3_PATH:-${GLUE_SCRIPT_BUCKET}/etl/glue_deal_yield_feature_engineering.py}"
 TRAINING_DATA_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}training-data-${ACCOUNT_ID}-${AWS_REGION}"
+
+# Only create/upload when GLUE_SCRIPT_S3_PATH was not overridden to point
+# somewhere else -- if the caller set GLUE_SCRIPT_S3_PATH explicitly (e.g. to
+# reuse an already-uploaded, possibly customized script), respect that and
+# don't overwrite it.
+if [[ "${GLUE_SCRIPT_S3_PATH}" == "${GLUE_SCRIPT_BUCKET}/etl/glue_feature_engineering.py" ]]; then
+  if ! aws s3api head-bucket --bucket "${GLUE_SCRIPT_BUCKET}" --region "${AWS_REGION}" 2>/dev/null; then
+    log "  Creating Glue script bucket: ${GLUE_SCRIPT_BUCKET}"
+    if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "${GLUE_SCRIPT_BUCKET}" --region "${AWS_REGION}" >/dev/null
+    else
+      aws s3api create-bucket --bucket "${GLUE_SCRIPT_BUCKET}" --region "${AWS_REGION}" \
+        --create-bucket-configuration LocationConstraint="${AWS_REGION}" >/dev/null
+    fi
+    aws s3api put-public-access-block --bucket "${GLUE_SCRIPT_BUCKET}" --region "${AWS_REGION}" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null
+  fi
+  log "  Uploading Glue ETL script to s3://${GLUE_SCRIPT_S3_PATH}"
+  aws s3 cp "${SCRIPT_DIR}/../source/etl/glue_feature_engineering.py" \
+    "s3://${GLUE_SCRIPT_S3_PATH}" --region "${AWS_REGION}" >/dev/null \
+    || fail "Failed to upload Glue ETL script to s3://${GLUE_SCRIPT_S3_PATH}"
+fi
+
+# Same pattern for the deal yield ETL script -- uploaded unconditionally
+# alongside the bid-shading one above whenever this default path is in use
+# (not gated on the bucket-creation check, since that already ran above).
+if [[ "${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}" == "${GLUE_SCRIPT_BUCKET}/etl/glue_deal_yield_feature_engineering.py" ]]; then
+  log "  Uploading deal yield Glue ETL script to s3://${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}"
+  aws s3 cp "${SCRIPT_DIR}/../source/etl/glue_deal_yield_feature_engineering.py" \
+    "s3://${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}" --region "${AWS_REGION}" >/dev/null \
+    || fail "Failed to upload deal yield Glue ETL script to s3://${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}"
+fi
 
 # The real Glue database name feedback_pipeline_cfn.yaml created in Step 1
 # (stack-prefix-aware — e.g. "nvd_feedback_pipeline", not the unprefixed
@@ -336,6 +408,7 @@ RAW_OUTCOMES_GLUE_DATABASE="${RAW_OUTCOMES_GLUE_DATABASE:-feedback_pipeline}"
 deploy_cfn_stack "${GLUE_STACK}" "${SCRIPT_DIR}/glue_etl_cfn.yaml" \
   "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
   "ParameterKey=GlueScriptS3Path,ParameterValue=${GLUE_SCRIPT_S3_PATH}" \
+  "ParameterKey=DealYieldGlueScriptS3Path,ParameterValue=${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}" \
   "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}" \
   "ParameterKey=RawOutcomesGlueDatabaseName,ParameterValue=${RAW_OUTCOMES_GLUE_DATABASE}"
 
@@ -914,13 +987,12 @@ log "  Training Execution Role: $(get_stack_output "${CLOSED_LOOP_STACK}" "SageM
 log "  Scheduled Retraining:    $(get_stack_output "${GOVERNANCE_EVENTBRIDGE_STACK}" "RetrainingScheduleArn" 2>/dev/null || echo '<not enabled>')"
 log ""
 log "Next Steps:"
-log "  1. Upload Glue ETL script to s3://${GLUE_SCRIPT_S3_PATH}"
-log "  2. Roles are created before runtimes and the invocation stack uses the real"
+log "  1. Roles are created before runtimes and the invocation stack uses the real"
 log "     runtime ARNs — no placeholder reconciliation needed."
-log "  3. Existing EKS/Triton manifests serve canary side-by-side — no changes needed"
-log "  4. Verify with: aws cloudformation describe-stacks --stack-name ${CLOSED_LOOP_STACK}"
-log "  5. Genesis models are registered automatically in Step 3 if MODEL_BUCKET is set."
-log "  6. Scheduled retraining fires every 6h once the training container (Step 4b)"
+log "  2. Existing EKS/Triton manifests serve canary side-by-side — no changes needed"
+log "  3. Verify with: aws cloudformation describe-stacks --stack-name ${CLOSED_LOOP_STACK}"
+log "  4. Genesis models are registered automatically in Step 3 if MODEL_BUCKET is set."
+log "  5. Scheduled retraining fires every 6h once the training container (Step 4b)"
 log "     has finished building - check with ./check_builds.sh --prefix ${STACK_PREFIX:-<prefix>}"
 log ""
 
