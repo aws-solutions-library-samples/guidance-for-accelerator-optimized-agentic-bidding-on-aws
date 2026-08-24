@@ -47,6 +47,7 @@ from orchestrator.training_trigger import (
     NoApprovedBaseVersionError,
     TrainingAlreadyInProgressError,
     TrainingNotConfirmedError,
+    XGBoostTrainingImageNotConfiguredError,
     estimate_cost,
     trigger_training,
 )
@@ -108,12 +109,18 @@ def _audit_table():
 # Which Glue job labels model_type's training data -- matches
 # deploy.sh's GLUE_JOB_NAME/DEAL_YIELD_GLUE_JOB_NAME env var naming
 # convention (glue_etl_cfn.yaml's FeatureEngineeringJob/
-# DealYieldFeatureEngineeringJob). Only dlrm_bid_shader is in
-# TRAINABLE_MODEL_TYPES today, but this map is written generically so
-# adding a model type later needs no change here.
+# DealYieldFeatureEngineeringJob). Both deal_yield_manager_floor and
+# deal_yield_manager_margin are labeled by the SAME Glue job
+# (glue_deal_yield_feature_engineering.py writes both output prefixes in
+# one run) -- there was never a bare "deal_yield_manager" model type post
+# the FIL multi-output-limitation correction (see
+# source/training/xgboost_pipeline.py's module docstring), so a prior
+# version of this map keyed on that non-existent name and every yield
+# trainable-runs lookup silently resolved to "no Glue job configured."
 _GLUE_JOB_ENV_VAR_BY_MODEL_TYPE = {
     "dlrm_bid_shader": "GLUE_JOB_NAME",
-    "deal_yield_manager": "DEAL_YIELD_GLUE_JOB_NAME",
+    "deal_yield_manager_floor": "DEAL_YIELD_GLUE_JOB_NAME",
+    "deal_yield_manager_margin": "DEAL_YIELD_GLUE_JOB_NAME",
 }
 
 
@@ -221,6 +228,10 @@ async def train_handler(request: Request) -> JSONResponse:
     model_bucket = os.environ.get("MODEL_BUCKET", "")
     training_data_bucket = os.environ.get("TRAINING_DATA_BUCKET", "")
     training_image_registry = os.environ.get("TRAINING_IMAGE_REGISTRY", "")
+    # Only required for deal_yield_manager_floor/margin (xgboost-shaped
+    # training -- see training_trigger._TRAINING_SHAPE); unset/empty is
+    # fine for dlrm_bid_shader, which never reads it.
+    xgboost_training_image_uri = os.environ.get("XGBOOST_TRAINING_IMAGE_URI", "") or None
 
     if not all([sagemaker_role_arn, model_bucket, training_data_bucket, training_image_registry]):
         return JSONResponse(
@@ -238,6 +249,7 @@ async def train_handler(request: Request) -> JSONResponse:
             model_bucket=model_bucket,
             training_data_bucket=training_data_bucket,
             training_image_registry=training_image_registry,
+            xgboost_training_image_uri=xgboost_training_image_uri,
         )
     except ModelTypeNotTrainableError as exc:
         return JSONResponse({"error": str(exc), "reason": "not_trainable"}, status_code=422)
@@ -250,6 +262,8 @@ async def train_handler(request: Request) -> JSONResponse:
         )
     except NoApprovedBaseVersionError as exc:
         return JSONResponse({"error": str(exc), "reason": "no_approved_base_version"}, status_code=422)
+    except XGBoostTrainingImageNotConfiguredError as exc:
+        return JSONResponse({"error": str(exc), "reason": "xgboost_image_not_configured"}, status_code=503)
     except Exception as exc:
         # Fail-safe: any other error (e.g. a boto3 ClientError) must still
         # return valid JSON, never fall through to a plain-text 500 that

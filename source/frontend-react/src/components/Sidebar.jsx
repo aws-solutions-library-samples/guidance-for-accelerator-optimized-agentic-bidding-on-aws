@@ -43,6 +43,13 @@ function applyTunerToPayload(payload, scenario, params) {
   if (params.segThreshold != null && scenario.controls?.includes("segThreshold")) {
     modelParams.segment_threshold = params.segThreshold;
   }
+  if (params.explore != null && scenario.controls?.includes("explore")) {
+    // Yield Optimizer's bounded exploration toggle (see
+    // containers/deal_yield_manager/app.py's _resolve_effective_epsilon) --
+    // explicit True/False, read the same way every other demo-tunable
+    // parameter here is (ext.model_params).
+    modelParams.explore = params.explore;
+  }
   if (Object.keys(modelParams).length > 0) {
     // Nonstandard signaling travels through the ARTF `ext` object, not as a
     // top-level field, per the spec's extension convention.

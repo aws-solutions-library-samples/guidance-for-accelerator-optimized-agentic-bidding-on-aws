@@ -49,10 +49,15 @@ from orchestrator.training_trigger import (
 
 
 class TestTrainableModelTypes:
-    def test_only_dlrm_is_trainable_today(self):
+    def test_dlrm_and_yield_submodels_are_trainable_today(self):
         """ncf_deal_manager is parked pending a deal_id schema change (see
-        module docstring) -- must not silently become trainable again."""
-        assert TRAINABLE_MODEL_TYPES == frozenset({"dlrm_bid_shader"})
+        module docstring) -- must not silently become trainable again.
+        dlrm_bid_shader and the two Yield Optimizer sub-models
+        (deal_yield_manager_floor/margin) are the three real trainable
+        model types."""
+        assert TRAINABLE_MODEL_TYPES == frozenset({
+            "dlrm_bid_shader", "deal_yield_manager_floor", "deal_yield_manager_margin",
+        })
 
     def test_ncf_deal_manager_is_not_trainable(self):
         assert "ncf_deal_manager" not in TRAINABLE_MODEL_TYPES
@@ -236,3 +241,108 @@ class TestTriggerTraining:
         assert "_" not in call_kwargs["TrainingJobName"]
         assert call_kwargs["TrainingJobName"].startswith("dlrm-bid-shader-")
         assert "_" not in result.job_name
+
+
+class TestTriggerTrainingXGBoostShape:
+    """deal_yield_manager_floor/margin use the xgboost training shape (see
+    _TRAINING_SHAPE) -- SageMaker's built-in XGBoost container, tree
+    hyperparameters, and a per-target training-data S3 prefix, rather than
+    the NeMo-RL shape dlrm_bid_shader/ncf_deal_manager use."""
+
+    _COMMON_KWARGS = dict(
+        sagemaker_role_arn="arn:aws:iam::123456789012:role/sagemaker-training",
+        model_bucket="artf-model-bucket",
+        training_data_bucket="artf-training-data-bucket",
+        training_image_registry="123456789012.dkr.ecr.us-east-1.amazonaws.com",
+    )
+
+    def _mock_client_ready(self, base_version_arn):
+        mock_client = MagicMock()
+        mock_client.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+        mock_client.list_model_packages.return_value = {
+            "ModelPackageSummaryList": [{"ModelPackageArn": base_version_arn}]
+        }
+        return mock_client
+
+    def test_rejects_when_xgboost_image_uri_not_configured(self):
+        from orchestrator.training_trigger import XGBoostTrainingImageNotConfiguredError
+
+        mock_client = self._mock_client_ready(
+            "arn:aws:sagemaker:us-east-1:123:model-package/artf-deal-yield-manager-floor/1"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            with pytest.raises(XGBoostTrainingImageNotConfiguredError):
+                trigger_training(
+                    "deal_yield_manager_floor", confirmed=True,
+                    xgboost_training_image_uri=None, **self._COMMON_KWARGS,
+                )
+        mock_client.create_training_job.assert_not_called()
+
+    def test_floor_target_uses_xgboost_image_and_floor_prefix(self):
+        mock_client = self._mock_client_ready(
+            "arn:aws:sagemaker:us-east-1:123:model-package/artf-deal-yield-manager-floor/1"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            result = trigger_training(
+                "deal_yield_manager_floor", confirmed=True,
+                xgboost_training_image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/xgboost:1.7-1",
+                **self._COMMON_KWARGS,
+            )
+
+        assert result.model_type == "deal_yield_manager_floor"
+        call_kwargs = mock_client.create_training_job.call_args[1]
+        assert call_kwargs["AlgorithmSpecification"]["TrainingImage"] == (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/xgboost:1.7-1"
+        )
+        s3_uri = call_kwargs["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"]
+        assert s3_uri == "s3://artf-training-data-bucket/training-data-deal-yield-floor/"
+        # Tree hyperparameters, not the NeMo-RL shape.
+        hp = call_kwargs["HyperParameters"]
+        assert hp["max_depth"] == "6"
+        assert hp["objective"] == "reg:squarederror"
+        assert "window_days" not in hp
+        assert "model_type" not in hp
+
+    def test_margin_target_uses_margin_prefix(self):
+        mock_client = self._mock_client_ready(
+            "arn:aws:sagemaker:us-east-1:123:model-package/artf-deal-yield-manager-margin/1"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            trigger_training(
+                "deal_yield_manager_margin", confirmed=True,
+                xgboost_training_image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/xgboost:1.7-1",
+                **self._COMMON_KWARGS,
+            )
+
+        call_kwargs = mock_client.create_training_job.call_args[1]
+        s3_uri = call_kwargs["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"]
+        assert s3_uri == "s3://artf-training-data-bucket/training-data-deal-yield-margin/"
+
+    def test_floor_job_name_has_no_underscore(self):
+        mock_client = self._mock_client_ready(
+            "arn:aws:sagemaker:us-east-1:123:model-package/artf-deal-yield-manager-floor/1"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            result = trigger_training(
+                "deal_yield_manager_floor", confirmed=True,
+                xgboost_training_image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/xgboost:1.7-1",
+                **self._COMMON_KWARGS,
+            )
+        assert "_" not in result.job_name
+        assert result.job_name.startswith("deal-yield-manager-floor-")
+
+    def test_dlrm_still_uses_nemo_rl_shape_unaffected(self):
+        """Sanity check that adding the xgboost branch didn't change
+        dlrm_bid_shader's existing behavior."""
+        mock_client = self._mock_client_ready(
+            "arn:aws:sagemaker:us-east-1:123:model-package/artf-dlrm-bid-shader/3"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=mock_client):
+            trigger_training("dlrm_bid_shader", confirmed=True, **self._COMMON_KWARGS)
+
+        call_kwargs = mock_client.create_training_job.call_args[1]
+        assert call_kwargs["AlgorithmSpecification"]["TrainingImage"] == (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/artf-nemo-rl-training:dlrm"
+        )
+        s3_uri = call_kwargs["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"]
+        assert s3_uri == "s3://artf-training-data-bucket/training-data/"
