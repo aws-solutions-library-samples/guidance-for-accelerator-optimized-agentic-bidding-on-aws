@@ -50,16 +50,21 @@ USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 #
 # Enabled by default (epsilon=0.1 -- override via the YIELD_EXPLORATION_EPSILON
 # env var, e.g. in deployment/eks/artf-containers-deployment.yaml, if a
-# different rate is needed) -- but STRUCTURALLY SCOPED to load-test-originated
-# calls only, never live auction traffic. This is
-# enforced below in mutate() via shared.load_test_context.get_is_load_test()
-# (True only when the orchestrator's load-test invocation path set the
-# X-Load-Test header -- see that module's docstring), NOT by this epsilon
-# value alone. A prior version of this container read this epsilon
-# unconditionally with a disabled (0.0) default, which meant a freshly
-# deployed stack's Yield Optimizer could NEVER produce a mutation for the
-# genesis (constant no-op) model -- confirmed live: every load test against
-# it produced exactly 0 mutations, so no DealYieldOutcomeEvent was ever
+# different rate is needed). By default this value only takes effect on
+# load-test-originated calls (see get_is_load_test() below) -- but a caller
+# can also opt in/out per-request via ``ext.model_params.explore`` (True/
+# False), the SAME override channel every other demo-tunable parameter in
+# this repo already uses (shade_factor, segment_threshold, etc. -- see
+# RTBRequest.model_params in shared/artf_types.py). This is what lets the
+# "PMP Deals — Yield Optimizer" scenario card's Explore toggle (default ON)
+# make a single scenario Send actually produce a mutation against the
+# genesis model too, not just a load test -- and lets a user turn it back
+# off once a real trained model version exists, to see that model's
+# unperturbed prediction. A prior version of this container read this
+# epsilon unconditionally with a disabled (0.0) default, which meant a
+# freshly deployed stack's Yield Optimizer could NEVER produce a mutation
+# for the genesis model -- confirmed live: every load test against it
+# produced exactly 0 mutations, so no DealYieldOutcomeEvent was ever
 # emitted and the training pipeline had no real data to bootstrap from.
 _EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.1"))
 _EXPLORATION_FLOOR_BOUND = float(os.environ.get("YIELD_EXPLORATION_FLOOR_BOUND", "0.05"))
@@ -89,6 +94,35 @@ def _margin_calculation_type(at: int | None) -> int:
     return MarginCalculationType.PERCENT
 
 
+def _resolve_effective_epsilon(is_load_test: bool, explore_override: bool | None) -> float:
+    """Decide whether exploration is armed for this specific request.
+
+    Two independent ways a caller can arm it:
+    - is_load_test: the orchestrator's load-test invocation path set the
+      X-Load-Test header (see shared/load_test_context.py) -- always
+      structurally load-test-only, never live auction traffic.
+    - explore_override: the caller set ``ext.model_params.explore``
+      explicitly (True or False) -- the demo Scenario card's Explore
+      toggle uses this, defaulting to True so a single scenario Send
+      against the genesis model can also produce a real mutation, not
+      just a load test.
+
+    An explicit ``explore=False`` always wins (lets a user who has since
+    trained a real model turn exploration off to see its unperturbed
+    prediction, even mid-load-test if ever needed). Otherwise, either
+    signal being "on" arms epsilon. Neither signal being set (real
+    production traffic hitting this same endpoint, with no override and
+    no load-test header) always resolves to 0.0 -- this is what keeps
+    exploration off by default for traffic this container cannot
+    otherwise identify as load-test or demo-originated.
+    """
+    if explore_override is False:
+        return 0.0
+    if is_load_test or explore_override is True:
+        return _EXPLORATION_EPSILON
+    return 0.0
+
+
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations -- ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN via
     Triton FIL-served XGBoost prediction per deal."""
@@ -103,13 +137,14 @@ def mutate(req: RTBRequest) -> RTBResponse:
     request_time = datetime.now(timezone.utc)
     bid_request = req.bid_request or {}
 
-    # Structural gate (BR-4-style scoping, mirroring target_variant's own
-    # load-test exclusivity): exploration must only ever perturb
-    # load-test-originated calls, never real auction traffic. epsilon=0.0
-    # would already suppress everything, but that's a config value, not a
-    # guarantee -- this check makes "live traffic never explores" true
-    # regardless of how YIELD_EXPLORATION_EPSILON is configured.
-    effective_epsilon = _EXPLORATION_EPSILON if get_is_load_test() else 0.0
+    model_params = req.model_params or {}
+    explore_override = model_params.get("explore")
+    if explore_override is not None and not isinstance(explore_override, bool):
+        # Never fabricate a boolean from an unexpected type (e.g. a stray
+        # string) -- treat anything non-bool as "no override" rather than
+        # guessing what the caller meant.
+        explore_override = None
+    effective_epsilon = _resolve_effective_epsilon(get_is_load_test(), explore_override)
 
     mutations: list[Mutation] = []
     served_model_version = ""

@@ -33,18 +33,27 @@ const MODEL_TYPES = [
 
 // Training-specific model selector for the "Train from load test" card,
 // decoupled from MODEL_TYPES above (which also drives scenario/compare/
-// promote — those work fine for NCF). ncf_deal_manager training is parked:
-// its ACTIVATE_DEALS/SUPPRESS_DEALS mutations disambiguate deals via
-// path + a list of deal IDs (verified against the real ARTF proto/reference
-// implementation — github.com/IABTechLab/agentic-real-time-framework), but
+// promote — those work fine for NCF). Three real trainable model types
+// exist today (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES,
+// the authoritative backend enforcement): dlrm_bid_shader (NeMo-RL) and
+// the Yield Optimizer's two independently-trained sub-models,
+// deal_yield_manager_floor/margin (SageMaker built-in XGBoost — see
+// training/xgboost_pipeline.py's module docstring on why Triton's FIL
+// backend requires floor/margin to be trained as separate single-output
+// models, not one combined "deal_yield_manager" model/target).
+//
+// ncf_deal_manager training is parked: its ACTIVATE_DEALS/SUPPRESS_DEALS
+// mutations disambiguate deals via path + a list of deal IDs (verified
+// against the real ARTF proto/reference implementation —
+// github.com/IABTechLab/agentic-real-time-framework), but
 // BidShadingOutcomeEvent/Record has no deal_id field and no per-deal
 // fan-out, so there's no way to attribute a training outcome to one
 // specific deal yet. Shown here, disabled, rather than removed, so it's
-// discoverable and trivial to re-enable once that schema work lands
-// (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES, the
-// authoritative backend enforcement).
+// discoverable and trivial to re-enable once that schema work lands.
 const TRAINING_MODEL_TYPES = [
   { key: "dlrm_bid_shader", label: "DLRM Bid Shader", trainable: true },
+  { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor", trainable: true },
+  { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin", trainable: true },
   { key: "ncf_deal_manager", label: "NCF Deal Manager (parked — coming in a future release)", trainable: false },
 ];
 

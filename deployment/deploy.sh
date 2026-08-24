@@ -325,6 +325,30 @@ TRAINING_DATA_BUCKET="${STACK_PREFIX:+${STACK_PREFIX}-}training-data-${ACCOUNT_I
 # Glue job run (see orchestrator/governance_api.py's trainable_runs_handler).
 GLUE_JOB_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}feature-engineering-etl"
 DEAL_YIELD_GLUE_JOB_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}deal-yield-feature-engineering-etl"
+# Deterministic Model Package Group names for the Yield Optimizer's two
+# independently-trained sub-models, matching closed_loop_cfn.yaml's naming
+# exactly (same convention as DLRM_MODEL_GROUP/NCF_MODEL_GROUP below --
+# resolved deterministically here rather than via a stack-output lookup,
+# since this substitution happens in Phase 3, before deploy_closed_loop.sh
+# (Phase 5) creates/queries any closed-loop stack outputs).
+YIELD_FLOOR_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-floor"
+YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-margin"
+# SageMaker's built-in XGBoost algorithm image lives in an AWS-owned
+# account that differs per region -- resolved via the sagemaker SDK, never
+# hardcoded/guessed (same resolution deploy_closed_loop.sh already uses
+# for the scheduled retraining Lambda). Required only for the on-demand
+# "Train from load test" trigger's deal_yield_manager_floor/margin path
+# (orchestrator/training_trigger.py's xgboost-shaped branch) -- left empty
+# if the sagemaker SDK isn't installed, and training_trigger.py reports a
+# clear 503 for that model type rather than fabricating a URI.
+XGBOOST_TRAINING_IMAGE_URI="$(${PYTHON} -c "
+import sys
+try:
+    from sagemaker import image_uris
+    print(image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1'))
+except Exception:
+    pass
+" 2>/dev/null || true)"
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
 # naming (HasStackPrefix condition). Only resolves to a real stream once
@@ -1492,7 +1516,7 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"ParameterStoreAndAudit\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:BatchGetItem\",\"dynamodb:DescribeTable\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]},\
 {\"Sid\":\"SchedulerToggle\",\"Effect\":\"Allow\",\"Action\":[\"scheduler:GetSchedule\",\"scheduler:UpdateSchedule\"],\"Resource\":[\"arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/default/*\"]},\
 {\"Sid\":\"ModelRegistryRead\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListModelPackages\",\"sagemaker:DescribeModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package-group/*artf-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
-{\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm-bid-shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf-deal-manager-*\"]},\
+{\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm-bid-shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf-deal-manager-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-floor-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-margin-*\"]},\
 {\"Sid\":\"ListTrainingJobsFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListTrainingJobs\"],\"Resource\":\"*\"},\
 {\"Sid\":\"GlueJobRunsForTrainableRunFilter\",\"Effect\":\"Allow\",\"Action\":[\"glue:GetJobRuns\"],\"Resource\":[\"arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:job/*feature-engineering-etl\"]},\
 {\"Sid\":\"PassSageMakerTrainingRole\",\"Effect\":\"Allow\",\"Action\":[\"iam:PassRole\"],\"Resource\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}\",\"Condition\":{\"StringEquals\":{\"iam:PassedToService\":\"sagemaker.amazonaws.com\"}}},\
@@ -1686,9 +1710,12 @@ for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-
       -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
       -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
       -e "s|__NCF_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager|g" \
+      -e "s|__YIELD_FLOOR_MODEL_GROUP__|${YIELD_FLOOR_MODEL_GROUP}|g" \
+      -e "s|__YIELD_MARGIN_MODEL_GROUP__|${YIELD_MARGIN_MODEL_GROUP}|g" \
       -e "s|__SAGEMAKER_TRAINING_ROLE_ARN__|arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}|g" \
       -e "s|__TRAINING_DATA_BUCKET__|${TRAINING_DATA_BUCKET}|g" \
       -e "s|__TRAINING_IMAGE_REGISTRY__|${REGISTRY}|g" \
+      -e "s|__XGBOOST_TRAINING_IMAGE_URI__|${XGBOOST_TRAINING_IMAGE_URI}|g" \
       -e "s|__FEEDBACK_STREAM_NAME__|${FEEDBACK_STREAM_NAME}|g" \
       -e "s|__DEAL_YIELD_FEEDBACK_STREAM_NAME__|${DEAL_YIELD_FEEDBACK_STREAM_NAME}|g" \
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \

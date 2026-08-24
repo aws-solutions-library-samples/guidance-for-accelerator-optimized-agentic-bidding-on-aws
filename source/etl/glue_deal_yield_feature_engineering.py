@@ -281,7 +281,16 @@ def main():
 
         logger.info("Reading from S3 location: %s (table=%s.%s)", table_location, database_name, table_name)
 
-        df = spark.read.format("parquet").load(table_location)
+        # pathGlobFilter restricts the read to actual *.parquet objects --
+        # without it, Spark tries to infer a schema from EVERY object under
+        # table_location, including the zero-byte ".keep" marker
+        # deploy_closed_loop.sh writes so this prefix exists before
+        # Firehose's first delivery. A prefix containing only that marker
+        # (no real deal-yield outcome data yet) fails outright with
+        # "AnalysisException: Unable to infer schema for Parquet. It must
+        # be specified manually." instead of reading 0 rows -- confirmed
+        # live (jr_181e457b77667dd1b2838e313462521fd98ac932e23ced041a88fdcde82441ad).
+        df = spark.read.format("parquet").option("pathGlobFilter", "*.parquet").load(table_location)
         df = df.filter(
             (F.col("timestamp") >= window_start_epoch)
             & (F.col("timestamp") < window_end_epoch)

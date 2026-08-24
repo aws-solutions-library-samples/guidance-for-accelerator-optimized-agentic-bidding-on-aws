@@ -333,8 +333,17 @@ def main():
 
         logger.info("Reading from S3 location: %s (table=%s.%s)", table_location, database_name, table_name)
 
-        # Read as Spark DataFrame for more control over filtering
-        df = spark.read.format("parquet").load(table_location)
+        # Read as Spark DataFrame for more control over filtering.
+        # pathGlobFilter restricts the read to actual *.parquet objects --
+        # without it, Spark tries to infer a schema from EVERY object under
+        # table_location, including the zero-byte ".keep" marker
+        # deploy_closed_loop.sh now writes so this prefix exists before
+        # Firehose's first delivery (see that script's comment). A prefix
+        # containing only that marker (no real data yet) fails outright
+        # with "Unable to infer schema for Parquet" instead of reading 0
+        # rows -- confirmed live on the deal-yield ETL job's equivalent
+        # prefix, which had no real Parquet data yet.
+        df = spark.read.format("parquet").option("pathGlobFilter", "*.parquet").load(table_location)
 
         # Filter by timestamp window
         df = df.filter(

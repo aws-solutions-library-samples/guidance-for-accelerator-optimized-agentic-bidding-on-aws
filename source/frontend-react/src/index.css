@@ -306,6 +306,23 @@ body {
   animation: spin .6s linear infinite;
 }
 .scenario h3 { font-size: clamp(13px, 1.2vw, 15px); font-weight: 700; margin-bottom: 4px; }
+.scenario-models { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.scenario-model-chip {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: clamp(9px, 0.75vw, 10px);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: var(--surface-low, rgba(148,163,184,.15));
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.scenario-model-chip.rules-based {
+  font-weight: 500;
+  font-style: italic;
+  opacity: 0.85;
+}
 .scenario p { font-size: clamp(11px, 1vw, 13px); color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
 .scenario.disabled {
   opacity: 0.5;
@@ -1231,6 +1248,21 @@ body {
   min-width: 45px;
   text-align: right;
   color: var(--text);
+}
+.tuner-row-toggle label {
+  min-width: 0;
+  flex: 1;
+}
+.tuner-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+.tuner-row-toggle input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  flex: none;
 }
 .tuner-send {
   margin-top: 10px;

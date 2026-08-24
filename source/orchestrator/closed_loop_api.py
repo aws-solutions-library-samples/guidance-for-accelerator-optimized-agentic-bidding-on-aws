@@ -65,6 +65,8 @@ _DEFAULT_MODEL_GROUPS = {
     "dlrm_bid_shader": "artf-dlrm-bid-shader",
     "ncf_deal_manager": "artf-ncf-deal-manager",
     "widedeep_segment_activator": "artf-widedeep-segment-activator",
+    "deal_yield_manager_floor": "artf-deal-yield-manager-floor",
+    "deal_yield_manager_margin": "artf-deal-yield-manager-margin",
 }
 
 

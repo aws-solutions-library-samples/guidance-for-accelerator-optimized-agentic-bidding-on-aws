@@ -94,6 +94,16 @@ spec:
               value: "__DLRM_MODEL_GROUP__"
             - name: CLOSED_LOOP_MODEL_GROUP_NCF_DEAL_MANAGER
               value: "__NCF_MODEL_GROUP__"
+            # Same stack-prefix-aware Model Package Group wiring as above,
+            # for the Yield Optimizer's two independently-trained sub-models
+            # (see training/xgboost_pipeline.py's module docstring on the
+            # FIL multi-output-limitation correction). Without these,
+            # closed_loop_api._model_group() falls back to the unprefixed
+            # default, which does not exist when a stack prefix is in use.
+            - name: CLOSED_LOOP_MODEL_GROUP_DEAL_YIELD_MANAGER_FLOOR
+              value: "__YIELD_FLOOR_MODEL_GROUP__"
+            - name: CLOSED_LOOP_MODEL_GROUP_DEAL_YIELD_MANAGER_MARGIN
+              value: "__YIELD_MARGIN_MODEL_GROUP__"
             # Governance panel on-demand training trigger (Train-from-Load-Test
             # feature, Unit 2). Reuses the SageMaker training execution role
             # and buckets closed_loop_cfn.yaml already provisions (Condition:
@@ -107,6 +117,17 @@ spec:
               value: "__TRAINING_DATA_BUCKET__"
             - name: TRAINING_IMAGE_REGISTRY
               value: "__TRAINING_IMAGE_REGISTRY__"
+            # SageMaker's built-in XGBoost algorithm container URI, resolved
+            # at deploy time (see deploy_closed_loop.sh's own resolution for
+            # the scheduled retraining Lambda) -- required only for
+            # deal_yield_manager_floor/margin's on-demand training trigger
+            # (orchestrator/training_trigger.py's xgboost-shaped branch).
+            # Left empty when unresolved (e.g. sagemaker SDK unavailable at
+            # deploy time) -- training_trigger.py raises a clear,
+            # never-fabricated error for that model type until this is set,
+            # rather than guessing a SageMaker-owned account ID/URI.
+            - name: XGBOOST_TRAINING_IMAGE_URI
+              value: "__XGBOOST_TRAINING_IMAGE_URI__"
             # Feedback pipeline (source/orchestrator/feedback_integration.py):
             # emits real BidShadingOutcomeEvents (live traffic + load-test outcome
             # capture) to the Kinesis stream created by feedback_pipeline_cfn.yaml
