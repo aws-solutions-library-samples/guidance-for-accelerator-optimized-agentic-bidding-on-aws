@@ -106,3 +106,164 @@ class TestMostRecentEligible:
 
     def test_none_for_empty_history(self):
         assert most_recent_eligible([], "dlrm_bid_shader", "current") is None
+
+
+class TestListTrainableRuns:
+    """list_trainable_runs() — only lists runs whose data has actually been
+    swept into training-data/ by a completed Glue job run (this fix)."""
+
+    def test_run_before_glue_completion_is_trainable(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "dlrm_bid_shader",
+            "target_variant": "current",
+            "outcome_sample_count": 100,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert [r["id"] for r in result] == ["lt-1"]
+
+    def test_run_after_glue_completion_is_excluded(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "dlrm_bid_shader",
+            "target_variant": "current",
+            "outcome_sample_count": 100,
+            "timestamp": "2026-08-22T07:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert result == []
+
+    def test_no_glue_completion_yet_excludes_everything(self):
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "dlrm_bid_shader",
+            "target_variant": "current",
+            "outcome_sample_count": 100,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        result = list_trainable_runs(history, "dlrm_bid_shader", None)
+        assert result == []
+
+    def test_different_model_type_excluded(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "ncf_deal_manager",
+            "target_variant": "current",
+            "outcome_sample_count": 100,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert result == []
+
+    def test_zero_outcome_samples_excluded(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "dlrm_bid_shader",
+            "target_variant": "current",
+            "outcome_sample_count": 0,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert result == []
+
+    def test_missing_timestamp_excluded(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "dlrm_bid_shader",
+            "target_variant": "current",
+            "outcome_sample_count": 100,
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert result == []
+
+    def test_empty_history_returns_empty(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        assert list_trainable_runs([], "dlrm_bid_shader", latest_completion) == []
+
+
+class TestListTrainableRunsYieldSubModelMapping:
+    """deal_yield_manager_floor/margin training targets must match load
+    test runs recorded under the shared container-level identifier
+    "deal_yield_manager" (see _LOAD_TEST_TARGET_BY_TRAINING_MODEL_TYPE) --
+    there is no per-sub-model load-test target. Reproduces a real bug: a
+    prior version of this filter required an exact match against
+    "deal_yield_manager_floor"/"deal_yield_manager_margin", which no load
+    test run ever records, so trainable-runs always returned empty for
+    both yield sub-models even with real captured outcome data."""
+
+    def test_floor_target_matches_deal_yield_manager_run(self):
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "deal_yield_manager",
+            "target_variant": "current",
+            "outcome_sample_count": 50,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "deal_yield_manager_floor", latest_completion)
+        assert [r["id"] for r in result] == ["lt-1"]
+
+    def test_margin_target_matches_same_deal_yield_manager_run(self):
+        """The SAME run qualifies for both training targets -- floor and
+        margin outcomes are emitted independently from one load test run,
+        not from separate runs."""
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "deal_yield_manager",
+            "target_variant": "current",
+            "outcome_sample_count": 50,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "deal_yield_manager_margin", latest_completion)
+        assert [r["id"] for r in result] == ["lt-1"]
+
+    def test_unrelated_model_type_still_excluded(self):
+        """Sanity check that the remap table doesn't accidentally make
+        every run trainable for every model type -- an unrelated model
+        type must still be excluded."""
+        from datetime import datetime, timezone
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        history = [{
+            "id": "lt-1",
+            "target_model_type": "deal_yield_manager",
+            "target_variant": "current",
+            "outcome_sample_count": 50,
+            "timestamp": "2026-08-22T06:00:00+00:00",
+        }]
+        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+        result = list_trainable_runs(history, "dlrm_bid_shader", latest_completion)
+        assert result == []

@@ -74,12 +74,25 @@ def train_genesis_booster(target: str) -> xgb.Booster:
     the booster predicts the same label for every input -- verified
     (see module docstring) across arbitrary feature vectors, not just the
     training point itself.
+
+    base_score is set explicitly to the target label rather than left to
+    XGBoost's default estimation. Default base_score behavior differs
+    across XGBoost versions (e.g. 1.7.x defaults to a fixed 0.5 and needs
+    many boosting rounds to converge on a single-sample label; 3.x
+    estimates it from the label mean and converges almost immediately) --
+    pinning it directly makes the genesis (exact constant-output) property
+    hold deterministically regardless of which XGBoost version trained it.
     """
     label = _GENESIS_LABEL_BY_TARGET[target]
     x_train = np.zeros((1, FEATURE_VECTOR_LENGTH), dtype=np.float32)
     y_train = np.array([label], dtype=np.float32)
     dtrain = xgb.DMatrix(x_train, label=y_train)
-    params = {"max_depth": 2, "eta": 0.3, "objective": "reg:squarederror"}
+    params = {
+        "max_depth": 2,
+        "eta": 0.3,
+        "objective": "reg:squarederror",
+        "base_score": label,
+    }
     return xgb.train(params, dtrain, num_boost_round=10)
 
 

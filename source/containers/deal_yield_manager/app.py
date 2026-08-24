@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import sys
 from datetime import datetime, timezone
 
@@ -32,6 +33,7 @@ from shared.artf_types import (
     Mutation, Operation, RTBRequest, RTBResponse, intent_applicable,
 )
 
+from .exploration import apply_exploration
 from .features import build_feature_vector
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,38 @@ logger = logging.getLogger(__name__)
 MODEL_VERSION = "deal-yield-xgboost-v1"
 
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
+
+# Bounded epsilon-greedy exploration (see exploration.py's module docstring
+# for the cold-start problem this solves: a model converged to "recommend
+# no change" -- true of the genesis model by construction -- never emits a
+# mutation, so it can never generate the outcome data needed to learn
+# anything else).
+#
+# Enabled by default (epsilon=0.1 -- override via the YIELD_EXPLORATION_EPSILON
+# env var, e.g. in deployment/eks/artf-containers-deployment.yaml, if a
+# different rate is needed). By default this value only takes effect on
+# load-test-originated calls (see get_is_load_test() below) -- but a caller
+# can also opt in/out per-request via ``ext.model_params.explore`` (True/
+# False), the SAME override channel every other demo-tunable parameter in
+# this repo already uses (shade_factor, segment_threshold, etc. -- see
+# RTBRequest.model_params in shared/artf_types.py). This is what lets the
+# "PMP Deals — Yield Optimizer" scenario card's Explore toggle (default ON)
+# make a single scenario Send actually produce a mutation against the
+# genesis model too, not just a load test -- and lets a user turn it back
+# off once a real trained model version exists, to see that model's
+# unperturbed prediction. A prior version of this container read this
+# epsilon unconditionally with a disabled (0.0) default, which meant a
+# freshly deployed stack's Yield Optimizer could NEVER produce a mutation
+# for the genesis model -- confirmed live: every load test against it
+# produced exactly 0 mutations, so no DealYieldOutcomeEvent was ever
+# emitted and the training pipeline had no real data to bootstrap from.
+_EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.1"))
+_EXPLORATION_FLOOR_BOUND = float(os.environ.get("YIELD_EXPLORATION_FLOOR_BOUND", "0.05"))
+_EXPLORATION_MARGIN_BOUND = float(os.environ.get("YIELD_EXPLORATION_MARGIN_BOUND", "0.02"))
+# Module-level so tests can monkeypatch a seeded random.Random() instance
+# for deterministic assertions, without a global monkeypatch of the
+# `random` module itself.
+_exploration_rng = random.Random()
 
 if USE_TRITON:
     from container.triton_inference import predict_yield_adjustment as _predict_yield
@@ -60,6 +94,35 @@ def _margin_calculation_type(at: int | None) -> int:
     return MarginCalculationType.PERCENT
 
 
+def _resolve_effective_epsilon(is_load_test: bool, explore_override: bool | None) -> float:
+    """Decide whether exploration is armed for this specific request.
+
+    Two independent ways a caller can arm it:
+    - is_load_test: the orchestrator's load-test invocation path set the
+      X-Load-Test header (see shared/load_test_context.py) -- always
+      structurally load-test-only, never live auction traffic.
+    - explore_override: the caller set ``ext.model_params.explore``
+      explicitly (True or False) -- the demo Scenario card's Explore
+      toggle uses this, defaulting to True so a single scenario Send
+      against the genesis model can also produce a real mutation, not
+      just a load test.
+
+    An explicit ``explore=False`` always wins (lets a user who has since
+    trained a real model turn exploration off to see its unperturbed
+    prediction, even mid-load-test if ever needed). Otherwise, either
+    signal being "on" arms epsilon. Neither signal being set (real
+    production traffic hitting this same endpoint, with no override and
+    no load-test header) always resolves to 0.0 -- this is what keeps
+    exploration off by default for traffic this container cannot
+    otherwise identify as load-test or demo-originated.
+    """
+    if explore_override is False:
+        return 0.0
+    if is_load_test or explore_override is True:
+        return _EXPLORATION_EPSILON
+    return 0.0
+
+
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations -- ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN via
     Triton FIL-served XGBoost prediction per deal."""
@@ -69,13 +132,23 @@ def mutate(req: RTBRequest) -> RTBResponse:
     if not (floor_ok or margin_ok):
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
-    from shared.load_test_context import get_target_variant
+    from shared.load_test_context import get_is_load_test, get_target_variant
 
     request_time = datetime.now(timezone.utc)
     bid_request = req.bid_request or {}
 
+    model_params = req.model_params or {}
+    explore_override = model_params.get("explore")
+    if explore_override is not None and not isinstance(explore_override, bool):
+        # Never fabricate a boolean from an unexpected type (e.g. a stray
+        # string) -- treat anything non-bool as "no override" rather than
+        # guessing what the caller meant.
+        explore_override = None
+    effective_epsilon = _resolve_effective_epsilon(get_is_load_test(), explore_override)
+
     mutations: list[Mutation] = []
     served_model_version = ""
+    any_explored = False
 
     for imp in bid_request.get("imp", []):
         imp_id = imp.get("id", "")
@@ -91,6 +164,15 @@ def mutate(req: RTBRequest) -> RTBResponse:
             )
             if resolved_version:
                 served_model_version = resolved_version
+
+            floor_multiplier, margin_value, explored = apply_exploration(
+                floor_multiplier, margin_value,
+                rng=_exploration_rng,
+                epsilon=effective_epsilon,
+                floor_bound=_EXPLORATION_FLOOR_BOUND,
+                margin_bound=_EXPLORATION_MARGIN_BOUND,
+            )
+            any_explored = any_explored or explored
 
             path = f"/imp/{imp_id}/deals/{deal_id}"
 
@@ -117,6 +199,12 @@ def mutate(req: RTBRequest) -> RTBResponse:
                 ))
 
     resolved_model_version = served_model_version or MODEL_VERSION
+    # Disclose exploration in the served model_version -- never let an
+    # exploratory probe look like a confident model recommendation to
+    # anything reading this response downstream (outcome events, training
+    # data, the demo UI). See exploration.py's module docstring.
+    if any_explored:
+        resolved_model_version = f"{resolved_model_version}:explore"
     return RTBResponse(
         id=req.id,
         mutations=mutations,

@@ -39,7 +39,7 @@ from orchestrator.comparison_service import (
     InsufficientSamplesError,
     compare as run_comparison,
 )
-from orchestrator.loadtest_eligibility import list_eligible_runs, most_recent_eligible
+from orchestrator.loadtest_eligibility import list_eligible_runs, list_trainable_runs, most_recent_eligible
 from orchestrator.promotion_service import PromotionNotRecommendedError, promote as run_promote
 from orchestrator.training_trigger import (
     TRAINABLE_MODEL_TYPES,
@@ -47,6 +47,7 @@ from orchestrator.training_trigger import (
     NoApprovedBaseVersionError,
     TrainingAlreadyInProgressError,
     TrainingNotConfirmedError,
+    XGBoostTrainingImageNotConfiguredError,
     estimate_cost,
     trigger_training,
 )
@@ -105,6 +106,83 @@ def _audit_table():
     return dynamodb.Table(_AUDIT_TRAIL_TABLE)
 
 
+# Which Glue job labels model_type's training data -- matches
+# deploy.sh's GLUE_JOB_NAME/DEAL_YIELD_GLUE_JOB_NAME env var naming
+# convention (glue_etl_cfn.yaml's FeatureEngineeringJob/
+# DealYieldFeatureEngineeringJob). Both deal_yield_manager_floor and
+# deal_yield_manager_margin are labeled by the SAME Glue job
+# (glue_deal_yield_feature_engineering.py writes both output prefixes in
+# one run) -- there was never a bare "deal_yield_manager" model type post
+# the FIL multi-output-limitation correction (see
+# source/training/xgboost_pipeline.py's module docstring), so a prior
+# version of this map keyed on that non-existent name and every yield
+# trainable-runs lookup silently resolved to "no Glue job configured."
+_GLUE_JOB_ENV_VAR_BY_MODEL_TYPE = {
+    "dlrm_bid_shader": "GLUE_JOB_NAME",
+    "deal_yield_manager_floor": "DEAL_YIELD_GLUE_JOB_NAME",
+    "deal_yield_manager_margin": "DEAL_YIELD_GLUE_JOB_NAME",
+}
+
+
+def _latest_glue_completion(model_type: str):
+    """Returns the CompletedOn timestamp (UTC datetime) of the most recent
+    SUCCEEDED run of the Glue job that labels model_type's training data,
+    or None if no job is configured or no run has ever succeeded."""
+    import boto3
+    from datetime import timezone
+
+    env_var = _GLUE_JOB_ENV_VAR_BY_MODEL_TYPE.get(model_type)
+    job_name = os.environ.get(env_var, "") if env_var else ""
+    if not job_name:
+        return None
+    glue = boto3.client("glue", region_name=_REGION)
+    resp = glue.get_job_runs(JobName=job_name, MaxResults=20)
+    completions = [
+        run["CompletedOn"] for run in resp.get("JobRuns", [])
+        if run.get("JobRunState") == "SUCCEEDED" and run.get("CompletedOn")
+    ]
+    if not completions:
+        return None
+    latest = max(completions)
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=timezone.utc)
+    return latest
+
+
+async def trainable_runs_handler(request: Request) -> JSONResponse:
+    """GET /v1/governance/trainable-runs?model_type=dlrm_bid_shader
+
+    Returns {"runs": [...]} — load-test runs for model_type whose outcome
+    data has actually been swept into training-data/ by a completed Glue
+    job run (see loadtest_eligibility.list_trainable_runs). Each run
+    includes its id, timestamp, target_model_type, and target_variant so
+    the UI can label which model/test type a run was for.
+    """
+    model_type = request.query_params.get("model_type", "")
+
+    try:
+        latest_completion = _latest_glue_completion(model_type)
+        history_fn = _get_loadtest_history_fn()
+        history = history_fn(limit=200)
+        runs = list_trainable_runs(history, model_type, latest_completion)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("trainable_runs_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
+
+    return JSONResponse({
+        "runs": [
+            {
+                "id": r.get("id"),
+                "timestamp": r.get("timestamp"),
+                "target_model_type": r.get("target_model_type"),
+                "target_variant": r.get("target_variant"),
+                "outcome_sample_count": r.get("outcome_sample_count"),
+            }
+            for r in runs
+        ],
+    })
+
+
 async def training_estimate_handler(request: Request) -> JSONResponse:
     """GET /v1/governance/training-estimate?model_type=dlrm_bid_shader
 
@@ -150,6 +228,10 @@ async def train_handler(request: Request) -> JSONResponse:
     model_bucket = os.environ.get("MODEL_BUCKET", "")
     training_data_bucket = os.environ.get("TRAINING_DATA_BUCKET", "")
     training_image_registry = os.environ.get("TRAINING_IMAGE_REGISTRY", "")
+    # Only required for deal_yield_manager_floor/margin (xgboost-shaped
+    # training -- see training_trigger._TRAINING_SHAPE); unset/empty is
+    # fine for dlrm_bid_shader, which never reads it.
+    xgboost_training_image_uri = os.environ.get("XGBOOST_TRAINING_IMAGE_URI", "") or None
 
     if not all([sagemaker_role_arn, model_bucket, training_data_bucket, training_image_registry]):
         return JSONResponse(
@@ -167,6 +249,7 @@ async def train_handler(request: Request) -> JSONResponse:
             model_bucket=model_bucket,
             training_data_bucket=training_data_bucket,
             training_image_registry=training_image_registry,
+            xgboost_training_image_uri=xgboost_training_image_uri,
         )
     except ModelTypeNotTrainableError as exc:
         return JSONResponse({"error": str(exc), "reason": "not_trainable"}, status_code=422)
@@ -179,6 +262,8 @@ async def train_handler(request: Request) -> JSONResponse:
         )
     except NoApprovedBaseVersionError as exc:
         return JSONResponse({"error": str(exc), "reason": "no_approved_base_version"}, status_code=422)
+    except XGBoostTrainingImageNotConfiguredError as exc:
+        return JSONResponse({"error": str(exc), "reason": "xgboost_image_not_configured"}, status_code=503)
     except Exception as exc:
         # Fail-safe: any other error (e.g. a boto3 ClientError) must still
         # return valid JSON, never fall through to a plain-text 500 that

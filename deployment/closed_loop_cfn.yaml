@@ -265,7 +265,18 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+                  # The Yield Optimizer's ETL job
+                  # (glue_deal_yield_feature_engineering.py) writes to two
+                  # SEPARATE prefixes -- not training-data/* -- since floor
+                  # and margin are independently-trained regression targets
+                  # (see governance_eventbridge_cfn.yaml's _MODEL_TYPES
+                  # comment). Without these, the floor/margin
+                  # CreateTrainingJob calls fail with S3 AccessDenied on
+                  # their input channel.
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-floor/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-margin/*'
         # The training-data bucket is SSE-KMS encrypted with KMSKeyArn (see
         # glue_etl_cfn.yaml). Without Decrypt on that key, CreateTrainingJob's
         # input-channel download fails with a KMS AccessDenied ClientError

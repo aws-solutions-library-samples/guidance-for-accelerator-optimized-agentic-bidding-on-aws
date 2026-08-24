@@ -20,7 +20,10 @@ from typing import Literal
 
 import boto3
 
-ModelTypeStr = Literal["dlrm_bid_shader", "ncf_deal_manager"]
+ModelTypeStr = Literal[
+    "dlrm_bid_shader", "ncf_deal_manager",
+    "deal_yield_manager_floor", "deal_yield_manager_margin",
+]
 
 # Real, current on-demand SageMaker Training pricing for the instance type
 # the automated retraining pipeline already uses (verified via
@@ -53,7 +56,9 @@ _MAX_RUNTIME_SECONDS = 14400
 # ValueError for ncf_deal_manager rather than silently misbehaving; this
 # set is the earlier, UI-facing enforcement point so the option is never
 # offered in the first place.
-TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({"dlrm_bid_shader"})
+TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({
+    "dlrm_bid_shader", "deal_yield_manager_floor", "deal_yield_manager_margin",
+})
 
 # Model types with real training infrastructure (container/pipeline
 # wiring exists) but temporarily excluded from TRAINABLE_MODEL_TYPES above.
@@ -62,11 +67,40 @@ TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({"dlrm_bid_shader"})
 # lands.
 _PARKED_MODEL_TYPES: frozenset[str] = frozenset({"ncf_deal_manager"})
 
+# Two distinct CreateTrainingJob shapes exist in this repo (matching
+# governance_eventbridge_cfn.yaml's RetrainingTriggerFunction, which this
+# on-demand trigger mirrors):
+# - "nemo-rl": custom NeMo-RL training image, model_type/window_days/
+#   cadence_hours hyperparameters (dlrm_bid_shader, ncf_deal_manager).
+# - "xgboost": SageMaker's built-in XGBoost algorithm container, tree
+#   hyperparameters (deal_yield_manager_floor/margin -- see
+#   source/training/xgboost_pipeline.py, which this on-demand path does
+#   NOT reuse directly since that class's trigger_training() blocks
+#   polling to completion, unsuitable for a UI request/response cycle;
+#   this function instead re-implements the same fire-and-forget
+#   CreateTrainingJob call the scheduled Lambda already uses for xgboost).
+_TRAINING_SHAPE: dict[str, str] = {
+    "dlrm_bid_shader": "nemo-rl",
+    "ncf_deal_manager": "nemo-rl",
+    "deal_yield_manager_floor": "xgboost",
+    "deal_yield_manager_margin": "xgboost",
+}
+
 # Same training image naming convention as source/training/pipeline.py's
 # _TRAINING_IMAGE_MAP and governance_eventbridge_cfn.yaml's image_tag.
 # Includes parked model types too -- this map describes image-naming
 # convention, not what's currently offered (that's TRAINABLE_MODEL_TYPES).
+# Only meaningful for "nemo-rl"-shaped model types (see _TRAINING_SHAPE).
 _IMAGE_TAG = {"dlrm_bid_shader": "dlrm", "ncf_deal_manager": "ncf"}
+
+# target -> S3 prefix, matching glue_deal_yield_feature_engineering.py's
+# ETL output paths exactly (training-data-deal-yield-floor/,
+# training-data-deal-yield-margin/) -- NOT the shared "training-data/"
+# prefix the nemo-rl model types use.
+_XGBOOST_TRAINING_DATA_PREFIX = {
+    "deal_yield_manager_floor": "training-data-deal-yield-floor",
+    "deal_yield_manager_margin": "training-data-deal-yield-margin",
+}
 
 
 class ModelTypeNotTrainableError(Exception):
@@ -230,6 +264,89 @@ def _resolve_base_model_version(model_type: str) -> str:
     return packages[0]["ModelPackageArn"]
 
 
+class XGBoostTrainingImageNotConfiguredError(Exception):
+    """Raised when triggering a deal_yield_manager_floor/margin job but no
+    XGBoost training image URI is configured on this deployment (mirrors
+    the scheduled Lambda's own honest skip when XGBOOST_TRAINING_IMAGE_URI
+    is unresolved — never guesses a SageMaker-owned account ID/URI)."""
+
+    def __init__(self, model_type: str):
+        super().__init__(
+            f"No XGBoost training image URI is configured for '{model_type}' "
+            "on this deployment (XGBOOST_TRAINING_IMAGE_URI unset)."
+        )
+        self.model_type = model_type
+
+
+def _build_training_job_params(
+    model_type: str,
+    job_name: str,
+    base_model_version: str,
+    *,
+    sagemaker_role_arn: str,
+    model_bucket: str,
+    training_data_bucket: str,
+    training_image_registry: str,
+    xgboost_training_image_uri: str | None,
+) -> dict:
+    """Builds the CreateTrainingJob params for model_type, branching by
+    training shape (see _TRAINING_SHAPE). Raises
+    XGBoostTrainingImageNotConfiguredError if model_type is xgboost-shaped
+    and no image URI was supplied.
+    """
+    shape = _TRAINING_SHAPE.get(model_type, "nemo-rl")
+    output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
+
+    if shape == "xgboost":
+        if not xgboost_training_image_uri:
+            raise XGBoostTrainingImageNotConfiguredError(model_type)
+        training_image = xgboost_training_image_uri
+        training_data_prefix = _XGBOOST_TRAINING_DATA_PREFIX[model_type]
+        hyperparameters = {
+            "base_model_version": base_model_version,
+            "max_depth": "6",
+            "eta": "0.3",
+            "num_round": "100",
+            "objective": "reg:squarederror",
+        }
+    else:
+        training_image = f"{training_image_registry}/artf-nemo-rl-training:{_IMAGE_TAG[model_type]}"
+        training_data_prefix = "training-data"
+        hyperparameters = {
+            "model_type": model_type,
+            "base_model_version": base_model_version,
+            "window_days": "7",
+            "cadence_hours": "6.0",
+            "triggered_by": "governance_ui_on_demand",
+        }
+
+    return {
+        "TrainingJobName": job_name,
+        "AlgorithmSpecification": {
+            "TrainingImage": training_image,
+            "TrainingInputMode": "File",
+        },
+        "RoleArn": sagemaker_role_arn,
+        "InputDataConfig": [{
+            "ChannelName": "training",
+            "DataSource": {"S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri": f"s3://{training_data_bucket}/{training_data_prefix}/",
+                "S3DataDistributionType": "FullyReplicated",
+            }},
+            "ContentType": "application/x-parquet",
+        }],
+        "OutputDataConfig": {"S3OutputPath": output_path},
+        "ResourceConfig": {
+            "InstanceType": _INSTANCE_TYPE,
+            "InstanceCount": 1,
+            "VolumeSizeInGB": 100,
+        },
+        "StoppingCondition": {"MaxRuntimeInSeconds": _MAX_RUNTIME_SECONDS},
+        "HyperParameters": hyperparameters,
+    }
+
+
 def trigger_training(
     model_type: str,
     confirmed: bool,
@@ -238,14 +355,20 @@ def trigger_training(
     model_bucket: str,
     training_data_bucket: str,
     training_image_registry: str,
+    xgboost_training_image_uri: str | None = None,
 ) -> TrainingTriggerResult:
     """Start a real, fire-and-forget SageMaker training job.
 
+    ``xgboost_training_image_uri`` is only required when model_type is
+    xgboost-shaped (deal_yield_manager_floor/margin -- see
+    _TRAINING_SHAPE); ignored otherwise.
+
     Raises ModelTypeNotTrainableError, TrainingNotConfirmedError,
-    TrainingAlreadyInProgressError, or NoApprovedBaseVersionError before
-    ever calling CreateTrainingJob — the caller (the new
-    POST /v1/governance/train route) is expected to have already shown
-    estimate_cost()'s result and gotten explicit user confirmation.
+    TrainingAlreadyInProgressError, NoApprovedBaseVersionError, or
+    XGBoostTrainingImageNotConfiguredError before ever calling
+    CreateTrainingJob — the caller (the new POST /v1/governance/train
+    route) is expected to have already shown estimate_cost()'s result and
+    gotten explicit user confirmation.
     """
     if model_type not in TRAINABLE_MODEL_TYPES:
         raise ModelTypeNotTrainableError(model_type)
@@ -259,41 +382,19 @@ def trigger_training(
     base_model_version = _resolve_base_model_version(model_type)
 
     job_name = f"{_job_name_prefix(model_type)}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    training_image = f"{training_image_registry}/artf-nemo-rl-training:{_IMAGE_TAG[model_type]}"
-    output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
+    create_params = _build_training_job_params(
+        model_type,
+        job_name,
+        base_model_version,
+        sagemaker_role_arn=sagemaker_role_arn,
+        model_bucket=model_bucket,
+        training_data_bucket=training_data_bucket,
+        training_image_registry=training_image_registry,
+        xgboost_training_image_uri=xgboost_training_image_uri,
+    )
 
     client = _sagemaker_client()
-    client.create_training_job(
-        TrainingJobName=job_name,
-        AlgorithmSpecification={
-            "TrainingImage": training_image,
-            "TrainingInputMode": "File",
-        },
-        RoleArn=sagemaker_role_arn,
-        InputDataConfig=[{
-            "ChannelName": "training",
-            "DataSource": {"S3DataSource": {
-                "S3DataType": "S3Prefix",
-                "S3Uri": f"s3://{training_data_bucket}/training-data/",
-                "S3DataDistributionType": "FullyReplicated",
-            }},
-            "ContentType": "application/x-parquet",
-        }],
-        OutputDataConfig={"S3OutputPath": output_path},
-        ResourceConfig={
-            "InstanceType": _INSTANCE_TYPE,
-            "InstanceCount": 1,
-            "VolumeSizeInGB": 100,
-        },
-        StoppingCondition={"MaxRuntimeInSeconds": _MAX_RUNTIME_SECONDS},
-        HyperParameters={
-            "model_type": model_type,
-            "base_model_version": base_model_version,
-            "window_days": "7",
-            "cadence_hours": "6.0",
-            "triggered_by": "governance_ui_on_demand",
-        },
-    )
+    client.create_training_job(**create_params)
 
     return TrainingTriggerResult(
         job_name=job_name,

@@ -11,7 +11,7 @@ Part 1 of this Guidance demonstrates ARTF-compliant containers that make real-ti
 
 Part 2 closes the loop. It observes the outcome of every bid, uses that feedback to retrain and validate new model versions, and rolls the winners into production without touching the real-time bidstream. It also introduces an AI agent that continuously tunes bidding parameters from live market signals. Three feedback mechanisms work together:
 
-1. **A batch retraining loop.** Bid outcomes (wins, losses, prices, CTR) are captured, transformed into labeled training data by AWS Glue, and used by NVIDIA NeMo-RL to retrain the bid pricer's and deal scorer's models (DLRM and NCF, respectively) on Amazon SageMaker. Each retrained version is registered in the SageMaker Model Registry with full lineage.
+1. **A batch retraining loop.** Bid outcomes (wins, losses, prices, CTR) are captured, transformed into labeled training data by AWS Glue, and used by NVIDIA NeMo-RL to retrain the bid pricer's and deal scorer's models (DLRM and NCF, respectively) on Amazon SageMaker. The yield optimizer's two XGBoost models (floor, margin) go through the same batch retraining loop via a separate Glue ETL job and SageMaker's built-in XGBoost training container, rather than NeMo-RL — a tree model has no reinforcement-learning loss to compute. Each retrained version is registered in the SageMaker Model Registry with full lineage.
 2. **A governance loop.** Every new model version is compiled from ONNX to a TensorRT engine, deployed as a live canary behind the same model name the ARTF containers already call, and evaluated with a statistically rigorous A/B test (Welch's t-test + SPRT). A promotion, rejection, or automatic guardrail rollback follows — every decision is written to an append-only audit trail.
 3. **An agentic parameter-tuning loop.** A Bedrock reasoning agent reads real CloudWatch bid-outcome metrics every five minutes and decides whether to adjust bidding parameters (`shade_factor`, `conversion_value`), subject to hard safety bounds enforced by the parameter store, not the agent.
 
@@ -51,6 +51,30 @@ Part 2 closes the loop. It observes the outcome of every bid, uses that feedback
 
 **1. Batch retraining loop.** The real-time bidding path (Part 1) emits bid outcome events, which are captured by a Kinesis Data Stream, buffered and partitioned by Kinesis Data Firehose, and land as raw Parquet in an S3 "raw outcomes" bucket cataloged in the Glue Data Catalog (`feedback_pipeline.raw_bid_outcomes`). An AWS Glue ETL job runs on a schedule (every 6 hours by default) against that catalog table and performs real feature engineering, not a pass-through copy: it de-duplicates records by `request_id`, engineers derived features (ROI, `shade_ratio`, a bucketed win-rate), and writes the labeled result as Parquet to a separate, KMS-encrypted training-data S3 bucket. Every 6 hours, Amazon EventBridge Scheduler resolves the latest **Approved** model version in the SageMaker Model Registry and starts a SageMaker training job running NVIDIA NeMo-RL (combined supervised + reinforcement learning loss, using auction-outcome signals as the reward) against that labeled dataset. On completion, the trained model is registered as a new version in the Model Registry and an event is emitted to trigger governance review.
 
+The yield optimizer's floor and margin models run the same loop through a
+**separate** pipeline path, since a deal floor/margin adjustment has no bid price
+to shade and produces a genuinely different event shape: a dedicated Kinesis
+stream/Firehose/S3 prefix/Glue table (`feedback_pipeline.raw_deal_yield_outcomes`)
+carries `DealYieldOutcomeEvent`s, and a dedicated Glue ETL job de-duplicates by
+`(request_id, deal_id, intent)` — a single deal can carry both a floor and a
+margin mutation, which are independent, not duplicates — and writes **two**
+independently labeled datasets, since Triton's FIL backend doesn't support
+multi-output regression and floor/margin are trained as separate single-target
+XGBoost models. Retraining then uses SageMaker's built-in XGBoost training
+container rather than NeMo-RL. Because no downstream win/loss signal path exists
+yet for live deal-level outcomes, this pipeline currently learns from two
+disclosed, non-fabricated sources rather than live traffic: outcome events
+emitted from **load-test traffic** (tagged `source=load_test`, using the load
+test's own known synthetic outcome rather than an unknown one), and the
+container's own **bounded exploration** — an opt-in, epsilon-greedy perturbation
+of its prediction (disabled by default) that breaks the cold-start deadlock a
+model converged to a constant "no change" recommendation would otherwise create,
+since a constant recommendation never emits a mutation for an outcome event to
+attach to. Every exploratory response is disclosed via a `:explore` suffix on the
+returned model version, so training data never mistakes an exploratory probe for
+a confident recommendation. Extending this pipeline to learn from real live-traffic
+outcomes is a natural next step once a downstream win/loss signal exists.
+
 **2. Governance loop.** A new model version registration triggers the Model Promotion Governance Agent (an Amazon Bedrock AgentCore runtime). The agent orchestrates: (a) TensorRT engine compilation via the on-demand Model Optimizer, (b) canary deployment at 5% initial traffic via the Triton-side canary router, (c) a live A/B test comparing the canary against the incumbent using real per-variant metrics, and (d) a promote, reject, or inconclusive decision. A promotion publishes the canary as the new stable version; a rejection or guardrail breach rolls back to the incumbent. Every decision, with its supporting metrics, is written to an append-only DynamoDB audit trail.
 
 **3. Agentic parameter-tuning loop.** Every five minutes, Amazon EventBridge Scheduler invokes the Adaptive Bidding Strategy Agent (also an AgentCore runtime). The agent reads real market metrics from CloudWatch (win rate, ROI, prices paid, sample counts), reads the current bidding parameters from a DynamoDB parameter store, and reasons — using a Bedrock model, with no hardcoded formula — about whether an adjustment is warranted. Any write is subject to hard bounds, a maximum per-update delta, and optimistic-concurrency locking enforced by the parameter store itself, not by the agent. The bid pricer container reads the current parameters at inference time.
@@ -65,7 +89,7 @@ Part 2 upgrades the Part 1 Triton serving path from ONNX Runtime to compiled `te
 
 **Model Optimizer (on-demand, not a stock NIM).** Engine compilation is performed by an in-cluster Model Optimizer microservice (`nvcr.io/nvidia/tensorrt:24.08-py3`) that runs `trtexec` on a GPU node to compile an ONNX artifact into a `model.plan`. Rather than an always-on GPU service, it runs on demand as one-shot Kubernetes Jobs: a deploy-time bootstrap Job builds the base engines and exits, and each promotion launches a dedicated optimize Job. This keeps Triton as the only steady-state GPU consumer, so the reference deployment still runs on a single GPU node. FP16 is the default precision; INT8 is refused with an honest HTTP 400 unless a real calibration cache is supplied — the service never emits a silently uncalibrated engine. This is deliberately not called a NIM: no stock NVIDIA NIM container exists for these custom DLRM/NCF architectures, and TensorRT is the same engine a NIM is built on.
 
-**Live canary via the Triton router.** Each recommender model name the ARTF containers already call (for example, `dlrm_bid_shader`) is a lightweight Triton Python-backend router model. It forwards each inference request to either `<model>_stable` or `<model>_canary` — two separate `tensorrt_plan` models — based on an in-memory traffic-split percentage read once at model load time. Changing the split is a control-plane action (the Governance Agent edits the router's configuration and Triton reloads it); it is never a per-request external lookup. This means the real-time ARTF bidstream gains no new dependency, and the four ARTF containers and their entrypoints are never modified. Staging a canary writes its engine to the S3 model repository and sets the router split; promotion publishes a new stable version and zeroes the split; rollback zeroes the split and removes the canary, restoring 100% traffic to the incumbent.
+**Live canary via the Triton router.** Each recommender model name the ARTF containers already call (for example, `dlrm_bid_shader`) is a lightweight Triton Python-backend router model. It forwards each inference request to either `<model>_stable` or `<model>_canary` — two separate `tensorrt_plan` models — based on an in-memory traffic-split percentage read once at model load time. Changing the split is a control-plane action (the Governance Agent edits the router's configuration and Triton reloads it); it is never a per-request external lookup. This means the real-time ARTF bidstream gains no new dependency, and none of the five ARTF containers or their entrypoints are ever modified. Staging a canary writes its engine to the S3 model repository and sets the router split; promotion publishes a new stable version and zeroes the split; rollback zeroes the split and removes the canary, restoring 100% traffic to the incumbent. The router pattern currently covers the bid pricer's and deal scorer's TensorRT-served models; the yield optimizer's FIL-served XGBoost models are retrained and re-registered through the same governance/registry flow but don't yet have a canary router of their own.
 
 **Governance runtime networking.** The Model Promotion Governance Agent runs as a public AgentCore runtime and reaches the cluster through a small VPC-attached proxy Lambda rather than entering VPC mode itself. Triton readiness and model-control calls are forwarded to an internal Network Load Balancer; a request to optimize a model instead causes the Lambda to launch a one-shot optimizer Job through the Kubernetes API and return the resulting engine URI. The Lambda's IAM role is mapped into the cluster's RBAC with access scoped to creating and reading Jobs only — no cluster-wide access.
 
@@ -97,8 +121,8 @@ While a canary is serving live traffic, a guardrail monitor independently polls 
 |-------------|------------------------|
 | Amazon Bedrock AgentCore | Hosts the Adaptive Bidding Strategy Agent and Model Promotion Governance Agent as managed reasoning-agent runtimes |
 | Amazon Bedrock | Provides the foundation model (default: a Claude Opus 4.8 cross-region inference profile) used by both agents' reasoning layers |
-| Amazon SageMaker | Runs NeMo-RL training jobs and hosts the versioned Model Registry with an approval workflow |
-| AWS Glue | Scheduled ETL job that de-duplicates bid outcomes by request ID, engineers features (ROI, shade ratio, bucketed win rate), and writes labeled Parquet training data from the raw-outcomes Glue Data Catalog table |
+| Amazon SageMaker | Runs NeMo-RL training jobs for DLRM/NCF and built-in XGBoost training jobs for the yield optimizer's floor/margin models; hosts the versioned Model Registry with an approval workflow for all four model types |
+| AWS Glue | Two scheduled ETL jobs: one de-duplicates bid outcomes by request ID and engineers features (ROI, shade ratio, bucketed win rate) for DLRM/NCF; a second de-duplicates deal-yield outcomes by (request ID, deal ID, intent) and writes two independently labeled datasets (floor, margin) for the yield optimizer's XGBoost models |
 | Amazon EventBridge (Scheduler + Rules) | Drives the five-minute agentic tuning cadence, the six-hour retraining cadence, and event-driven governance review on model registration and training completion |
 | AWS Lambda | Invocation shims between EventBridge and AgentCore, and a VPC-attached proxy bridging the public Governance runtime to cluster-internal endpoints |
 | Amazon DynamoDB | Stores the bidding parameter store, the append-only audit trail, and per-user feature vectors, all encrypted at rest with AWS KMS |
@@ -192,9 +216,9 @@ cd deployment
 
 | Step | Action |
 |------|--------|
-| 1 | Deploy the feedback pipeline (Kinesis, Firehose, S3, KMS) |
-| 2 | Deploy the Glue ETL feature-engineering job and training-data bucket |
-| 3 | Deploy DynamoDB tables (parameter store, audit trail, user features), the SageMaker Model Registry package groups, and register genesis model versions |
+| 1 | Deploy the feedback pipeline (Kinesis, Firehose, S3, KMS) — includes the yield optimizer's dedicated stream/table alongside the bid-outcome one |
+| 2 | Deploy the Glue ETL feature-engineering jobs (bid outcomes, and the yield optimizer's floor/margin outcomes) and the training-data bucket |
+| 3 | Deploy DynamoDB tables (parameter store, audit trail, user features), the SageMaker Model Registry package groups (DLRM, NCF, and the yield optimizer's floor/margin groups), and register genesis model versions for all of them |
 | 4 | Deploy AgentCore execution roles, seed the parameter store, and build the NeMo-RL training container |
 | 5 | Deploy both AgentCore runtimes (Adaptive Bidding Strategy Agent, Model Promotion Governance Agent) |
 | 6 | Deploy the EventBridge invocation paths (scheduled agent invocation, model-registration triggers, scheduled retraining) |
@@ -223,7 +247,11 @@ The frontend's Adaptive Bidding page also exposes this as a toggle.
 
 ## Cost Estimation
 
-The following costs are in addition to the Part 1 base cost (see [GUIDANCE.md](GUIDANCE.md)):
+The following costs are in addition to the Part 1 base cost (see
+[GUIDANCE.md](GUIDANCE.md#cost-estimation)). Two AWS Glue ETL jobs run in Part
+2, not one — the original bid-outcome (DLRM/NCF) job and a separate deal-yield
+outcome (Yield Optimizer floor/margin) job, each on its own schedule and Glue
+table:
 
 | AWS Service | Dimensions | Cost [USD/month] |
 |-------------|-----------|--------------------|
@@ -231,12 +259,19 @@ The following costs are in addition to the Part 1 base cost (see [GUIDANCE.md](G
 | Amazon DynamoDB Accelerator (optional) | 1 × dax.t3.small cluster | ~$36 |
 | Amazon Bedrock AgentCore | Adaptive Bidding Agent, ~8,640 invocations/month at a 5-minute cadence | ~$15 |
 | Amazon Bedrock AgentCore | Governance Agent, triggered on model registration | ~$2 |
-| Amazon SageMaker Training | 1 × ml.g5.xlarge, approximately 4 retraining jobs/day at 15 minutes each | ~$60 |
-| AWS Glue | 10 DPU-hours/day for feature engineering | ~$44 |
+| Amazon SageMaker Training | NeMo-RL (DLRM/NCF) + built-in XGBoost (floor/margin), ~4 retraining jobs/day combined at 15 min each, 1 × ml.g5.xlarge | ~$60 |
+| AWS Glue | 2 scheduled ETL jobs, ~10 DPU-hours/day each | ~$88 |
 | Amazon EventBridge Scheduler | 2 schedules, negligible | <$1 |
-| **Estimated Total** | | **~$125–160/month** |
+| **Estimated Total** | | **~$170–200/month** |
 
 Disabling the scheduled components (see above) reduces Part 2's ongoing cost to near zero, leaving only DynamoDB storage. DAX is optional and only needed for very high parameter-read request rates.
+
+### Combined Total (Part 1 + Part 2)
+
+The default `deploy.sh` run deploys both parts together. Combined with Part
+1's ~$592–1,080/month (see [GUIDANCE.md](GUIDANCE.md#cost-estimation),
+depending on the GPU schedule), expect roughly **$762–1,250/month** total. See
+[README.md](README.md#cost) for the full combined line-item table.
 
 ## Related Content
 
