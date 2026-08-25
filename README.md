@@ -95,15 +95,59 @@ Browser (React UI)
 | **Audience Activator** | Activates audience segments from bid-request signals |
 | **Deal Scorer** | Scores and activates/suppresses private marketplace deals |
 | **Signals Enricher** | Adds viewability and brand-safety quality signals |
-| **Yield Optimizer** | Publisher/SSP-side counterpart — adjusts deal floors and margins using two independent XGBoost models (floor, margin) on Triton |
-
-See [Architecture](#architecture) for the full picture, including which containers run GPU inference on Triton and which run rule-based logic on CPU.
+| **Yield Optimizer** | Publisher/SSP-side counterpart — adjusts deal floors and margins |
 
 The orchestrator fans out every incoming bid request to all five containers in parallel, merges their mutations, and returns a single response — the same fan-out list includes the yield optimizer, so it's exercised whenever a scenario carries a deal with a floor/margin-adjustable intent. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
 
-> **Note on the models.** The bundled models (DLRM, NCF, XGBoost) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
+### Which models exist, and how each one is served
 
-> **How the Yield Optimizer breaks its own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Right inside `source/containers/deal_yield_manager/app.py`, after the model returns its prediction, an optional exploration step (`exploration.py`, off by default — set `YIELD_EXPLORATION_EPSILON` to enable) nudges the floor/margin recommendation by a small, bounded random amount instead of always returning the same answer. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what actually produces the variation the Yield Optimizer's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
+Containers and models are not 1:1. Three of the five containers run a real model on
+the GPU; two are deterministic rule engines with no model at all. The Yield
+Optimizer runs **two** independent models. Each model below is a genuinely separate
+unit — its own Triton model name, its own config, its own SageMaker Model Package
+Group, its own training job, and its own promotion lifecycle.
+
+| Model | Container | Type | Artifact served | Triton backend | GPU |
+|---|---|---|---|---|---|
+| `dlrm_bid_shader` | Bid Pricer | DLRM (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `ncf_deal_manager` | Deal Scorer | NCF/NeuMF (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `deal_yield_manager_floor` | Yield Optimizer | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| `deal_yield_manager_margin` | Yield Optimizer | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| *(none — rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
+| *(none — rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
+
+**Two different serving paths, and why.** ONNX and FIL are not alternatives to each
+other — one is a file format, the other is an inference engine:
+
+- **Neural networks (DLRM, NCF).** PyTorch → **ONNX** (a portable file format for
+  neural networks) → NVIDIA **TensorRT** compiles that ONNX into a `.plan` engine
+  tuned for the specific GPU → Triton serves the `.plan`. The compile step is what
+  TensorRT is for.
+- **Tree models (floor, margin).** XGBoost → native `xgboost.json` → NVIDIA's
+  **FIL** (Forest Inference Library, from RAPIDS/cuML, bundled in Triton) reads that
+  format directly on the GPU. **There is no ONNX and no compile step in this path** —
+  FIL loads the tree model as-is.
+
+Both paths run inside the same Triton server on the same GPU node. Note that
+`dlrm_bid_shader` and `ncf_deal_manager` are each fronted by a small Python-backend
+router on CPU that splits traffic between `*_stable` and `*_canary` versions; the two
+yield models are currently single-version and loaded directly, with no router.
+
+> **On the XGBoost version pin.** `xgboost` is pinned to `1.7.6` deliberately. Newer
+> versions write a `"cats"` field into the saved JSON that Triton 24.08's bundled FIL
+> backend rejects outright (`Error: key "cats" is not recognized!`), which would take
+> both yield models down. The pin matches the SageMaker training-side version.
+
+> **One container, two models — for now.** Both yield models are served by a single
+> container today, which makes the architecture asymmetric with every other model here:
+> everywhere else, one container runs at most one model. Splitting them into two
+> independent containers is planned. Note that the model *lifecycle* is already fully
+> per-model — separate Triton models, separate registry groups, separate training jobs,
+> separate promotions — so only the serving container and its request plumbing are shared.
+
+> **Note on the models.** The bundled models (DLRM, NCF, and both XGBoost models) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
+
+> **How the Yield Optimizer breaks its own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Right inside `source/containers/deal_yield_manager/app.py`, after the model returns its prediction, an exploration step (`exploration.py`) nudges the floor/margin recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`) but **structurally scoped to load-test and demo traffic only** — live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what actually produces the variation the Yield Optimizer's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
 
 ### The 5 deployment phases
 
@@ -239,6 +283,24 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ### Part 2: closed-loop learning
 
 The models above ship with static, untrained weights. Part 2 closes the loop: it watches real bid outcomes, retrains and validates new model versions, and tunes bidding parameters continuously — all without touching the real-time bidding path. It's deployed by default (`--with-retraining`) alongside Part 1.
+
+**How each model is retrained.** The two serving paths from Part 1 carry through to
+two different retraining paths, one per model type:
+
+| Model | Trained by | Training data | Result loaded as | Compile step? |
+|---|---|---|---|---|
+| `dlrm_bid_shader` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
+| `ncf_deal_manager` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
+| `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
+| `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
+| Audience Activator, Signals Enricher | *not applicable* — rule engines | — | — | — |
+
+Each model has its own SageMaker Model Package Group, so versions, approval status,
+and promotions are tracked independently — including the two yield models, which
+train from two separately labeled datasets produced by a single Glue ETL job (its
+dedup key includes the ARTF intent, which is what separates floor rows from margin
+rows). Tree models skip TensorRT entirely: FIL loads the retrained `xgboost.json`
+directly, so there is no engine-compile stage in that path.
 
 See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 
