@@ -21,13 +21,11 @@
      Plan of record: aidlc-docs/inception/requirements/
                      yield-container-split-requirements.md  (gitignored, local)
 
-     NAMING ASSUMPTION: this draft uses container names
-     `yield-optimizer-floor` / `yield-optimizer-margin` and display names
-     "Yield Optimizer — Floor" / "Yield Optimizer — Margin", matching the
-     labels ALREADY shipped in GovernancePanel.jsx's TRAINING_MODEL_TYPES.
-     That corresponds to option (B) of the spec's open Question 1. If you
-     answer Q1 differently, every name in this file must be reconciled before
-     the swap.
+     NAMING (DECIDED, not assumed): container names `yield-optimizer-floor` /
+     `yield-optimizer-margin`, display names "Yield Optimizer — Floor" /
+     "Yield Optimizer — Margin". This was resolved as option (B) of the spec's
+     Question 1, and matches the labels ALREADY shipped in
+     GovernancePanel.jsx's TRAINING_MODEL_TYPES.
 
      Search this file for "FUTURE-CHECK" to find every claim that depends on
      the split actually being done.
@@ -187,6 +185,14 @@ yield models are currently single-version and loaded directly, with no router.
 > backend rejects outright (`Error: key "cats" is not recognized!`), which would take
 > both yield models down. The pin matches the SageMaker training-side version.
 
+> **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
+> each yield model in two formats — the native `xgboost.json` that FIL actually loads,
+> and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
+> registration script can treat all four models identically instead of branching on
+> format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
+> If you're tracing artifacts through S3, that's why an ONNX file appears for a model
+> that is not served from ONNX.
+
 > **Note on the two yield containers.** Earlier releases served both yield models from
 > a single container. They are now split, so each model has its own container, image,
 > Kubernetes Deployment, HPA, and load-test target — matching how every other model in
@@ -194,6 +200,11 @@ yield models are currently single-version and loaded directly, with no router.
 > `deal_yield_manager_margin`) and their SageMaker Model Package Groups are unchanged
 > from before the split, so existing registered model versions and promotion history
 > carry over.
+>
+> **If you are upgrading from a pre-split deployment:** load-test runs recorded before
+> the split were tagged with a single combined target and are **not** eligible as
+> training data for either model afterward. Re-run a load test against each new target
+> to regenerate training data. Registered model versions are unaffected.
 
 > **Note on the models.** The bundled models (DLRM, NCF, and both XGBoost models) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
 

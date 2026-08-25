@@ -138,6 +138,14 @@ yield models are currently single-version and loaded directly, with no router.
 > backend rejects outright (`Error: key "cats" is not recognized!`), which would take
 > both yield models down. The pin matches the SageMaker training-side version.
 
+> **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
+> each yield model in two formats — the native `xgboost.json` that FIL actually loads,
+> and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
+> registration script can treat all four models identically instead of branching on
+> format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
+> If you're tracing artifacts through S3, that's why an ONNX file appears for a model
+> that is not served from ONNX.
+
 > **One container, two models — for now.** Both yield models are served by a single
 > container today, which makes the architecture asymmetric with every other model here:
 > everywhere else, one container runs at most one model. Splitting them into two
