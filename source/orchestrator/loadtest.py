@@ -62,18 +62,26 @@ def _get_app_deps():
 # model-type selector today covers these two Triton-backed types plus the
 # two rule-based ones — per Q4=B, all 4 stay selectable so a future
 # Triton/canary rollout for the rule-based ones needs no API change).
-# deal_yield_manager added so the Yield Optimizer's genesis (constant-
-# output) model can accumulate real, disclosed load-test-origin outcome
-# data -- without this, ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN never had a
-# route to real training data at all (the genesis model never emits a
-# mutation on its own, so live traffic alone can never produce a signal to
-# learn from either -- see deal_yield_feedback.emit_load_test_deal_yield_outcome()).
+# The two yield types are listed so the Yield Optimizer's genesis (constant-
+# output) models can accumulate real, disclosed load-test-origin outcome data --
+# without them, ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN have no route to real
+# training data at all (a genesis model never emits a mutation on its own, so
+# live traffic alone can never produce a signal to learn from either -- see
+# deal_yield_feedback.emit_load_test_deal_yield_outcome()).
+#
+# These are spelled deal_yield_manager_floor/_margin, matching the TRAINING
+# model types exactly (see governance_api.py) so a load-test run's recorded
+# target_model_type is directly usable as a training target. A single
+# "deal_yield_manager" type used to be recorded here, which matched neither
+# real training model type and required a separate bridging map to translate
+# between them; splitting the containers removed the need for that map.
 _TARGET_MODEL_TYPES = (
     "dlrm_bid_shader",
     "widedeep_segment_activator",
     "ncf_deal_manager",
     "metrics_enricher",
-    "deal_yield_manager",
+    "deal_yield_manager_floor",
+    "deal_yield_manager_margin",
 )
 
 # Maps a target_model_type to the CONTAINERS registry entry name it
@@ -85,7 +93,8 @@ _MODEL_TYPE_TO_CONTAINER_NAME = {
     "widedeep_segment_activator": "widedeep-segment-activator",
     "ncf_deal_manager": "ncf-deal-manager",
     "metrics_enricher": "metrics-enricher",
-    "deal_yield_manager": "deal-yield-manager",
+    "deal_yield_manager_floor": "yield-optimizer-floor",
+    "deal_yield_manager_margin": "yield-optimizer-margin",
 }
 
 
@@ -101,7 +110,8 @@ class LoadTestRequest(BaseModel):
     # realism but ignored for outcome/version purposes (Q3=A).
     target_model_type: Literal[
         "dlrm_bid_shader", "widedeep_segment_activator",
-        "ncf_deal_manager", "metrics_enricher", "deal_yield_manager",
+        "ncf_deal_manager", "metrics_enricher",
+        "deal_yield_manager_floor", "deal_yield_manager_margin",
     ] | None = None
     target_variant: Literal["current", "challenger"] = "current"
 
@@ -164,10 +174,11 @@ PRESET_CONFIG = {
 }
 
 # Intents that trigger a full fan-out across all containers. Includes
-# ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN so deal_yield_manager is actually
-# included in _filter_containers()'s fan-out below -- without these, load
-# test traffic never reached deal_yield_manager at all, regardless of
-# target_model_type targeting.
+# ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN so both yield containers are actually
+# included in _filter_containers()'s fan-out below -- without these, load test
+# traffic never reached either of them at all, regardless of target_model_type
+# targeting. Each intent selects exactly one yield container now, so both must
+# be listed or one of the two models gets no traffic.
 ALL_INTENTS = [
     "ACTIVATE_SEGMENTS",
     "ACTIVATE_DEALS",
@@ -506,8 +517,8 @@ async def _run_load_test(
     target_headers = build_override_headers(target_variant) if target_model_type else {}
     # X-Load-Test is sent on EVERY container call this run makes (unlike
     # target_headers above, which is scoped to only the one targeted
-    # container). This is the signal containers/deal_yield_manager's
-    # bounded exploration gates on (see shared/load_test_context.py's
+    # container). This is the signal the yield containers' bounded
+    # exploration gates on (see shared/load_test_context.py's
     # module docstring) -- exploration must fire for load-test traffic
     # regardless of which container this run happens to be targeting for
     # outcome capture, but must never fire for real bid-serving traffic.
@@ -564,13 +575,17 @@ async def _run_load_test(
                     and inv.status == "ok"
                 ):
                     per_request_versions.append(inv.model_version)
-                    if target_model_type == "deal_yield_manager":
-                        # deal_yield_manager can emit 0, 1, or 2 mutations
-                        # per request (ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN
-                        # are independent per BR-5) -- reconstruct the
-                        # RTBRequest/RTBResponse this container actually saw
-                        # and let emit_load_test_deal_yield_outcome() build
-                        # one DealYieldOutcomeEvent per adjust_deal mutation.
+                    if target_model_type in (
+                        "deal_yield_manager_floor", "deal_yield_manager_margin",
+                    ):
+                        # A yield container emits one mutation per deal it
+                        # actually adjusts, so a single request can still yield
+                        # 0..N mutations (N = number of PMP deals) even though
+                        # each container now serves only one intent --
+                        # reconstruct the RTBRequest/RTBResponse this container
+                        # actually saw and let
+                        # emit_load_test_deal_yield_outcome() build one
+                        # DealYieldOutcomeEvent per adjust_deal mutation.
                         req_model = RTBRequest(**payload)
                         resp_model = RTBResponse(
                             id=req_model.id,

@@ -51,7 +51,7 @@ class TestTrainableRunsHandler:
 
         history = [{
             "id": "lt-1",
-            "target_model_type": "deal_yield_manager",
+            "target_model_type": "deal_yield_manager_floor",
             "target_variant": "current",
             "outcome_sample_count": 50,
             "timestamp": "2026-08-22T06:00:00+00:00",
@@ -78,14 +78,15 @@ class TestTrainableRunsHandler:
         )
 
     def test_margin_model_type_uses_same_glue_job_as_floor(self, monkeypatch):
-        """Both sub-models are labeled by the SAME Glue job run (it writes
-        both output prefixes in one pass) -- must resolve to the same job
-        name, not a distinct/nonexistent one."""
+        """Both models are labeled by the SAME Glue job run (it writes both
+        output prefixes in one pass) -- the margin model type must resolve to
+        that same job name, not a distinct/nonexistent one. Only the Glue job
+        resolution is shared; each model type matches its own runs."""
         monkeypatch.setenv("DEAL_YIELD_GLUE_JOB_NAME", "nv5-deal-yield-feature-engineering-etl")
 
         history = [{
             "id": "lt-1",
-            "target_model_type": "deal_yield_manager",
+            "target_model_type": "deal_yield_manager_margin",
             "target_variant": "current",
             "outcome_sample_count": 50,
             "timestamp": "2026-08-22T06:00:00+00:00",
@@ -139,11 +140,14 @@ class TestTrainableRunsHandler:
         )
 
     def test_no_glue_job_configured_returns_empty_not_an_error(self, monkeypatch):
+        """The run below DOES target the queried model type, so an empty result
+        can only come from the unconfigured Glue job -- a mismatched fixture
+        would make this pass for the wrong reason."""
         monkeypatch.delenv("DEAL_YIELD_GLUE_JOB_NAME", raising=False)
 
         history = [{
             "id": "lt-1",
-            "target_model_type": "deal_yield_manager",
+            "target_model_type": "deal_yield_manager_floor",
             "target_variant": "current",
             "outcome_sample_count": 50,
             "timestamp": "2026-08-22T06:00:00+00:00",

@@ -45,7 +45,11 @@ display_name() {
     widedeep-segment-activator)  echo "audience-activator" ;;
     ncf-deal-manager)            echo "deal-scorer" ;;
     metrics-enricher)            echo "signals-enricher" ;;
-    deal-yield-manager)          echo "yield-optimizer" ;;
+    # The two Yield Optimizer containers were named for their job when the
+    # combined deal-yield-manager was split, so their keys already ARE their
+    # display names (kept in step with deploy.sh's display_name()).
+    yield-optimizer-floor)       echo "yield-optimizer-floor" ;;
+    yield-optimizer-margin)      echo "yield-optimizer-margin" ;;
     *)                           echo "$1" ;;
   esac
 }
@@ -202,7 +206,8 @@ REPOS=(
   "${STACK_NAME}-$(display_name widedeep-segment-activator)"
   "${STACK_NAME}-$(display_name ncf-deal-manager)"
   "${STACK_NAME}-$(display_name metrics-enricher)"
-  "${STACK_NAME}-$(display_name deal-yield-manager)"
+  "${STACK_NAME}-$(display_name yield-optimizer-floor)"
+  "${STACK_NAME}-$(display_name yield-optimizer-margin)"
   "${STACK_NAME}-orchestrator"
   "${STACK_NAME}-agentcore"
 )

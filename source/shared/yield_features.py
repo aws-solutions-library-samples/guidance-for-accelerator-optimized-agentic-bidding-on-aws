@@ -1,8 +1,16 @@
-"""Pure feature-engineering for the Yield Optimizer (deal floor/margin) model.
+"""Pure feature-engineering shared by the two Yield Optimizer containers.
+
+Both `yield_optimizer_floor` and `yield_optimizer_margin` consume the SAME
+7-element feature vector, and so does the Glue ETL job that reconstructs it
+when building training data
+(source/etl/glue_deal_yield_feature_engineering.py). This module is the single
+definition of that vector: duplicating it per container would let the two
+containers drift from each other and from the ETL job, which would silently
+desync training data from what the models actually see at inference time --
+a failure no existing test catches.
 
 No I/O, no Triton calls, no randomness -- every value is derived from a real
-field on the bid request or the real wall-clock time. Testable in isolation
-(see source/tests/test_deal_yield_features.py).
+field on the bid request or the real wall-clock time. Testable in isolation.
 
 Feature vector shape (fixed, 7 elements, never varies with input
 completeness -- see business-rules.md BR-1):
@@ -13,6 +21,11 @@ completeness -- see business-rules.md BR-1):
     [4] category_tier    (0.0=none, 1.0=standard, 2.0=premium)
     [5] hour_norm        (real UTC hour / 24, [0,1])
     [6] weekday_norm     (real UTC weekday / 7, [0,1])
+
+CHANGING THIS VECTOR IS A BREAKING CHANGE. The two Triton FIL models are
+trained against exactly this layout (`dims: [ 7 ]` in each config.pbtxt), and
+the ETL job rebuilds it from stored outcome events. Any edit here must land in
+all three places together, plus a retrain.
 """
 
 from __future__ import annotations
@@ -25,10 +38,14 @@ _REMNANT_BIDFLOOR_MAX = 1.0
 _PREMIUM_BIDFLOOR_MIN = 5.0
 
 # IAB tier-1 codes classified as premium content for floor/margin purposes.
+#
 # Deliberately independent of widedeep_segment_activator's own
-# _IAB_SEGMENT_MAP -- see business-rules.md BR-2 (container atomicity;
-# no cross-container/shared-module dependency even where category codes
-# overlap).
+# _IAB_SEGMENT_MAP -- see business-rules.md BR-2. Living in source/shared/
+# does NOT relax that: BR-2's constraint is that the yield models' category
+# judgement must not be coupled to the segment activator's, even where the
+# codes overlap. This module is shared only between the two yield containers,
+# which were one container until the split. Do not "consolidate" these sets
+# with widedeep's map.
 _PREMIUM_IAB_CATEGORIES: frozenset[str] = frozenset({
     "IAB17",  # Sports
     "IAB1",   # Arts & Entertainment

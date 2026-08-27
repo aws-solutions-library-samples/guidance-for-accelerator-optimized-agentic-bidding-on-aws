@@ -61,8 +61,13 @@ spec:
               value: "http://deal-scorer:8081"
             - name: METRICS_URL
               value: "http://signals-enricher:8081"
-            - name: YIELD_URL
-              value: "http://yield-optimizer:8081"
+            # Two Yield Optimizer Services, one per intent (see
+            # artf-containers-deployment.yaml). Same single-value *_URL form the
+            # other four containers use above.
+            - name: YIELD_FLOOR_URL
+              value: "http://yield-optimizer-floor:8081"
+            - name: YIELD_MARGIN_URL
+              value: "http://yield-optimizer-margin:8081"
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME

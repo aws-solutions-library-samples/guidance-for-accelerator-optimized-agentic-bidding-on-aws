@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from orchestrator.loadtest_eligibility import list_eligible_runs, most_recent_eligible
@@ -208,47 +210,67 @@ class TestListTrainableRuns:
 
 
 class TestListTrainableRunsYieldSubModelMapping:
-    """deal_yield_manager_floor/margin training targets must match load
-    test runs recorded under the shared container-level identifier
-    "deal_yield_manager" (see _LOAD_TEST_TARGET_BY_TRAINING_MODEL_TYPE) --
-    there is no per-sub-model load-test target. Reproduces a real bug: a
-    prior version of this filter required an exact match against
-    "deal_yield_manager_floor"/"deal_yield_manager_margin", which no load
-    test run ever records, so trainable-runs always returned empty for
-    both yield sub-models even with real captured outcome data."""
+    """After the container split, a yield load-test run records the training
+    model type directly (deal_yield_manager_floor / deal_yield_manager_margin),
+    so trainable-runs matches on exact equality with no translation step.
 
-    def test_floor_target_matches_deal_yield_manager_run(self):
-        from datetime import datetime, timezone
-        from orchestrator.loadtest_eligibility import list_trainable_runs
+    A bridging table used to map both training targets onto a single
+    container-level "deal_yield_manager" load-test identifier. Splitting the
+    containers made each target its own container, so the table was deleted --
+    there is no longer a mapping that can be wrong in either direction."""
 
-        history = [{
-            "id": "lt-1",
-            "target_model_type": "deal_yield_manager",
+    @staticmethod
+    def _run(target_model_type, run_id="lt-1"):
+        return {
+            "id": run_id,
+            "target_model_type": target_model_type,
             "target_variant": "current",
             "outcome_sample_count": 50,
             "timestamp": "2026-08-22T06:00:00+00:00",
-        }]
-        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
-        result = list_trainable_runs(history, "deal_yield_manager_floor", latest_completion)
-        assert [r["id"] for r in result] == ["lt-1"]
+        }
 
-    def test_margin_target_matches_same_deal_yield_manager_run(self):
-        """The SAME run qualifies for both training targets -- floor and
-        margin outcomes are emitted independently from one load test run,
-        not from separate runs."""
+    @staticmethod
+    def _completion():
         from datetime import datetime, timezone
+        return datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "model_type", ["deal_yield_manager_floor", "deal_yield_manager_margin"]
+    )
+    def test_each_target_matches_its_own_run(self, model_type):
         from orchestrator.loadtest_eligibility import list_trainable_runs
 
-        history = [{
-            "id": "lt-1",
-            "target_model_type": "deal_yield_manager",
-            "target_variant": "current",
-            "outcome_sample_count": 50,
-            "timestamp": "2026-08-22T06:00:00+00:00",
-        }]
-        latest_completion = datetime(2026, 8, 22, 6, 30, tzinfo=timezone.utc)
-        result = list_trainable_runs(history, "deal_yield_manager_margin", latest_completion)
+        result = list_trainable_runs([self._run(model_type)], model_type, self._completion())
         assert [r["id"] for r in result] == ["lt-1"]
+
+    def test_floor_and_margin_runs_no_longer_cross_match(self):
+        """Each container is targeted separately, so a floor run is training
+        data for the floor model only. Cross-matching would feed one model
+        outcomes produced by the other."""
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        floor_run = self._run("deal_yield_manager_floor", "lt-floor")
+        margin_run = self._run("deal_yield_manager_margin", "lt-margin")
+        history = [floor_run, margin_run]
+        c = self._completion()
+
+        assert [r["id"] for r in list_trainable_runs(history, "deal_yield_manager_floor", c)] == ["lt-floor"]
+        assert [r["id"] for r in list_trainable_runs(history, "deal_yield_manager_margin", c)] == ["lt-margin"]
+
+    @pytest.mark.parametrize(
+        "model_type", ["deal_yield_manager_floor", "deal_yield_manager_margin"]
+    )
+    def test_pre_split_runs_are_not_trainable(self, model_type):
+        """Documents an accepted consequence of the split, not a bug: runs
+        recorded before it carry target_model_type="deal_yield_manager", which
+        is no longer a real training model type, so they are not offered as
+        trainable. Their captured outcome data still exists in DynamoDB -- it is
+        simply not selectable, and a fresh load test against either yield
+        container produces a directly-matching run."""
+        from orchestrator.loadtest_eligibility import list_trainable_runs
+
+        legacy = [self._run("deal_yield_manager", "lt-legacy")]
+        assert list_trainable_runs(legacy, model_type, self._completion()) == []
 
     def test_unrelated_model_type_still_excluded(self):
         """Sanity check that the remap table doesn't accidentally make

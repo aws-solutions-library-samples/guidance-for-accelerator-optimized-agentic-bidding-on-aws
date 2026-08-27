@@ -25,7 +25,8 @@ const AGENT_LABELS = {
   "widedeep-segment-activator": "Audience Activator",
   "ncf-deal-manager": "Deal Scorer",
   "metrics-enricher": "Signals Enricher",
-  "deal-yield-manager": "Yield Optimizer",
+  "yield-optimizer-floor": "Yield Optimizer — Floor",
+  "yield-optimizer-margin": "Yield Optimizer — Margin",
 };
 
 function intentColorClass(intent) {

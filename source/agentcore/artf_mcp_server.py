@@ -86,11 +86,20 @@ def _load_local_mutators():
         _local_mutators.append(("metrics-enricher", metrics))
     except ImportError as e:
         logger.warning("Metrics container not available locally: %s", e)
+    # The Yield Optimizer is TWO containers, one per intent -- imported
+    # separately so a failure to load one still leaves the other serving
+    # (BR-5: ADJUST_DEAL_FLOOR and ADJUST_DEAL_MARGIN are independent and
+    # atomic, never gated on each other).
     try:
-        from containers.deal_yield_manager.app import mutate as yield_mgr
-        _local_mutators.append(("deal-yield-manager", yield_mgr))
+        from containers.yield_optimizer_floor.app import mutate as yield_floor
+        _local_mutators.append(("yield-optimizer-floor", yield_floor))
     except ImportError as e:
-        logger.warning("Deal Yield Manager container not available locally: %s", e)
+        logger.warning("Yield Optimizer (Floor) container not available locally: %s", e)
+    try:
+        from containers.yield_optimizer_margin.app import mutate as yield_margin
+        _local_mutators.append(("yield-optimizer-margin", yield_margin))
+    except ImportError as e:
+        logger.warning("Yield Optimizer (Margin) container not available locally: %s", e)
     return _local_mutators
 
 

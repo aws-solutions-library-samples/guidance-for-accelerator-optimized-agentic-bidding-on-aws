@@ -109,7 +109,7 @@ Parameters:
       see deployment/scripts/register_genesis_models.py's
       _resolve_inference_image_uri()). Passed in rather than hardcoded here
       because the per-region SageMaker-owned account IDs are not something
-      to guess. If empty, deal_yield_manager retraining is skipped
+      to guess. If empty, yield model retraining is skipped
       (Condition: HasRetrainingConfig).
 
   RetrainingScheduleRate:

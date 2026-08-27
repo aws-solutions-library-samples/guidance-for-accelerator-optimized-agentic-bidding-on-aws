@@ -19,8 +19,10 @@ services:
       NCF_MCP: http://deal-scorer:8081
       METRICS_GRPC: signals-enricher:50051
       METRICS_MCP: http://signals-enricher:8081
-      YIELD_GRPC: yield-optimizer:50051
-      YIELD_MCP: http://yield-optimizer:8081
+      YIELD_FLOOR_GRPC: yield-optimizer-floor:50051
+      YIELD_FLOOR_MCP: http://yield-optimizer-floor:8081
+      YIELD_MARGIN_GRPC: yield-optimizer-margin:50051
+      YIELD_MARGIN_MCP: http://yield-optimizer-margin:8081
     depends_on:
       bid-pricer:
         condition: service_healthy
@@ -30,7 +32,9 @@ services:
         condition: service_healthy
       signals-enricher:
         condition: service_healthy
-      yield-optimizer:
+      yield-optimizer-floor:
+        condition: service_healthy
+      yield-optimizer-margin:
         condition: service_healthy
     networks:
       - artf
@@ -150,17 +154,21 @@ services:
       - artf
 
   # -----------------------------------------------------------------------
-  # Yield Optimizer — ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN intents
+  # Yield Optimizer (Floor) — ADJUST_DEAL_FLOOR intent
   # (Triton FIL-backend XGBoost model; see
-  # source/containers/deal_yield_manager/app.py)
+  # source/containers/yield_optimizer_floor/app.py)
+  #
+  # Two services, not one: FIL cannot serve a two-output tree model, so the
+  # floor and margin predictions were always two separate models. Splitting the
+  # containers stops one model's availability from gating the other's (BR-5).
   # -----------------------------------------------------------------------
-  yield-optimizer:
+  yield-optimizer-floor:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        CONTAINER: containers/deal_yield_manager
-        AGENT_NAME: deal-yield-manager
+        CONTAINER: containers/yield_optimizer_floor
+        AGENT_NAME: yield-optimizer-floor
     expose:
       - "50051"
       - "8081"
@@ -168,6 +176,36 @@ services:
     ports:
       - "50065:50051"
       - "8095:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - artf
+
+  # -----------------------------------------------------------------------
+  # Yield Optimizer (Margin) — ADJUST_DEAL_MARGIN intent
+  # (Triton FIL-backend XGBoost model; see
+  # source/containers/yield_optimizer_margin/app.py)
+  # -----------------------------------------------------------------------
+  yield-optimizer-margin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER: containers/yield_optimizer_margin
+        AGENT_NAME: yield-optimizer-margin
+    expose:
+      - "50051"
+      - "8081"
+      - "8080"
+    ports:
+      - "50066:50051"
+      - "8096:8081"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
       interval: 5s
