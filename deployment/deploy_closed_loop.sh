@@ -838,14 +838,33 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # Both deal_yield_manager_floor and deal_yield_manager_margin are
   # SageMaker-built-in-XGBoost models (same version/framework), so this is
   # resolved once and shared by both -- it does not need to be per-target.
+  # NOTE the stdout redirect below. Importing sagemaker emits
+  # "sagemaker.config INFO - Not applying SDK defaults from location: ..." lines
+  # on STDOUT (one per config path it checks), so a bare `print(uri)` here
+  # captured THREE lines, not one -- which would then be passed verbatim as a
+  # CloudFormation ParameterValue, and the -z check below would NOT catch it
+  # because junk is still non-empty. `2>/dev/null` cannot help; the noise is on
+  # stdout. Redirecting stdout for the import+retrieve sends that logging to
+  # stderr (discarded) and leaves stdout carrying only the URI. Same fix as
+  # deploy.sh's copy of this resolution -- keep the two in step.
   XGBOOST_TRAINING_IMAGE_URI="$(python3 -c "
-import sys
+import contextlib, sys
 try:
-    from sagemaker import image_uris
-    print(image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1'))
+    with contextlib.redirect_stdout(sys.stderr):
+        from sagemaker import image_uris
+        _uri = image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1')
+    sys.stdout.write(_uri)
 except Exception:
     pass
 " 2>/dev/null || true)"
+  # Only accept a single-line ECR image URI; anything else becomes empty so
+  # HasRetrainingConfig disables scheduled retraining honestly rather than
+  # deploying a corrupted image URI into the retraining Lambda's environment.
+  _XGB_URI_RE='^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/[^[:space:]]+$'
+  if [[ -n "${XGBOOST_TRAINING_IMAGE_URI}" && ! "${XGBOOST_TRAINING_IMAGE_URI}" =~ ${_XGB_URI_RE} ]]; then
+    warn "  Ignoring unexpected XGBoost training image URI from the sagemaker SDK (not a single-line ECR URI)."
+    XGBOOST_TRAINING_IMAGE_URI=""
+  fi
   if [[ -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
     warn "  Could not resolve the SageMaker built-in XGBoost image URI (sagemaker SDK not installed?) - deal_yield_manager_floor/margin scheduled retraining will be skipped until this is set."
   fi

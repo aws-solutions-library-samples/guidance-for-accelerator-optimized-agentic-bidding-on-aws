@@ -85,11 +85,17 @@ def _find_deal(bid_request: dict, imp_id: str, deal_id: str) -> dict | None:
 
 
 def _classify_category_tier(bid_request: dict) -> float:
-    """Mirrors containers.deal_yield_manager.features.classify_content_tier,
-    reading the same real site/app.cat fields -- not a call to that module
-    (Unit 2 has no dependency on Unit 1's code, per unit-of-work-dependency.md;
-    this is a second, independent reader of the same request data)."""
-    from containers.deal_yield_manager.features import classify_content_tier
+    """Classifies the same real site/app.cat fields the yield models see.
+
+    Calls shared.yield_features.classify_content_tier directly rather than
+    reimplementing it: the outcome event this feeds must describe the request
+    the way the model that acted on it did, so a second independent
+    implementation could drift and silently mislabel training data. (An earlier
+    version of this docstring claimed it was NOT a call into that module while
+    the code below imported it anyway -- the function now lives in shared/,
+    where both the containers and this reader legitimately depend on it.)
+    """
+    from shared.yield_features import classify_content_tier
 
     site = bid_request.get("site") or bid_request.get("app") or {}
     return classify_content_tier(site.get("cat", []))

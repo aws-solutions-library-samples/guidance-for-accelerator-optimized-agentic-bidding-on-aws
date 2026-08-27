@@ -166,19 +166,30 @@ total_categories).
 #### Yield Optimizer: publisher deal floor & margin adjustment (ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN)
 
 **What it does:** An SSP/publisher-side example — predicts a floor-price
-multiplier and margin adjustment per private marketplace deal, so a publisher
+multiplier and a margin adjustment per private marketplace deal, so a publisher
 can raise floors on high-demand inventory and lower them on remnant inventory
 without manual deal management, and set margins appropriately for the deal's
-auction type. Distinct from the (buy-side) bid pricer: this container adjusts
-what the *seller* will accept, not what the buyer bids.
+auction type. Distinct from the (buy-side) bid pricer: this adjusts what the
+*seller* will accept, not what the buyer bids.
 
-**How:** Builds a 7-feature vector per deal from real signals already on the
-bid request (auction type, existing bidfloor, IAB content-category tier,
-hour-of-day, day-of-week — no fabricated signals), sends it to a Triton-served
-XGBoost model, and emits `ADJUST_DEAL_FLOOR`/`ADJUST_DEAL_MARGIN` mutations
-independently per deal when the model recommends a real change.
+**Two containers, two models.** The floor and the margin are served by two
+separate containers — `yield-optimizer-floor` and `yield-optimizer-margin` —
+each owning one single-target XGBoost model. This is not an arbitrary division:
+Triton's FIL backend cannot serve a multi-output tree model, so a floor and a
+margin prediction were always two distinct models. Giving each its own container
+means each can be retrained, rolled out, and scaled on its own, and one model
+being down no longer takes the other's intent offline. `ADJUST_DEAL_FLOOR` and
+`ADJUST_DEAL_MARGIN` are independent, atomic mutations, so nothing in the
+bidstream contract couples them either.
 
-**Model (implementation detail):** An XGBoost tree ensemble, served by
+**How:** Each container builds the same 7-feature vector per deal from real
+signals already on the bid request (auction type, existing bidfloor, IAB
+content-category tier, hour-of-day, day-of-week — no fabricated signals), sends
+it to its own Triton-served XGBoost model, and emits its one intent per deal
+when that model recommends a real change. A prediction of "no change" (a floor
+multiplier of exactly 1.0, or a margin of exactly 0.0) never becomes a mutation.
+
+**Model (implementation detail):** Two XGBoost tree ensembles, served by
 NVIDIA Triton's Forest Inference Library (FIL) backend rather than the
 ONNX/TensorRT path DLRM/NCF use — FIL is purpose-built for GPU-accelerated
 tree-model inference and is already bundled in the same
@@ -186,8 +197,10 @@ tree-model inference and is already bundled in the same
 additional Triton image is required. Tree/regression models are the approach
 used in the published literature for reserve-price optimization, unlike the
 deep embedding architectures (DLRM, NCF) used for CTR prediction and
-relevance scoring. Served by Triton as model `deal_yield_manager` (FIL
-backend, GPU instance).
+relevance scoring. Served by Triton as models `deal_yield_manager_floor` and
+`deal_yield_manager_margin` (FIL backend, GPU instance). Those two model names
+predate the container split and are deliberately unchanged — they identify
+already-registered Triton models and SageMaker Model Package Groups.
 
 ### Container → Model → Intent Mapping
 
@@ -197,7 +210,8 @@ backend, GPU instance).
 | Audience Activator | Activates audience segments from bid-request signals | Rule engine (CPU) — slated for a partner ISV neural model | N/A | ACTIVATE_SEGMENTS | Audience segments |
 | Deal Scorer | Scores and activates/suppresses PMP deals | NCF / NeuMF | ncf_deal_manager | ACTIVATE_DEALS / SUPPRESS_DEALS | Deal activations / suppressions |
 | Signals Enricher | Adds viewability + brand-safety quality signals | Rule engine (CPU) | N/A | ADD_METRICS | Viewability + brand safety |
-| Yield Optimizer | Predicts deal floor/margin adjustments | XGBoost (Triton FIL backend) | deal_yield_manager | ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN | Floor multiplier + margin value |
+| Yield Optimizer — Floor | Predicts deal floor-price adjustments | XGBoost (Triton FIL backend) | deal_yield_manager_floor | ADJUST_DEAL_FLOOR | Floor multiplier |
+| Yield Optimizer — Margin | Predicts deal margin adjustments | XGBoost (Triton FIL backend) | deal_yield_manager_margin | ADJUST_DEAL_MARGIN | Margin value |
 | [Future] Creative Enricher (ISV) | Scores creative quality signals | ViT/CLIP mock (CPU) | N/A | ADD_METRICS | Creative quality, attention, suitability, fatigue |
 | [Future] Identity Resolver (ISV) | Resolves cross-device identity | Graph NN mock (CPU) | N/A | ADD_CIDS | Cross-device + household IDs |
 | [Future] Location Activator (ISV) | Activates location-derived segments | Blueprints™ mock (CPU) | N/A | ACTIVATE_SEGMENTS | Location-derived audience segments |

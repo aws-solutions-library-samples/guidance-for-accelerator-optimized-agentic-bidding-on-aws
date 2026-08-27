@@ -13,8 +13,8 @@ implements identically:
 - ``X-Load-Test`` (get_is_load_test()) — a plain "this call originated from
   a load test" signal, sent on EVERY container call a load test makes
   (target or not, and regardless of target_variant). This is the signal
-  the Yield Optimizer's bounded exploration (containers/deal_yield_manager/
-  exploration.py) gates on: exploration perturbs a real prediction before
+  the Yield Optimizer's bounded exploration (shared/yield_exploration.py)
+  gates on: exploration perturbs a real prediction before
   it's used, so it must never fire on live auction traffic, only on
   load-test-originated calls used to bootstrap training data (see
   CLOSED_LOOP.md's "Yield Optimizer" section). get_target_variant() alone

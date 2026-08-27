@@ -44,7 +44,8 @@ aws: "AWS Cloud" {
     wd: "Wide & Deep Segment Activator\nACTIVATE_SEGMENTS"
     ncf: "NCF Deal Manager\nACTIVATE_DEALS / SUPPRESS_DEALS"
     metrics: "Metrics Enricher\nADD_METRICS (rule-based, CPU)"
-    yield: "Yield Optimizer\nADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN"
+    yield_floor: "Yield Optimizer — Floor\nADJUST_DEAL_FLOOR"
+    yield_margin: "Yield Optimizer — Margin\nADJUST_DEAL_MARGIN"
   }
 
   triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nONNX Runtime + FIL + CUDA EP · 4 models" {
@@ -75,12 +76,14 @@ aws.orch -> aws.containers.dlrm: "parallel fan-out"
 aws.orch -> aws.containers.wd
 aws.orch -> aws.containers.ncf
 aws.orch -> aws.containers.metrics
-aws.orch -> aws.containers.yield
+aws.orch -> aws.containers.yield_floor
+aws.orch -> aws.containers.yield_margin
 
 aws.containers.dlrm -> aws.triton: "tritonclient"
 aws.containers.wd -> aws.triton
 aws.containers.ncf -> aws.triton
-aws.containers.yield -> aws.triton
+aws.containers.yield_floor -> aws.triton
+aws.containers.yield_margin -> aws.triton
 
 aws.triton -> aws.models: "load models at startup" {
   style.stroke-dash: 4

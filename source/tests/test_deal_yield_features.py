@@ -1,4 +1,4 @@
-"""Tests for containers.deal_yield_manager.features -- pure feature
+"""Tests for shared.yield_features -- pure feature
 engineering for the Yield Optimizer (deal floor/margin) model.
 
 Property-based tests (PBT Partial mode -- pure functions, per this
@@ -15,9 +15,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "containers", "deal_yield_manager"))
 
-from containers.deal_yield_manager.features import (
+from shared.yield_features import (
     FEATURE_VECTOR_LENGTH,
     build_feature_vector,
     classify_content_tier,

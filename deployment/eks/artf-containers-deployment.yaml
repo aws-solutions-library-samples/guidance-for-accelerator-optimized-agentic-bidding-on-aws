@@ -408,26 +408,35 @@ spec:
           averageUtilization: 70
 
 ---
-# Yield Optimizer — runs on GPU node for co-location with Triton
-# (ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN via Triton FIL-backend XGBoost model)
+# Yield Optimizer (Floor) — runs on GPU node for co-location with Triton
+# (ADJUST_DEAL_FLOOR via the deal_yield_manager_floor Triton FIL XGBoost model)
+#
+# Two Deployments, not one: Triton's FIL backend cannot serve a two-output tree
+# model, so the floor and margin predictions were always two separate models.
+# Separate Deployments stop one model's rollout or crashloop from taking the
+# other's intent offline (BR-5 -- the two intents are independent and atomic).
+#
+# NOTE the label is `model: yield-floor`, not `model: yield`. Both Deployments
+# sharing `model: yield` would make each Service select BOTH models' pods and
+# round-robin ADJUST_DEAL_FLOOR calls into the margin container half the time.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yield-optimizer
+  name: yield-optimizer-floor
   labels:
     app: artf
-    model: yield
+    model: yield-floor
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: artf
-      model: yield
+      model: yield-floor
   template:
     metadata:
       labels:
         app: artf
-        model: yield
+        model: yield-floor
     spec:
       nodeSelector:
         role: __ARTF_NODE_ROLE__
@@ -436,8 +445,8 @@ spec:
           operator: Exists
           effect: NoSchedule
       containers:
-        - name: yield
-          image: __REGISTRY__/__STACK_NAME__-yield-optimizer:__IMAGE_TAG__
+        - name: yield-floor
+          image: __REGISTRY__/__STACK_NAME__-yield-optimizer-floor:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8081
@@ -451,14 +460,14 @@ spec:
               value: "triton-inference-server:8000"
             - name: USE_TRITON
               value: "true"
-            # Bounded epsilon-greedy exploration (breaks the genesis
-            # model's cold-start deadlock -- see
-            # containers/deal_yield_manager/exploration.py and
-            # CLOSED_LOOP.md's "Yield Optimizer" section). Structurally
-            # scoped to load-test-originated calls only (see
-            # shared/load_test_context.py's get_is_load_test()) --
-            # this value has no effect on real auction traffic regardless
-            # of what it's set to.
+            # Bounded epsilon-greedy exploration (breaks the genesis model's
+            # cold-start deadlock -- see shared/yield_exploration.py and
+            # CLOSED_LOOP.md's "Yield Optimizer" section). Structurally scoped
+            # to load-test-originated calls and explicit
+            # ext.model_params.explore opt-ins only (see
+            # shared/load_test_context.py's get_is_load_test()) -- this value
+            # has no effect on real auction traffic regardless of what it is
+            # set to.
             - name: YIELD_EXPLORATION_EPSILON
               value: "0.1"
           resources:
@@ -479,7 +488,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: yield-optimizer
+  name: yield-optimizer-floor
 spec:
   type: ClusterIP
   ports:
@@ -494,18 +503,121 @@ spec:
       name: grpc
   selector:
     app: artf
-    model: yield
+    model: yield-floor
 
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: yield-hpa
+  name: yield-floor-hpa
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: yield-optimizer
+    name: yield-optimizer-floor
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Yield Optimizer (Margin) — runs on GPU node for co-location with Triton
+# (ADJUST_DEAL_MARGIN via the deal_yield_manager_margin Triton FIL XGBoost model)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yield-optimizer-margin
+  labels:
+    app: artf
+    model: yield-margin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artf
+      model: yield-margin
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: yield-margin
+    spec:
+      nodeSelector:
+        role: __ARTF_NODE_ROLE__
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: yield-margin
+          image: __REGISTRY__/__STACK_NAME__-yield-optimizer-margin:__IMAGE_TAG__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: TRITON_URL
+              value: "triton-inference-server:8000"
+            - name: USE_TRITON
+              value: "true"
+            # See the floor Deployment above for what this gates and why it is
+            # safe to enable by default.
+            - name: YIELD_EXPLORATION_EPSILON
+              value: "0.1"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-margin
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-margin
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yield-margin-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yield-optimizer-margin
   minReplicas: 1
   maxReplicas: 5
   metrics:

@@ -214,7 +214,7 @@ DealYieldIntent = Literal["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"]
 
 class DealYieldOutcomeEvent(BaseModel):
     """A single deal floor/margin adjustment outcome, emitted by the
-    orchestrator (never by deal_yield_manager itself -- a container only
+    orchestrator (never by a yield container itself -- a container only
     proposes mutations and has no visibility into what happens after).
     """
 
