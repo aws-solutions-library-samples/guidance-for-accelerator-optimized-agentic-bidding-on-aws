@@ -789,6 +789,16 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   [[ -z "${PROXY_SUBNETS}" || "${PROXY_SUBNETS}" == "None" ]] && PROXY_SUBNETS="${SUBNET_IDS}"
 
   VPC_PROXY_LAMBDA_ARN=""
+  # How long the governance agent waits for a RequestResponse invoke of the VPC
+  # proxy Lambda. MUST be >= that Lambda's own Timeout (vpc_proxy_cfn.yaml sets
+  # 900), because the invoke holds the connection until the function returns.
+  #
+  # It was previously left at the client's 600s default while the Lambda's
+  # ceiling was 900, so a TensorRT optimize that ran 846s tripped the client's
+  # read timeout first. The agent saw 502 "Read timeout", rejected the model
+  # version with "Model optimization failed", and never staged a canary -- even
+  # though the compile itself was fine. Raise both together if compiles slow down.
+  VPC_PROXY_TIMEOUT_SECONDS="${VPC_PROXY_TIMEOUT_SECONDS:-900}"
   if [[ -n "${PROXY_SUBNETS}" && -n "${GOV_SG}" && "${GOV_SG}" != "None" ]]; then
     # CloudFormation List<> params require commas escaped in the CLI shorthand.
     PROXY_SUBNETS_ESC="${PROXY_SUBNETS//,/\\,}"
@@ -843,6 +853,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     --environment "OPTIMIZER_ENDPOINT=${OPTIMIZER_ENDPOINT:-}" \
     --environment "TRITON_URL=${GOV_TRITON_URL:-}" \
     --environment "VPC_PROXY_LAMBDA_ARN=${VPC_PROXY_LAMBDA_ARN:-}" \
+    --environment "VPC_PROXY_TIMEOUT_SECONDS=${VPC_PROXY_TIMEOUT_SECONDS}" \
     --description "Model Promotion Governance Agent — deterministic A/B gate + Bedrock reasoning" \
     --region "${AWS_REGION}" \
     --print-arn)"

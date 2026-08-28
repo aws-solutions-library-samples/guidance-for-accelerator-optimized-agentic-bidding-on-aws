@@ -29,6 +29,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
 from orchestrator.deal_yield_feedback import emit_load_test_deal_yield_outcome
+from orchestrator.etl_trigger import SWEEP_DELAY_SECONDS, trigger_etl_sweep
 from orchestrator.loadtest_instrumentation import (
     aggregate_run_model_version,
     emit_load_test_outcome,
@@ -43,6 +44,23 @@ from orchestrator.loadtest_targeting import (
 )
 from shared.artf_types import Metadata, RTBRequest, RTBResponse
 from shared.load_test_context import IS_LOAD_TEST_HEADER_NAME
+
+
+def _shaded_price_from_mutations(mutations) -> float | None:
+    """The price a bid-shading container actually chose, or None if it set none.
+
+    Reads the adjust_bid payload of the container's own response (see
+    shared/artf_types.py's Mutation.adjust_bid: AdjustBidPayload.price). None is
+    a real "this request produced no priced bid" — the caller must not
+    substitute a stand-in, since the price is what the synthetic auction outcome
+    is scored against.
+    """
+    for mutation in mutations or []:
+        adjust_bid = getattr(mutation, "adjust_bid", None)
+        price = getattr(adjust_bid, "price", None) if adjust_bid is not None else None
+        if price is not None:
+            return float(price)
+    return None
 
 
 def _get_app_deps():
@@ -600,12 +618,21 @@ async def _run_load_test(
                             if len(outcome_samples) < _MAX_STORED_SAMPLES:
                                 outcome_samples.append(sample_value)
                     else:
+                        # Pass the price this container actually chose, plus the
+                        # run's seed, so the synthetic auction outcome responds to
+                        # the model instead of being drawn independently of it
+                        # (see loadtest_instrumentation.generate_outcome_sample).
                         sample_value = emit_load_test_outcome(
-                            test_id, request_index, inv.model_version, target_model_type
+                            test_id, request_index, inv.model_version, target_model_type,
+                            seed=seed,
+                            shaded_price=_shaded_price_from_mutations(inv.mutations),
                         )
-                        outcome_sample_count += 1
-                        if len(outcome_samples) < _MAX_STORED_SAMPLES:
-                            outcome_samples.append(sample_value)
+                        # None means the container returned no price for this
+                        # request, so there is no model decision to score.
+                        if sample_value is not None:
+                            outcome_sample_count += 1
+                            if len(outcome_samples) < _MAX_STORED_SAMPLES:
+                                outcome_samples.append(sample_value)
 
             _progress_completed[test_id] += 1
         except Exception:
@@ -724,8 +751,37 @@ async def _run_load_test(
     # Persist to DynamoDB
     _save_to_dynamodb(test_id, _active_tests[test_id])
 
+    # Schedule an on-demand Glue sweep so this run becomes trainable in
+    # minutes instead of waiting up to 6 hours for the next scheduled sweep
+    # (see etl_trigger's module docstring). Only worth doing when this run
+    # actually captured outcomes for a specific model -- with no samples there
+    # is nothing new for the sweep to label.
+    if target_model_type and outcome_sample_count > 0:
+        asyncio.create_task(
+            _trigger_etl_sweep_after_delay(target_model_type, SWEEP_DELAY_SECONDS)
+        )
+
     # Schedule scale-down after 2 minutes
     asyncio.create_task(_scale_down_after_delay(120))
+
+
+async def _trigger_etl_sweep_after_delay(model_type: str, delay_s: int) -> None:
+    """Wait for Firehose to flush this run's outcomes to S3, then start a Glue
+    sweep so the run passes the trainability gate.
+
+    The delay is required for correctness, not politeness: sweeping before the
+    outcomes land would mark the run trainable without its data being present
+    (see etl_trigger's module docstring). Never raises — a failed sweep must
+    not surface as an unhandled task exception; the run simply stays
+    untrainable until the next scheduled sweep.
+    """
+    try:
+        await asyncio.sleep(delay_s)
+        await asyncio.to_thread(trigger_etl_sweep, model_type)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — best-effort background task
+        print(f"[loadtest] on-demand ETL sweep failed for {model_type}: {exc}")
 
 
 # ---------------------------------------------------------------------------

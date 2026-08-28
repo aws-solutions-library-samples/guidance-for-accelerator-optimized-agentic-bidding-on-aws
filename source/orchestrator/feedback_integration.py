@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from shared.artf_types import RTBRequest, RTBResponse
-from shared.feedback_collector import FeedbackCollector
+from shared.feedback_collector import FeedbackCollector, fire_and_forget_emit
 from shared.feedback_models import BidShadingOutcomeEvent
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,10 @@ def emit_bid_outcome(
         event = _build_bid_outcome_event(
             req, resp, start_time, source=source, model_version=model_version
         )
-        asyncio.create_task(_feedback_collector.emit(event))
+        fire_and_forget_emit(
+            _feedback_collector.emit(event),
+            description=f"bid outcome emit (request={event.request_id})",
+        )
     except Exception:
         # Never impact the bid response path
         logger.warning("Failed to emit bid outcome event", exc_info=True)
@@ -173,7 +176,10 @@ def emit_load_test_bid_outcome(
             shade_factor_used=shade_factor_used,
             conversion_value_estimate_used=conversion_value_estimate_used,
         )
-        asyncio.create_task(_feedback_collector.emit(event))
+        fire_and_forget_emit(
+            _feedback_collector.emit(event),
+            description=f"load-test bid outcome emit (request={event.request_id})",
+        )
     except Exception:
         logger.warning("Failed to emit load-test bid outcome event", exc_info=True)
 

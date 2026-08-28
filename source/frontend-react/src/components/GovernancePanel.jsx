@@ -8,6 +8,7 @@ import {
   ModelsView, MutationIntentCard, BidstreamImpactCard,
   GovernanceVerdictCard, SessionAuditTrail, RecommendationBadge,
 } from "./closedLoopUi.jsx";
+import LoadTestSweepStatus from "./LoadTestSweepStatus.jsx";
 
 // Default pipeline stages shown (all "done"/grey) before any scenario has run,
 // matching the prototype's always-visible pipeline bar at the top of the page.
@@ -115,6 +116,12 @@ export default function GovernancePanel() {
   const [trainableRuns, setTrainableRuns] = useState([]);
   const [selectedTrainingRun, setSelectedTrainingRun] = useState("");
   const [trainableRunsError, setTrainableRunsError] = useState(null);
+  // Health of the Glue job that labels this model's training data, plus the runs
+  // it has captured but not yet swept. Without these the picker cannot explain
+  // itself: "nothing listed" looks identical whether no outcomes were ever
+  // captured, a run is waiting on the next sweep, or the job fails every run.
+  const [trainEtl, setTrainEtl] = useState(null);
+  const [pendingRuns, setPendingRuns] = useState([]);
 
   // Load-test-based comparison (FR-7/FR-8, Story 5) and Promote (FR-9/FR-10, Story 6).
   const [currentRuns, setCurrentRuns] = useState([]);
@@ -197,15 +204,26 @@ export default function GovernancePanel() {
       if (resp.ok) {
         const runs = data.runs || [];
         setTrainableRuns(runs);
-        setSelectedTrainingRun(runs[0]?.id || "");
+        setTrainEtl(data.etl || null);
+        setPendingRuns(data.pending || []);
+        // This runs on an interval as well as on model change (see below), so
+        // it keeps an existing selection when that run is still listed rather
+        // than snapping back to the newest run under the user every refresh.
+        setSelectedTrainingRun((cur) => (
+          cur && runs.some((r) => r.id === cur) ? cur : (runs[0]?.id || "")
+        ));
       } else {
         setTrainableRuns([]);
         setSelectedTrainingRun("");
+        setTrainEtl(null);
+        setPendingRuns([]);
         setTrainableRunsError(data.error || `HTTP ${resp.status}`);
       }
     } catch (e) {
       setTrainableRuns([]);
       setSelectedTrainingRun("");
+      setTrainEtl(null);
+      setPendingRuns([]);
       setTrainableRunsError(String(e));
     }
   }, [trainingModelType]);
@@ -218,6 +236,14 @@ export default function GovernancePanel() {
     setTrainingResult(null);
     setTrainingError(null);
   }, [trainingModelType, fetchTrainingEstimate, fetchTrainableRuns]);
+
+  // A run becomes trainable when a Glue ETL sweep covering it succeeds, which
+  // happens minutes after the load test ends and independently of this panel.
+  // Without a refresh the picker stays stale until the browser is reloaded.
+  useEffect(() => {
+    const timer = setInterval(fetchTrainableRuns, 30000);
+    return () => clearInterval(timer);
+  }, [fetchTrainableRuns]);
 
   const startTraining = useCallback(async () => {
     setTrainingSubmitting(true);
@@ -530,17 +556,22 @@ export default function GovernancePanel() {
 
       {runError && <div className="cl-honest cl-honest-block">Run failed: {runError}</div>}
 
-      {/* Step-by-step governance flow — simple text log per stage, replacing
-          the bulkier per-stage detail cards. */}
-      <StepByStepLog nodes={nodes} revealed={revealed} />
+      {/* Step log and session history also pair up rather than each taking a
+          full-width row for a few lines of content. Both render their own
+          .cl-card, so they align without extra wrappers. */}
+      <div className="cl-side-by-side">
+        {/* Step-by-step governance flow — simple text log per stage, replacing
+            the bulkier per-stage detail cards. */}
+        <StepByStepLog nodes={nodes} revealed={revealed} />
 
-      {/* Session audit trail — real decisions from this browser session, matching
-          DESIGN_BRIEF.md section 6 (never a write into the real audit table). */}
-      <div className="cl-card sg-elevated">
-        <div className="cl-card-head">
-          <span className="cl-card-title">Session decision history</span>
+        {/* Session audit trail — real decisions from this browser session, matching
+            DESIGN_BRIEF.md section 6 (never a write into the real audit table). */}
+        <div className="cl-card sg-elevated">
+          <div className="cl-card-head">
+            <span className="cl-card-title">Session decision history</span>
+          </div>
+          <SessionAuditTrail entries={sessionAudit} />
         </div>
-        <SessionAuditTrail entries={sessionAudit} />
       </div>
 
       {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
@@ -548,6 +579,21 @@ export default function GovernancePanel() {
           Has its own model selector (decoupled from the general one above)
           since ncf_deal_manager training is parked while scenario/compare/
           promote still work for it. */}
+      {/* Train and Compare sit side by side: both are compact forms (two
+          selects and a button) that were each spanning the full page width
+          with most of it empty. Collapses to one column under 980px. The
+          step-by-step log, session history and model registry below stay
+          full-width -- those hold logs and tables that actually use it. */}
+      <div className="cl-side-by-side">
+      <section className="cl-side-by-side-col">
+      {/* Sweep status stacks directly above the training picker in the SAME
+          column, because it answers that picker's most common question: a load
+          test that just finished is missing from it until a Glue ETL sweep has
+          swept its outcomes into the training bucket. Its stage bar uses the
+          compact sizing in .cl-sweep-card so four stages fit a half-width
+          column without wrapping. */}
+      <div className="cl-section-title">Load test outcome pipeline</div>
+      <LoadTestSweepStatus onRunBecameTrainable={fetchTrainableRuns} />
       <div className="cl-section-title">Train from load test</div>
       <div className="cl-card sg-elevated" data-testid="governance-train-card">
         <div className="cl-control-group">
@@ -587,14 +633,76 @@ export default function GovernancePanel() {
             )}
           </select>
         </div>
+        {/* Timestamps are shown on every run above precisely so a run can be
+            told apart from an older one. A run only becomes selectable after a
+            Glue ETL pass has swept its outcomes into the training bucket, so
+            the newest run in this list is NOT necessarily the load test you
+            just finished. */}
+        <div className="cl-train-latency-note" data-testid="governance-train-latency-note">
+          Only runs already swept into the training bucket by a Glue ETL job are
+          listed here, so a load test you just finished will be missing for a few
+          minutes. The Load test outcome pipeline card above shows which stage
+          each run is on. This list refreshes on its own — check the timestamp on
+          the run you select so you are not retraining on data from an earlier
+          load test.
+        </div>
         {trainableRunsError && (
           <div className="cl-honest cl-honest-block">Could not load trainable runs: {trainableRunsError}</div>
         )}
-        {trainableRuns.length === 0 && !trainableRunsError && (
+        {/* The Glue job is what turns captured outcomes into training data, so
+            its health decides whether waiting will ever help. A job that fails
+            every run is not a "wait a few minutes" situation, and the picker
+            previously looked identical in both cases. */}
+        {trainEtl && trainEtl.configured && trainEtl.never_succeeded && (
+          <div className="cl-honest cl-honest-block" data-testid="governance-train-etl-broken">
+            <strong>The ETL job for {trainingModelType} has never completed successfully.</strong>{" "}
+            No run of <code>{trainEtl.job_name}</code> has ever succeeded
+            {trainEtl.consecutive_failures > 0
+              ? ` (${trainEtl.consecutive_failures} consecutive failures)`
+              : ""}
+            , so no training data exists for this model and waiting will not
+            change that.
+            {trainEtl.last_error?.message && (
+              <div
+                className="cl-etl-error-detail"
+                title={trainEtl.last_error.message}
+                data-testid="governance-train-etl-error"
+              >
+                Latest failure: {trainEtl.last_error.message.slice(0, 140)}
+                {trainEtl.last_error.message.length > 140 ? "..." : ""}
+              </div>
+            )}
+          </div>
+        )}
+        {trainEtl && !trainEtl.configured && (
           <div className="cl-honest cl-honest-block">
-            No load test run for {trainingModelType} has been processed by a completed Glue ETL job yet
-            — run a load test targeting this model, then wait for the next Glue run (or trigger it
-            manually) before training.
+            No Glue ETL job is configured for {trainingModelType}, so its load
+            test outcomes are never labelled into training data.
+          </div>
+        )}
+        {/* Recorded outcomes that simply have not been swept yet. This is the
+            usual reason the run you just finished is not in the list, and it is
+            a different situation from a broken job. */}
+        {pendingRuns.length > 0 && (
+          <div className="cl-honest cl-honest-block" data-testid="governance-train-pending">
+            {pendingRuns.length} run{pendingRuns.length === 1 ? "" : "s"} for{" "}
+            {trainingModelType} captured outcomes but{" "}
+            {trainEtl?.never_succeeded
+              ? "cannot be swept until that job succeeds"
+              : "are waiting for the next ETL sweep"}
+            {trainEtl?.last_success
+              ? ` (last successful sweep ${new Date(trainEtl.last_success).toLocaleString()})`
+              : ""}
+            . Newest pending:{" "}
+            {new Date(pendingRuns[0].timestamp).toLocaleString()} (
+            {pendingRuns[0].outcome_sample_count} samples).
+          </div>
+        )}
+        {trainableRuns.length === 0 && !trainableRunsError && !trainEtl?.never_succeeded && pendingRuns.length === 0 && (
+          <div className="cl-honest cl-honest-block">
+            No load test run for {trainingModelType} has captured outcomes yet
+            — run a load test targeting this model, then wait for the next Glue
+            sweep before training.
           </div>
         )}
         {trainingEstimateError && (
@@ -651,10 +759,13 @@ export default function GovernancePanel() {
         )}
       </div>
 
+      </section>
+
       {/* Compare load-test outcomes (FR-7/FR-8, Story 5) + Promote
           (FR-9/FR-10, Story 6). Every result below is labeled by source —
           load-test-derived, distinct from the automated pipeline's
           live-canary-CloudWatch-derived decisions above. */}
+      <section className="cl-side-by-side-col">
       <div className="cl-section-title">Compare load-test outcomes</div>
       <div className="cl-card sg-elevated" data-testid="governance-compare-card">
         {eligibleRunsError && (
@@ -746,6 +857,9 @@ export default function GovernancePanel() {
             )}
           </div>
         )}
+      </div>
+
+      </section>
       </div>
 
       <div className="cl-section-title">Model registry</div>
