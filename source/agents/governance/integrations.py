@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -92,6 +93,26 @@ class HttpxClient:
 # ---------------------------------------------------------------------------
 
 
+# How long to wait for a RequestResponse proxy invoke, in seconds.
+#
+# MUST be >= the proxy Lambda's own Timeout (900s in
+# deployment/vpc_proxy_cfn.yaml). The invoke holds the connection until the
+# function returns, so a client timeout below the Lambda ceiling makes the caller
+# give up on a call that is still running and will still succeed.
+#
+# This was 600 while the Lambda's ceiling was 900, which is what rejected
+# dlrm-bid-shader version 2: a TensorRT optimize took 846s, the client gave up at
+# 630s (600 + 30) and returned 502 "Read timeout", the agent recorded
+# "Model optimization failed", and no canary was ever staged. The compile itself
+# had not failed.
+#
+# Overridable so the two can be raised together without a code change if
+# compilation gets slower.
+DEFAULT_PROXY_TIMEOUT_SECONDS = float(
+    os.environ.get("VPC_PROXY_TIMEOUT_SECONDS", "900")
+)
+
+
 class LambdaProxyHttpClient:
     """HttpClient that tunnels http(s) calls through a VPC-attached Lambda.
 
@@ -112,10 +133,10 @@ class LambdaProxyHttpClient:
         response: {"status": int, "headers": {..}, "body_b64": "<base64>"}
     """
 
-    def __init__(self, function_arn: str, region: str, timeout: float = 600.0):
+    def __init__(self, function_arn: str, region: str, timeout: float | None = None):
         self._function_arn = function_arn
         self._region = region
-        self._timeout = timeout
+        self._timeout = DEFAULT_PROXY_TIMEOUT_SECONDS if timeout is None else timeout
         self._lambda: Any = None
         self._s3: Any = None
 

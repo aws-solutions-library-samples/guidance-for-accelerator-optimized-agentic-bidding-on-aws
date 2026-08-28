@@ -15,6 +15,7 @@
 #   --stack-name NAME   Resource stack name (required)
 #   --target TARGET     Build target: all|part1|nemo|agents|optimizer (default: all)
 #   --tag TAG           Docker image tag (default: git short SHA)
+#   --nemo-src-tag TAG  Extra content-hash tag for the NeMo image (src-<hash>)
 #   --ngc-secret NAME   Secrets Manager secret name for NGC API key
 #   --no-wait           Start build and exit without waiting for completion
 #   --region REGION     AWS region (default: $AWS_REGION or us-east-1)
@@ -45,7 +46,11 @@ display_name() {
     widedeep-segment-activator)  echo "audience-activator" ;;
     ncf-deal-manager)            echo "deal-scorer" ;;
     metrics-enricher)            echo "signals-enricher" ;;
-    deal-yield-manager)          echo "yield-optimizer" ;;
+    # The two Yield Optimizer containers were named for their job when the
+    # combined deal-yield-manager was split, so their keys already ARE their
+    # display names (kept in step with deploy.sh's display_name()).
+    yield-optimizer-floor)       echo "yield-optimizer-floor" ;;
+    yield-optimizer-margin)      echo "yield-optimizer-margin" ;;
     *)                           echo "$1" ;;
   esac
 }
@@ -56,6 +61,10 @@ STACK_NAME=""
 BUILD_TARGET="all"
 BUILD_ONLY=""
 IMAGE_TAG=""
+# Content-hash tag (src-<hash>) for the NeMo training image, supplied by
+# deploy_closed_loop.sh. Pushed alongside dlrm/ncf so a later run can tell
+# whether the image matches source/training/container/ as it stands now.
+NEMO_SRC_TAG=""
 NGC_SECRET=""
 NGC_KEY=""
 NO_WAIT=0
@@ -70,6 +79,8 @@ for arg in "$@"; do
     --only)         ;; # value in next arg (space-separated image keys)
     --tag=*)        IMAGE_TAG="${arg#--tag=}" ;;
     --tag)          ;; # value in next arg
+    --nemo-src-tag=*) NEMO_SRC_TAG="${arg#--nemo-src-tag=}" ;;
+    --nemo-src-tag) ;; # value in next arg
     --ngc-secret=*) NGC_SECRET="${arg#--ngc-secret=}" ;;
     --ngc-secret)   ;; # value in next arg
     --ngc-key=*)    NGC_KEY="${arg#--ngc-key=}" ;;
@@ -82,6 +93,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--target" ]]; then BUILD_TARGET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--only" ]]; then BUILD_ONLY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--tag" ]]; then IMAGE_TAG="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--nemo-src-tag" ]]; then NEMO_SRC_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-secret" ]]; then NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--region" ]]; then AWS_REGION="${arg}"
@@ -202,7 +214,8 @@ REPOS=(
   "${STACK_NAME}-$(display_name widedeep-segment-activator)"
   "${STACK_NAME}-$(display_name ncf-deal-manager)"
   "${STACK_NAME}-$(display_name metrics-enricher)"
-  "${STACK_NAME}-$(display_name deal-yield-manager)"
+  "${STACK_NAME}-$(display_name yield-optimizer-floor)"
+  "${STACK_NAME}-$(display_name yield-optimizer-margin)"
   "${STACK_NAME}-orchestrator"
   "${STACK_NAME}-agentcore"
 )
@@ -272,7 +285,8 @@ ENV_OVERRIDES="[
   {\"name\":\"IMAGE_TAG\",\"value\":\"${IMAGE_TAG}\",\"type\":\"PLAINTEXT\"},
   {\"name\":\"STACK_NAME\",\"value\":\"${STACK_NAME}\",\"type\":\"PLAINTEXT\"},
   {\"name\":\"AWS_ACCOUNT_ID\",\"value\":\"${ACCOUNT_ID}\",\"type\":\"PLAINTEXT\"},
-  {\"name\":\"AWS_DEFAULT_REGION\",\"value\":\"${AWS_REGION}\",\"type\":\"PLAINTEXT\"}
+  {\"name\":\"AWS_DEFAULT_REGION\",\"value\":\"${AWS_REGION}\",\"type\":\"PLAINTEXT\"},
+  {\"name\":\"NEMO_SRC_TAG\",\"value\":\"${NEMO_SRC_TAG}\",\"type\":\"PLAINTEXT\"}
 ]"
 
 if [[ -n "${NGC_SECRET}" ]]; then

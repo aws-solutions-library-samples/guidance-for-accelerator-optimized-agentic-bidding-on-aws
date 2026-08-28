@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ from typing import Optional
 
 from closed_loop_demo.scenarios import BidOutcomeMetrics
 from shared.artf_types import RTBRequest, RTBResponse, Mutation
-from shared.feedback_collector import FeedbackCollector
+from shared.feedback_collector import FeedbackCollector, fire_and_forget_emit
 from shared.feedback_models import DealYieldOutcomeEvent
 
 logger = logging.getLogger(__name__)
@@ -85,11 +86,17 @@ def _find_deal(bid_request: dict, imp_id: str, deal_id: str) -> dict | None:
 
 
 def _classify_category_tier(bid_request: dict) -> float:
-    """Mirrors containers.deal_yield_manager.features.classify_content_tier,
-    reading the same real site/app.cat fields -- not a call to that module
-    (Unit 2 has no dependency on Unit 1's code, per unit-of-work-dependency.md;
-    this is a second, independent reader of the same request data)."""
-    from containers.deal_yield_manager.features import classify_content_tier
+    """Classifies the same real site/app.cat fields the yield models see.
+
+    Calls shared.yield_features.classify_content_tier directly rather than
+    reimplementing it: the outcome event this feeds must describe the request
+    the way the model that acted on it did, so a second independent
+    implementation could drift and silently mislabel training data. (An earlier
+    version of this docstring claimed it was NOT a call into that module while
+    the code below imported it anyway -- the function now lives in shared/,
+    where both the containers and this reader legitimately depend on it.)
+    """
+    from shared.yield_features import classify_content_tier
 
     site = bid_request.get("site") or bid_request.get("app") or {}
     return classify_content_tier(site.get("cat", []))
@@ -190,8 +197,24 @@ def _synthesize_load_test_outcome(run_id: str, request_index: int, deal_id: str)
     clearing, not two independent events.
     """
     records = _LOAD_TEST_SCENARIO.sample_outcomes(n=_LOAD_TEST_SAMPLE_POOL_SIZE, seed=4242)
-    index = (hash((run_id, request_index, deal_id)) & 0xFFFFFFFF) % _LOAD_TEST_SAMPLE_POOL_SIZE
-    record = records[index]
+    # Indexed via random.Random over a string key rather than builtin hash().
+    # hash() is salted per process for str input (unless PYTHONHASHSEED is
+    # pinned), so the same (run_id, request_index, deal_id) produced different
+    # outcomes in different orchestrator pods -- the docstring's "deterministic"
+    # claim only held within a single process. random.Random seeds from a str via
+    # sha512, which is stable everywhere.
+    #
+    # KNOWN LIMITATION (tracked in
+    # aidlc-docs/construction/model-comparison-fix/tasks.md, task 2.6): this
+    # outcome still does not depend on the yield model's own decision -- the
+    # adjusted bidfloor / margin value never enters. The bid-shading path was
+    # fixed for this (loadtest_instrumentation.generate_outcome_sample now scores
+    # the container's real price against a seeded market), but the equivalent
+    # market model for floors/margins is an open design question. Until then, a
+    # canary-vs-stable comparison for the yield models would measure run_id, not
+    # the model, so do not present one as a model verdict.
+    rng = random.Random(f"deal-yield:{run_id}:{request_index}:{deal_id}")
+    record = records[rng.randrange(_LOAD_TEST_SAMPLE_POOL_SIZE)]
     return record["won"], record["price_paid"]
 
 
@@ -243,7 +266,10 @@ def emit_load_test_deal_yield_outcome(
             # model_copy(update=...) is pydantic's supported way to derive a
             # modified copy of an immutable model.
             event = event.model_copy(update={"won": won, "price_paid": price_paid})
-            asyncio.create_task(_deal_yield_collector.emit(event))
+            fire_and_forget_emit(
+                _deal_yield_collector.emit(event),
+                description=f"load-test deal yield outcome emit (deal={event.deal_id})",
+            )
             samples.append(price_paid if won and price_paid is not None else 0.0)
         except Exception:
             logger.warning("Failed to emit load-test deal yield outcome event", exc_info=True)
@@ -280,6 +306,9 @@ def emit_deal_yield_outcome(
                 req, mutation, source=source, model_version=model_version
             )
             if event is not None:
-                asyncio.create_task(_deal_yield_collector.emit(event))
+                fire_and_forget_emit(
+                    _deal_yield_collector.emit(event),
+                    description=f"deal yield outcome emit (deal={event.deal_id})",
+                )
         except Exception:
             logger.warning("Failed to emit deal yield outcome event", exc_info=True)

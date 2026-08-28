@@ -85,8 +85,12 @@ cycle (retrain → canary → A/B test → promote/reject). Both pages show the 
 real reasoning and real telemetry — never simulated data.
 
 To generate real training data for the Yield Optimizer specifically, go to the
-**Load Test** page, select **Yield Optimizer** as the target, and run a batch —
-see [Yield Optimizer: bootstrapping training data](#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet)
+**Load Test** page and select either **Yield Optimizer — Floor** or **Yield
+Optimizer — Margin** as the target, then run a batch. The floor and margin
+models are separate containers with separate training targets, so a run captures
+outcomes for the one you selected — run it twice, once per target, to produce
+training data for both. See [Yield Optimizer: bootstrapping training
+data](#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet)
 above for why this matters and what it emits.
 
 ## Disabling scheduled components

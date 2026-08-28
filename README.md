@@ -72,14 +72,15 @@ Browser (React UI)
     |  parallel calls
     v
 +--------------------------------+
-|  5 ARTF containers (EKS)       |
+|  6 ARTF containers (EKS)       |
 |  bid pricer, audience          |
 |  activator, deal scorer,       |
-|  signals enricher, yield       |
-|  optimizer                     |
+|  signals enricher,             |
+|  yield optimizer floor,        |
+|  yield optimizer margin        |
 +--------------------------------+
     |
-    |  3 of the 5 call Triton
+    |  4 of the 6 call Triton
     v
 +--------------------------------+
 |  NVIDIA Triton (GPU node)      |
@@ -87,7 +88,7 @@ Browser (React UI)
 +--------------------------------+
 ```
 
-`deploy.sh` deployed an Amazon EKS cluster with two node groups: a GPU node running NVIDIA Triton Inference Server, and CPU nodes running the orchestrator and five bidding containers, each responsible for one job in the pipeline:
+`deploy.sh` deployed an Amazon EKS cluster with two node groups: a GPU node running NVIDIA Triton Inference Server, and CPU nodes running the orchestrator and six bidding containers, each responsible for one job in the pipeline:
 
 | Container | What it does |
 |-----------|---------------|
@@ -95,15 +96,84 @@ Browser (React UI)
 | **Audience Activator** | Activates audience segments from bid-request signals |
 | **Deal Scorer** | Scores and activates/suppresses private marketplace deals |
 | **Signals Enricher** | Adds viewability and brand-safety quality signals |
-| **Yield Optimizer** | Publisher/SSP-side counterpart — adjusts deal floors and margins using two independent XGBoost models (floor, margin) on Triton |
+| **Yield Optimizer — Floor** | Publisher/SSP-side — adjusts the floor price on private marketplace deals |
+| **Yield Optimizer — Margin** | Publisher/SSP-side — adjusts the margin taken on private marketplace deals |
 
-See [Architecture](#architecture) for the full picture, including which containers run GPU inference on Triton and which run rule-based logic on CPU.
+The orchestrator fans out every incoming bid request to all six containers in parallel, merges their mutations, and returns a single response — the fan-out includes both yield containers, so each is exercised whenever a scenario carries a deal with the matching floor- or margin-adjustable intent. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
 
-The orchestrator fans out every incoming bid request to all five containers in parallel, merges their mutations, and returns a single response — the same fan-out list includes the yield optimizer, so it's exercised whenever a scenario carries a deal with a floor/margin-adjustable intent. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
+The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents — neither is gated on the other — so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
 
-> **Note on the models.** The bundled models (DLRM, NCF, XGBoost) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
+### Which models exist, and how each one is served
 
-> **How the Yield Optimizer breaks its own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Right inside `source/containers/deal_yield_manager/app.py`, after the model returns its prediction, an optional exploration step (`exploration.py`, off by default — set `YIELD_EXPLORATION_EPSILON` to enable) nudges the floor/margin recommendation by a small, bounded random amount instead of always returning the same answer. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what actually produces the variation the Yield Optimizer's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
+Containers and models are not 1:1. Four of the six containers run a real model on
+the GPU; two are deterministic rule engines with no model at all. Every model that
+exists has exactly one container, and every model is a fully separate unit — its own
+Triton model name, its own config, its own SageMaker Model Package Group, its own
+training job, and its own promotion lifecycle.
+
+
+| Model | Container | Type | Artifact served | Triton backend | GPU |
+|---|---|---|---|---|---|
+| `dlrm_bid_shader` | Bid Pricer | DLRM (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `ncf_deal_manager` | Deal Scorer | NCF/NeuMF (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `deal_yield_manager_floor` | Yield Optimizer — Floor | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| `deal_yield_manager_margin` | Yield Optimizer — Margin | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| *(none — rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
+| *(none — rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
+
+The two yield models share one thing by design: the **7-element feature vector** both
+consume. That derivation lives in shared code rather than being duplicated per
+container, because the Glue ETL job reconstructs the same vector when building
+training data — if the two containers computed it differently, or drifted from the
+ETL job, training data would silently stop matching what the models see at inference
+time.
+
+**Two different serving paths, and why.** ONNX and FIL are not alternatives to each
+other — one is a file format, the other is an inference engine:
+
+- **Neural networks (DLRM, NCF).** PyTorch → **ONNX** (a portable file format for
+  neural networks) → NVIDIA **TensorRT** compiles that ONNX into a `.plan` engine
+  tuned for the specific GPU → Triton serves the `.plan`. The compile step is what
+  TensorRT is for.
+- **Tree models (floor, margin).** XGBoost → native `xgboost.json` → NVIDIA's
+  **FIL** (Forest Inference Library, from RAPIDS/cuML, bundled in Triton) reads that
+  format directly on the GPU. **There is no ONNX and no compile step in this path** —
+  FIL loads the tree model as-is.
+
+Both paths run inside the same Triton server on the same GPU node. Note that
+`dlrm_bid_shader` and `ncf_deal_manager` are each fronted by a small Python-backend
+router on CPU that splits traffic between `*_stable` and `*_canary` versions; the two
+yield models are currently single-version and loaded directly, with no router.
+
+> **On the XGBoost version pin.** `xgboost` is pinned to `1.7.6` deliberately. Newer
+> versions write a `"cats"` field into the saved JSON that Triton 24.08's bundled FIL
+> backend rejects outright (`Error: key "cats" is not recognized!`), which would take
+> both yield models down. The pin matches the SageMaker training-side version.
+
+> **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
+> each yield model in two formats — the native `xgboost.json` that FIL actually loads,
+> and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
+> registration script can treat all four models identically instead of branching on
+> format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
+> If you're tracing artifacts through S3, that's why an ONNX file appears for a model
+> that is not served from ONNX.
+
+> **Note on the two yield containers.** Earlier releases served both yield models from
+> a single container. They are now split, so each model has its own container, image,
+> Kubernetes Deployment, HPA, and load-test target — matching how every other model in
+> this guidance is deployed. The Triton model names (`deal_yield_manager_floor` /
+> `deal_yield_manager_margin`) and their SageMaker Model Package Groups are unchanged
+> from before the split, so existing registered model versions and promotion history
+> carry over.
+>
+> **If you are upgrading from a pre-split deployment:** load-test runs recorded before
+> the split were tagged with a single combined target and are **not** eligible as
+> training data for either model afterward. Re-run a load test against each new target
+> to regenerate training data. Registered model versions are unaffected.
+
+> **Note on the models.** The bundled models (DLRM, NCF, and both XGBoost models) ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data — see [Next steps](#next-steps). The audience activator and signals enricher are deterministic rule engines, not models.
+
+> **How the yield models break their own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Both yield containers run an exploration step after the model returns its prediction, which nudges the recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`, settable independently per container) but **structurally scoped to load-test and demo traffic only** — live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what produces the variation each model's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
 
 ### The 5 deployment phases
 
@@ -113,7 +183,7 @@ The orchestrator fans out every incoming bid request to all five containers in p
 |-------|---------------|
 | **1/5 — Preparing models** | Creates the ECR repositories and the DynamoDB load-test-history table; exports the PyTorch DLRM/NCF models to ONNX and the yield optimizer's genesis XGBoost models (best-effort — the deploy continues even if this step is skipped); uploads all of it, plus the Triton router/model-config repository, to the S3 model bucket. |
 | **2/5 — Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster (GPU + CPU node groups) — the two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
-| **3/5 — Deploying workloads** | Provisions the Cognito user pool, then applies the Kubernetes manifests for Triton, the five ARTF containers, and the orchestrator. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node — this runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Also configures the included daily GPU-node scheduled shutdown. |
+| **3/5 — Deploying workloads** | Provisions the Cognito user pool, then applies the Kubernetes manifests for Triton, the six ARTF containers, and the orchestrator. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node — this runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Also configures the included daily GPU-node scheduled shutdown. |
 | **4/5 — Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
 | **5/5 — Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime, then — unless you passed `--no-retraining` — deploys the entire Part 2 closed-loop stack: the bid-outcome feedback pipeline, the Glue ETL job, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously — this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
 
@@ -123,7 +193,7 @@ The orchestrator fans out every incoming bid request to all five containers in p
 
 ```bash
 kubectl get nodes    # at least one GPU node + CPU nodes, all Ready
-kubectl get pods     # Triton, the 5 containers, and the orchestrator all Running
+kubectl get pods     # Triton, the 6 containers, and the orchestrator all Running
 ```
 
 Triton and the model-optimizer bootstrap Job may take a few minutes to finish loading/compiling models after the script exits — `deploy.sh`'s final summary tells you whether that finished and how to check.
@@ -148,9 +218,9 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
    |----------|----------------------|
    | Banner Ad — Segment Activation | Audience Activator, Signals Enricher |
    | Bid Shading — Price Optimization | Bid Pricer |
-   | Video + PMP Deals — Deal Scoring | Deal Scorer, Signals Enricher, Yield Optimizer |
+   | Video + PMP Deals — Deal Scoring | Deal Scorer, Signals Enricher |
    | SSP Enrichment — 3 Containers | Audience Activator, Deal Scorer, Signals Enricher |
-   | PMP Deals — Yield Optimizer | Yield Optimizer (floor + margin adjustment) |
+   | PMP Deals — Yield Optimizer | Yield Optimizer — Floor, Yield Optimizer — Margin |
 
    <img src="assets/images/scenario-result.png" alt="Scenario result" height="350">
 
@@ -158,7 +228,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
 4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
 
-5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any container, including the Yield Optimizer. This isn't only a throughput demo — for the Yield Optimizer specifically, load-test traffic is the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how its training data actually gets bootstrapped before real auction outcomes accumulate. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
+5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any single container — including either yield container, selectable independently. This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
 
 ## Go deeper
 
@@ -239,6 +309,82 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ### Part 2: closed-loop learning
 
 The models above ship with static, untrained weights. Part 2 closes the loop: it watches real bid outcomes, retrains and validates new model versions, and tunes bidding parameters continuously — all without touching the real-time bidding path. It's deployed by default (`--with-retraining`) alongside Part 1.
+
+**How each model is retrained.** The two serving paths from Part 1 carry through to
+two different retraining paths, one per model type:
+
+| Model | Trained by | Training data | Result loaded as | Compile step? |
+|---|---|---|---|---|
+| `dlrm_bid_shader` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
+| `ncf_deal_manager` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
+| `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
+| `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
+| Audience Activator, Signals Enricher | *not applicable* — rule engines | — | — | — |
+
+Each model has its own SageMaker Model Package Group, so versions, approval status,
+and promotions are tracked independently. The two yield models train from two
+separately labeled datasets produced by a **single** Glue ETL job — one job is
+sufficient because its dedup key includes the ARTF intent, which is what separates
+floor rows from margin rows. Tree models skip TensorRT entirely: FIL loads the
+retrained `xgboost.json` directly, so there is no engine-compile stage in that path.
+
+Because the two yield containers are now separate load-test targets, you can also
+bootstrap training data for one model without generating traffic for the other.
+
+#### Testing the governance flow end to end
+
+The **Governance** page drives the whole loop from a load test. Each step gates on
+the previous one finishing, so the order matters:
+
+1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
+   outcomes for* (e.g. **Bid Pricer**), leave the variant on **Current (stable)**,
+   and run a batch. Only the selected target's responses are captured as outcomes.
+2. **Wait for the sweep — about 6 minutes.** Outcomes reach S3 through Kinesis
+   Firehose, which buffers up to 300s by default
+   (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into
+   `training-data/`. A completed load test schedules that sweep itself, waiting
+   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first —
+   sweeping earlier would mark the run ready with no data behind it. If you raise
+   the Firehose interval, raise this too. The Glue schedule (every 6 hours by
+   default, `ScheduleIntervalHours`) remains as a backstop. The **Load test
+   outcome pipeline** card shows which stage your run is on.
+3. **Train.** Under **Train from load test**, pick the run, review the cost
+   estimate, and confirm. This starts a real SageMaker training job. Note the
+   picker only lists runs a sweep has already covered, so the run you just
+   finished appears a few minutes later — check the timestamp so you aren't
+   retraining on an older test.
+4. **Let governance run.** When training completes, the new version registers in
+   its SageMaker Model Package Group automatically, which triggers the Model
+   Promotion Governance Agent: compile TensorRT → stage a canary → live A/B test →
+   promote, reject, or roll back. The **Model registry versions** table shows the
+   resulting approval status and the agent's stated reason, with the full text on
+   hover.
+5. **Compare a challenger.** Once a canary is staged, re-run the load test with
+   **Challenger (canary)** selected, then use **Compare load-test outcomes**.
+   Re-use the same preset and seed as your baseline run: requests are generated
+   from the seed, so replaying it puts both variants under identical market
+   conditions and leaves the model as the only difference.
+
+If something isn't selectable, the panel now says why rather than showing an
+empty list:
+
+| What you see | What it means |
+|---|---|
+| *"N runs … waiting for the next ETL sweep"* | Normal. The outcomes are recorded; the sweep hasn't covered them yet. |
+| *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
+| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now — a challenger-targeted test is refused rather than quietly run against the stable model. |
+| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail) — this is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
+
+**Reading the comparison.** The primary metric is advertiser surplus — the
+impression's value to the advertiser minus what was actually paid, and zero on a
+loss. Higher is better, and it has an interior optimum: bidding too low forfeits
+winnable impressions and bidding too high overpays for them, so it rewards what
+bid shading is actually for rather than simply winning more.
+
+**One caveat on the yield models.** Floor and margin load-test outcomes are not
+yet a function of those models' own floor/margin decisions, so a yield
+canary-vs-stable comparison should not be read as a verdict on the model. Bid
+Pricer and Deal Scorer are unaffected.
 
 See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 

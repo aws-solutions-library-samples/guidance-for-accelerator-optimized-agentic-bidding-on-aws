@@ -64,32 +64,28 @@ def most_recent_eligible(
     return eligible[0] if eligible else None
 
 
-# A load test run's target_model_type is always the container-level
-# identifier "deal_yield_manager" (see loadtest.py's _TARGET_MODEL_TYPES) --
-# there is no per-sub-model load-test target, since the container's
-# mutate() emits BOTH ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN outcomes
-# independently per request (0, 1, or 2 events per call). Training,
-# however, operates on the two sub-models independently
-# (deal_yield_manager_floor/margin -- see training/xgboost_pipeline.py's
-# module docstring on the FIL multi-output-limitation correction). This
-# map lets a trainable-runs lookup for either training target match load
-# test runs recorded under the single container-level identifier.
-_LOAD_TEST_TARGET_BY_TRAINING_MODEL_TYPE = {
-    "deal_yield_manager_floor": "deal_yield_manager",
-    "deal_yield_manager_margin": "deal_yield_manager",
-}
+# A load test run's target_model_type now always equals the training model type
+# exactly, including for the two yield models (deal_yield_manager_floor and
+# deal_yield_manager_margin -- see loadtest.py's _TARGET_MODEL_TYPES), because
+# each yield container serves exactly one intent and is targeted on its own.
+#
+# A bridging map used to live here, translating both training targets to a
+# single container-level "deal_yield_manager" load-test identifier. It is gone:
+# the identifiers match directly now, so no translation is possible to get
+# wrong. Consequence, accepted deliberately: load-test runs recorded BEFORE the
+# container split carry target_model_type="deal_yield_manager", which matches
+# neither training model type, so those historical runs are no longer offered as
+# trainable. Their captured outcome data is not deleted -- it simply stops being
+# selectable, and a fresh load test against either yield container produces
+# directly-matching runs.
 
 
 def _is_trainable(run: dict, model_type: str, latest_glue_completion: datetime | None) -> bool:
-    """A run is trainable if it targeted model_type (or, for
-    deal_yield_manager_floor/margin, the shared "deal_yield_manager"
-    load-test target -- see
-    _LOAD_TEST_TARGET_BY_TRAINING_MODEL_TYPE), captured at least one
+    """A run is trainable if it targeted model_type, captured at least one
     outcome sample, and a Glue job run covering its timestamp has already
     completed — otherwise its data may not exist under training-data/ yet
     (see this module's docstring)."""
-    expected_target = _LOAD_TEST_TARGET_BY_TRAINING_MODEL_TYPE.get(model_type, model_type)
-    if run.get("target_model_type") != expected_target:
+    if run.get("target_model_type") != model_type:
         return False
     if int(run.get("outcome_sample_count") or 0) <= 0:
         return False

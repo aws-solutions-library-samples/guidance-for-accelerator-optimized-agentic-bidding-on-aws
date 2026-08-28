@@ -99,6 +99,10 @@ export const IconSplit = (
 export const IconGavel = (
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m14 13-7.5 7.5a2.12 2.12 0 0 1-3-3L11 10" /><path d="m16 16 6-6" /><path d="m8 8 6-6" /><path d="m9 7 8 8" /><path d="m21 11-8-8" /></svg>
 );
+export const IconEtl = (
+  // Funnel — the Glue ETL sweep that filters/labels raw outcomes into training data.
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 4h18l-7 8v7l-4 2v-9z" /></svg>
+);
 export const IconAudit = (
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><path d="m9 15 2 2 4-4" /></svg>
 );
@@ -134,6 +138,66 @@ export function RecommendationBadge({ rec }) {
   };
   const s = map[rec] || { bg: "var(--text-muted)", label: String(rec || "—").toUpperCase() };
   return <span className="cl-rec-badge" style={{ background: s.bg }}>{s.label}</span>;
+}
+
+// Recognises the reasons the governance agent writes for a step that FAILED,
+// as opposed to a model that was evaluated and lost. The distinction matters to
+// a reader: "the pipeline broke" and "the challenger underperformed" are very
+// different conclusions, and a bare "Rejected" badge conflates them.
+//
+// Matched against the ApprovalDescription text the agent produces (see
+// agents/governance/governance_agent.py, which prefixes step failures with
+// "Model optimization failed", "Canary deployment failed", "A/B test error", or
+// "Guardrail breach"). Anything unmatched is treated as an evaluation verdict
+// rather than asserting a category we cannot confirm.
+const PIPELINE_FAILURE_PREFIXES = [
+  "model optimization failed",
+  "canary deployment failed",
+  "canary load",
+  "a/b test error",
+  "guardrail breach",
+];
+
+export function isPipelineFailure(reason) {
+  if (!reason) return false;
+  const text = String(reason).toLowerCase();
+  return PIPELINE_FAILURE_PREFIXES.some((p) => text.startsWith(p));
+}
+
+// First sentence / clause of the reason, for the inline cell. The full text goes
+// in the title attribute so nothing is lost — some reasons carry an entire HTTP
+// error body and would otherwise wreck the table layout.
+export function shortReason(reason) {
+  const text = String(reason).trim();
+  const cut = text.indexOf(": ");
+  const head = cut > 0 ? text.slice(0, cut) : text;
+  return head.length > 60 ? `${head.slice(0, 57)}...` : head;
+}
+
+export function ApprovalReason({ status, reason }) {
+  if (!reason) {
+    // Pending versions have not been decided, so "no reason" is expected and
+    // needs no explanation. A decided version with no recorded reason is worth
+    // saying plainly rather than leaving the cell blank.
+    if (status === "PendingManualApproval" || !status) return <span style={SUBTLE}>—</span>;
+    return <span style={SUBTLE}>No reason recorded</span>;
+  }
+
+  const pipelineFailure = isPipelineFailure(reason);
+  return (
+    <span
+      className="cl-approval-reason"
+      title={reason}
+      data-testid="approval-reason"
+    >
+      {pipelineFailure && (
+        <span className="cl-approval-reason-tag" title={reason}>
+          pipeline failure
+        </span>
+      )}
+      <span style={SUBTLE}>{shortReason(reason)}</span>
+    </span>
+  );
 }
 
 export function ApprovalBadge({ status }) {
@@ -377,9 +441,9 @@ function _pipelineStageClass(node, i, revealed, running) {
   return "done";
 }
 
-export function PipelineBar({ nodes, revealed, running }) {
+export function PipelineBar({ nodes, revealed, running, ariaLabel = "Governance pipeline stages" }) {
   return (
-    <div className="cl-pipeline-bar sg-elevated" role="list" aria-label="Governance pipeline stages">
+    <div className="cl-pipeline-bar sg-elevated" role="list" aria-label={ariaLabel}>
       {nodes.map((node, i) => {
         const cls = _pipelineStageClass(node, i, revealed, running);
         const isRevealed = i < revealed;
@@ -727,12 +791,13 @@ export function ModelsView({ versions, error }) {
       {!error && versions && versions.length === 0 && <div style={SUBTLE}>No registered model versions yet.</div>}
       {!error && versions && versions.length > 0 && (
         <table className="cl-table">
-          <thead><tr><th>Version</th><th>Approval</th><th>Status</th><th>Created</th></tr></thead>
+          <thead><tr><th>Version</th><th>Approval</th><th>Reason</th><th>Status</th><th>Created</th></tr></thead>
           <tbody>
             {versions.map((v, i) => (
               <tr key={i}>
                 <td>{v.version}</td>
                 <td><ApprovalBadge status={v.approval_status} /></td>
+                <td><ApprovalReason status={v.approval_status} reason={v.approval_description} /></td>
                 <td style={SUBTLE}>{v.status}</td>
                 <td style={SUBTLE}>{v.created_at}</td>
               </tr>

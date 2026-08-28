@@ -59,9 +59,18 @@ const AGENT_NODES = [
     type: "agent",
   },
   {
-    id: "yield",
-    label: "Yield Optimizer",
-    intents: ["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+    id: "yield-floor",
+    label: "Yield Optimizer — Floor",
+    intents: ["ADJUST_DEAL_FLOOR"],
+    model: "XGBoost (Triton FIL backend)",
+    logo: nvidiaLogo,
+    color: "#be185d",
+    type: "agent",
+  },
+  {
+    id: "yield-margin",
+    label: "Yield Optimizer — Margin",
+    intents: ["ADJUST_DEAL_MARGIN"],
     model: "XGBoost (Triton FIL backend)",
     logo: nvidiaLogo,
     color: "#be185d",
@@ -78,13 +87,20 @@ const AGENT_NODES = [
   },
 ];
 
-// Map stop IDs from orchestrator response to our node IDs
+// Map stop IDs from the orchestrator response to our node IDs.
+//
+// Vestigial: this table is keyed by CONTAINER name but is applied to `s.id`,
+// which normalizer.js already emits as a stop id -- so every lookup misses and
+// the `|| s.id` fallback below is what actually resolves the node. Kept (with
+// the container names corrected) rather than silently deleted, since removing
+// it is a behavior-neutral cleanup that belongs in its own change.
 const STOP_ID_MAP = {
   "dlrm-bid-shader": "dlrm",
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
-  "deal-yield-manager": "yield",
+  "yield-optimizer-floor": "yield-floor",
+  "yield-optimizer-margin": "yield-margin",
 };
 
 /**

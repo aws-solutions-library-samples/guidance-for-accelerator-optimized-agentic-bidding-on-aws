@@ -51,8 +51,8 @@ sys.path.insert(0, REPO_ROOT)
 
 from training.xgboost_pipeline import MODEL_TYPE_BY_TARGET, TARGET_FLOOR, TARGET_MARGIN  # noqa: E402
 
-# Matches features.py::FEATURE_VECTOR_LENGTH (source/containers/deal_yield_manager/
-# features.py) -- kept as a literal here rather than importing that module,
+# Matches FEATURE_VECTOR_LENGTH in source/shared/yield_features.py -- kept as
+# a literal here rather than importing that module,
 # since this script must run standalone at deploy/build time without the
 # full container package's runtime dependencies (tritonclient, etc.).
 FEATURE_VECTOR_LENGTH = 7

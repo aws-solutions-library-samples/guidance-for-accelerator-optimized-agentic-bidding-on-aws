@@ -92,8 +92,8 @@ export default function ScenarioCard({ scenario, isActive, isLoading, disabled, 
   const [shadeFactor, setShadeFactor] = useState(0.65);
   const [convValue, setConvValue] = useState(12);
   const [segThreshold, setSegThreshold] = useState(0.55);
-  // Yield Optimizer's bounded exploration (see containers/deal_yield_manager/
-  // app.py's _resolve_effective_epsilon) -- on by default so a scenario Send
+  // Yield Optimizer's bounded exploration (see shared/yield_exploration.py's
+  // resolve_effective_epsilon) -- on by default so a scenario Send
   // against the still-untrained genesis model can produce a real mutation
   // instead of always 0. Once a real model has been trained at least once,
   // the user can flip this off to see that model's unperturbed prediction.

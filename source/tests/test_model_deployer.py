@@ -423,7 +423,7 @@ class TestTritonModelLoader:
         assert self._key(f"{BASE_MODEL}_stable", "1", "model.plan") in s3.objects
 
     # ------------------------------------------------------------------
-    # FIL backend variants (deal_yield_manager) — native XGBoost artifact,
+    # FIL backend variants (the two yield models) — native XGBoost artifact,
     # no TensorRT engine, no ModelOptimizer.optimize() call in this path.
     # ------------------------------------------------------------------
 

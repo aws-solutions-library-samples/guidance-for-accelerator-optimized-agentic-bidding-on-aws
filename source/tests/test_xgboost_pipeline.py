@@ -30,7 +30,7 @@ from training.xgboost_pipeline import (
 
 def _make_config(**overrides) -> XGBoostTrainingJobConfig:
     defaults = {
-        "training_data_uri": "s3://test-bucket/training-data/deal_yield_manager/",
+        "training_data_uri": "s3://test-bucket/training-data-deal-yield-floor/",
         "base_model_version": "v1.0.0",
         "validation_split": 0.2,
         "max_depth": 6,

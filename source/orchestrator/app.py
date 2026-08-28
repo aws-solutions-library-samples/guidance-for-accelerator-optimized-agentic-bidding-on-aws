@@ -73,13 +73,23 @@ CONTAINERS = [
         "grpc": os.environ.get("METRICS_GRPC", os.environ.get("METRICS_URL", "http://localhost:50064")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("METRICS_MCP", os.environ.get("METRICS_URL", "http://localhost:8094")),
     },
+    # The Yield Optimizer is two containers, one per intent. Each is called
+    # only for its own intent, so a request asking for just ADJUST_DEAL_FLOOR
+    # never fans out to the margin model (BR-5: the two intents are
+    # independent and atomic). YIELD_FLOOR_URL/YIELD_MARGIN_URL remain
+    # supported as single-value fallbacks for parity with the other four.
     {
-        "name": "deal-yield-manager",
-        "intents": {"ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"},
-        "grpc": os.environ.get("YIELD_GRPC", os.environ.get("YIELD_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
-        "mcp": os.environ.get("YIELD_MCP", os.environ.get("YIELD_URL", "http://localhost:8095")),
+        "name": "yield-optimizer-floor",
+        "intents": {"ADJUST_DEAL_FLOOR"},
+        "grpc": os.environ.get("YIELD_FLOOR_GRPC", os.environ.get("YIELD_FLOOR_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
+        "mcp": os.environ.get("YIELD_FLOOR_MCP", os.environ.get("YIELD_FLOOR_URL", "http://localhost:8095")),
     },
-
+    {
+        "name": "yield-optimizer-margin",
+        "intents": {"ADJUST_DEAL_MARGIN"},
+        "grpc": os.environ.get("YIELD_MARGIN_GRPC", os.environ.get("YIELD_MARGIN_URL", "http://localhost:50066")).replace("http://", "").rstrip("/"),
+        "mcp": os.environ.get("YIELD_MARGIN_MCP", os.environ.get("YIELD_MARGIN_URL", "http://localhost:8096")),
+    },
 ]
 
 
@@ -427,15 +437,18 @@ async def list_containers(request: Request) -> JSONResponse:
     # here would always report UNAVAILABLE and misrepresent a healthy
     # rules-based container as degraded.
     #
-    # deal_yield_manager is served as TWO independent single-output FIL
-    # models, not one — Triton's FIL backend does not support multi-output
-    # regression (confirmed against NVIDIA's FIL backend docs; see
-    # aidlc-docs/construction/deal-yield-training-pipeline/tasks.md Group 1
-    # and source/triton/model_repository/deal_yield_manager_floor/config.pbtxt).
+    # The yield models are TWO independent single-output FIL models, not one —
+    # Triton's FIL backend does not support multi-output regression (confirmed
+    # against NVIDIA's FIL backend docs; see
+    # aidlc-docs/construction/deal-yield-training-pipeline/tasks.md Group 1 and
+    # source/triton/model_repository/deal_yield_manager_floor/config.pbtxt).
     # A model literally named "deal_yield_manager" was never registered with
-    # Triton post-correction, so probing for it always 400s and the
-    # container health panel misreports the Yield Optimizer as
-    # model_unavailable even when both sub-models are actually ready.
+    # Triton, so probing for one always 400s. Each yield container now owns
+    # exactly one of these models, so every container below maps to at most a
+    # single model name — the tuple special-case this code used to carry is
+    # gone. The MODEL names keep their historical deal_yield_manager_* spelling
+    # because they are real registered Triton models and real SageMaker Model
+    # Package Groups; only the CONTAINERS were renamed.
     triton_models: dict[str, dict] = {}
     if triton_ready:
         model_names = [
@@ -452,16 +465,16 @@ async def list_containers(request: Request) -> JSONResponse:
                     "evidence": ev,
                 }
 
-    # Map container names to their Triton model name(s). widedeep-segment-activator
-    # maps to None like metrics-enricher — both are rules-based, no Triton model.
-    # deal-yield-manager maps to a tuple of both sub-model names (see note above) —
-    # every other entry maps to a single model name string.
+    # Map each container to its single Triton model name, or None for the
+    # rules-based containers (widedeep-segment-activator and metrics-enricher
+    # have no Triton model at all).
     container_to_model = {
         "dlrm-bid-shader": "dlrm_bid_shader",
         "widedeep-segment-activator": None,  # rules-based, no Triton model
         "ncf-deal-manager": "ncf_deal_manager",
         "metrics-enricher": None,  # rules-based, no Triton model
-        "deal-yield-manager": ("deal_yield_manager_floor", "deal_yield_manager_margin"),
+        "yield-optimizer-floor": "deal_yield_manager_floor",
+        "yield-optimizer-margin": "deal_yield_manager_margin",
     }
 
     async with httpx.AsyncClient(timeout=2.0) as client:
@@ -488,22 +501,13 @@ async def list_containers(request: Request) -> JSONResponse:
                     container_status = "unreachable"
 
             # Determine inference readiness (depends on Triton for GPU containers).
-            # deal-yield-manager maps to a tuple of two sub-model names (floor +
-            # margin) — both must be READY for the container to be reported ready.
             model_name = container_to_model.get(c["name"])
-            model_names_for_container = (
-                model_name if isinstance(model_name, tuple)
-                else ((model_name,) if model_name is not None else ())
-            )
             if model_name is None:
-                # Rules-based container (metrics-enricher) — no Triton dependency
+                # Rules-based container — no Triton dependency
                 inference_status = "ready" if container_status == "ready" else "unavailable"
             elif not triton_ready:
                 inference_status = "gpu_offline"
-            elif all(
-                triton_models.get(name, {}).get("state") == "READY"
-                for name in model_names_for_container
-            ):
+            elif triton_models.get(model_name, {}).get("state") == "READY":
                 inference_status = "ready"
             else:
                 inference_status = "model_unavailable"
@@ -527,19 +531,15 @@ async def list_containers(request: Request) -> JSONResponse:
                 "containerStatus": container_status,
                 "inferenceStatus": inference_status,
                 "protocol": protocol,
-                # "+".join over a 1-tuple is just that model's name, so this is
-                # unchanged for every container except deal-yield-manager
-                # (which now shows "deal_yield_manager_floor+deal_yield_manager_margin").
-                "tritonModel": "+".join(model_names_for_container) or None,
+                "tritonModel": model_name,
                 "evidence": {
                     "httpProbe": http_probe,
                     "grpcProbe": grpc_probe,
-                    # One evidence entry per Triton sub-model probed for this
-                    # container (usually 0 or 1; 2 for deal-yield-manager).
+                    # Kept as a list (0 entries for a rules-based container, 1
+                    # otherwise) so the response shape the UI reads is stable.
                     "tritonModelProbes": [
-                        {"model": name, **triton_models.get(name, {}).get("evidence", {})}
-                        for name in model_names_for_container
-                    ],
+                        {"model": model_name, **triton_models.get(model_name, {}).get("evidence", {})}
+                    ] if model_name is not None else [],
                 },
             }
             results.append(entry)
@@ -787,6 +787,7 @@ try:
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
+            sweep_status_handler as gov_sweep_status,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -796,6 +797,7 @@ try:
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
+            sweep_status_handler as gov_sweep_status,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -815,6 +817,7 @@ def _governance_routes(prefix: str) -> list:
         Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
         Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
         Route(f"{prefix}/v1/governance/trainable-runs", gov_trainable_runs, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/sweep-status", gov_sweep_status, methods=["GET"]),
         Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
         Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
     ]

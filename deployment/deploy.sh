@@ -72,7 +72,12 @@ display_name() {
     widedeep-segment-activator)  echo "audience-activator" ;;
     ncf-deal-manager)            echo "deal-scorer" ;;
     metrics-enricher)            echo "signals-enricher" ;;
-    deal-yield-manager)          echo "yield-optimizer" ;;
+    # The two Yield Optimizer containers were named for their job when the
+    # combined deal-yield-manager was split, so their keys already ARE their
+    # display names -- listed explicitly rather than left to the identity
+    # fallback below so the mapping is obvious next to the other four.
+    yield-optimizer-floor)       echo "yield-optimizer-floor" ;;
+    yield-optimizer-margin)      echo "yield-optimizer-margin" ;;
     *)                           echo "$1" ;;
   esac
 }
@@ -341,14 +346,34 @@ YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manag
 # (orchestrator/training_trigger.py's xgboost-shaped branch) -- left empty
 # if the sagemaker SDK isn't installed, and training_trigger.py reports a
 # clear 503 for that model type rather than fabricating a URI.
+# NOTE the stdout redirect below. Importing sagemaker emits
+# "sagemaker.config INFO - Not applying SDK defaults from location: ..." lines
+# on STDOUT (one per config path it checks), so a bare `print(uri)` here
+# captured THREE lines, not one. That broke the Phase-3 manifest substitution
+# with "sed: 1: unescaped newline inside substitute pattern" (observed live) and
+# would have passed a multi-line value as a CloudFormation ParameterValue in
+# deploy_closed_loop.sh. `2>/dev/null` cannot help -- the noise is on stdout.
+# Redirecting stdout for the import+retrieve sends that logging to stderr
+# (where it is discarded) and leaves stdout carrying only the URI.
 XGBOOST_TRAINING_IMAGE_URI="$(${PYTHON} -c "
-import sys
+import contextlib, sys
 try:
-    from sagemaker import image_uris
-    print(image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1'))
+    with contextlib.redirect_stdout(sys.stderr):
+        from sagemaker import image_uris
+        _uri = image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1')
+    sys.stdout.write(_uri)
 except Exception:
     pass
 " 2>/dev/null || true)"
+# Second line of defense: only accept something that actually looks like an ECR
+# image URI on a single line. Anything else (a future SDK logging change, a
+# partial write) becomes empty, so training_trigger.py reports its honest 503
+# instead of a fabricated or corrupted image URI reaching SageMaker.
+_XGB_URI_RE='^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/[^[:space:]]+$'
+if [[ -n "${XGBOOST_TRAINING_IMAGE_URI}" && ! "${XGBOOST_TRAINING_IMAGE_URI}" =~ ${_XGB_URI_RE} ]]; then
+  warn "Ignoring unexpected XGBoost training image URI from the sagemaker SDK (not a single-line ECR URI); on-demand yield retraining will report 503 until this resolves cleanly."
+  XGBOOST_TRAINING_IMAGE_URI=""
+fi
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
 # naming (HasStackPrefix condition). Only resolves to a real stream once
@@ -540,7 +565,16 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # Package Group ... cannot be deleted because it still contains Model
   # Packages" (observed live). Names mirror closed_loop_cfn.yaml exactly.
   say "Emptying SageMaker Model Package Groups (so closed-loop-core can delete)..."
-  for GROUP in "${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader" "${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager" "${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager"; do
+  # NOTE: the Yield Optimizer has TWO groups (floor, margin), not one. A prior
+  # version of this loop listed a single "artf-deal-yield-manager", a name that
+  # has never existed -- Triton's FIL backend cannot serve multi-output
+  # regression, so the yield model was split into two single-target models with
+  # two groups from the start (see closed_loop_cfn.yaml's
+  # DealYieldManagerFloorModelPackageGroup/...MarginModelPackageGroup and
+  # deploy.sh's own YIELD_FLOOR_MODEL_GROUP/YIELD_MARGIN_MODEL_GROUP). The
+  # effect was that neither real group was ever emptied, so closed-loop-core's
+  # delete hit the exact DELETE_FAILED this loop exists to prevent.
+  for GROUP in "${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader" "${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager" "${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-floor" "${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-margin"; do
     if aws sagemaker describe-model-package-group --model-package-group-name "${GROUP}" --region "${AWS_REGION}" >/dev/null 2>&1; then
       for PKG_ARN in $(aws sagemaker list-model-packages --model-package-group-name "${GROUP}" --region "${AWS_REGION}" --query 'ModelPackageSummaryList[].ModelPackageArn' --output text 2>/dev/null); do
         aws sagemaker delete-model-package --model-package-name "${PKG_ARN}" --region "${AWS_REGION}" 2>/dev/null || true
@@ -734,7 +768,8 @@ REPOS=(
   ${STACK_NAME}-$(display_name widedeep-segment-activator)
   ${STACK_NAME}-$(display_name ncf-deal-manager)
   ${STACK_NAME}-$(display_name metrics-enricher)
-  ${STACK_NAME}-$(display_name deal-yield-manager)
+  ${STACK_NAME}-$(display_name yield-optimizer-floor)
+  ${STACK_NAME}-$(display_name yield-optimizer-margin)
   ${STACK_NAME}-orchestrator
   ${STACK_NAME}-agentcore
 )
@@ -977,7 +1012,7 @@ _source_hash() {
   local src="${SCRIPT_DIR}/../source"
   local paths=()
   case "${key}" in
-    dlrm-bid-shader|ncf-deal-manager|deal-yield-manager)
+    dlrm-bid-shader|ncf-deal-manager|yield-optimizer-floor|yield-optimizer-margin)
       paths=("${src}/triton/Dockerfile.triton-artf" "${src}/shared" "${src}/containers/${key//-/_}") ;;
     widedeep-segment-activator|metrics-enricher)
       paths=("${src}/Dockerfile" "${src}/shared" "${src}/containers/${key//-/_}") ;;
@@ -1056,7 +1091,7 @@ build_image_local() {
     aws ecr create-repository --repository-name "${repo}" --region "${AWS_REGION}" \
       --image-scanning-configuration scanOnPush=true >/dev/null
   case "${key}" in
-    dlrm-bid-shader|ncf-deal-manager|deal-yield-manager)
+    dlrm-bid-shader|ncf-deal-manager|yield-optimizer-floor|yield-optimizer-margin)
       log "  Building ${repo} (amd64, tritonclient)"
       docker buildx build --platform linux/amd64 --build-arg CONTAINER="containers/${key//-/_}" \
         -f "${src}/triton/Dockerfile.triton-artf" -t "${image}" --load "${src}"
@@ -1111,7 +1146,7 @@ build_image_local() {
 # with ensure_eks_cluster() below (FR-8) — building images has no dependency
 # on the cluster existing.
 build_images() {
-  STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher deal-yield-manager orchestrator model-optimizer)
+  STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher yield-optimizer-floor yield-optimizer-margin orchestrator model-optimizer)
   if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then STEP4_KEYS+=(agentcore); fi
 
   MISSING_KEYS=()
@@ -1519,6 +1554,7 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm-bid-shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf-deal-manager-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-floor-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-margin-*\"]},\
 {\"Sid\":\"ListTrainingJobsFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListTrainingJobs\"],\"Resource\":\"*\"},\
 {\"Sid\":\"GlueJobRunsForTrainableRunFilter\",\"Effect\":\"Allow\",\"Action\":[\"glue:GetJobRuns\"],\"Resource\":[\"arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:job/*feature-engineering-etl\"]},\
+{\"Sid\":\"GlueOnDemandSweepAfterLoadTest\",\"Effect\":\"Allow\",\"Action\":[\"glue:StartJobRun\"],\"Resource\":[\"arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:job/*feature-engineering-etl\"]},\
 {\"Sid\":\"PassSageMakerTrainingRole\",\"Effect\":\"Allow\",\"Action\":[\"iam:PassRole\"],\"Resource\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}\",\"Condition\":{\"StringEquals\":{\"iam:PassedToService\":\"sagemaker.amazonaws.com\"}}},\
 {\"Sid\":\"PromoteFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:UpdateModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
 {\"Sid\":\"TritonModelRepoReadWrite\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::${MODEL_BUCKET}\",\"arn:aws:s3:::${MODEL_BUCKET}/triton-models/*\"]},\
@@ -1722,6 +1758,27 @@ for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
   kubectl apply -f "${PROCESSED}"
+done
+
+# --- Prune pre-split Yield Optimizer objects.
+# `kubectl apply` only creates and updates; it NEVER deletes objects that were
+# removed from (or renamed within) a manifest. The Yield Optimizer used to be a
+# single `yield-optimizer` Deployment/Service/HPA and is now
+# `yield-optimizer-floor` + `yield-optimizer-margin`, so applying the new
+# manifest leaves the old trio Running on any cluster deployed before the split
+# (observed live: 7 ARTF pods instead of 6, the stale pod still on the
+# pre-split combined image).
+#
+# It receives no traffic -- the orchestrator's CONTAINERS registry no longer
+# lists it -- so this is not a correctness problem, but it holds a pod slot, its
+# HPA can still scale it to 5 replicas, and it contradicts the six-container
+# topology the docs describe. Deleting exactly these three names (never a broad
+# prune) is idempotent and a no-op on a fresh cluster.
+for OBJ in "deployment/yield-optimizer" "service/yield-optimizer" "hpa/yield-hpa"; do
+  if kubectl get "${OBJ}" >/dev/null 2>&1; then
+    kubectl delete "${OBJ}" --ignore-not-found >/dev/null 2>&1 && \
+      say "  Removed pre-split ${OBJ} (replaced by yield-optimizer-floor/-margin)"
+  fi
 done
 
 log "  Waiting for Triton Inference Server..."

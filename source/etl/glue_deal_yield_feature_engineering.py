@@ -3,8 +3,8 @@
 Reads raw deal floor/margin outcome records from the Glue catalog
 (feedback_pipeline.raw_deal_yield_outcomes), de-duplicates by
 (request_id, deal_id, intent) (keeping the latest by timestamp), reconstructs
-the same feature vector deal_yield_manager's own
-containers/deal_yield_manager/features.py.build_feature_vector() computes at
+the same feature vector the two yield containers'
+shared/yield_features.py.build_feature_vector() computes at
 inference time, and writes TWO labeled Parquet datasets -- one per XGBoost
 target (floor, margin) -- for XGBoostTrainingPipeline to train on. See
 source/training/xgboost_pipeline.py's TARGET_FLOOR/TARGET_MARGIN: Triton's
@@ -12,7 +12,7 @@ FIL backend does not support multi-output regression, so the two targets
 are independently-trained single-output models with their own training data.
 
 Feature reconstruction is duplicated here rather than imported from
-containers.deal_yield_manager.features -- consistent with the
+shared.yield_features -- consistent with the
 "no cross-unit code dependency" boundary
 aidlc-docs/construction/deal-yield-outcome-capture/functional-design/
 business-logic-model.md documents for deal_yield_feedback.py's own
@@ -34,8 +34,8 @@ deal-yield-outcome-capture/functional-design/business-rules.md BR-7, no
 downstream-signal-association path exists yet for deal-level outcomes on
 live traffic, so won/price_paid are real "unknown" (False/None) defaults
 there today; only source="load_test" events (deliberately, honestly
-synthetic per NFR-2) and the deal_yield_manager container's own bounded
-exploration (source/containers/deal_yield_manager/exploration.py, disclosed
+synthetic per NFR-2) and the yield containers' own bounded
+exploration (source/shared/yield_exploration.py, disclosed
 via a ":explore" model_version suffix) currently produce the variance this
 labeling function needs. This is a documented limitation, not a hidden
 assumption -- extending won/price_paid capture to live traffic is future
@@ -92,7 +92,7 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
 # ---------------------------------------------------------------------------
-# Constants -- mirror containers/deal_yield_manager/features.py's thresholds
+# Constants -- mirror shared/yield_features.py's thresholds
 # exactly, so the reconstructed feature vector matches what the model was
 # actually served at inference time.
 # ---------------------------------------------------------------------------

@@ -537,33 +537,70 @@ aws ecr describe-repositories --repository-names "${TRAINING_REPO}" --region "${
 NEMO_OUTPUTS="${SCRIPT_DIR}/.nemo-outputs.json"
 NEMO_BUILD_ID=""
 
-if [[ -f "${NEMO_OUTPUTS}" ]]; then
-  PREV_NEMO_REPO="$(jq -r '.Repository // empty' "${NEMO_OUTPUTS}" 2>/dev/null || echo '')"
-  if [[ "${PREV_NEMO_REPO}" == "${TRAINING_REPO}" ]]; then
-    if aws ecr describe-images --repository-name "${TRAINING_REPO}" \
-        --image-ids imageTag="dlrm" --region "${AWS_REGION}" >/dev/null 2>&1; then
-      log "  NeMo-RL images already built. Skipping. (Delete ${NEMO_OUTPUTS} to force rebuild)"
-    else
-      rm -f "${NEMO_OUTPUTS}"
-    fi
-  fi
+# --- Content hash over exactly what this image's Dockerfile COPYs.
+# Mirrors deploy.sh's _source_hash() for the ARTF images. This gate used to be
+# "does the dlrm tag exist in ECR", which is true forever after the first build
+# -- so every later change under source/training/container/ was silently never
+# rebuilt, and SageMaker kept running whatever code the first build captured.
+# Confirmed live: job dlrm-bid-shader-1787848983-8332085c died on
+# `KeyError: 'supervised_epochs'` against an image ~6 days older than the fix
+# already sitting in train.py (its traceback line numbers did not even match
+# the current file). The hash is pushed as a src-<hash> tag next to dlrm/ncf,
+# so ECR -- not a local state file that can be deleted -- is the record of
+# which source a built image actually contains.
+_nemo_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+}
+_nemo_source_hash() {
+  local dir="${SCRIPT_DIR}/../source/training/container"
+  [[ -d "${dir}" ]] || return 1
+  # Per-file digests collected into a path:hash manifest, then hashed. Uses a
+  # read loop rather than `xargs -0 _nemo_sha256`, because xargs execs a real
+  # binary and cannot invoke a shell function -- that silently produced the
+  # SHA-256 of EMPTY INPUT (e3b0c442...), a hash that is stable but identical
+  # for every possible source tree, which would have skipped every rebuild
+  # forever. Sorted so the digest does not depend on traversal order; the
+  # relative path is included so a rename alone changes the hash.
+  local f rel manifest=""
+  while IFS= read -r f; do
+    rel="${f#"${dir}/"}"
+    manifest+="${rel}:$(_nemo_sha256 < "${f}" | awk '{print $1}')"$'\n'
+  done < <(find "${dir}" -type f ! -name '*.pyc' 2>/dev/null | LC_ALL=C sort)
+  # An empty manifest means the find matched nothing; refuse to return a hash
+  # rather than hand back the empty-input digest as if it described real source.
+  [[ -n "${manifest}" ]] || return 1
+  printf '%s' "${manifest}" | _nemo_sha256 | awk '{print substr($1,1,16)}'
+}
+
+NEMO_SRC_HASH="$(_nemo_source_hash || echo '')"
+if [[ -n "${NEMO_SRC_HASH}" ]]; then
+  NEMO_SRC_TAG="src-${NEMO_SRC_HASH}"
+  log "  NeMo-RL training source hash: ${NEMO_SRC_TAG}"
+else
+  NEMO_SRC_TAG=""
+  warn "  Could not hash source/training/container/ — will rebuild rather than risk a stale image."
 fi
 
-# Also check ECR directly (build may have finished on a previous interrupted run)
-if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
-  if aws ecr describe-images --repository-name "${TRAINING_REPO}" \
-      --image-ids imageTag="dlrm" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log "  NeMo-RL images found in ECR. Skipping."
-    TRAINING_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    cat > "${NEMO_OUTPUTS}" <<EOF
+# Skip ONLY when ECR already holds an image built from exactly this source.
+# No hash (or no matching tag) always falls through to a rebuild: failing
+# toward a rebuild is recoverable, whereas skipping a needed one silently
+# ships stale training code.
+rm -f "${NEMO_OUTPUTS}"
+if [[ -n "${NEMO_SRC_TAG}" ]] && aws ecr describe-images --repository-name "${TRAINING_REPO}" \
+     --image-ids imageTag="${NEMO_SRC_TAG}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  log "  NeMo-RL image content unchanged (${NEMO_SRC_TAG}) — skipping rebuild."
+  TRAINING_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+  cat > "${NEMO_OUTPUTS}" <<EOF
 {
   "Repository": "${TRAINING_REPO}",
   "Registry": "${TRAINING_REGISTRY}",
-  "Tags": ["dlrm", "ncf"],
+  "Tags": ["dlrm", "ncf", "${NEMO_SRC_TAG}"],
+  "SourceHash": "${NEMO_SRC_HASH}",
   "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-  fi
+elif [[ -n "${NEMO_SRC_TAG}" ]]; then
+  log "  source/training/container/ changed (no ${NEMO_SRC_TAG} in ECR) — rebuilding."
 fi
 
 # Build if needed
@@ -574,7 +611,11 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
     # Local build (synchronous — requires ~25 GB free disk)
     aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${TRAINING_REGISTRY}" 2>/dev/null
     docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SCRIPT_DIR}/../source/training/container/"
-    for tag in dlrm ncf; do
+    # src-<hash> is pushed alongside dlrm/ncf so the next run can tell this
+    # image was built from the current source (see the hash note above).
+    NEMO_PUSH_TAGS=(dlrm ncf)
+    [[ -n "${NEMO_SRC_TAG}" ]] && NEMO_PUSH_TAGS+=("${NEMO_SRC_TAG}")
+    for tag in "${NEMO_PUSH_TAGS[@]}"; do
       docker tag "${TRAINING_REPO}:latest" "${TRAINING_REGISTRY}/${TRAINING_REPO}:${tag}"
       docker push "${TRAINING_REGISTRY}/${TRAINING_REPO}:${tag}"
     done
@@ -582,11 +623,12 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
 {
   "Repository": "${TRAINING_REPO}",
   "Registry": "${TRAINING_REGISTRY}",
-  "Tags": ["dlrm", "ncf"],
+  "Tags": ["dlrm", "ncf"${NEMO_SRC_TAG:+, \"${NEMO_SRC_TAG}\"}],
+  "SourceHash": "${NEMO_SRC_HASH}",
   "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    log "  NeMo-RL training container pushed"
+    log "  NeMo-RL training container pushed (${NEMO_PUSH_TAGS[*]})"
   else
     # Remote build via CodeBuild — fire async, continue deploying
     log "  Starting NeMo-RL build on CodeBuild (async — takes 15-50 min)"
@@ -599,10 +641,15 @@ EOF
     elif [[ -n "${NGC_SECRET}" ]]; then
       NGC_FLAG="--ngc-secret ${NGC_SECRET}"
     fi
+    # --nemo-src-tag makes CodeBuild stamp the content hash onto the pushed
+    # image. Deliberately NOT writing .nemo-outputs.json here: this build is
+    # async and may still be running, so the only honest record that it finished
+    # is the src-<hash> tag appearing in ECR, which the check above reads.
     NEMO_BUILD_ID=$("${SCRIPT_DIR}/codebuild/remote_build.sh" \
       --stack-name "${STACK_NAME_CL}" \
       --target nemo \
       --tag latest \
+      --nemo-src-tag "${NEMO_SRC_TAG}" \
       --region "${AWS_REGION}" \
       --no-wait \
       ${NGC_FLAG})
@@ -742,6 +789,16 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   [[ -z "${PROXY_SUBNETS}" || "${PROXY_SUBNETS}" == "None" ]] && PROXY_SUBNETS="${SUBNET_IDS}"
 
   VPC_PROXY_LAMBDA_ARN=""
+  # How long the governance agent waits for a RequestResponse invoke of the VPC
+  # proxy Lambda. MUST be >= that Lambda's own Timeout (vpc_proxy_cfn.yaml sets
+  # 900), because the invoke holds the connection until the function returns.
+  #
+  # It was previously left at the client's 600s default while the Lambda's
+  # ceiling was 900, so a TensorRT optimize that ran 846s tripped the client's
+  # read timeout first. The agent saw 502 "Read timeout", rejected the model
+  # version with "Model optimization failed", and never staged a canary -- even
+  # though the compile itself was fine. Raise both together if compiles slow down.
+  VPC_PROXY_TIMEOUT_SECONDS="${VPC_PROXY_TIMEOUT_SECONDS:-900}"
   if [[ -n "${PROXY_SUBNETS}" && -n "${GOV_SG}" && "${GOV_SG}" != "None" ]]; then
     # CloudFormation List<> params require commas escaped in the CLI shorthand.
     PROXY_SUBNETS_ESC="${PROXY_SUBNETS//,/\\,}"
@@ -796,6 +853,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     --environment "OPTIMIZER_ENDPOINT=${OPTIMIZER_ENDPOINT:-}" \
     --environment "TRITON_URL=${GOV_TRITON_URL:-}" \
     --environment "VPC_PROXY_LAMBDA_ARN=${VPC_PROXY_LAMBDA_ARN:-}" \
+    --environment "VPC_PROXY_TIMEOUT_SECONDS=${VPC_PROXY_TIMEOUT_SECONDS}" \
     --description "Model Promotion Governance Agent — deterministic A/B gate + Bedrock reasoning" \
     --region "${AWS_REGION}" \
     --print-arn)"
@@ -838,14 +896,33 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # Both deal_yield_manager_floor and deal_yield_manager_margin are
   # SageMaker-built-in-XGBoost models (same version/framework), so this is
   # resolved once and shared by both -- it does not need to be per-target.
+  # NOTE the stdout redirect below. Importing sagemaker emits
+  # "sagemaker.config INFO - Not applying SDK defaults from location: ..." lines
+  # on STDOUT (one per config path it checks), so a bare `print(uri)` here
+  # captured THREE lines, not one -- which would then be passed verbatim as a
+  # CloudFormation ParameterValue, and the -z check below would NOT catch it
+  # because junk is still non-empty. `2>/dev/null` cannot help; the noise is on
+  # stdout. Redirecting stdout for the import+retrieve sends that logging to
+  # stderr (discarded) and leaves stdout carrying only the URI. Same fix as
+  # deploy.sh's copy of this resolution -- keep the two in step.
   XGBOOST_TRAINING_IMAGE_URI="$(python3 -c "
-import sys
+import contextlib, sys
 try:
-    from sagemaker import image_uris
-    print(image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1'))
+    with contextlib.redirect_stdout(sys.stderr):
+        from sagemaker import image_uris
+        _uri = image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1')
+    sys.stdout.write(_uri)
 except Exception:
     pass
 " 2>/dev/null || true)"
+  # Only accept a single-line ECR image URI; anything else becomes empty so
+  # HasRetrainingConfig disables scheduled retraining honestly rather than
+  # deploying a corrupted image URI into the retraining Lambda's environment.
+  _XGB_URI_RE='^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/[^[:space:]]+$'
+  if [[ -n "${XGBOOST_TRAINING_IMAGE_URI}" && ! "${XGBOOST_TRAINING_IMAGE_URI}" =~ ${_XGB_URI_RE} ]]; then
+    warn "  Ignoring unexpected XGBoost training image URI from the sagemaker SDK (not a single-line ECR URI)."
+    XGBOOST_TRAINING_IMAGE_URI=""
+  fi
   if [[ -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
     warn "  Could not resolve the SageMaker built-in XGBoost image URI (sagemaker SDK not installed?) - deal_yield_manager_floor/margin scheduled retraining will be skipped until this is set."
   fi
@@ -1000,19 +1077,23 @@ log ""
 # Final check: NeMo build status
 # =========================================================================
 if [[ -n "${NEMO_BUILD_ID}" && ! -f "${NEMO_OUTPUTS}" ]]; then
-  # NeMo was fired async — check if it finished while we deployed everything else
-  if aws ecr describe-images --repository-name "${TRAINING_REPO}" \
-      --image-ids imageTag="dlrm" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  # NeMo was fired async — check if it finished while we deployed everything else.
+  # Probes the src-<hash> tag, not "dlrm": a dlrm tag may be left over from an
+  # OLDER build, and treating that as "this build finished" is how a stale image
+  # gets recorded as current.
+  if [[ -n "${NEMO_SRC_TAG}" ]] && aws ecr describe-images --repository-name "${TRAINING_REPO}" \
+       --image-ids imageTag="${NEMO_SRC_TAG}" --region "${AWS_REGION}" >/dev/null 2>&1; then
     TRAINING_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
     cat > "${NEMO_OUTPUTS}" <<EOF
 {
   "Repository": "${TRAINING_REPO}",
   "Registry": "${TRAINING_REGISTRY}",
-  "Tags": ["dlrm", "ncf"],
+  "Tags": ["dlrm", "ncf", "${NEMO_SRC_TAG}"],
+  "SourceHash": "${NEMO_SRC_HASH}",
   "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    log "NeMo-RL build completed while deploying. All done."
+    log "NeMo-RL build completed while deploying (${NEMO_SRC_TAG}). All done."
   else
     echo ""
     warn "═══════════════════════════════════════════════════════════════════"

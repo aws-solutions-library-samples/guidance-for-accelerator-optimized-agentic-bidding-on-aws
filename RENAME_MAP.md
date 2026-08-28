@@ -1,10 +1,11 @@
 # Rename Map
 
-This Guidance renamed its four ARTF containers from model-architecture names to
-job-oriented names that describe what each container does in the bidstream. This
-document is the single reference for what changed, what didn't, and why.
+This Guidance renamed its ARTF containers from model-architecture names to
+job-oriented names that describe what each container does in the bidstream, and
+later split the Yield Optimizer into two containers. This document is the single
+reference for what changed, what didn't, and why.
 
-## The four containers
+## The renamed containers
 
 | Old name | New name | What it does |
 | --- | --- | --- |
@@ -16,6 +17,61 @@ document is the single reference for what changed, what didn't, and why.
 The underlying model architectures (DLRM, NCF/NeuMF, Wide & Deep) are unchanged —
 they're implementation detail, documented alongside each container, not the
 container's name. See [GUIDANCE.md](GUIDANCE.md) for the model-level detail.
+
+## The Yield Optimizer split (`yield-optimizer` → two containers)
+
+Separately from the rename above, the Yield Optimizer became **two** containers,
+one per ARTF intent:
+
+| Old | New | ARTF intent | Triton model (unchanged) |
+| --- | --- | --- | --- |
+| `yield-optimizer` | **`yield-optimizer-floor`** | `ADJUST_DEAL_FLOOR` | `deal_yield_manager_floor` |
+| `yield-optimizer` | **`yield-optimizer-margin`** | `ADJUST_DEAL_MARGIN` | `deal_yield_manager_margin` |
+
+This was not a cosmetic rename. Triton's Forest Inference Library (FIL) backend
+cannot serve a multi-output tree model, so the floor and margin predictions were
+**always two separate models** — one container served both, which made each
+model's availability depend on the other's for no reason the business rules
+required. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic
+mutations, so nothing in the bidstream contract coupled them either. Each
+container now retrains, rolls out, and scales on its own.
+
+Unlike the rename above, the build **keys** here did change, because the keys
+resolve the container source directory: `yield-optimizer-floor` →
+`source/containers/yield_optimizer_floor/`. The keys happen to equal their own
+display names, so `display_name()` maps them to themselves.
+
+### What did NOT change in the split, and why
+
+- **Triton model names** — `deal_yield_manager_floor` and
+  `deal_yield_manager_margin`. Real registered Triton models; renaming breaks the
+  model-name binding and the poll-mode repository layout.
+- **SageMaker Model Package Group names** — `artf-deal-yield-manager-floor` and
+  `artf-deal-yield-manager-margin`. Real, already-created AWS resources; renaming
+  would orphan Model Registry history.
+- **Training model types** — `deal_yield_manager_floor` /
+  `deal_yield_manager_margin`, already the governance/training identifiers before
+  the split.
+- **The ARTF request/response contract** — same mutation path
+  (`/imp/{imp_id}/deals/{deal_id}`), same `AdjustDealPayload` shape.
+
+### Split consequences worth knowing
+
+- **Load-test targets replaced, not aliased.** The container-level
+  `deal_yield_manager` target is gone; the two targets are now
+  `deal_yield_manager_floor` and `deal_yield_manager_margin`, which match the
+  training model types exactly. Load-test runs recorded **before** the split
+  carry the old value and are therefore no longer offered as trainable. Their
+  captured data still exists; it is simply not selectable. Run a fresh load test
+  per target.
+- **Exploration now flips per model.** Bounded epsilon-greedy exploration used
+  one coin flip for floor and margin together. Two containers means two
+  processes and two RNGs, so each model decides independently — for one deal you
+  may see an explored floor beside an unexplored margin. Both remain disclosed
+  via their own `:explore` suffix on `model_version`.
+- **An old ECR repo is left behind.** `${STACK_NAME}-yield-optimizer` is replaced
+  by `${STACK_NAME}-yield-optimizer-floor` and `-margin`. The old repo is unused
+  until `--destroy` (which deletes by `${STACK_NAME}*` prefix and does clean it).
 
 ## Surfaces that changed
 
@@ -47,7 +103,9 @@ continuity for anyone who has already deployed, or require re-registering real
 AWS resources for no functional benefit:
 
 - **`source/containers/{dlrm_bid_shader,widedeep_segment_activator,ncf_deal_manager,metrics_enricher}/`**
-  — container source directory names.
+  — container source directory names. (The two yield packages are the exception:
+  they were renamed to `yield_optimizer_floor/` and `yield_optimizer_margin/` as
+  part of the split above.)
 - **Triton model repository names and `config.pbtxt` model names**
   (`dlrm_bid_shader`, `ncf_deal_manager`) — renaming breaks the TensorRT engines'
   model-name binding and Triton's poll-mode repository layout.

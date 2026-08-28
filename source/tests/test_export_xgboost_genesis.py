@@ -28,7 +28,7 @@ from training.export_xgboost_genesis import (
 from training.xgboost_pipeline import MODEL_TYPE_BY_TARGET, TARGET_FLOOR, TARGET_MARGIN
 
 # A spread of feature vectors covering the real value ranges documented in
-# source/containers/deal_yield_manager/features.py (auction-type one-hot,
+# source/shared/yield_features.py (auction-type one-hot,
 # bidfloor + tier, category tier, hour/weekday norms) -- not just zeros.
 _SAMPLE_FEATURE_VECTORS = [
     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -144,7 +144,7 @@ def test_feature_vector_length_matches_container_convention():
     import importlib.util
 
     features_path = os.path.join(
-        os.path.dirname(__file__), "..", "containers", "deal_yield_manager", "features.py"
+        os.path.dirname(__file__), "..", "shared", "yield_features.py"
     )
     spec = importlib.util.spec_from_file_location("_deal_yield_features_check", features_path)
     features = importlib.util.module_from_spec(spec)

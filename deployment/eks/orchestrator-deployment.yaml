@@ -61,8 +61,13 @@ spec:
               value: "http://deal-scorer:8081"
             - name: METRICS_URL
               value: "http://signals-enricher:8081"
-            - name: YIELD_URL
-              value: "http://yield-optimizer:8081"
+            # Two Yield Optimizer Services, one per intent (see
+            # artf-containers-deployment.yaml). Same single-value *_URL form the
+            # other four containers use above.
+            - name: YIELD_FLOOR_URL
+              value: "http://yield-optimizer-floor:8081"
+            - name: YIELD_MARGIN_URL
+              value: "http://yield-optimizer-margin:8081"
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME
@@ -153,6 +158,19 @@ spec:
               value: "__GLUE_JOB_NAME__"
             - name: DEAL_YIELD_GLUE_JOB_NAME
               value: "__DEAL_YIELD_GLUE_JOB_NAME__"
+            # How long a completed load test waits before its on-demand Glue
+            # sweep starts (source/orchestrator/etl_trigger.py). Those Glue
+            # jobs are otherwise only scheduled every 6 hours, so without the
+            # sweep a run stays untrainable for hours.
+            #
+            # Must exceed the Firehose buffering interval — 300s on both
+            # delivery streams in feedback_pipeline_cfn.yaml. Sweeping sooner
+            # would read S3 before the run's outcomes land, and the sweep's
+            # CompletedOn would then mark the run trainable with no data
+            # behind it. 360 = 300s buffer + 60s margin. Raise this if the
+            # delivery streams' BufferingHints are ever increased.
+            - name: ETL_SWEEP_DELAY_SECONDS
+              value: "360"
             # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
             # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
             # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.
