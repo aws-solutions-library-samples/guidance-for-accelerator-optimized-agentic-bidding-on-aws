@@ -331,6 +331,61 @@ retrained `xgboost.json` directly, so there is no engine-compile stage in that p
 Because the two yield containers are now separate load-test targets, you can also
 bootstrap training data for one model without generating traffic for the other.
 
+#### Testing the governance flow end to end
+
+The **Governance** page drives the whole loop from a load test. Each step gates on
+the previous one finishing, so the order matters:
+
+1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
+   outcomes for* (e.g. **Bid Pricer**), leave the variant on **Current (stable)**,
+   and run a batch. Only the selected target's responses are captured as outcomes.
+2. **Wait for the sweep — about 6 minutes.** Outcomes reach S3 through Kinesis
+   Firehose, which buffers up to 300s by default
+   (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into
+   `training-data/`. A completed load test schedules that sweep itself, waiting
+   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first —
+   sweeping earlier would mark the run ready with no data behind it. If you raise
+   the Firehose interval, raise this too. The Glue schedule (every 6 hours by
+   default, `ScheduleIntervalHours`) remains as a backstop. The **Load test
+   outcome pipeline** card shows which stage your run is on.
+3. **Train.** Under **Train from load test**, pick the run, review the cost
+   estimate, and confirm. This starts a real SageMaker training job. Note the
+   picker only lists runs a sweep has already covered, so the run you just
+   finished appears a few minutes later — check the timestamp so you aren't
+   retraining on an older test.
+4. **Let governance run.** When training completes, the new version registers in
+   its SageMaker Model Package Group automatically, which triggers the Model
+   Promotion Governance Agent: compile TensorRT → stage a canary → live A/B test →
+   promote, reject, or roll back. The **Model registry versions** table shows the
+   resulting approval status and the agent's stated reason, with the full text on
+   hover.
+5. **Compare a challenger.** Once a canary is staged, re-run the load test with
+   **Challenger (canary)** selected, then use **Compare load-test outcomes**.
+   Re-use the same preset and seed as your baseline run: requests are generated
+   from the seed, so replaying it puts both variants under identical market
+   conditions and leaves the model as the only difference.
+
+If something isn't selectable, the panel now says why rather than showing an
+empty list:
+
+| What you see | What it means |
+|---|---|
+| *"N runs … waiting for the next ETL sweep"* | Normal. The outcomes are recorded; the sweep hasn't covered them yet. |
+| *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
+| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now — a challenger-targeted test is refused rather than quietly run against the stable model. |
+| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail) — this is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
+
+**Reading the comparison.** The primary metric is advertiser surplus — the
+impression's value to the advertiser minus what was actually paid, and zero on a
+loss. Higher is better, and it has an interior optimum: bidding too low forfeits
+winnable impressions and bidding too high overpays for them, so it rewards what
+bid shading is actually for rather than simply winning more.
+
+**One caveat on the yield models.** Floor and margin load-test outcomes are not
+yet a function of those models' own floor/margin decisions, so a yield
+canary-vs-stable comparison should not be read as a verdict on the model. Bid
+Pricer and Deal Scorer are unaffected.
+
 See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 
 ### Next steps

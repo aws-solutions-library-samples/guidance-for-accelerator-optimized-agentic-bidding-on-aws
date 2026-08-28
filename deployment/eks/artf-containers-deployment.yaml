@@ -33,7 +33,12 @@ metadata:
     app: artf
     model: dlrm
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -66,13 +71,22 @@ spec:
               value: "triton-inference-server:8000"
             - name: USE_TRITON
               value: "true"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -120,7 +134,12 @@ metadata:
     app: artf
     model: widedeep
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -144,13 +163,22 @@ spec:
               name: health
             - containerPort: 50051
               name: grpc
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -189,7 +217,12 @@ metadata:
     app: artf
     model: ncf
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -222,13 +255,22 @@ spec:
               value: "triton-inference-server:8000"
             - name: USE_TRITON
               value: "true"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -267,7 +309,12 @@ metadata:
     app: artf
     model: metrics
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -291,13 +338,22 @@ spec:
               name: health
             - containerPort: 50051
               name: grpc
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -337,7 +393,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: bid-pricer
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -357,7 +419,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: audience-activator
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -377,7 +445,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: deal-scorer
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -397,7 +471,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: signals-enricher
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -427,7 +507,12 @@ metadata:
     app: artf
     model: yield-floor
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -470,13 +555,22 @@ spec:
             # set to.
             - name: YIELD_EXPLORATION_EPSILON
               value: "0.1"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -515,7 +609,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: yield-optimizer-floor
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -536,7 +636,12 @@ metadata:
     app: artf
     model: yield-margin
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -573,13 +678,22 @@ spec:
             # safe to enable by default.
             - name: YIELD_EXPLORATION_EPSILON
               value: "0.1"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -618,7 +732,13 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: yield-optimizer-margin
-  minReplicas: 1
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource

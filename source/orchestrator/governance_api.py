@@ -8,6 +8,9 @@ Exposes:
   training job (requires {"model_type": ..., "confirmed": true}).
 - ``GET  /v1/governance/eligible-runs?model_type=...&role=current|challenger``
   — eligible load-test runs for comparison, auto-selecting the most recent.
+- ``GET  /v1/governance/sweep-status[?run_id=...]`` — where a load-test run
+  sits in the outcome-to-training-data pipeline (Firehose flush -> Glue sweep
+  -> selectable for training), defaulting to the most recent run.
 - ``POST /v1/governance/compare`` — real per-sample ABEvaluator comparison
   between a current-version run and a challenger-version run.
 - ``POST /v1/governance/promote`` — the real Promote action (Triton
@@ -39,8 +42,10 @@ from orchestrator.comparison_service import (
     InsufficientSamplesError,
     compare as run_comparison,
 )
+from orchestrator.etl_trigger import SWEEP_DELAY_SECONDS, resolve_glue_job_name
 from orchestrator.loadtest_eligibility import list_eligible_runs, list_trainable_runs, most_recent_eligible
 from orchestrator.promotion_service import PromotionNotRecommendedError, promote as run_promote
+from orchestrator.sweep_status import GLUE_FAILED_STATES, as_utc, build_sweep_status
 from orchestrator.training_trigger import (
     TRAINABLE_MODEL_TYPES,
     ModelTypeNotTrainableError,
@@ -106,39 +111,30 @@ def _audit_table():
     return dynamodb.Table(_AUDIT_TRAIL_TABLE)
 
 
-# Which Glue job labels model_type's training data -- matches
-# deploy.sh's GLUE_JOB_NAME/DEAL_YIELD_GLUE_JOB_NAME env var naming
-# convention (glue_etl_cfn.yaml's FeatureEngineeringJob/
-# DealYieldFeatureEngineeringJob). Both deal_yield_manager_floor and
-# deal_yield_manager_margin are labeled by the SAME Glue job
-# (glue_deal_yield_feature_engineering.py writes both output prefixes in
-# one run) -- there was never a bare "deal_yield_manager" model type post
-# the FIL multi-output-limitation correction (see
-# source/training/xgboost_pipeline.py's module docstring), so a prior
-# version of this map keyed on that non-existent name and every yield
-# trainable-runs lookup silently resolved to "no Glue job configured."
-_GLUE_JOB_ENV_VAR_BY_MODEL_TYPE = {
-    "dlrm_bid_shader": "GLUE_JOB_NAME",
-    "deal_yield_manager_floor": "DEAL_YIELD_GLUE_JOB_NAME",
-    "deal_yield_manager_margin": "DEAL_YIELD_GLUE_JOB_NAME",
-}
+def _glue_job_runs(job_name: str) -> list[dict]:
+    """Returns the recent JobRuns for job_name (unfiltered by state), or [] when
+    no job is configured.
 
-
-def _latest_glue_completion(model_type: str):
-    """Returns the CompletedOn timestamp (UTC datetime) of the most recent
-    SUCCEEDED run of the Glue job that labels model_type's training data,
-    or None if no job is configured or no run has ever succeeded."""
+    Unfiltered because the sweep-status poller needs the in-flight and failed
+    runs that the trainability gate discards -- those are exactly what tells a
+    user their run is mid-sweep rather than merely absent.
+    """
     import boto3
-    from datetime import timezone
 
-    env_var = _GLUE_JOB_ENV_VAR_BY_MODEL_TYPE.get(model_type)
-    job_name = os.environ.get(env_var, "") if env_var else ""
     if not job_name:
-        return None
+        return []
     glue = boto3.client("glue", region_name=_REGION)
     resp = glue.get_job_runs(JobName=job_name, MaxResults=20)
+    return resp.get("JobRuns", []) or []
+
+
+def _latest_successful_completion(job_runs: list[dict]):
+    """Returns the CompletedOn timestamp (UTC datetime) of the most recent
+    SUCCEEDED run in job_runs, or None. Pure -- no I/O."""
+    from datetime import timezone
+
     completions = [
-        run["CompletedOn"] for run in resp.get("JobRuns", [])
+        run["CompletedOn"] for run in job_runs
         if run.get("JobRunState") == "SUCCEEDED" and run.get("CompletedOn")
     ]
     if not completions:
@@ -149,6 +145,101 @@ def _latest_glue_completion(model_type: str):
     return latest
 
 
+def _latest_glue_completion(model_type: str):
+    """Returns the CompletedOn timestamp (UTC datetime) of the most recent
+    SUCCEEDED run of the Glue job that labels model_type's training data,
+    or None if no job is configured or no run has ever succeeded.
+
+    The model_type -> job-name resolution lives in etl_trigger, which is also
+    what starts an on-demand sweep after a load test. Keeping one mapping means
+    the "which job covers this model" answer cannot differ between the read
+    path (this gate) and the write path (the sweep) -- an earlier duplicate
+    keyed on a non-existent bare "deal_yield_manager" type made every yield
+    trainable-runs lookup silently resolve to "no Glue job configured."
+    """
+    job_name = resolve_glue_job_name(model_type)
+    if not job_name:
+        return None
+    return _latest_successful_completion(_glue_job_runs(job_name))
+
+
+def _run_summary(run: dict) -> dict:
+    """The subset of a load-test history record the run pickers need."""
+    return {
+        "id": run.get("id"),
+        "timestamp": run.get("timestamp"),
+        "target_model_type": run.get("target_model_type") or "",
+        "target_variant": run.get("target_variant") or "",
+        "outcome_sample_count": int(run.get("outcome_sample_count") or 0),
+        "preset": run.get("preset") or "",
+        "state": run.get("state") or "",
+    }
+
+
+async def sweep_status_handler(request: Request) -> JSONResponse:
+    """GET /v1/governance/sweep-status[?run_id=lt-abc123]
+
+    Returns where one load-test run sits in the outcome-to-training-data
+    pipeline, plus the recent run list the status picker offers.
+
+    ``run_id`` is optional: omitted, the most recent recorded run is used, so
+    the panel opens on the load test the user most likely just finished.
+
+    The ``trainable`` verdict is taken from list_trainable_runs -- the same
+    function that populates the "Train from load test" picker -- so this card
+    cannot report a run as ready while the picker still omits it.
+    """
+    from datetime import datetime, timezone
+
+    requested_run_id = request.query_params.get("run_id", "")
+
+    try:
+        history_fn = _get_loadtest_history_fn()
+        history = history_fn(limit=200)
+        runs = [r for r in history if r.get("id")]
+
+        selected = None
+        if requested_run_id:
+            selected = next((r for r in runs if r.get("id") == requested_run_id), None)
+            if selected is None:
+                return JSONResponse(
+                    {
+                        "error": f"Load test run '{requested_run_id}' is not in the recorded history.",
+                        "reason": "run_not_found",
+                        "runs": [_run_summary(r) for r in runs],
+                    },
+                    status_code=404,
+                )
+        elif runs:
+            # _get_history_from_dynamodb already sorts newest-first.
+            selected = runs[0]
+
+        status = None
+        if selected is not None:
+            model_type = selected.get("target_model_type") or ""
+            job_name = resolve_glue_job_name(model_type)
+            job_runs = _glue_job_runs(job_name)
+            latest_completion = _latest_successful_completion(job_runs)
+            trainable = bool(list_trainable_runs([selected], model_type, latest_completion))
+            status = build_sweep_status(
+                selected,
+                job_runs,
+                job_name,
+                now=datetime.now(timezone.utc),
+                sweep_delay_seconds=SWEEP_DELAY_SECONDS,
+                trainable=trainable,
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("sweep_status_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
+
+    return JSONResponse({
+        "runs": [_run_summary(r) for r in runs],
+        "selected_run_id": (selected or {}).get("id") or "",
+        "status": status,
+    })
+
+
 async def trainable_runs_handler(request: Request) -> JSONResponse:
     """GET /v1/governance/trainable-runs?model_type=dlrm_bid_shader
 
@@ -157,14 +248,35 @@ async def trainable_runs_handler(request: Request) -> JSONResponse:
     job run (see loadtest_eligibility.list_trainable_runs). Each run
     includes its id, timestamp, target_model_type, and target_variant so
     the UI can label which model/test type a run was for.
+
+    Also returns an ``etl`` block and a ``pending`` list so the picker can say
+    WHY a run is missing instead of just showing a short list. Without it an
+    empty or stale picker is indistinguishable between three very different
+    situations: no load test has captured outcomes for this model, a run was
+    captured but the next sweep has not happened yet, or the Glue job that
+    labels this model's data is failing every run and no data will ever arrive.
     """
     model_type = request.query_params.get("model_type", "")
 
     try:
-        latest_completion = _latest_glue_completion(model_type)
+        job_name = resolve_glue_job_name(model_type)
+        job_runs = _glue_job_runs(job_name)
+        latest_completion = _latest_successful_completion(job_runs)
         history_fn = _get_loadtest_history_fn()
         history = history_fn(limit=200)
         runs = list_trainable_runs(history, model_type, latest_completion)
+
+        # Runs that captured outcomes for this model but are not yet offered.
+        # Almost always "recorded after the last successful sweep", which is the
+        # single most common reason a user cannot find the run they just made.
+        trainable_ids = {r.get("id") for r in runs}
+        pending = [
+            r for r in history
+            if r.get("target_model_type") == model_type
+            and int(r.get("outcome_sample_count") or 0) > 0
+            and r.get("id") not in trainable_ids
+        ]
+        etl = _etl_health(job_name, job_runs, latest_completion)
     except Exception as exc:
         logging.getLogger(__name__).exception("trainable_runs_handler failed unexpectedly")
         return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
@@ -180,7 +292,80 @@ async def trainable_runs_handler(request: Request) -> JSONResponse:
             }
             for r in runs
         ],
+        "etl": etl,
+        "pending": [
+            {
+                "id": r.get("id"),
+                "timestamp": r.get("timestamp"),
+                "outcome_sample_count": int(r.get("outcome_sample_count") or 0),
+            }
+            for r in pending
+        ],
     })
+
+
+def _etl_health(job_name: str, job_runs: list[dict], latest_completion) -> dict:  # noqa: C901
+    """Health of the Glue job that labels a model type's training data.
+
+    Reports the job's own state rather than only its last success, so a picker
+    can distinguish "waiting for the next scheduled sweep" from "this job fails
+    every run, so waiting will never help". The yield job is currently the second
+    case: it has never succeeded, failing each run with "Unable to infer schema
+    for Parquet" because its input prefix is empty.
+
+    ``last_error`` is taken from the most recent FAILED run regardless of when it
+    started -- unlike sweep_status._describe_glue_runs, which only attributes a
+    failure to a specific load test when the Glue run started after it. Here the
+    question is "is this job working at all", which an older failure still
+    answers.
+    """
+    from datetime import datetime, timezone
+
+    if not job_name:
+        return {
+            "job_name": "",
+            "configured": False,
+            "last_success": None,
+            "never_succeeded": True,
+            "last_error": None,
+            "consecutive_failures": 0,
+        }
+
+    failed = [r for r in job_runs if (r.get("JobRunState") or "").upper() in GLUE_FAILED_STATES]
+    latest_failed = max(
+        failed,
+        key=lambda r: as_utc(r.get("StartedOn")) or datetime.min.replace(tzinfo=timezone.utc),
+        default=None,
+    )
+
+    # job_runs comes back newest-first from Glue; count the unbroken run of
+    # failures at the head, which is what makes a job "broken" rather than
+    # "occasionally flaky".
+    consecutive = 0
+    for raw in job_runs:
+        state = (raw.get("JobRunState") or "").upper()
+        if state in GLUE_FAILED_STATES:
+            consecutive += 1
+        elif state == "SUCCEEDED":
+            break
+
+    return {
+        "job_name": job_name,
+        "configured": True,
+        "last_success": latest_completion.isoformat() if latest_completion else None,
+        "never_succeeded": latest_completion is None,
+        "last_error": (
+            {
+                "started_on": (
+                    as_utc(latest_failed.get("StartedOn")).isoformat()
+                    if as_utc(latest_failed.get("StartedOn")) else None
+                ),
+                "message": latest_failed.get("ErrorMessage") or "",
+            }
+            if latest_failed is not None else None
+        ),
+        "consecutive_failures": consecutive,
+    }
 
 
 async def training_estimate_handler(request: Request) -> JSONResponse:

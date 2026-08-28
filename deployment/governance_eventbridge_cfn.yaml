@@ -773,6 +773,66 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerFloorModelPackageGroupName}'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerMarginModelPackageGroupName}'
+        # CreateModelPackage validates the InferenceSpecification's ModelDataUrl
+        # using the CALLER's credentials, so this role needs to read the trained
+        # artifact -- not just call the SageMaker API. Without it every
+        # registration failed with "ValidationException ... Access denied for
+        # bucket: <model bucket>, object key: models/.../output/model.tar.gz",
+        # so completed training jobs never produced a new model package version.
+        # That in turn meant the model-registered event never fired, the
+        # governance agent never ran, and no canary was ever staged.
+        #
+        # Scoped to the models/ prefix this template's own retraining path writes
+        # to (OutputDataConfig.S3OutputPath = models/<model_type>/<job_name>).
+        # SageMaker appends <job_name>/output/model.tar.gz beneath that, which is
+        # why the job name appears twice in the real key -- expected, not a bug.
+        - PolicyName: ReadTrainedModelArtifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/models/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}'
+                Condition:
+                  StringLike:
+                    's3:prefix': 'models/*'
+        # CreateModelPackage validates the InferenceSpecification's container
+        # Image as well as its ModelDataUrl, again with the caller's credentials.
+        # With only the S3 grant above, registration still failed with
+        # "Access denied for registry ID: <account>, repository name:
+        # artf-nemo-rl-training" -- confirmed live by replaying a completed
+        # training job through this Lambda.
+        #
+        # Same action set and GetAuthorizationToken-on-* split that
+        # closed_loop_cfn.yaml's training role already uses. Scoped to
+        # repositories in this account, which covers the NeMo-RL training image
+        # the DLRM/NCF model packages reference. The xgboost-shaped model types
+        # reference an AWS-published SageMaker image in a different account
+        # (XGBoostTrainingImageUri), which an account-scoped ARN cannot cover --
+        # if yield registration ever fails on image validation, that is why.
+        - PolicyName: ReadTrainingImageForRegistration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:DescribeImages'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchCheckLayerAvailability'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
         - PolicyName: EmitModelPackageGroupChanged
           PolicyDocument:
             Version: '2012-10-17'

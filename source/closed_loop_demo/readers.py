@@ -111,17 +111,47 @@ def read_model_versions(
     versions = []
     for pkg in resp.get("ModelPackageSummaryList", []):
         created = pkg.get("CreationTime")
+        arn = pkg.get("ModelPackageArn")
         versions.append(
             {
-                "model_package_arn": pkg.get("ModelPackageArn"),
+                "model_package_arn": arn,
                 "version": pkg.get("ModelPackageVersion"),
                 "approval_status": pkg.get("ModelApprovalStatus"),
                 "status": pkg.get("ModelPackageStatus"),
                 "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
                 "description": pkg.get("ModelPackageDescription"),
+                "approval_description": _approval_description(sagemaker_client, arn),
             }
         )
     return versions
+
+
+def _approval_description(sagemaker_client, model_package_arn: Optional[str]) -> Optional[str]:
+    """The governance agent's stated reason for a version's approval status.
+
+    Requires a per-version DescribeModelPackage call: ModelPackageSummaryList
+    carries ModelApprovalStatus but NOT ApprovalDescription, so the reason is
+    simply absent from the list response.
+
+    The agent writes this field whenever it sets a status (see
+    agents/governance/governance_agent.py's _update_registry, which passes
+    ApprovalDescription=reason), so a rejection normally has a reason. It is not
+    guaranteed though: a version registered but never evaluated has none, and a
+    status set by hand outside the agent may have none. Returns None in that case
+    so callers can render "no reason recorded" rather than invent one.
+
+    Best-effort by design — a failed describe must not take down the whole
+    registry listing, which is the caller's primary content.
+    """
+    if not model_package_arn:
+        return None
+    try:
+        detail = sagemaker_client.describe_model_package(
+            ModelPackageName=model_package_arn
+        )
+    except Exception:  # noqa: BLE001 — listing must survive a per-version failure
+        return None
+    return detail.get("ApprovalDescription") or None
 
 
 def _to_float(value: Any) -> Optional[float]:

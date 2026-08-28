@@ -787,6 +787,7 @@ try:
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
+            sweep_status_handler as gov_sweep_status,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -796,6 +797,7 @@ try:
             train_handler as gov_train,
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
+            sweep_status_handler as gov_sweep_status,
             compare_handler as gov_compare,
             promote_handler as gov_promote,
         )
@@ -815,6 +817,7 @@ def _governance_routes(prefix: str) -> list:
         Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
         Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
         Route(f"{prefix}/v1/governance/trainable-runs", gov_trainable_runs, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/sweep-status", gov_sweep_status, methods=["GET"]),
         Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
         Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
     ]

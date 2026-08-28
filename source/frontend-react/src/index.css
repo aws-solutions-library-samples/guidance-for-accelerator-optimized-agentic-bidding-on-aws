@@ -3053,6 +3053,28 @@ h1, h2, h3, .sg-display {
   color: #fff; font-size: 10px; font-weight: 700; padding: 3px 12px; border-radius: 20px; letter-spacing: .03em;
 }
 
+/* Governance reason for a model version's approval status. The cell shows a
+   short lead-in; the full text (which can be an entire HTTP error body) is on
+   the title attribute, so the row height stays stable. */
+.cl-approval-reason {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; line-height: 1.4; cursor: help;
+}
+/* Marks a rejection caused by a failed pipeline step rather than by a model
+   losing its A/B test — the two read identically without it. */
+.cl-approval-reason-tag {
+  display: inline-block; flex: none;
+  font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: #b45309; background: rgba(245, 158, 11, .12);
+  border-radius: 20px; padding: 2px 8px; white-space: nowrap;
+}
+/* Glue failure text inside an honest-state block. Truncated inline with the full
+   message on hover, since a Spark stack trace would otherwise dominate the card. */
+.cl-etl-error-detail {
+  margin-top: 6px; font-size: 11px; line-height: 1.45; cursor: help;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #92400e; word-break: break-word;
+}
 /* Honest unknown/unreachable states (no fabricated data). */
 .cl-honest {
   font-size: 12px; color: #b45309; background: rgba(245, 158, 11, .10);
@@ -3143,7 +3165,41 @@ h1, h2, h3, .sg-display {
 }
 @media (max-width: 780px) { .cl-mutation-grid { grid-template-columns: 1fr; } }
 
+/* Two compact sections side by side instead of each spanning the full page
+   width with most of it empty. Same idiom as .cl-mutation-grid above; the
+   breakpoint is wider (980px) because these columns hold selects with long
+   option text (run ids plus timestamps) and get cramped sooner than the
+   verdict cards do. align-items:start so a taller column does not stretch
+   its neighbour's card. */
+.cl-side-by-side {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  align-items: start;
+  /* .cl-page has no row gap -- vertical rhythm comes from element margins, and
+     the step-log/history pair has no .cl-section-title to supply one. Matches
+     .cl-mutation-grid's spacing so stacked grids do not butt together. */
+  margin-bottom: 20px;
+}
+.cl-side-by-side-col { min-width: 0; }
+@media (max-width: 980px) { .cl-side-by-side { grid-template-columns: 1fr; } }
+
 /* ── Train from load test (FR-4/FR-5) ── */
+/* Advisory note in the train-from-load-test card: ETL latency means the newest
+   run in the picker may not be the load test the user just ran. Informational,
+   so it is deliberately quieter than .cl-honest-block (which reports a real
+   error or an unavailable capability). */
+.cl-train-latency-note {
+  font-size: clamp(11px, 0.9vw, 12.5px);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--surface-low);
+  border-left: 3px solid rgba(99, 102, 241, .35);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
 .cl-train-estimate {
   display: flex;
   flex-wrap: wrap;
@@ -3151,6 +3207,69 @@ h1, h2, h3, .sg-display {
   font-size: clamp(11px, 0.95vw, 13px);
   color: var(--text-secondary);
   margin-bottom: 10px;
+}
+
+/* ── Load test outcome pipeline (sweep status poller) ── */
+/* Lives in the same half-width column as the Train card (.cl-side-by-side-col),
+   so every dimension here is tuned to fit ~470px, not the full page width. */
+.cl-sweep-card { margin-bottom: 16px; }
+
+/* The run picker and "Check now" control wrap: run option text carries an id, a
+   model type and a timestamp, so the select is wide even in a narrow column. */
+.cl-sweep-card .cl-control-group { flex-wrap: wrap; margin-bottom: 12px; }
+.cl-sweep-card .cl-select { min-width: 0; flex: 1 1 160px; }
+.cl-sweep-card .cl-control-group button { flex: 0 0 auto; white-space: nowrap; }
+
+/* The stage bar is nested inside this card, so it drops the standalone bar's
+   surface treatment. Compact sizing (vs the 96px stages / 56px icons / 28px
+   connectors of the page-top bar) keeps all four stages on one row in a
+   half-width column: 4x66 + 3x14 = 306px. */
+.cl-sweep-card .cl-pipeline-bar {
+  padding: 12px 6px;
+  margin-bottom: 12px;
+  gap: 2px;
+  background: var(--surface-low);
+  box-shadow: none;
+}
+.cl-sweep-card .cl-pi-stage { width: 66px; gap: 4px; }
+.cl-sweep-card .cl-pi-icon { width: 34px; height: 34px; }
+.cl-sweep-card .cl-pi-icon svg { width: 16px; height: 16px; }
+.cl-sweep-card .cl-pi-name { font-size: 10px; }
+.cl-sweep-card .cl-pi-service { font-size: 8.5px; }
+.cl-sweep-card .cl-pi-conn { flex: 0 0 14px; margin-top: 22px; }
+
+.cl-sweep-summary {
+  font-size: clamp(11.5px, 0.95vw, 13px);
+  font-weight: 600;
+  line-height: 1.5;
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border-left: 3px solid var(--border);
+  background: var(--surface-low);
+  color: var(--text-secondary);
+  transition: background .2s ease, border-color .2s ease, color .2s ease;
+}
+.cl-sweep-summary--ok { border-left-color: var(--green); color: var(--text); }
+.cl-sweep-summary--active { border-left-color: var(--accent); }
+.cl-sweep-summary--error { border-left-color: var(--red); }
+
+.cl-sweep-stagelog { font-size: 11px; line-height: 1.6; color: var(--text-muted); }
+.cl-sweep-stageline { padding: 3px 0; }
+.cl-sweep-stageline strong { color: var(--text); }
+.cl-sweep-stageline--ok strong { color: var(--green); }
+.cl-sweep-stageline--processing strong { color: var(--accent); }
+.cl-sweep-stageline--error strong { color: var(--red); }
+
+.cl-sweep-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--text-muted);
 }
 
 .cl-train-result {

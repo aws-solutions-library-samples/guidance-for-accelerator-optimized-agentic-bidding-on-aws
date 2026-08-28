@@ -21,8 +21,10 @@ this module handles all protocol plumbing.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import os
 import signal
 import threading
 import time
@@ -49,6 +51,42 @@ logger = logging.getLogger("artf.server")
 
 # Type alias for the container's mutation handler
 MutateFunc = Callable[[RTBRequest], RTBResponse]
+
+
+# ---------------------------------------------------------------------------
+# mutate() offloading
+# ---------------------------------------------------------------------------
+#
+# mutate() is a synchronous function that reaches blocking network I/O:
+# dlrm_bid_shader/ncf_deal_manager call Triton through tritonclient.http, the
+# SYNCHRONOUS Triton client. Calling it inline from an async handler blocks the
+# single uvicorn event loop for the whole Triton round trip, so concurrent
+# requests do not overlap -- they queue, and the Nth in flight waits N round
+# trips. Measured effect: a model that infers in single-digit milliseconds
+# reported hundreds of milliseconds as soon as load-test concurrency exceeded 1.
+#
+# Both HTTP entry points therefore run mutate() in this pool instead.
+ARTF_MUTATE_WORKERS = max(1, int(os.environ.get("ARTF_MUTATE_WORKERS", "16")))
+
+_mutate_executor = futures.ThreadPoolExecutor(
+    max_workers=ARTF_MUTATE_WORKERS, thread_name_prefix="artf-mutate",
+)
+
+
+async def _await_mutate(mutate_fn: MutateFunc, req: RTBRequest) -> RTBResponse:
+    """Run a container's synchronous mutate() off the event loop.
+
+    The context is copied explicitly: run_in_executor does not propagate
+    contextvars, and target_variant_scope/load_test_scope (shared/
+    load_test_context.py) are ContextVars that mutate() reads. Without the
+    copy, a load test's X-Load-Test-Target-Variant would silently stop
+    reaching the Triton router. asyncio.to_thread would copy the context for
+    us but runs on the default executor, shared with unrelated callers and
+    sized from the host's CPU count rather than this pod's limit.
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_mutate_executor, lambda: ctx.run(mutate_fn, req))
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +167,14 @@ def _grpc_handler(mutate_fn: MutateFunc):
 
 
 def _build_grpc_server(mutate_fn: MutateFunc, port: int) -> grpc.Server:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    # gRPC is the real-time bidding path and each mutate() blocks its worker
+    # thread for a full Triton round trip, so the worker count is the hard
+    # concurrency ceiling: at 4 workers the 5th concurrent bid request waits.
+    # Shares ARTF_MUTATE_WORKERS with the HTTP pool so one env var tunes the
+    # container's concurrency regardless of which protocol drives it.
+    server = grpc.server(futures.ThreadPoolExecutor(
+        max_workers=ARTF_MUTATE_WORKERS, thread_name_prefix="artf-grpc",
+    ))
 
     # Register the generic handler using the correct grpc API
     rpc_handler = grpc.unary_unary_rpc_method_handler(
@@ -253,7 +298,7 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
                 return _err(rpc_id, -32601, f"Unknown tool: {tool_name}")
             try:
                 req = RTBRequest(**arguments)
-                resp = mutate_fn(req)
+                resp = await _await_mutate(mutate_fn, req)
                 return _ok(rpc_id, {
                     "content": [{"type": "text", "text": json.dumps(resp.model_dump())}],
                 }, headers={"Mcp-Session-Id": session_id} if session_id else None)
@@ -286,8 +331,10 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
             raw_variant = request.headers.get(HEADER_NAME.lower())
             variant = raw_variant if raw_variant in ("stable", "canary") else None
             is_load_test = request.headers.get(IS_LOAD_TEST_HEADER_NAME.lower()) == "1"
+            # The scopes are entered BEFORE the offload so _await_mutate's
+            # copy_context() captures them for the worker thread.
             with target_variant_scope(variant), load_test_scope(is_load_test):
-                resp = mutate_fn(req)
+                resp = await _await_mutate(mutate_fn, req)
             return JSONResponse(resp.model_dump())
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
