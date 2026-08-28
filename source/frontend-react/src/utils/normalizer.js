@@ -10,7 +10,10 @@ import {
   DISPLAY_NAME_BY_STOP_ID,
 } from "./intentMapping.js";
 
-const CONTAINER_STOP_IDS = Object.freeze(["dlrm", "widedeep", "ncf", "metrics", "yield"]);
+// Two yield stops, one per container -- see intentMapping.js's INTENT_TO_STOP note.
+const CONTAINER_STOP_IDS = Object.freeze([
+  "dlrm", "widedeep", "ncf", "metrics", "yield-floor", "yield-margin",
+]);
 
 function isFiniteNumber(n) {
   return typeof n === "number" && Number.isFinite(n);
@@ -178,7 +181,10 @@ function buildExplicitContainerStops(containers) {
 }
 
 function buildInferredContainerStops(mutations) {
-  const buckets = { dlrm: [], widedeep: [], ncf: [], metrics: [], yield: [] };
+  const buckets = {
+    dlrm: [], widedeep: [], ncf: [], metrics: [],
+    "yield-floor": [], "yield-margin": [],
+  };
   for (const m of mutations) {
     const intentCode = m?.intent;
     const stopId = (typeof intentCode === "number" && INTENT_TO_STOP[intentCode]) || "metrics";

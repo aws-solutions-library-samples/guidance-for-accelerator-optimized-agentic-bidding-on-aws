@@ -20,13 +20,19 @@ export const OP_NAMES = Object.freeze({
   3: "REPLACE",
 });
 
+// ADJUST_DEAL_FLOOR (4) and ADJUST_DEAL_MARGIN (5) map to SEPARATE stops
+// because they are served by two separate containers. They shared a single
+// "yield" stop when one container served both; keeping that would make
+// normalizer.js's buildExplicitContainerStops() collapse the two containers
+// into one stop and silently discard the second one's status, latency and
+// mutations (it keeps the first entry per stop id).
 export const INTENT_TO_STOP = Object.freeze({
   0: "metrics",
   1: "widedeep",
   2: "ncf",
   3: "ncf",
-  4: "yield",
-  5: "yield",
+  4: "yield-floor",
+  5: "yield-margin",
   6: "dlrm",
   7: "metrics",
   8: "metrics",
@@ -38,7 +44,8 @@ export const STOP_MODEL_FAMILY = Object.freeze({
   widedeep: "WIDE_AND_DEEP",
   ncf: "NCF",
   metrics: "RULES",
-  yield: "XGBOOST_FIL",
+  "yield-floor": "XGBOOST_FIL",
+  "yield-margin": "XGBOOST_FIL",
   dsp: "NONE",
 });
 
@@ -47,7 +54,8 @@ export const CONTAINER_NAME_TO_STOP_ID = Object.freeze({
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
-  "deal-yield-manager": "yield",
+  "yield-optimizer-floor": "yield-floor",
+  "yield-optimizer-margin": "yield-margin",
 });
 
 export const DISPLAY_NAME_BY_STOP_ID = Object.freeze({
@@ -56,6 +64,7 @@ export const DISPLAY_NAME_BY_STOP_ID = Object.freeze({
   widedeep: "Wide & Deep",
   ncf: "NCF Deal Mgr",
   metrics: "Metrics Enricher",
-  yield: "Yield Optimizer",
+  "yield-floor": "Yield Optimizer — Floor",
+  "yield-margin": "Yield Optimizer — Margin",
   dsp: "DSP",
 });

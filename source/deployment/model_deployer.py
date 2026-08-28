@@ -465,7 +465,7 @@ class TritonModelLoader:
     async def stage_canary_fil(self, base_model: str, artifact_uri: str) -> str:
         """FIL counterpart to stage_canary() for tree-model backends.
 
-        Triton's FIL backend (used by deal_yield_manager) loads a native
+        Triton's FIL backend (used by the two yield models) loads a native
         XGBoost artifact directly -- ``<canary>/1/xgboost.json`` -- instead
         of a TensorRT ``model.plan`` engine. No ``ModelOptimizer.optimize()``
         call exists in this path: FIL reads XGBoost's native format as-is,

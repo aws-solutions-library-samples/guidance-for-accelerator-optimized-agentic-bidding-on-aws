@@ -25,7 +25,11 @@ const TARGET_MODEL_TYPES = [
   { value: "widedeep_segment_activator", label: "Audience Activator" },
   { value: "ncf_deal_manager", label: "Deal Scorer" },
   { value: "metrics_enricher", label: "Signals Enricher" },
-  { value: "deal_yield_manager", label: "Yield Optimizer" },
+  // Two entries: each yield container is targeted on its own, and these
+  // values are also the training model types (see the orchestrator's
+  // _TARGET_MODEL_TYPES), so a run is directly usable as a training target.
+  { value: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
+  { value: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
 ];
 
 /**
@@ -622,7 +626,8 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator",
     "ncf-deal-manager",
     "metrics-enricher",
-    "deal-yield-manager",
+    "yield-optimizer-floor",
+    "yield-optimizer-margin",
   ];
 
   const CONTAINER_LOGOS = {
@@ -630,7 +635,8 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator": null,
     "ncf-deal-manager": nvidiaLogo,
     "metrics-enricher": null,
-    "deal-yield-manager": nvidiaLogo,
+    "yield-optimizer-floor": nvidiaLogo,
+    "yield-optimizer-margin": nvidiaLogo,
   };
 
   // Job-oriented display labels shown instead of the raw internal name.
@@ -639,7 +645,8 @@ function ContainerBreakdown({ containers }) {
     "widedeep-segment-activator": "Audience Activator",
     "ncf-deal-manager": "Deal Scorer",
     "metrics-enricher": "Signals Enricher",
-    "deal-yield-manager": "Yield Optimizer",
+    "yield-optimizer-floor": "Yield Optimizer — Floor",
+    "yield-optimizer-margin": "Yield Optimizer — Margin",
   };
 
   const rows = containers && containers.length > 0

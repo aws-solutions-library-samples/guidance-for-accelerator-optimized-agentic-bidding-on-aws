@@ -3,7 +3,7 @@ load-test-only behavior (target-variant override, and the plain
 is-load-test flag) away from real bid-serving traffic.
 
 The is-load-test flag (get_is_load_test()/load_test_scope()) is what
-containers/deal_yield_manager/app.py's bounded exploration gates on -- see
+the yield containers' bounded exploration gates on -- see
 that module and CLOSED_LOOP.md's "Yield Optimizer" section for why this
 distinction matters: without it, enabling exploration by default would
 perturb real auction bids, not just load-test traffic used to bootstrap

@@ -45,7 +45,7 @@ function applyTunerToPayload(payload, scenario, params) {
   }
   if (params.explore != null && scenario.controls?.includes("explore")) {
     // Yield Optimizer's bounded exploration toggle (see
-    // containers/deal_yield_manager/app.py's _resolve_effective_epsilon) --
+    // shared/yield_exploration.py's resolve_effective_epsilon) --
     // explicit True/False, read the same way every other demo-tunable
     // parameter here is (ext.model_params).
     modelParams.explore = params.explore;

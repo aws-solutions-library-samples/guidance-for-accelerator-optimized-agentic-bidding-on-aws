@@ -102,6 +102,17 @@ class BidShadingOutcomeEvent(BaseModel):
     shade_factor_used: float
     conversion_value_estimate_used: float
 
+    @property
+    def partition_key(self) -> str:
+        """Kinesis partition key — user_id_hash, giving per-user ordering.
+
+        FeedbackCollector reads this rather than a specific field name so it
+        can carry more than one event type. It previously read .user_id_hash
+        directly, which made every DealYieldOutcomeEvent raise AttributeError
+        before any Kinesis call (see DealYieldOutcomeEvent.partition_key).
+        """
+        return self.user_id_hash
+
     @model_validator(mode="after")
     def _validate_bid_outcome_rules(self) -> "BidShadingOutcomeEvent":
         _validate_common_fields(
@@ -214,7 +225,7 @@ DealYieldIntent = Literal["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"]
 
 class DealYieldOutcomeEvent(BaseModel):
     """A single deal floor/margin adjustment outcome, emitted by the
-    orchestrator (never by deal_yield_manager itself -- a container only
+    orchestrator (never by a yield container itself -- a container only
     proposes mutations and has no visibility into what happens after).
     """
 
@@ -247,6 +258,24 @@ class DealYieldOutcomeEvent(BaseModel):
     category_tier: float = 0.0
     hour_of_day: int = Field(ge=0, le=23)
     day_of_week: int = Field(ge=0, le=6)
+
+    @property
+    def partition_key(self) -> str:
+        """Kinesis partition key — deal_id, giving per-deal ordering.
+
+        This event has no user_id_hash: a deal-level floor/margin adjustment
+        is not attributable to one user, and the meaningful ordering guarantee
+        is per deal (a deal's successive floor/margin adjustments stay in
+        sequence on one shard).
+
+        FeedbackCollector used to read .user_id_hash directly, so emitting this
+        event raised AttributeError before any Kinesis call. That line sat
+        outside the method's try/except and ran inside an
+        asyncio.create_task(...) whose result nothing awaited, so the failure
+        surfaced nowhere: no records reached the stream, no error was logged,
+        and callers still counted the event as an emitted sample.
+        """
+        return self.deal_id
 
 
 class DealYieldOutcomeRecord(BaseModel):
