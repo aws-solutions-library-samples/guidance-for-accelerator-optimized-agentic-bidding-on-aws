@@ -219,40 +219,127 @@ class TestSynthesizeLoadTestOutcome:
     emit_load_test_bid_outcome()'s precedent, rather than leaving
     won/price_paid unknown as the live path does)."""
 
+    @staticmethod
+    def _event(intent="ADJUST_DEAL_FLOOR", *, deal_id="deal-a", **kw):
+        from shared.feedback_models import DealYieldOutcomeEvent
+
+        base = dict(
+            request_id="r", timestamp=1.0, model_version="v", source="load_test",
+            imp_id="1", deal_id=deal_id, intent=intent, original_bidfloor=3.0,
+            hour_of_day=12, day_of_week=3,
+        )
+        base.update(kw)
+        return DealYieldOutcomeEvent(**base)
+
+    @classmethod
+    def _mean_revenue(cls, intent, n=800, **kw):
+        total = 0.0
+        for i in range(n):
+            event = cls._event(intent, deal_id=f"deal-{i % 40}", **kw)
+            _, _, revenue = deal_yield_feedback._synthesize_load_test_outcome(
+                event, seed=42, request_index=i
+            )
+            total += revenue
+        return total / n
+
     def test_deterministic_same_inputs(self):
-        r1 = deal_yield_feedback._synthesize_load_test_outcome("run-1", 5, "deal-a")
-        r2 = deal_yield_feedback._synthesize_load_test_outcome("run-1", 5, "deal-a")
+        event = self._event(adjusted_bidfloor=3.3)
+        r1 = deal_yield_feedback._synthesize_load_test_outcome(event, seed=7, request_index=5)
+        r2 = deal_yield_feedback._synthesize_load_test_outcome(event, seed=7, request_index=5)
         assert r1 == r2
 
-    def test_floor_and_margin_mutations_on_same_deal_get_same_outcome(self):
-        """Two mutations describing the same deal clearing (floor + margin)
-        must resolve to the SAME synthetic won/price_paid -- they are not
-        two independent auctions."""
-        r_floor = deal_yield_feedback._synthesize_load_test_outcome("run-1", 5, "deal-a")
-        r_margin = deal_yield_feedback._synthesize_load_test_outcome("run-1", 5, "deal-a")
-        assert r_floor == r_margin
+    def test_demand_is_fixed_by_the_seed_not_the_run(self):
+        """Two runs replayed at one seed face identical demand, so a
+        canary-vs-stable difference is attributable to the model. Keyed on
+        run_id before, which made a fresh uuid4 per run the real variable."""
+        wtp = deal_yield_feedback.buyer_willingness_to_pay
+        assert wtp(7, 3, "deal-a") == wtp(7, 3, "deal-a")
+        assert wtp(7, 3, "deal-a") != wtp(8, 3, "deal-a")
+        assert "run_id" not in deal_yield_feedback._synthesize_load_test_outcome.__code__.co_varnames
 
     def test_different_deal_ids_can_differ(self):
         """Real per-deal variation across a run, not a constant stuck value."""
         outcomes = {
-            deal_yield_feedback._synthesize_load_test_outcome("run-1", 0, f"deal-{i}")
+            deal_yield_feedback._synthesize_load_test_outcome(
+                self._event(deal_id=f"deal-{i}", adjusted_bidfloor=3.3),
+                seed=42, request_index=0,
+            )
             for i in range(50)
         }
-        won_values = {o[0] for o in outcomes}
-        assert len(won_values) > 1
+        assert len({o[0] for o in outcomes}) > 1
 
-    def test_price_paid_none_when_not_won(self):
-        for i in range(50):
-            won, price_paid = deal_yield_feedback._synthesize_load_test_outcome("run-x", i, "deal-a")
-            if not won:
-                assert price_paid is None
+    def test_price_paid_none_and_zero_revenue_when_it_does_not_clear(self):
+        cleared, price_paid, revenue = deal_yield_feedback._synthesize_load_test_outcome(
+            self._event(adjusted_bidfloor=99.0), seed=7, request_index=3
+        )
+        assert (cleared, price_paid, revenue) == (False, None, 0.0)
+
+    def test_raising_the_floor_reduces_the_clear_rate(self):
+        """The model's decision has to move its own outcome -- the whole point
+        of this change. A higher floor clears less often."""
+        def clear_rate(floor):
+            hits = sum(
+                deal_yield_feedback._synthesize_load_test_outcome(
+                    self._event(deal_id=f"deal-{i % 40}", adjusted_bidfloor=floor),
+                    seed=42, request_index=i,
+                )[0]
+                for i in range(600)
+            )
+            return hits / 600
+
+        assert clear_rate(2.0) > clear_rate(3.0) > clear_rate(4.5)
+
+    def test_floor_revenue_has_an_interior_optimum(self):
+        """Reserve-price tradeoff: too low earns little per clear, too high
+        forfeits clears. Neither extreme may win."""
+        floors = [1.5, 2.1, 2.7, 3.0, 3.3, 3.9, 4.5]
+        scores = {f: self._mean_revenue("ADJUST_DEAL_FLOOR", adjusted_bidfloor=f) for f in floors}
+        best = max(scores, key=scores.get)
+        assert best not in (floors[0], floors[-1]), scores
+
+    def test_margin_percent_revenue_has_an_interior_optimum(self):
+        from shared.artf_types import MarginCalculationType
+
+        takes = [-0.3, -0.1, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+        scores = {
+            t: self._mean_revenue(
+                "ADJUST_DEAL_MARGIN",
+                margin_value=t,
+                margin_calculation_type=int(MarginCalculationType.PERCENT),
+            )
+            for t in takes
+        }
+        best = max(scores, key=scores.get)
+        assert best not in (takes[0], takes[-1]), scores
+
+    def test_a_negative_margin_loses_money(self):
+        """A discount clears more often and earns less. No special case for it."""
+        from shared.artf_types import MarginCalculationType
+
+        assert self._mean_revenue(
+            "ADJUST_DEAL_MARGIN", margin_value=-0.3,
+            margin_calculation_type=int(MarginCalculationType.PERCENT),
+        ) < 0
+
+    def test_cpm_margin_earns_the_absolute_take(self):
+        """CPM adds an absolute amount rather than scaling the floor
+        (shared/artf_types.py: CPM=0, PERCENT=1)."""
+        from shared.artf_types import MarginCalculationType
+
+        event = self._event(
+            "ADJUST_DEAL_MARGIN", margin_value=0.4,
+            margin_calculation_type=int(MarginCalculationType.CPM),
+        )
+        price, revenue = deal_yield_feedback._effective_price_and_revenue(event)
+        assert price == 3.0 + 0.4
+        assert revenue == 0.4
 
 
 class TestEmitLoadTestDealYieldOutcome:
     def test_noop_when_collector_not_configured(self, monkeypatch):
         monkeypatch.setattr(deal_yield_feedback, "_deal_yield_collector", None)
         result = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-            _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0
+            _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0, seed=42
         )
         assert result == []
 
@@ -261,7 +348,7 @@ class TestEmitLoadTestDealYieldOutcome:
         monkeypatch.setattr(deal_yield_feedback, "_deal_yield_collector", mock_collector)
         resp = RTBResponse(id="req-1", mutations=[], metadata=Metadata(model_version="v1"))
         result = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-            _req(), resp, run_id="run-1", request_index=0
+            _req(), resp, run_id="run-1", request_index=0, seed=42
         )
         assert result == []
         mock_collector.emit.assert_not_called()
@@ -272,7 +359,7 @@ class TestEmitLoadTestDealYieldOutcome:
 
         async def _run():
             samples = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-                _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0
+                _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0, seed=42
             )
             await asyncio.sleep(0.01)
             return samples
@@ -309,7 +396,7 @@ class TestEmitLoadTestDealYieldOutcome:
 
         async def _run():
             samples = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-                _req(), resp, run_id="run-1", request_index=0
+                _req(), resp, run_id="run-1", request_index=0, seed=42
             )
             await asyncio.sleep(0.01)
             return samples
@@ -327,7 +414,7 @@ class TestEmitLoadTestDealYieldOutcome:
 
         async def _run():
             samples = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-                _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0
+                _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0, seed=42
             )
             await asyncio.sleep(0.01)
             return samples
@@ -343,7 +430,7 @@ class TestEmitLoadTestDealYieldOutcome:
             type("Bad", (), {"emit": lambda self, e: 1 / 0})(),
         )
         result = deal_yield_feedback.emit_load_test_deal_yield_outcome(
-            _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0
+            _req(), _resp_with_floor_mutation(), run_id="run-1", request_index=0, seed=42
         )
         # Errors are swallowed per-mutation; no sample recorded for the
         # failed emission, but the call itself must not raise.

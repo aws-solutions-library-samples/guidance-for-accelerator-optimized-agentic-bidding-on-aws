@@ -40,23 +40,39 @@ def predict_floor_multiplier(
             shared.yield_features.build_feature_vector().
         target_variant: "stable" | "canary" | None. Load-test-only override
             (see source/orchestrator/loadtest_targeting.py); always None on
-            live bid-serving traffic. There is no canary router for the yield
-            models yet -- this parameter is accepted for interface parity with
-            the other Triton-backed containers and to avoid a signature change
-            when one is added, but has no effect today.
+            live bid-serving traffic.
+
+            "canary" selects the ``<model>_canary`` Triton model DIRECTLY, by
+            name. The TensorRT-backed containers instead pass a target_variant
+            INPUT to a Python-backend router model that owns the split
+            (dlrm_bid_shader/triton_inference.py), but a FIL model accepts only
+            input__0, so a router input is not available here. Selecting the
+            model by name achieves the same thing for a targeted load test.
+
+            This deliberately does NOT give the yield models a live canary
+            split: live traffic never sets a variant, so it always reaches the
+            stable model exactly as before. Splitting live traffic would still
+            need a router.
 
     Returns:
         (floor_multiplier, served_variant, served_model_version).
         floor_multiplier == 1.0 means "no change recommended".
-        served_variant/served_model_version are "" until a canary router
-        exists -- a real "unknown", never fabricated. Never raises.
+
+        ``served_variant`` is only populated when a variant was explicitly
+        targeted AND that model actually returned a prediction -- so a canary
+        request that fell back to the no-change default reports "", never a
+        claim that the canary served it. ``served_model_version`` stays ""
+        because no router declares it for these models: a real "unknown", never
+        fabricated. Never raises.
     """
-    floor_multiplier = infer_single_output(FLOOR_MODEL_NAME, feature_vector)
-    return (
-        floor_multiplier if floor_multiplier is not None else NO_CHANGE_FLOOR_MULTIPLIER,
-        "",
-        "",
+    model_name = (
+        f"{FLOOR_MODEL_NAME}_canary" if target_variant == "canary" else FLOOR_MODEL_NAME
     )
+    floor_multiplier = infer_single_output(model_name, feature_vector)
+    if floor_multiplier is None:
+        return NO_CHANGE_FLOOR_MULTIPLIER, "", ""
+    served_variant = target_variant if target_variant in ("stable", "canary") else ""
+    return floor_multiplier, served_variant, ""
 
 
 def is_triton_ready() -> bool:

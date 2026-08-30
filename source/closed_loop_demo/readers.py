@@ -120,38 +120,49 @@ def read_model_versions(
                 "status": pkg.get("ModelPackageStatus"),
                 "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
                 "description": pkg.get("ModelPackageDescription"),
-                "approval_description": _approval_description(sagemaker_client, arn),
+                **_version_detail(sagemaker_client, arn),
             }
         )
     return versions
 
 
-def _approval_description(sagemaker_client, model_package_arn: Optional[str]) -> Optional[str]:
-    """The governance agent's stated reason for a version's approval status.
+def _version_detail(sagemaker_client, model_package_arn: Optional[str]) -> dict:
+    """The per-version fields that require a DescribeModelPackage call.
 
-    Requires a per-version DescribeModelPackage call: ModelPackageSummaryList
-    carries ModelApprovalStatus but NOT ApprovalDescription, so the reason is
-    simply absent from the list response.
-
-    The agent writes this field whenever it sets a status (see
-    agents/governance/governance_agent.py's _update_registry, which passes
-    ApprovalDescription=reason), so a rejection normally has a reason. It is not
-    guaranteed though: a version registered but never evaluated has none, and a
-    status set by hand outside the agent may have none. Returns None in that case
-    so callers can render "no reason recorded" rather than invent one.
-
-    Best-effort by design — a failed describe must not take down the whole
-    registry listing, which is the caller's primary content.
+    Both of these are absent from ModelPackageSummaryList, so the list response
+    alone cannot supply them. Fetched together in ONE describe per version --
+    reading them with a call each doubled the API traffic for the same data.
     """
     if not model_package_arn:
-        return None
+        return {"approval_description": None, "training_run_id": None}
+    detail = _describe(sagemaker_client, model_package_arn)
+    metadata = detail.get("CustomerMetadataProperties") or {}
+    return {
+        # The governance agent's stated reason for the approval status.
+        "approval_description": detail.get("ApprovalDescription") or None,
+        # The load-test run this version's training job was triggered from,
+        # written as a hyperparameter by the on-demand trigger and copied here by
+        # the registration Lambda (governance_eventbridge_cfn.yaml). None for
+        # scheduled retraining, which has no originating run, and for versions
+        # registered before it was recorded. Provenance only -- the training input
+        # is an entire prefix of swept runs, so this is the run the job was
+        # triggered FROM, not the only data behind the model.
+        "training_run_id": metadata.get("load_test_run_id") or None,
+    }
+
+
+def _describe(sagemaker_client, model_package_arn: str) -> dict:
+    """DescribeModelPackage, or {} when it fails.
+
+    Best-effort by design -- a failed describe must not take down the registry
+    listing, which is the caller's primary content.
+    """
     try:
-        detail = sagemaker_client.describe_model_package(
+        return sagemaker_client.describe_model_package(
             ModelPackageName=model_package_arn
         )
     except Exception:  # noqa: BLE001 — listing must survive a per-version failure
-        return None
-    return detail.get("ApprovalDescription") or None
+        return {}
 
 
 def _to_float(value: Any) -> Optional[float]:
