@@ -441,6 +441,39 @@ class TritonModelLoader:
         logger.info("Staged canary model %s from %s", canary, engine_uri)
         return canary
 
+    async def _canary_source_config(self, base_model: str) -> tuple[str, str]:
+        """The config a canary should be derived from, and the model name in it.
+
+        Two repo layouts exist, and a canary has to work in both:
+
+        - **Router layout** (dlrm_bid_shader, ncf_deal_manager): the base name is
+          a Python-backend router and the served engine lives under
+          ``<base>_stable``. The canary is derived from that stable config.
+        - **Direct layout** (deal_yield_manager_floor/margin): there is no router
+          and no ``<base>_stable`` -- the model is loaded directly under its base
+          name. Verified live: ``deal_yield_manager_floor`` is ready while
+          ``deal_yield_manager_floor_stable`` returns 400.
+
+        Returns (config_text, name_to_replace). Raises TritonModelLoadError when
+        neither exists, since a canary config cannot then be derived from
+        anything real.
+        """
+        stable = self.stable_name(base_model)
+        stable_cfg = await self._get_text(self._key(stable, "config.pbtxt"))
+        if stable_cfg:
+            return stable_cfg, stable
+
+        base_cfg = await self._get_text(self._key(base_model, "config.pbtxt"))
+        if base_cfg:
+            return base_cfg, base_model
+
+        raise TritonModelLoadError(
+            f"no config found for {stable} or {base_model}; "
+            "cannot derive canary config",
+            model_name=self.canary_name(base_model),
+            version=1,
+        )
+
     async def remove_canary(self, base_model: str) -> None:
         """Delete the ``<base>_canary`` model from the repo (Triton poll-unloads)."""
         canary = self.canary_name(base_model)
@@ -474,17 +507,14 @@ class TritonModelLoader:
         server-side-copy pattern). Raises TritonModelLoadError if the stable
         config is missing.
         """
-        stable = self.stable_name(base_model)
         canary = self.canary_name(base_model)
 
-        stable_cfg = await self._get_text(self._key(stable, "config.pbtxt"))
-        if not stable_cfg:
-            raise TritonModelLoadError(
-                f"stable config not found for {stable}; cannot derive canary config",
-                model_name=canary,
-                version=1,
-            )
-        canary_cfg = stable_cfg.replace(f'"{stable}"', f'"{canary}"')
+        # The yield models use the direct layout (no <base>_stable), so the
+        # canary config is derived from whichever of the two exists. Deriving
+        # only from <base>_stable, as this used to, made a yield canary
+        # impossible to stage.
+        source_cfg, source_name = await self._canary_source_config(base_model)
+        canary_cfg = source_cfg.replace(f'"{source_name}"', f'"{canary}"')
 
         await self._put_text(self._key(canary, "config.pbtxt"), canary_cfg)
         await self._copy_engine(artifact_uri, self._key(canary, "1", self._MODEL_XGBOOST_JSON))

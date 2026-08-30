@@ -129,6 +129,11 @@ export default function GovernancePanel() {
   const [selectedCurrentRun, setSelectedCurrentRun] = useState("");
   const [selectedChallengerRun, setSelectedChallengerRun] = useState("");
   const [eligibleRunsError, setEligibleRunsError] = useState(null);
+  // Where the preselected control came from — "training_provenance" (the run the
+  // challenger was trained from) or "most_recent" (a weaker fallback). Shown so
+  // the baseline is never implied to be the training data when it is not.
+  const [controlSource, setControlSource] = useState("none");
+  const [controlProvenance, setControlProvenance] = useState(null);
   const [comparing, setComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
   const [comparisonError, setComparisonError] = useState(null);
@@ -252,7 +257,15 @@ export default function GovernancePanel() {
       const resp = await authFetch("/api/v1/governance/train", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_type: trainingModelType, confirmed: true }),
+        // run_id is the run selected in the picker. It was collected in state but
+        // never sent, so the resulting model version had no link back to the run
+        // it was triggered from — which is what a later comparison needs to pick
+        // its control.
+        body: JSON.stringify({
+          model_type: trainingModelType,
+          confirmed: true,
+          run_id: selectedTrainingRun,
+        }),
       });
       const data = await resp.json();
       if (resp.ok) {
@@ -289,8 +302,33 @@ export default function GovernancePanel() {
       if (curResp.ok && chalResp.ok) {
         setCurrentRuns(curData.runs || []);
         setChallengerRuns(chalData.runs || []);
-        setSelectedCurrentRun(curData.most_recent?.id || "");
         setSelectedChallengerRun(chalData.most_recent?.id || "");
+
+        // Prefer the run the challenger was actually trained from over simply
+        // the newest eligible run. That is the comparison worth making: did
+        // training on this data beat what that data itself produced? The
+        // endpoint reports which source it used so the label below stays honest
+        // — it is a suggestion, and either side can still be overridden.
+        let control = curData.most_recent?.id || "";
+        let source = control ? "most_recent" : "none";
+        try {
+          const pairResp = await authFetch(
+            `/api/v1/governance/comparison-pair?model_type=${modelType}`
+          );
+          if (pairResp.ok) {
+            const pair = await pairResp.json();
+            if (pair.control_run_id) {
+              control = pair.control_run_id;
+              source = pair.control_source || source;
+            }
+            setControlProvenance(pair);
+          }
+        } catch {
+          // Suggestion is optional; the manual pickers still work without it.
+          setControlProvenance(null);
+        }
+        setSelectedCurrentRun(control);
+        setControlSource(source);
       } else {
         setEligibleRunsError(curData.error || chalData.error || "Could not load eligible runs.");
       }
@@ -788,6 +826,24 @@ export default function GovernancePanel() {
                 </option>
               ))}
             </select>
+            {/* Says which baseline this actually is. Calling a most-recent run
+                "the training data" when it is not would misstate what the
+                comparison measured. */}
+            {controlSource === "training_provenance" && (
+              <div className="cl-control-note" data-testid="governance-control-provenance">
+                Preselected the run this challenger was trained from.
+              </div>
+            )}
+            {controlSource === "most_recent" && (
+              <div className="cl-control-note" data-testid="governance-control-fallback">
+                Most recent eligible run — not necessarily the data the challenger
+                was trained from.
+                {controlProvenance?.provenance_run_unavailable && (
+                  <> Its training run ({controlProvenance.provenance_run_id}) is no
+                  longer available as a control.</>
+                )}
+              </div>
+            )}
           </div>
           <div className="cl-control-group">
             <label htmlFor="cl-gov-challenger-run">Challenger version run:</label>

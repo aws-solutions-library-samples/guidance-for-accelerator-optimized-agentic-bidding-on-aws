@@ -41,23 +41,39 @@ def predict_margin_value(
             shared.yield_features.build_feature_vector().
         target_variant: "stable" | "canary" | None. Load-test-only override
             (see source/orchestrator/loadtest_targeting.py); always None on
-            live bid-serving traffic. There is no canary router for the yield
-            models yet -- this parameter is accepted for interface parity with
-            the other Triton-backed containers and to avoid a signature change
-            when one is added, but has no effect today.
+            live bid-serving traffic.
+
+            "canary" selects the ``<model>_canary`` Triton model DIRECTLY, by
+            name. The TensorRT-backed containers instead pass a target_variant
+            INPUT to a Python-backend router model that owns the split
+            (dlrm_bid_shader/triton_inference.py), but a FIL model accepts only
+            input__0, so a router input is not available here. Selecting the
+            model by name achieves the same thing for a targeted load test.
+
+            This deliberately does NOT give the yield models a live canary
+            split: live traffic never sets a variant, so it always reaches the
+            stable model exactly as before. Splitting live traffic would still
+            need a router.
 
     Returns:
         (margin_value, served_variant, served_model_version).
         margin_value == 0.0 means "no adjustment recommended".
-        served_variant/served_model_version are "" until a canary router
-        exists -- a real "unknown", never fabricated. Never raises.
+
+        ``served_variant`` is only populated when a variant was explicitly
+        targeted AND that model actually returned a prediction -- so a canary
+        request that fell back to the no-change default reports "", never a
+        claim that the canary served it. ``served_model_version`` stays ""
+        because no router declares it for these models: a real "unknown", never
+        fabricated. Never raises.
     """
-    margin_value = infer_single_output(MARGIN_MODEL_NAME, feature_vector)
-    return (
-        margin_value if margin_value is not None else NO_CHANGE_MARGIN_VALUE,
-        "",
-        "",
+    model_name = (
+        f"{MARGIN_MODEL_NAME}_canary" if target_variant == "canary" else MARGIN_MODEL_NAME
     )
+    margin_value = infer_single_output(model_name, feature_vector)
+    if margin_value is None:
+        return NO_CHANGE_MARGIN_VALUE, "", ""
+    served_variant = target_variant if target_variant in ("stable", "canary") else ""
+    return margin_value, served_variant, ""
 
 
 def is_triton_ready() -> bool:

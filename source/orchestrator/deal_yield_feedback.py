@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from closed_loop_demo.scenarios import BidOutcomeMetrics
-from shared.artf_types import RTBRequest, RTBResponse, Mutation
+from shared.artf_types import MarginCalculationType, RTBRequest, RTBResponse, Mutation
 from shared.feedback_collector import FeedbackCollector, fire_and_forget_emit
 from shared.feedback_models import DealYieldOutcomeEvent
 
@@ -188,34 +188,81 @@ _LOAD_TEST_SCENARIO = BidOutcomeMetrics(
 _LOAD_TEST_SAMPLE_POOL_SIZE = 100
 
 
-def _synthesize_load_test_outcome(run_id: str, request_index: int, deal_id: str) -> tuple[bool, float | None]:
-    """Deterministically derives (won, price_paid) for one load-test deal
-    outcome from the same fixed scenario pool loadtest_instrumentation.py
-    uses for bid-shading. Keyed by (run_id, request_index, deal_id) so a
-    request with two adjust_deal mutations (floor + margin, same deal) gets
-    the SAME synthetic outcome for both -- they describe the same deal
-    clearing, not two independent events.
+# Sell-side market model (see _synthesize_load_test_outcome).
+#
+# What a buyer is willing to pay for one deal impression. Fixed by
+# (seed, request_index, deal_id) -- a property of the request, never of the
+# model -- so a run replayed at the same seed faces identical demand and the
+# only variable is what the yield model decided. Centred a little above the
+# scenario's average price so that both raising and lowering a floor can be
+# wrong, which is what gives the metric an interior optimum.
+_BUYER_VALUE_MEAN = 3.60
+_BUYER_VALUE_STD = 0.90
+
+
+def buyer_willingness_to_pay(seed: int, request_index: int, deal_id: str) -> float:
+    """The highest price this deal impression can clear at, for this request.
+
+    Seeded with a string: random.Random hashes str input with sha512 and is
+    stable across processes, unlike builtin hash(), which is salted per process
+    and made the previous implementation return different outcomes in different
+    orchestrator pods despite claiming determinism.
     """
-    records = _LOAD_TEST_SCENARIO.sample_outcomes(n=_LOAD_TEST_SAMPLE_POOL_SIZE, seed=4242)
-    # Indexed via random.Random over a string key rather than builtin hash().
-    # hash() is salted per process for str input (unless PYTHONHASHSEED is
-    # pinned), so the same (run_id, request_index, deal_id) produced different
-    # outcomes in different orchestrator pods -- the docstring's "deterministic"
-    # claim only held within a single process. random.Random seeds from a str via
-    # sha512, which is stable everywhere.
-    #
-    # KNOWN LIMITATION (tracked in
-    # aidlc-docs/construction/model-comparison-fix/tasks.md, task 2.6): this
-    # outcome still does not depend on the yield model's own decision -- the
-    # adjusted bidfloor / margin value never enters. The bid-shading path was
-    # fixed for this (loadtest_instrumentation.generate_outcome_sample now scores
-    # the container's real price against a seeded market), but the equivalent
-    # market model for floors/margins is an open design question. Until then, a
-    # canary-vs-stable comparison for the yield models would measure run_id, not
-    # the model, so do not present one as a model verdict.
-    rng = random.Random(f"deal-yield:{run_id}:{request_index}:{deal_id}")
-    record = records[rng.randrange(_LOAD_TEST_SAMPLE_POOL_SIZE)]
-    return record["won"], record["price_paid"]
+    rng = random.Random(f"deal-yield-demand:{seed}:{request_index}:{deal_id}")
+    return max(0.01, round(rng.gauss(_BUYER_VALUE_MEAN, _BUYER_VALUE_STD), 4))
+
+
+def _effective_price_and_revenue(event: DealYieldOutcomeEvent) -> tuple[float, float]:
+    """(price the buyer faces, sell-side revenue if it clears) for one decision.
+
+    ADJUST_DEAL_FLOOR sets the deal's floor directly, so the buyer faces the
+    adjusted floor and the publisher earns it on a clear. This is the classic
+    reserve-price tradeoff: raise the floor and each clear is worth more, but
+    fewer clear.
+
+    ADJUST_DEAL_MARGIN is the SSP's take, applied additively (see
+    yield_optimizer_margin/triton_inference.py -- margin is additive, floor is
+    multiplicative). PERCENT scales the original floor, CPM adds an absolute
+    amount (shared/artf_types.py: CPM=0, PERCENT=1). Either way a bigger take
+    raises the price the buyer faces and earns more per clear, so it has the same
+    shape of tradeoff. A negative margin is a discount: it clears more often and
+    earns less, which the arithmetic handles without a special case.
+    """
+    original = event.original_bidfloor
+
+    if event.intent == "ADJUST_DEAL_FLOOR":
+        floor = event.adjusted_bidfloor if event.adjusted_bidfloor is not None else original
+        return floor, floor
+
+    margin = event.margin_value if event.margin_value is not None else 0.0
+    if event.margin_calculation_type == MarginCalculationType.PERCENT:
+        return original * (1.0 + margin), original * margin
+    return original + margin, margin
+
+
+def _synthesize_load_test_outcome(
+    event: DealYieldOutcomeEvent, *, seed: int, request_index: int
+) -> tuple[bool, float | None, float]:
+    """Resolve one load-test deal outcome against the yield model's own decision.
+
+    Returns (cleared, price_paid, sell_side_revenue). The deal clears when a
+    buyer's willingness to pay covers the price the decision produced, and the
+    price paid is that price -- so the model's floor or margin determines both
+    whether it clears and what it earns.
+
+    Previously this drew (won, price_paid) from a fixed pool indexed by
+    hash((run_id, request_index, deal_id)), ignoring the adjusted floor and
+    margin entirely. The model could not affect its own outcome, and because
+    run_id is a fresh uuid4 per run, two runs differed even at an identical seed
+    -- so a canary-vs-stable comparison measured the run id rather than the
+    model. This mirrors the fix already made for bid shading in
+    loadtest_instrumentation.generate_outcome_sample.
+    """
+    effective_price, revenue = _effective_price_and_revenue(event)
+    cleared = buyer_willingness_to_pay(seed, request_index, event.deal_id) >= effective_price
+    if not cleared:
+        return False, None, 0.0
+    return True, round(effective_price, 4), round(revenue, 4)
 
 
 def emit_load_test_deal_yield_outcome(
@@ -224,6 +271,7 @@ def emit_load_test_deal_yield_outcome(
     *,
     run_id: str,
     request_index: int,
+    seed: int,
 ) -> list[float]:
     """Fire-and-forget: build and emit a DealYieldOutcomeEvent per
     adjust_deal-bearing mutation, with a real, disclosed synthetic
@@ -261,7 +309,9 @@ def emit_load_test_deal_yield_outcome(
             )
             if event is None:
                 continue
-            won, price_paid = _synthesize_load_test_outcome(run_id, request_index, event.deal_id)
+            won, price_paid, revenue = _synthesize_load_test_outcome(
+                event, seed=seed, request_index=request_index
+            )
             # DealYieldOutcomeEvent is frozen (model_config=ConfigDict(frozen=True)) --
             # model_copy(update=...) is pydantic's supported way to derive a
             # modified copy of an immutable model.
@@ -270,7 +320,10 @@ def emit_load_test_deal_yield_outcome(
                 _deal_yield_collector.emit(event),
                 description=f"load-test deal yield outcome emit (deal={event.deal_id})",
             )
-            samples.append(price_paid if won and price_paid is not None else 0.0)
+            # Sell-side revenue, not price_paid: for a margin decision the SSP
+            # earns its take, not the whole clearing price. For a floor decision
+            # the two coincide.
+            samples.append(revenue)
         except Exception:
             logger.warning("Failed to emit load-test deal yield outcome event", exc_info=True)
 

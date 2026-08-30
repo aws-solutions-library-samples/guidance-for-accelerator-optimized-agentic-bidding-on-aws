@@ -288,11 +288,23 @@ def _build_training_job_params(
     training_data_bucket: str,
     training_image_registry: str,
     xgboost_training_image_uri: str | None,
+    load_test_run_id: str = "",
 ) -> dict:
     """Builds the CreateTrainingJob params for model_type, branching by
     training shape (see _TRAINING_SHAPE). Raises
     XGBoostTrainingImageNotConfiguredError if model_type is xgboost-shaped
     and no image URI was supplied.
+
+    ``load_test_run_id`` is recorded as a hyperparameter purely as provenance:
+    which load-test run the operator selected when triggering this job. The
+    registration Lambda copies it onto the resulting model package version
+    (governance_eventbridge_cfn.yaml), so a later comparison can use that run as
+    its control.
+
+    It does NOT scope the training input. Both shapes read an entire S3 prefix
+    (`training-data/` or `training-data-deal-yield-*/`), which holds every run
+    swept so far -- so this is "the run this job was triggered from", not "the
+    only data it learned from". Anything presenting it must say so.
     """
     shape = _TRAINING_SHAPE.get(model_type, "nemo-rl")
     output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
@@ -309,6 +321,8 @@ def _build_training_job_params(
             "num_round": "100",
             "objective": "reg:squarederror",
         }
+        if load_test_run_id:
+            hyperparameters["load_test_run_id"] = load_test_run_id
     else:
         training_image = f"{training_image_registry}/artf-nemo-rl-training:{_IMAGE_TAG[model_type]}"
         training_data_prefix = "training-data"
@@ -319,6 +333,8 @@ def _build_training_job_params(
             "cadence_hours": "6.0",
             "triggered_by": "governance_ui_on_demand",
         }
+        if load_test_run_id:
+            hyperparameters["load_test_run_id"] = load_test_run_id
 
     return {
         "TrainingJobName": job_name,
@@ -356,6 +372,7 @@ def trigger_training(
     training_data_bucket: str,
     training_image_registry: str,
     xgboost_training_image_uri: str | None = None,
+    load_test_run_id: str = "",
 ) -> TrainingTriggerResult:
     """Start a real, fire-and-forget SageMaker training job.
 
@@ -391,6 +408,7 @@ def trigger_training(
         training_data_bucket=training_data_bucket,
         training_image_registry=training_image_registry,
         xgboost_training_image_uri=xgboost_training_image_uri,
+        load_test_run_id=load_test_run_id,
     )
 
     client = _sagemaker_client()

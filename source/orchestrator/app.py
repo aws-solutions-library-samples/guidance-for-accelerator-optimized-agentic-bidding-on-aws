@@ -788,7 +788,9 @@ try:
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
             sweep_status_handler as gov_sweep_status,
+            stage_canary_handler as gov_stage_canary,
             compare_handler as gov_compare,
+            comparison_pair_handler as gov_comparison_pair,
             promote_handler as gov_promote,
         )
     except ImportError:
@@ -798,7 +800,9 @@ try:
             eligible_runs_handler as gov_eligible_runs,
             trainable_runs_handler as gov_trainable_runs,
             sweep_status_handler as gov_sweep_status,
+            stage_canary_handler as gov_stage_canary,
             compare_handler as gov_compare,
+            comparison_pair_handler as gov_comparison_pair,
             promote_handler as gov_promote,
         )
     _GOVERNANCE_API_AVAILABLE = True
@@ -818,7 +822,9 @@ def _governance_routes(prefix: str) -> list:
         Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
         Route(f"{prefix}/v1/governance/trainable-runs", gov_trainable_runs, methods=["GET"]),
         Route(f"{prefix}/v1/governance/sweep-status", gov_sweep_status, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/comparison-pair", gov_comparison_pair, methods=["GET"]),
         Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
+        Route(f"{prefix}/v1/governance/stage-canary", gov_stage_canary, methods=["POST"]),
         Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
     ]
 

@@ -693,6 +693,12 @@ Resources:
                   'model_artifact_uri': model_artifact_uri,
                   'base_model_version': hyperparams.get('base_model_version', ''),
                   'window_days': hyperparams.get('window_days', ''),
+                  # Which load-test run the operator selected when triggering
+                  # this training job, so a later comparison can use that run as
+                  # the control. Empty for scheduled retraining, which has no
+                  # originating run. NOT a claim that the job trained only on
+                  # that run: the input is the whole training-data prefix.
+                  'load_test_run_id': hyperparams.get('load_test_run_id', ''),
               }
               for metric_name, value in metrics.items():
                   customer_metadata[f'metric_{metric_name}'] = str(value)

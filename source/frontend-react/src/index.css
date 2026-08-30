@@ -3068,6 +3068,11 @@ h1, h2, h3, .sg-display {
   color: #b45309; background: rgba(245, 158, 11, .12);
   border-radius: 20px; padding: 2px 8px; white-space: nowrap;
 }
+/* Qualifier under a preselected control run, stating which baseline it actually
+   is so a most-recent fallback is never read as the training data. */
+.cl-control-note {
+  margin-top: 4px; font-size: 11px; line-height: 1.45; color: var(--text-muted);
+}
 /* Glue failure text inside an honest-state block. Truncated inline with the full
    message on hover, since a Spark stack trace would otherwise dominate the card. */
 .cl-etl-error-detail {

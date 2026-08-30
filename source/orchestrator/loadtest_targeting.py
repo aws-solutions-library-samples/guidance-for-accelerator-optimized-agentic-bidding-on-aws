@@ -23,13 +23,35 @@ import httpx
 
 from shared.load_test_context import HEADER_NAME
 
-# The two model types with real Triton/canary infrastructure today (per
-# Question 3/4 of the load-test-outcome-capture unit's functional design).
+# The model types that can actually serve a targeted challenger request today.
 # widedeep_segment_activator/metrics_enricher are rule-based — kept in the
 # selectable set (Q4=B) so a future Triton/canary rollout for them doesn't
 # require an API contract change, but they report "not supported" rather
 # than attempting an override.
-CANARY_SUPPORTED_MODEL_TYPES = frozenset({"dlrm_bid_shader", "ncf_deal_manager"})
+#
+# The two yield models reach their canary a different way from the two
+# TensorRT-backed ones. dlrm_bid_shader/ncf_deal_manager pass a target_variant
+# INPUT to a Python-backend router model that owns the split. A FIL model
+# accepts only input__0, so the yield containers instead select the
+# ``<model>_canary`` model by NAME
+# (yield_optimizer_floor/triton_inference.py). Both end up serving the
+# requested variant, which is what this set is about.
+#
+# They were excluded while that routing did not exist. Including them then would
+# have been worse than excluding them: is_canary_staged() below only probes
+# whether the canary MODEL is loaded, so the check would have passed while the
+# container still inferred against the stable model — returning stable results
+# labelled challenger.
+#
+# Note this covers targeted load tests, not a live canary split: live traffic
+# never sets a variant, so it always reaches the stable model. A live split for
+# the yield models would still need a router of their own.
+CANARY_SUPPORTED_MODEL_TYPES = frozenset({
+    "dlrm_bid_shader",
+    "ncf_deal_manager",
+    "deal_yield_manager_floor",
+    "deal_yield_manager_margin",
+})
 
 TargetVariant = Literal["current", "challenger"]
 

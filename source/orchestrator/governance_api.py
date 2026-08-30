@@ -368,6 +368,104 @@ def _etl_health(job_name: str, job_runs: list[dict], latest_completion) -> dict:
     }
 
 
+# Model types Triton serves through its FIL backend. FIL loads a native XGBoost
+# artifact as-is, so staging a canary for these needs no TensorRT compile --
+# which is what makes on-demand staging possible from the orchestrator. The
+# nemo-rl-shaped types must be compiled first (see stage_canary_handler).
+_FIL_MODEL_TYPES = frozenset({"deal_yield_manager_floor", "deal_yield_manager_margin"})
+
+
+def _model_artifact_uri(sagemaker_client, version_arn: str) -> str:
+    """The trained artifact S3 URI for a registered model package version.
+
+    Prefers the CustomerMetadataProperties entry the registration Lambda writes
+    (governance_eventbridge_cfn.yaml), falling back to the
+    InferenceSpecification's ModelDataUrl, which SageMaker always populates.
+    Returns "" when neither is present rather than guessing a path.
+    """
+    detail = sagemaker_client.describe_model_package(ModelPackageName=version_arn)
+    from_metadata = (detail.get("CustomerMetadataProperties") or {}).get(
+        "model_artifact_uri", ""
+    )
+    if from_metadata:
+        return from_metadata
+    containers = (detail.get("InferenceSpecification") or {}).get("Containers") or []
+    return containers[0].get("ModelDataUrl", "") if containers else ""
+
+
+async def stage_canary_handler(request: Request) -> JSONResponse:
+    """POST /v1/governance/stage-canary
+
+    Body: {"model_type": str, "version_arn": str}. Stages a registered model
+    version as ``<model>_canary`` in the Triton repo so a challenger-targeted
+    load test can reach it.
+
+    Only the FIL-served model types are staged here. Triton's FIL backend reads
+    XGBoost's native format directly, so there is nothing to compile. The
+    TensorRT-served types (dlrm_bid_shader, ncf_deal_manager) need their ONNX
+    compiled into a model.plan by the Model Optimizer first; that orchestration
+    already lives in the Model Promotion Governance Agent, and this returns 422
+    pointing there rather than duplicating it -- and rather than appearing to
+    stage a canary that would never load.
+    """
+    body = await request.json()
+    model_type = body.get("model_type", "")
+    version_arn = body.get("version_arn", "")
+
+    if not model_type or not version_arn:
+        return JSONResponse(
+            {"error": "model_type and version_arn are required.", "reason": "bad_request"},
+            status_code=422,
+        )
+
+    if model_type not in _FIL_MODEL_TYPES:
+        return JSONResponse(
+            {
+                "error": (
+                    f"'{model_type}' is served by TensorRT, so a canary must be "
+                    "compiled from ONNX by the Model Optimizer before it can be "
+                    "staged. That runs in the Model Promotion Governance Agent, "
+                    "which is triggered automatically when a new model version is "
+                    "registered."
+                ),
+                "reason": "compile_required",
+                "fil_model_types": sorted(_FIL_MODEL_TYPES),
+            },
+            status_code=422,
+        )
+
+    try:
+        sagemaker_client = _sagemaker_client()
+        artifact_uri = _model_artifact_uri(sagemaker_client, version_arn)
+        if not artifact_uri:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"No model artifact URI recorded for '{version_arn}', so "
+                        "there is nothing to stage."
+                    ),
+                    "reason": "artifact_not_found",
+                },
+                status_code=422,
+            )
+        canary_model = await _triton_loader().stage_canary_fil(model_type, artifact_uri)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("stage_canary_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
+
+    return JSONResponse({
+        "model_type": model_type,
+        "version_arn": version_arn,
+        "artifact_uri": artifact_uri,
+        "canary_model": canary_model,
+        # Triton poll-loads from the repo, so the model is not servable the
+        # instant this returns. The caller should poll readiness (the load-test
+        # panel already refuses a challenger run until the canary reports ready)
+        # rather than assume it is live.
+        "ready": False,
+    }, status_code=202)
+
+
 async def training_estimate_handler(request: Request) -> JSONResponse:
     """GET /v1/governance/training-estimate?model_type=dlrm_bid_shader
 
@@ -399,15 +497,25 @@ async def training_estimate_handler(request: Request) -> JSONResponse:
 async def train_handler(request: Request) -> JSONResponse:
     """POST /v1/governance/train
 
-    Body: {"model_type": str, "confirmed": bool}.
+    Body: {"model_type": str, "confirmed": bool, "run_id"?: str}.
     Returns 202 with the started job's name/base_model_version on success.
     Returns 422 for a precondition failure (not trainable, not confirmed,
     already in progress, no approved base version) — reported plainly,
     never silently substituting a different outcome.
+
+    ``run_id`` is the load-test run the operator selected in the picker. It is
+    recorded as training provenance so a later comparison can use that run as its
+    control. The UI collected this selection but never sent it, so the resulting
+    model version had no link back to the run it was triggered from.
+
+    Provenance only: the training input is an entire S3 prefix containing every
+    swept run, so this identifies the run the job was triggered FROM, not the only
+    data it learned from.
     """
     body = await request.json()
     model_type = body.get("model_type", "")
     confirmed = bool(body.get("confirmed", False))
+    run_id = body.get("run_id", "") or ""
 
     sagemaker_role_arn = os.environ.get("SAGEMAKER_TRAINING_ROLE_ARN", "")
     model_bucket = os.environ.get("MODEL_BUCKET", "")
@@ -435,6 +543,7 @@ async def train_handler(request: Request) -> JSONResponse:
             training_data_bucket=training_data_bucket,
             training_image_registry=training_image_registry,
             xgboost_training_image_uri=xgboost_training_image_uri,
+            load_test_run_id=run_id,
         )
     except ModelTypeNotTrainableError as exc:
         return JSONResponse({"error": str(exc), "reason": "not_trainable"}, status_code=422)
@@ -489,6 +598,90 @@ async def eligible_runs_handler(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
 
     return JSONResponse({"runs": eligible, "most_recent": most_recent})
+
+
+async def comparison_pair_handler(request: Request) -> JSONResponse:
+    """GET /v1/governance/comparison-pair?model_type=dlrm_bid_shader
+
+    Suggests which two runs to compare, so the operator does not have to
+    remember which load test a challenger was trained from.
+
+    The control it prefers is the run recorded as the challenger version's
+    training trigger (``training_run_id``, written through the provenance chain in
+    training_trigger/governance_eventbridge_cfn.yaml). That answers the question
+    the comparison is really asking: did training on this data beat what that data
+    itself produced?
+
+    Reports ``control_source`` so the caller can label the pair truthfully rather
+    than implying provenance it does not have:
+
+    - ``training_provenance`` — the challenger version records its originating run
+      AND that run is still eligible as a control.
+    - ``most_recent`` — no usable provenance, so this falls back to the most
+      recent eligible current-variant run. Honest but weaker: it is not
+      necessarily the data the challenger learned from.
+    - ``none`` — nothing eligible to suggest.
+
+    Suggestion only. It performs no comparison, and the caller may override
+    either side; POST /v1/governance/compare still takes both ids explicitly.
+    """
+    model_type = request.query_params.get("model_type", "")
+
+    try:
+        history_fn = _get_loadtest_history_fn()
+        history = history_fn(limit=200)
+        eligible_current = list_eligible_runs(history, model_type, "current")
+        eligible_ids = {r.get("id") for r in eligible_current}
+
+        provenance_run_id = ""
+        challenger_version_arn = ""
+        try:
+            # Imported here, matching training_trigger._resolve_base_model_version's
+            # own lazy import of _model_group, which exists to avoid a module-level
+            # cycle between the two API modules.
+            from closed_loop_demo import readers
+            from orchestrator.closed_loop_api import _model_group
+
+            versions = readers.read_model_versions(
+                _sagemaker_client(), _model_group(model_type), limit=20
+            )
+        except Exception:  # noqa: BLE001 — a registry failure must not block a manual pick
+            logging.getLogger(__name__).exception("comparison_pair_handler: registry read failed")
+            versions = []
+        for version in versions:
+            if version.get("training_run_id"):
+                provenance_run_id = version["training_run_id"]
+                challenger_version_arn = version.get("model_package_arn") or ""
+                break
+
+        if provenance_run_id and provenance_run_id in eligible_ids:
+            control_run_id = provenance_run_id
+            control_source = "training_provenance"
+        else:
+            fallback = most_recent_eligible(history, model_type, "current")
+            control_run_id = (fallback or {}).get("id") or ""
+            control_source = "most_recent" if control_run_id else "none"
+
+        challenger = most_recent_eligible(history, model_type, "challenger")
+        challenger_run_id = (challenger or {}).get("id") or ""
+    except Exception as exc:
+        logging.getLogger(__name__).exception("comparison_pair_handler failed unexpectedly")
+        return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
+
+    return JSONResponse({
+        "model_type": model_type,
+        "control_run_id": control_run_id,
+        "control_source": control_source,
+        "challenger_run_id": challenger_run_id,
+        "challenger_version_arn": challenger_version_arn,
+        # Set when a version records provenance but that run is no longer an
+        # eligible control (aged out of history, or captured no samples). Surfaced
+        # rather than silently falling back, so the weaker pairing is visible.
+        "provenance_run_unavailable": bool(
+            provenance_run_id and provenance_run_id not in eligible_ids
+        ),
+        "provenance_run_id": provenance_run_id,
+    })
 
 
 async def compare_handler(request: Request) -> JSONResponse:

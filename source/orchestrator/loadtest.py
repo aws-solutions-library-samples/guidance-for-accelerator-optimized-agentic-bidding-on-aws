@@ -612,6 +612,7 @@ async def _run_load_test(
                         )
                         sample_values = emit_load_test_deal_yield_outcome(
                             req_model, resp_model, run_id=test_id, request_index=request_index,
+                            seed=seed,
                         )
                         outcome_sample_count += len(sample_values)
                         for sample_value in sample_values:
