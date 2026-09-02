@@ -18,18 +18,58 @@ const DURATIONS = [
 ];
 
 // Model types selectable for outcome/version capture (target_model_type).
-// Internal keys match the orchestrator's model-architecture naming (RENAME_MAP.md);
-// labels are the same job-oriented display names used elsewhere in the UI.
+// Only model types with a real training pipeline are offered — the whole point
+// of capturing outcomes is to produce training data, so a container you cannot
+// train on has nothing to capture for. This mirrors the Governance panel's
+// TRAINING_MODEL_TYPES (the authoritative backend set is
+// orchestrator.training_trigger.TRAINABLE_MODEL_TYPES): dlrm_bid_shader and the
+// Yield Optimizer's two independently-trained sub-models are trainable today.
+// ncf_deal_manager has a training pipeline but is parked (its outcome events
+// carry no deal_id yet), so it is shown disabled rather than removed. The
+// rule-based containers (Audience Activator / widedeep_segment_activator and
+// Signals Enricher / metrics_enricher) have no training pipeline at all and are
+// intentionally not listed. Internal keys match the orchestrator's
+// model-architecture naming (RENAME_MAP.md); labels are the job-oriented
+// display names used elsewhere in the UI.
 const TARGET_MODEL_TYPES = [
-  { value: "dlrm_bid_shader", label: "Bid Pricer" },
-  { value: "widedeep_segment_activator", label: "Audience Activator" },
-  { value: "ncf_deal_manager", label: "Deal Scorer" },
-  { value: "metrics_enricher", label: "Signals Enricher" },
-  // Two entries: each yield container is targeted on its own, and these
-  // values are also the training model types (see the orchestrator's
-  // _TARGET_MODEL_TYPES), so a run is directly usable as a training target.
-  { value: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
-  { value: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
+  { value: "dlrm_bid_shader", label: "Bid Pricer", trainable: true },
+  { value: "deal_yield_manager_floor", label: "Yield Optimizer — Floor", trainable: true },
+  { value: "deal_yield_manager_margin", label: "Yield Optimizer — Margin", trainable: true },
+  { value: "ncf_deal_manager", label: "Deal Scorer (parked — coming in a future release)", trainable: false },
+];
+
+// Traffic scenarios mirror the backend registry in orchestrator/loadtest.py
+// (TRAFFIC_SCENARIO_KEYS). Each shapes the SYNTHETIC requests this run
+// generates — the mix of publisher domains, IAB content categories, devices,
+// PMP deals and bid-floor ranges — to model a recognisable demand shape. This
+// changes the request inputs the pipeline processes; it does not replay real
+// traffic recorded during that event.
+const SCENARIOS = [
+  {
+    value: "baseline",
+    label: "Typical mixed traffic",
+    detail: "Broad, balanced mix of publishers, content categories and devices.",
+  },
+  {
+    value: "black_friday",
+    label: "Black Friday — retail surge",
+    detail: "Retail/commerce publishers, shopping & personal-finance content, mobile-heavy, elevated deal floors.",
+  },
+  {
+    value: "nfl_sunday",
+    label: "NFL Sunday — primetime sports",
+    detail: "Sports publishers, automotive & food advertisers, second-screen mobile/desktop mix, elevated floors.",
+  },
+  {
+    value: "holiday_season",
+    label: "Holiday season — Christmas shopping",
+    detail: "Broad retail, travel & gifting across shopping/travel/food content, mobile-leaning, sustained demand.",
+  },
+  {
+    value: "late_night_longtail",
+    label: "Late-night long-tail",
+    detail: "Off-peak news & entertainment browsing, thinner demand and lower floors.",
+  },
 ];
 
 /**
@@ -45,6 +85,8 @@ const TARGET_MODEL_TYPES = [
 export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   const [preset, setPreset] = useState("100");
   const [duration, setDuration] = useState(10);
+  // Traffic scenario shaping the synthetic requests generated this run.
+  const [scenario, setScenario] = useState("baseline");
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(null);
   const [result, setResult] = useState(null);
@@ -172,6 +214,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
           preset,
           seed: 42,
           duration_s: duration,
+          scenario,
           ...(targetModelType ? { target_model_type: targetModelType, target_variant: targetVariant } : {}),
         }),
       });
@@ -255,7 +298,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       setError(err.message);
       resetToIdle();
     }
-  }, [preset, duration, targetModelType, targetVariant, stopTest, resetToIdle, startPolling]);
+  }, [preset, duration, scenario, targetModelType, targetVariant, stopTest, resetToIdle, startPolling]);
 
   const totalRequests = PRESETS.find((p) => p.value === preset)?.requests || 0;
   const completedPct = progress ? ((progress.completed / progress.total) * 100).toFixed(1) : 0;
@@ -267,6 +310,31 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
         {running && (
           <span className="loadtest-elapsed">{elapsedDisplay}s</span>
         )}
+      </div>
+
+      {/* Traffic scenario — shapes the synthetic requests this run generates
+          (publisher / content category / device / deal / floor mix). This
+          changes the request inputs the pipeline processes; it does not replay
+          real traffic recorded during that event. */}
+      <div className="loadtest-scenario" aria-label="Traffic scenario">
+        <label className="loadtest-scenario-label">
+          Traffic scenario:
+          <select
+            className="loadtest-scenario-select"
+            value={scenario}
+            onChange={(e) => setScenario(e.target.value)}
+            disabled={running}
+            aria-label="Traffic scenario for synthetic request generation"
+            data-testid="loadtest-scenario-select"
+          >
+            {SCENARIOS.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
+            ))}
+          </select>
+        </label>
+        <p className="loadtest-scenario-detail" data-testid="loadtest-scenario-detail">
+          {SCENARIOS.find((s) => s.value === scenario)?.detail}
+        </p>
       </div>
 
       {/* Preset selector */}
@@ -331,7 +399,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
           >
             <option value="">None (latency/throughput only)</option>
             {TARGET_MODEL_TYPES.map((m) => (
-              <option key={m.value} value={m.value}>{m.label}</option>
+              <option key={m.value} value={m.value} disabled={!m.trainable}>{m.label}</option>
             ))}
           </select>
         </label>

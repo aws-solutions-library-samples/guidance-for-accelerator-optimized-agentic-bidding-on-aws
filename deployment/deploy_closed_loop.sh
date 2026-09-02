@@ -802,7 +802,28 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   if [[ -n "${PROXY_SUBNETS}" && -n "${GOV_SG}" && "${GOV_SG}" != "None" ]]; then
     # CloudFormation List<> params require commas escaped in the CLI shorthand.
     PROXY_SUBNETS_ESC="${PROXY_SUBNETS//,/\\,}"
-    OPTIMIZER_IMAGE="${REGISTRY}/${STACK_NAME}-model-optimizer:${IMAGE_TAG}"
+
+    # model-optimizer is built by deploy.sh (Step 4), not by this script, so its
+    # tag is whatever deploy.sh last pushed -- recorded in .image-outputs.json.
+    # IMAGE_TAG here is the current git HEAD, which is correct for the agent
+    # images this script builds itself but wrong for the optimizer: any commit
+    # made after the last deploy.sh run points the proxy Lambda at a tag that
+    # was never built, and every on-demand optimize Job then ImagePullBackOffs
+    # while holding a GPU reservation.
+    OPTIMIZER_TAG="$(jq -r '.ImageTag // empty' "${SCRIPT_DIR}/.image-outputs.json" 2>/dev/null || echo '')"
+    [[ -n "${OPTIMIZER_TAG}" ]] || OPTIMIZER_TAG="${IMAGE_TAG}"
+    OPTIMIZER_IMAGE="${REGISTRY}/${STACK_NAME}-model-optimizer:${OPTIMIZER_TAG}"
+
+    # Verify the tag resolves before baking it into the Lambda. Failing here is
+    # far cheaper than a promotion that dies 15 min later on an image pull.
+    if ! aws ecr describe-images \
+          --repository-name "${STACK_NAME}-model-optimizer" \
+          --image-ids "imageTag=${OPTIMIZER_TAG}" \
+          --region "${AWS_REGION}" >/dev/null 2>&1; then
+      fail "model-optimizer:${OPTIMIZER_TAG} not found in ECR. The optimize Jobs the governance agent launches would fail to pull it. Run deploy.sh (Step 4) to build and push the image first, then re-run this script."
+    fi
+    log "  Optimizer image: ${OPTIMIZER_IMAGE}"
+
     JOB_NAMESPACE="default"
     deploy_cfn_stack "${VPC_PROXY_STACK}" "${SCRIPT_DIR}/vpc_proxy_cfn.yaml" \
       "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \

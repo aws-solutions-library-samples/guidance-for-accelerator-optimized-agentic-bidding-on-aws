@@ -1017,7 +1017,16 @@ _source_hash() {
     widedeep-segment-activator|metrics-enricher)
       paths=("${src}/Dockerfile" "${src}/shared" "${src}/containers/${key//-/_}") ;;
     orchestrator)
-      paths=("${src}/Dockerfile.orchestrator" "${src}/shared" "${src}/agents" "${src}/closed_loop_demo" "${src}/orchestrator") ;;
+      # The three deployment/ files are listed individually because
+      # Dockerfile.orchestrator COPYs exactly those, not the whole directory
+      # (governance_api imports TritonModelLoader from deployment.model_deployer).
+      # They were missing here, so editing one changed the image without changing
+      # the hash — the gate would report "content unchanged" and reuse a stale
+      # image, which is the exact failure it exists to prevent.
+      paths=("${src}/Dockerfile.orchestrator" "${src}/shared" "${src}/agents" \
+             "${src}/closed_loop_demo" "${src}/orchestrator" \
+             "${src}/deployment/model_deployer.py" "${src}/deployment/canary_deployer.py" \
+             "${src}/deployment/__init__.py") ;;
     agentcore)
       paths=("${src}/Dockerfile.agentcore" "${src}/shared" "${src}/containers" "${src}/agentcore") ;;
     model-optimizer)
