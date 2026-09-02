@@ -189,7 +189,7 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
           )}
         </select>
         <button
-          className="btn-secondary sg-interactive"
+          className="btn btn-secondary sg-interactive"
           data-testid="sweep-status-refresh-button"
           onClick={fetchStatus}
           disabled={checking}

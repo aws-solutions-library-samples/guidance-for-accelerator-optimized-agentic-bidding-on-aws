@@ -524,94 +524,6 @@ export default function GovernancePanel() {
         </p>
       </div>
 
-      {/* Pipeline bar — icon steps at the TOP of the page, matching the
-          prototype's layout order. Always visible; reflects real state once
-          a scenario runs (default = all "done"/grey before any run). */}
-      <PipelineBar
-        nodes={nodes.length > 0 ? nodes : DEFAULT_PIPELINE_NODES}
-        revealed={nodes.length > 0 ? revealed : DEFAULT_PIPELINE_NODES.length}
-        running={running}
-      />
-
-      {/* Controls — simple single row: model select first (drives which
-          scenarios are selectable), scenario select, run button. */}
-      <div className="cl-controls-bar">
-        <div className="cl-control-group">
-          <label htmlFor="cl-gov-model">Model:</label>
-          <select
-            id="cl-gov-model"
-            className="cl-select sg-interactive"
-            value={modelType}
-            onChange={(e) => handleModelChange(e.target.value)}
-            disabled={running}
-          >
-            {MODEL_TYPES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
-          </select>
-        </div>
-        <div className="cl-control-group">
-          <label htmlFor="cl-gov-scenario">Scenario:</label>
-          <select
-            id="cl-gov-scenario"
-            className="cl-select sg-interactive"
-            value={selected || ""}
-            onChange={(e) => setSelected(e.target.value)}
-            disabled={running}
-          >
-            {scenariosForModel.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
-          </select>
-        </div>
-        <button className="btn btn-primary sg-interactive" onClick={runScenario} disabled={!selected || running}>
-          {running ? <><span className="spinner" /> Running…</> : "Run governance scenario"}
-        </button>
-        {selected && <span className="cl-run-status">Selected: {selected}</span>}
-      </div>
-
-      {/* Consolidated: selected scenario's detail next to only the selected
-          model's mutation-intent card, side by side (not a grid of every
-          scenario/model at once). */}
-      <div className="cl-mutation-grid">
-        <ScenarioDetailCard
-          s={scenariosForModel.find((s) => s.key === selected)}
-          onViewSamples={setSamplesScenario}
-        />
-        <MutationIntentCard
-          modelKey={modelType}
-          decision={lastDecision}
-          agentModelType={lastModelType}
-        />
-      </div>
-
-      {/* Governance result — verdict card + bidstream impact, matching
-          DESIGN_BRIEF.md section 4. */}
-      <div className="cl-mutation-grid">
-        <GovernanceVerdictCard
-          decision={lastDecision}
-          rationale={lastRationale}
-          unavailableReason={lastDecision ? agentUnavailableReason("governance") : null}
-        />
-        <BidstreamImpactCard modelType={lastModelType || modelType} />
-      </div>
-
-      {runError && <div className="cl-honest cl-honest-block">Run failed: {runError}</div>}
-
-      {/* Step log and session history also pair up rather than each taking a
-          full-width row for a few lines of content. Both render their own
-          .cl-card, so they align without extra wrappers. */}
-      <div className="cl-side-by-side">
-        {/* Step-by-step governance flow — simple text log per stage, replacing
-            the bulkier per-stage detail cards. */}
-        <StepByStepLog nodes={nodes} revealed={revealed} />
-
-        {/* Session audit trail — real decisions from this browser session, matching
-            DESIGN_BRIEF.md section 6 (never a write into the real audit table). */}
-        <div className="cl-card sg-elevated">
-          <div className="cl-card-head">
-            <span className="cl-card-title">Session decision history</span>
-          </div>
-          <SessionAuditTrail entries={sessionAudit} />
-        </div>
-      </div>
-
       {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
           estimate + explicit confirmation + concurrency-guarded trigger.
           Has its own model selector (decoupled from the general one above)
@@ -924,6 +836,106 @@ export default function GovernancePanel() {
         <button className="btn-secondary sg-interactive" onClick={refreshState} style={{ padding: "5px 12px" }}>Refresh</button>
       </div>
       <ModelsView versions={models} error={stateError.models} />
+
+      {/* Governance Agent Testing — the synthetic A/B scenario harness. Demoted
+          below the operational cards above and collapsed by default: this runs
+          the REAL promotion gate (Welch's t-test + SPRT) and the deployed
+          governance agent's explanation against a chosen A/B scenario. It is a
+          decision demo and does NOT send traffic through the pipeline — the
+          Load Test panel's traffic scenarios do that. The scenario selector
+          lives here (rather than as a top-level control) because it only drives
+          this testing harness. */}
+      <details className="cl-collapsible" data-testid="governance-agent-testing">
+        <summary className="cl-collapsible-summary">Governance Agent Testing</summary>
+        <div className="cl-collapsible-body">
+          <p className="cl-collapsible-note">
+            Runs the real A/B promotion gate (Welch&apos;s t-test + SPRT) and the
+            deployed governance agent&apos;s explanation against a synthetic A/B
+            scenario. This is a decision demo — it does not send traffic through
+            the pipeline. To shape synthetic <em>traffic</em>, use the Load Test
+            panel&apos;s traffic scenarios.
+          </p>
+
+          {/* Pipeline bar — reflects real state once a scenario runs (default =
+              all "done"/grey before any run). */}
+          <PipelineBar
+            nodes={nodes.length > 0 ? nodes : DEFAULT_PIPELINE_NODES}
+            revealed={nodes.length > 0 ? revealed : DEFAULT_PIPELINE_NODES.length}
+            running={running}
+          />
+
+          {/* Controls — model select first (drives which scenarios are
+              selectable), scenario select, run button. */}
+          <div className="cl-controls-bar">
+            <div className="cl-control-group">
+              <label htmlFor="cl-gov-model">Model:</label>
+              <select
+                id="cl-gov-model"
+                className="cl-select sg-interactive"
+                value={modelType}
+                onChange={(e) => handleModelChange(e.target.value)}
+                disabled={running}
+              >
+                {MODEL_TYPES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+              </select>
+            </div>
+            <div className="cl-control-group">
+              <label htmlFor="cl-gov-scenario">Scenario:</label>
+              <select
+                id="cl-gov-scenario"
+                className="cl-select sg-interactive"
+                value={selected || ""}
+                onChange={(e) => setSelected(e.target.value)}
+                disabled={running}
+              >
+                {scenariosForModel.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+              </select>
+            </div>
+            <button className="btn btn-primary sg-interactive" onClick={runScenario} disabled={!selected || running}>
+              {running ? <><span className="spinner" /> Running…</> : "Run governance scenario"}
+            </button>
+            {selected && <span className="cl-run-status">Selected: {selected}</span>}
+          </div>
+
+          {/* Selected scenario's detail next to the selected model's
+              mutation-intent card. */}
+          <div className="cl-mutation-grid">
+            <ScenarioDetailCard
+              s={scenariosForModel.find((s) => s.key === selected)}
+              onViewSamples={setSamplesScenario}
+            />
+            <MutationIntentCard
+              modelKey={modelType}
+              decision={lastDecision}
+              agentModelType={lastModelType}
+            />
+          </div>
+
+          {/* Governance result — verdict card + bidstream impact. */}
+          <div className="cl-mutation-grid">
+            <GovernanceVerdictCard
+              decision={lastDecision}
+              rationale={lastRationale}
+              unavailableReason={lastDecision ? agentUnavailableReason("governance") : null}
+            />
+            <BidstreamImpactCard modelType={lastModelType || modelType} />
+          </div>
+
+          {runError && <div className="cl-honest cl-honest-block">Run failed: {runError}</div>}
+
+          {/* Step log + session decision history. */}
+          <div className="cl-side-by-side">
+            <StepByStepLog nodes={nodes} revealed={revealed} />
+
+            <div className="cl-card sg-elevated">
+              <div className="cl-card-head">
+                <span className="cl-card-title">Session decision history</span>
+              </div>
+              <SessionAuditTrail entries={sessionAudit} />
+            </div>
+          </div>
+        </div>
+      </details>
 
       {samplesScenario && (
         <SampleOutcomesModal scenario={samplesScenario} onClose={() => setSamplesScenario(null)} />

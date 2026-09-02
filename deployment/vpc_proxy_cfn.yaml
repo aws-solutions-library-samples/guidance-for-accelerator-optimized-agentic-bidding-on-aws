@@ -219,6 +219,13 @@ Resources:
                   "spec": {
                       "backoffLimit": 0,
                       "ttlSecondsAfterFinished": 600,
+                      # Bounds a Job that never starts. ttlSecondsAfterFinished only
+                      # reaps Jobs that reached Complete/Failed, so a pod stuck in
+                      # Pending or ImagePullBackOff stays active=1 forever while
+                      # holding its nvidia.com/gpu reservation -- which starves Triton
+                      # off the only GPU node. 1800s clears the 900s TensorRT compile
+                      # ceiling and still forces a terminal state that TTL can collect.
+                      "activeDeadlineSeconds": 1800,
                       "template": {
                           "metadata": {"labels": {"app": "model-optimizer", "role": "on-demand"}},
                           "spec": {

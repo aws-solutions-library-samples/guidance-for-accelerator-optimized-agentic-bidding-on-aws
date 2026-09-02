@@ -21,6 +21,7 @@ import os
 import random
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncGenerator, Literal
 
 import httpx
@@ -132,6 +133,11 @@ class LoadTestRequest(BaseModel):
         "deal_yield_manager_floor", "deal_yield_manager_margin",
     ] | None = None
     target_variant: Literal["current", "challenger"] = "current"
+    # Traffic scenario shaping the synthetic requests (see TrafficProfile).
+    # Validated against the registry in start_loadtest (422 on unknown) rather
+    # than a Literal here, so the registry stays the single source of truth.
+    # Defaults to the broad baseline mix, reproducing the pre-scenario behavior.
+    scenario: str = "baseline"
 
 
 class LoadTestStatus(BaseModel):
@@ -163,6 +169,9 @@ class LoadTestStatus(BaseModel):
     model_version: str = ""
     target_model_type: str = ""
     target_variant: str = "current"
+    # Traffic scenario this run used (see TrafficProfile). Recorded so history
+    # and comparisons can show which demand shape a run exercised.
+    scenario: str = "baseline"
     canary_supported: bool = False
     canary_staged: bool = False
     # outcome_sample_count: how many BidShadingOutcomeEvents were actually emitted
@@ -250,35 +259,251 @@ def _cleanup_expired() -> None:
 # Seeded PRNG payload generator — uses scenario templates with variations
 # ---------------------------------------------------------------------------
 
-_DOMAINS = [
-    "espn.com", "cnn.com", "techcrunch.com", "nytimes.com", "weather.com",
-    "yelp.com", "reddit.com", "amazon.com", "walmart.com", "target.com",
-]
+# A load test's synthetic requests are shaped by a selectable *traffic
+# scenario* (TrafficProfile). A scenario is NOT a replay of real observed
+# traffic — it is a deterministic synthetic profile that biases which publisher
+# domains, IAB content categories, devices, PMP deals and bid-floor ranges the
+# generated OpenRTB requests draw from, so a run can exercise the pipeline under
+# a recognisable demand shape (a retail surge, a sports primetime window, an
+# off-peak lull) rather than one flat uniform mix. Same (seed, scenario) => the
+# same request sequence, so runs stay reproducible and comparable.
+#
+# The containers really process whatever these profiles generate, so the
+# resulting latency and mutation behaviour is real for that request mix. The
+# downstream win/price/CTR *outcome* model used for training/comparison (see
+# loadtest_instrumentation._LOAD_TEST_SCENARIO) is deliberately fixed and is NOT
+# changed by the traffic scenario — a scenario shapes the request inputs, never
+# a pre-decided result.
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Safari/17.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Mobile/15E148",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120.0 Mobile",
-    "Mozilla/5.0 (iPad; CPU OS 17_0) AppleWebKit/605.1",
-]
+# Device user agents keyed by form factor so a profile can skew the device mix
+# by repeating entries (weighted random.choice), not just list them.
+_USER_AGENTS = {
+    "desktop_win": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0",
+    "desktop_mac": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Safari/17.0",
+    "mobile_ios": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Mobile/15E148",
+    "mobile_android": "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120.0 Mobile",
+    "tablet_ipad": "Mozilla/5.0 (iPad; CPU OS 17_0) AppleWebKit/605.1",
+}
 
 _BANNER_SIZES = [
     (728, 90), (300, 250), (160, 600), (320, 50),
     (970, 250), (300, 600), (468, 60), (336, 280),
 ]
 
-_IAB_CATS = ["IAB1", "IAB2", "IAB3", "IAB7", "IAB9", "IAB12", "IAB17", "IAB19", "IAB20"]
 
-_DEAL_IDS = [
-    "deal-premium-auto", "deal-standard-sports", "deal-luxury-travel",
-    "deal-tech-enterprise", "deal-finance-wealth", "deal-health-wellness",
-]
+@dataclass(frozen=True)
+class TrafficProfile:
+    """A selectable synthetic traffic shape for a load-test run.
 
-# Base scenario templates that produce real mutations from the containers
-_SCENARIO_TEMPLATES = [
-    # Template 1: Full fan-out (all intents, rich data)
-    lambda rng, idx: {
+    Every field is a *pool the generator samples from* (or a numeric range), not
+    a fixed value — the scenario biases the distribution of generated requests,
+    it does not hand-pick individual ones. ``user_agents`` may repeat an entry
+    to skew the device mix via weighted ``random.choice``.
+    """
+
+    key: str
+    label: str
+    description: str
+    domains: tuple[str, ...]
+    iab_cats: tuple[str, ...]
+    user_agents: tuple[str, ...]
+    deal_ids: tuple[str, ...]
+    # (min, max) uniform ranges for the three price-like fields the templates set.
+    bidfloor_range: tuple[float, float]
+    deal_floor_range: tuple[float, float]
+    bid_price_range: tuple[float, float]
+
+
+# Real IAB Content Taxonomy tier-1 category IDs are used throughout so the
+# category signal the containers see is well-formed:
+#   IAB1 Arts&Entertainment, IAB2 Automotive, IAB3 Business, IAB7 Health&Fitness,
+#   IAB8 Food&Drink, IAB9 Hobbies&Interests, IAB12 News, IAB13 Personal Finance,
+#   IAB17 Sports, IAB19 Technology, IAB20 Travel, IAB22 Shopping.
+
+_BASELINE_PROFILE = TrafficProfile(
+    key="baseline",
+    label="Typical mixed traffic",
+    description=(
+        "A broad, balanced mix of publishers, content categories and devices — "
+        "the default when no particular event is being modelled."
+    ),
+    domains=(
+        "espn.com", "cnn.com", "techcrunch.com", "nytimes.com", "weather.com",
+        "yelp.com", "reddit.com", "amazon.com", "walmart.com", "target.com",
+    ),
+    iab_cats=("IAB1", "IAB2", "IAB3", "IAB7", "IAB9", "IAB12", "IAB17", "IAB19", "IAB20"),
+    user_agents=tuple(_USER_AGENTS.values()),
+    deal_ids=(
+        "deal-premium-auto", "deal-standard-sports", "deal-luxury-travel",
+        "deal-tech-enterprise", "deal-finance-wealth", "deal-health-wellness",
+    ),
+    bidfloor_range=(1.0, 8.0),
+    deal_floor_range=(1.0, 10.0),
+    bid_price_range=(3.0, 12.0),
+)
+
+_BLACK_FRIDAY_PROFILE = TrafficProfile(
+    key="black_friday",
+    label="Black Friday — retail surge",
+    description=(
+        "Weighted toward retail/commerce publishers, shopping and personal-finance "
+        "content, mobile devices, and elevated deal floors — the shape of a Black "
+        "Friday demand spike. Shapes request content only; not a replay of real "
+        "Black Friday traffic."
+    ),
+    domains=(
+        "amazon.com", "walmart.com", "target.com", "bestbuy.com",
+        "ebay.com", "etsy.com", "reddit.com",
+    ),
+    iab_cats=("IAB22", "IAB13", "IAB1", "IAB19"),
+    # Mobile-heavy: shoppers on phones. iOS/Android repeated to skew the mix.
+    user_agents=(
+        _USER_AGENTS["mobile_ios"], _USER_AGENTS["mobile_ios"],
+        _USER_AGENTS["mobile_android"], _USER_AGENTS["mobile_android"],
+        _USER_AGENTS["desktop_win"], _USER_AGENTS["tablet_ipad"],
+    ),
+    deal_ids=(
+        "deal-retail-doorbuster", "deal-electronics-blowout",
+        "deal-premium-auto", "deal-finance-wealth",
+    ),
+    bidfloor_range=(3.0, 14.0),
+    deal_floor_range=(4.0, 16.0),
+    bid_price_range=(5.0, 20.0),
+)
+
+_NFL_SUNDAY_PROFILE = TrafficProfile(
+    key="nfl_sunday",
+    label="NFL Sunday — primetime sports",
+    description=(
+        "Sports publishers and content, automotive and food-and-drink advertisers, "
+        "and a second-screen mobile/desktop device mix with elevated floors during "
+        "the game window."
+    ),
+    domains=(
+        "espn.com", "cbssports.com", "nfl.com", "foxsports.com",
+        "bleacherreport.com", "yahoo.com",
+    ),
+    iab_cats=("IAB17", "IAB2", "IAB8", "IAB1"),
+    user_agents=(
+        _USER_AGENTS["mobile_ios"], _USER_AGENTS["mobile_android"],
+        _USER_AGENTS["desktop_win"], _USER_AGENTS["desktop_mac"],
+        _USER_AGENTS["tablet_ipad"],
+    ),
+    deal_ids=(
+        "deal-sports-primetime", "deal-standard-sports",
+        "deal-premium-auto", "deal-food-beverage",
+    ),
+    bidfloor_range=(2.5, 12.0),
+    deal_floor_range=(3.0, 14.0),
+    bid_price_range=(4.0, 16.0),
+)
+
+_HOLIDAY_PROFILE = TrafficProfile(
+    key="holiday_season",
+    label="Holiday season — Christmas shopping",
+    description=(
+        "Broad holiday retail, travel and gifting across shopping, travel and "
+        "food content, mobile-leaning, with sustained elevated demand."
+    ),
+    domains=(
+        "amazon.com", "walmart.com", "target.com", "etsy.com",
+        "expedia.com", "booking.com", "nytimes.com",
+    ),
+    iab_cats=("IAB22", "IAB20", "IAB8", "IAB1", "IAB7"),
+    user_agents=(
+        _USER_AGENTS["mobile_ios"], _USER_AGENTS["mobile_ios"],
+        _USER_AGENTS["mobile_android"], _USER_AGENTS["desktop_win"],
+        _USER_AGENTS["tablet_ipad"],
+    ),
+    deal_ids=(
+        "deal-holiday-gifting", "deal-luxury-travel",
+        "deal-retail-doorbuster", "deal-food-beverage",
+    ),
+    bidfloor_range=(2.0, 11.0),
+    deal_floor_range=(3.0, 13.0),
+    bid_price_range=(4.0, 15.0),
+)
+
+_LATE_NIGHT_PROFILE = TrafficProfile(
+    key="late_night_longtail",
+    label="Late-night long-tail",
+    description=(
+        "Off-peak news and entertainment browsing on desktop and mobile, with "
+        "thinner demand and lower floors."
+    ),
+    domains=(
+        "reddit.com", "cnn.com", "nytimes.com", "techcrunch.com",
+        "theverge.com", "weather.com", "yelp.com",
+    ),
+    iab_cats=("IAB1", "IAB12", "IAB19", "IAB9"),
+    user_agents=(
+        _USER_AGENTS["desktop_win"], _USER_AGENTS["desktop_mac"],
+        _USER_AGENTS["mobile_ios"], _USER_AGENTS["mobile_android"],
+    ),
+    deal_ids=(
+        "deal-standard-sports", "deal-tech-enterprise", "deal-health-wellness",
+    ),
+    bidfloor_range=(0.5, 4.0),
+    deal_floor_range=(1.0, 5.0),
+    bid_price_range=(1.5, 8.0),
+)
+
+# Registry. TRAFFIC_SCENARIO_KEYS is the tuple the API/UI validate against;
+# DEFAULT_SCENARIO reproduces the pre-scenario broad uniform mix.
+_TRAFFIC_PROFILES: dict[str, TrafficProfile] = {
+    p.key: p
+    for p in (
+        _BASELINE_PROFILE,
+        _BLACK_FRIDAY_PROFILE,
+        _NFL_SUNDAY_PROFILE,
+        _HOLIDAY_PROFILE,
+        _LATE_NIGHT_PROFILE,
+    )
+}
+TRAFFIC_SCENARIO_KEYS: tuple[str, ...] = tuple(_TRAFFIC_PROFILES)
+DEFAULT_SCENARIO = _BASELINE_PROFILE.key
+
+
+def get_traffic_profile(scenario: str | None) -> TrafficProfile:
+    """Resolve a scenario key to its TrafficProfile.
+
+    Raises KeyError for an unknown key so the route can answer 422 rather than
+    silently substituting a different traffic shape than the caller asked for.
+    ``None``/empty resolves to the baseline profile (the pre-scenario default).
+    """
+    if not scenario:
+        return _BASELINE_PROFILE
+    try:
+        return _TRAFFIC_PROFILES[scenario]
+    except KeyError as exc:
+        raise KeyError(
+            f"Unknown load-test scenario '{scenario}'. "
+            f"Valid scenarios: {sorted(_TRAFFIC_PROFILES)}."
+        ) from exc
+
+
+def _rand_ifa(rng: random.Random) -> str:
+    """A UUID-shaped device advertising ID (four rng draws, matching the
+    original inline form so per-template draw order is unchanged)."""
+    return (
+        f"{rng.randint(10000000, 99999999):08x}-{rng.randint(1000, 9999):04x}-"
+        f"4{rng.randint(100, 999):03x}-{rng.randint(1000, 9999):04x}-"
+        f"{rng.randint(100000000000, 999999999999):012x}"
+    )
+
+
+def _rand_ip(rng: random.Random) -> str:
+    return f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+
+
+# Scenario templates that produce real mutations from the containers. Each takes
+# the run's TrafficProfile and draws domains/categories/devices/deals/floors
+# from it, so the SAME template yields a Black-Friday-shaped or NFL-shaped
+# request depending on the scenario.
+def _tmpl_full(rng: random.Random, idx: int, p: TrafficProfile) -> dict:
+    """Full fan-out (all intents, rich data)."""
+    banner = rng.choice(_BANNER_SIZES)
+    return {
         "id": f"lt-full-{idx}",
         "tmax": 100,
         "applicable_intents": ALL_INTENTS,
@@ -287,20 +512,20 @@ _SCENARIO_TEMPLATES = [
             "imp": [
                 {
                     "id": f"imp-{idx}-0",
-                    "banner": {"w": rng.choice(_BANNER_SIZES)[0], "h": rng.choice(_BANNER_SIZES)[1]},
+                    "banner": {"w": banner[0], "h": banner[1]},
                     "pos": rng.randint(1, 3),
-                    "bidfloor": round(rng.uniform(1.0, 8.0), 2),
+                    "bidfloor": round(rng.uniform(*p.bidfloor_range), 2),
                     "pmp": {
                         "deals": [
-                            {"id": rng.choice(_DEAL_IDS), "bidfloor": round(rng.uniform(2.0, 10.0), 2), "at": 1},
-                            {"id": rng.choice(_DEAL_IDS), "bidfloor": round(rng.uniform(1.0, 5.0), 2), "at": 2},
+                            {"id": rng.choice(p.deal_ids), "bidfloor": round(rng.uniform(*p.deal_floor_range), 2), "at": 1},
+                            {"id": rng.choice(p.deal_ids), "bidfloor": round(rng.uniform(*p.deal_floor_range), 2), "at": 2},
                         ]
                     },
                 }
             ],
             "site": {
-                "domain": rng.choice(_DOMAINS),
-                "cat": [rng.choice(_IAB_CATS), rng.choice(_IAB_CATS)],
+                "domain": rng.choice(p.domains),
+                "cat": [rng.choice(p.iab_cats), rng.choice(p.iab_cats)],
             },
             "user": {
                 "id": f"user-{rng.randint(100000, 999999)}",
@@ -309,9 +534,9 @@ _SCENARIO_TEMPLATES = [
                 "data": [{"segment": [{"id": f"seg-{rng.randint(100, 999)}"}]}],
             },
             "device": {
-                "ifa": f"{rng.randint(10000000, 99999999):08x}-{rng.randint(1000, 9999):04x}-4{rng.randint(100, 999):03x}-{rng.randint(1000, 9999):04x}-{rng.randint(100000000000, 999999999999):012x}",
-                "ip": f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}",
-                "ua": rng.choice(_USER_AGENTS),
+                "ifa": _rand_ifa(rng),
+                "ip": _rand_ip(rng),
+                "ua": rng.choice(p.user_agents),
                 "geo": {
                     "lat": round(rng.uniform(25.0, 48.0), 4),
                     "lon": round(rng.uniform(-122.0, -73.0), 4),
@@ -321,71 +546,85 @@ _SCENARIO_TEMPLATES = [
                 },
             },
         },
-    },
-    # Template 2: Bid shading scenario (with bid_response)
-    lambda rng, idx: {
+    }
+
+
+def _tmpl_shade(rng: random.Random, idx: int, p: TrafficProfile) -> dict:
+    """Bid shading scenario (with bid_response)."""
+    return {
         "id": f"lt-shade-{idx}",
         "tmax": 100,
         "applicable_intents": ["BID_SHADE", "ADD_METRICS"],
         "bid_request": {
             "id": f"br-{idx}",
-            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 728, "h": 90}, "pos": 1, "bidfloor": round(rng.uniform(1.0, 4.0), 2)}],
-            "site": {"domain": rng.choice(_DOMAINS), "cat": [rng.choice(_IAB_CATS)]},
+            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 728, "h": 90}, "pos": 1, "bidfloor": round(rng.uniform(*p.bidfloor_range), 2)}],
+            "site": {"domain": rng.choice(p.domains), "cat": [rng.choice(p.iab_cats)]},
             "user": {"id": f"user-{rng.randint(100000, 999999)}", "yob": rng.randint(1970, 2000)},
-            "device": {"ua": rng.choice(_USER_AGENTS), "ip": f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"},
+            "device": {"ua": rng.choice(p.user_agents), "ip": _rand_ip(rng)},
         },
         "bid_response": {
-            "seatbid": [{"bid": [{"id": f"bid-{idx}", "impid": f"imp-{idx}-0", "price": round(rng.uniform(3.0, 12.0), 2)}]}]
+            "seatbid": [{"bid": [{"id": f"bid-{idx}", "impid": f"imp-{idx}-0", "price": round(rng.uniform(*p.bid_price_range), 2)}]}]
         },
-    },
-    # Template 3: Segment activation (behavioral + location)
-    lambda rng, idx: {
+    }
+
+
+def _tmpl_segment(rng: random.Random, idx: int, p: TrafficProfile) -> dict:
+    """Segment activation (behavioral + location)."""
+    return {
         "id": f"lt-seg-{idx}",
         "tmax": 100,
         "applicable_intents": ["ACTIVATE_SEGMENTS", "ADD_METRICS"],
         "bid_request": {
             "id": f"br-{idx}",
-            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 300, "h": 250}, "pos": rng.randint(1, 3), "bidfloor": round(rng.uniform(1.0, 5.0), 2)}],
-            "site": {"domain": rng.choice(_DOMAINS), "cat": [rng.choice(_IAB_CATS), rng.choice(_IAB_CATS)]},
+            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 300, "h": 250}, "pos": rng.randint(1, 3), "bidfloor": round(rng.uniform(*p.bidfloor_range), 2)}],
+            "site": {"domain": rng.choice(p.domains), "cat": [rng.choice(p.iab_cats), rng.choice(p.iab_cats)]},
             "user": {"id": f"user-{rng.randint(100000, 999999)}", "yob": rng.randint(1965, 2000), "gender": rng.choice(["M", "F"])},
             "device": {
-                "ifa": f"{rng.randint(10000000, 99999999):08x}-{rng.randint(1000, 9999):04x}-4{rng.randint(100, 999):03x}-{rng.randint(1000, 9999):04x}-{rng.randint(100000000000, 999999999999):012x}",
-                "ip": f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}",
-                "ua": rng.choice(_USER_AGENTS),
+                "ifa": _rand_ifa(rng),
+                "ip": _rand_ip(rng),
+                "ua": rng.choice(p.user_agents),
                 "geo": {"lat": round(rng.uniform(25.0, 48.0), 4), "lon": round(rng.uniform(-122.0, -73.0), 4), "type": 1, "country": "USA"},
             },
         },
-    },
-    # Template 4: Identity resolution + deals
-    lambda rng, idx: {
+    }
+
+
+def _tmpl_identity(rng: random.Random, idx: int, p: TrafficProfile) -> dict:
+    """Identity resolution + deals."""
+    return {
         "id": f"lt-id-{idx}",
         "tmax": 100,
         "applicable_intents": ["ADD_CIDS", "ACTIVATE_DEALS", "ADD_METRICS"],
         "bid_request": {
             "id": f"br-{idx}",
-            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 320, "h": 50}, "pos": 1, "bidfloor": round(rng.uniform(1.0, 4.0), 2),
-                     "pmp": {"deals": [{"id": rng.choice(_DEAL_IDS), "bidfloor": round(rng.uniform(2.0, 8.0), 2)}]}}],
-            "site": {"domain": rng.choice(_DOMAINS), "cat": [rng.choice(_IAB_CATS)]},
+            "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 320, "h": 50}, "pos": 1, "bidfloor": round(rng.uniform(*p.bidfloor_range), 2),
+                     "pmp": {"deals": [{"id": rng.choice(p.deal_ids), "bidfloor": round(rng.uniform(*p.deal_floor_range), 2)}]}}],
+            "site": {"domain": rng.choice(p.domains), "cat": [rng.choice(p.iab_cats)]},
             "user": {"id": f"user-{rng.randint(100000, 999999)}", "yob": rng.randint(1970, 1995), "data": [{"segment": [{"id": f"seg-{rng.randint(100, 999)}"}]}]},
             "device": {
-                "ifa": f"{rng.randint(10000000, 99999999):08x}-{rng.randint(1000, 9999):04x}-4{rng.randint(100, 999):03x}-{rng.randint(1000, 9999):04x}-{rng.randint(100000000000, 999999999999):012x}",
-                "ip": f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}",
-                "ua": rng.choice(_USER_AGENTS),
+                "ifa": _rand_ifa(rng),
+                "ip": _rand_ip(rng),
+                "ua": rng.choice(p.user_agents),
                 "geo": {"country": "USA", "region": rng.choice(["CA", "NY", "TX", "FL", "IL"])},
             },
         },
-    },
-]
+    }
 
 
-def generate_payload(rng: random.Random, index: int) -> dict:
-    """Generate a varied RTBRequest by picking a scenario template and randomizing inputs.
+_SCENARIO_TEMPLATES = (_tmpl_full, _tmpl_shade, _tmpl_segment, _tmpl_identity)
 
-    Uses known-good scenario structures that produce real mutations from the containers.
-    Same seed always produces the same sequence.
+
+def generate_payload(rng: random.Random, index: int, profile: TrafficProfile | None = None) -> dict:
+    """Generate a varied RTBRequest by picking a template and drawing its
+    content from the run's traffic ``profile``.
+
+    Uses known-good request structures that produce real mutations from the
+    containers. Same (seed, profile) always produces the same sequence. A None
+    profile falls back to the baseline (broad uniform) mix.
     """
+    profile = profile or _BASELINE_PROFILE
     template = rng.choice(_SCENARIO_TEMPLATES)
-    return template(rng, index)
+    return template(rng, index, profile)
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +715,7 @@ async def _run_load_test(
     duration_s: int,
     target_model_type: str | None = None,
     target_variant: str = "current",
+    scenario: str = DEFAULT_SCENARIO,
 ) -> None:
     """Execute the load test asynchronously.
 
@@ -508,6 +748,15 @@ async def _run_load_test(
 
     rng = random.Random(seed)
 
+    # Resolve the traffic scenario shaping this run's requests. Unknown keys are
+    # rejected before the run starts (start_loadtest); this defensive fallback
+    # keeps a direct _run_load_test caller on the baseline mix rather than
+    # raising mid-run.
+    try:
+        profile = get_traffic_profile(scenario)
+    except KeyError:
+        profile = get_traffic_profile(DEFAULT_SCENARIO)
+
     # Initialize shared progress data
     _progress_latencies[test_id] = []
     _progress_errors[test_id] = 0
@@ -519,8 +768,8 @@ async def _run_load_test(
     start_time = _progress_start_time[test_id]
     deadline = start_time + duration_s  # absolute monotonic deadline
 
-    # Pre-generate all payloads for reproducibility
-    payloads = [generate_payload(rng, i) for i in range(total)]
+    # Pre-generate all payloads for reproducibility, shaped by the scenario.
+    payloads = [generate_payload(rng, i, profile) for i in range(total)]
 
     # Get all containers (full fan-out since applicable_intents includes all)
     active_containers = _filter_containers(ALL_INTENTS)
@@ -735,6 +984,7 @@ async def _run_load_test(
         model_version=aggregated_model_version,
         target_model_type=target_model_type or "",
         target_variant=target_variant,
+        scenario=profile.key,
         canary_supported=canary_supported(target_model_type) if target_model_type else False,
         canary_staged=(
             await is_canary_staged(target_model_type)
@@ -898,6 +1148,13 @@ async def start_loadtest(request: Request) -> JSONResponse:
         except CanaryNotStagedError as exc:
             return JSONResponse({"error": str(exc), "reason": "no_canary_staged"}, status_code=422)
 
+    # Validate the traffic scenario up front so an unknown key is a plain 422,
+    # never a silent fallback to a different traffic shape than was requested.
+    try:
+        get_traffic_profile(req.scenario)
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc), "reason": "unknown_scenario"}, status_code=422)
+
     test_id = f"lt-{uuid.uuid4().hex[:12]}"
     config = PRESET_CONFIG[req.preset]
 
@@ -921,6 +1178,7 @@ async def start_loadtest(request: Request) -> JSONResponse:
         per_container=[],
         target_model_type=req.target_model_type or "",
         target_variant=req.target_variant,
+        scenario=req.scenario,
     )
     _cancel_flags[test_id] = False
 
@@ -930,6 +1188,7 @@ async def start_loadtest(request: Request) -> JSONResponse:
             test_id, req.preset, req.seed, req.duration_s,
             target_model_type=req.target_model_type,
             target_variant=req.target_variant,
+            scenario=req.scenario,
         )
     )
 
