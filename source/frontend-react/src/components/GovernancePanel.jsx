@@ -24,17 +24,17 @@ const DEFAULT_PIPELINE_NODES = [
 // models (per DESIGN_BRIEF.md — Wide&Deep is rule-based, no canary/A-B loop).
 // The model selector filters the scenario list, so picking a model actually
 // changes which real scenario/decision can run — not just a display label.
-// NCF still has full scenario/compare/promote support (no training data
-// needed there), so it stays in this general selector even though it's
-// parked for the training section below (see TRAINING_MODEL_TYPES).
+// NCF still has full scenario support in the testing harness (no training
+// data needed there), so it stays in this general selector even though it's
+// parked for the training section (see TRAINING_MODEL_TYPES).
 const MODEL_TYPES = [
   { key: "dlrm_bid_shader", label: "DLRM Bid Shader" },
   { key: "ncf_deal_manager", label: "NCF Deal Manager" },
 ];
 
 // Training-specific model selector for the "Train from load test" card,
-// decoupled from MODEL_TYPES above (which also drives scenario/compare/
-// promote — those work fine for NCF). Three real trainable model types
+// decoupled from MODEL_TYPES above (which drives the scenario testing
+// harness — that works fine for NCF). Three real trainable model types
 // exist today (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES,
 // the authoritative backend enforcement): dlrm_bid_shader (NeMo-RL) and
 // the Yield Optimizer's two independently-trained sub-models,
@@ -524,26 +524,22 @@ export default function GovernancePanel() {
         </p>
       </div>
 
-      {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
-          estimate + explicit confirmation + concurrency-guarded trigger.
-          Has its own model selector (decoupled from the general one above)
-          since ncf_deal_manager training is parked while scenario/compare/
-          promote still work for it. */}
-      {/* Train and Compare sit side by side: both are compact forms (two
-          selects and a button) that were each spanning the full page width
-          with most of it empty. Collapses to one column under 980px. The
-          step-by-step log, session history and model registry below stay
-          full-width -- those hold logs and tables that actually use it. */}
+      {/* Load-test outcome pipeline and Train-from-load-test sit side by side:
+          the pipeline card shows which runs a Glue ETL sweep has moved into the
+          training bucket, and the training card trains from one of them. Both
+          are compact forms; collapses to one column under 980px. The step log,
+          session history and model registry below stay full-width. */}
       <div className="cl-side-by-side">
       <section className="cl-side-by-side-col">
-      {/* Sweep status stacks directly above the training picker in the SAME
-          column, because it answers that picker's most common question: a load
-          test that just finished is missing from it until a Glue ETL sweep has
-          swept its outcomes into the training bucket. Its stage bar uses the
-          compact sizing in .cl-sweep-card so four stages fit a half-width
-          column without wrapping. */}
       <div className="cl-section-title">Load test outcome pipeline</div>
       <LoadTestSweepStatus onRunBecameTrainable={fetchTrainableRuns} />
+      </section>
+
+      {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
+          estimate + explicit confirmation + concurrency-guarded trigger. Its
+          own model selector (decoupled from the general one) since
+          ncf_deal_manager training is parked. */}
+      <section className="cl-side-by-side-col">
       <div className="cl-section-title">Train from load test</div>
       <div className="cl-card sg-elevated" data-testid="governance-train-card">
         <div className="cl-control-group">
@@ -711,11 +707,13 @@ export default function GovernancePanel() {
 
       </section>
 
+      </div>
+
       {/* Compare load-test outcomes (FR-7/FR-8, Story 5) + Promote
-          (FR-9/FR-10, Story 6). Every result below is labeled by source —
-          load-test-derived, distinct from the automated pipeline's
-          live-canary-CloudWatch-derived decisions above. */}
-      <section className="cl-side-by-side-col">
+          (FR-9/FR-10, Story 6) — its own full-width row below the pipeline/train
+          row. Every result below is labeled by source — load-test-derived,
+          distinct from the automated pipeline's live-canary-CloudWatch-derived
+          decisions. */}
       <div className="cl-section-title">Compare load-test outcomes</div>
       <div className="cl-card sg-elevated" data-testid="governance-compare-card">
         {eligibleRunsError && (
@@ -825,9 +823,6 @@ export default function GovernancePanel() {
             )}
           </div>
         )}
-      </div>
-
-      </section>
       </div>
 
       <div className="cl-section-title">Model registry</div>

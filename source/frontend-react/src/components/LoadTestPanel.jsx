@@ -35,7 +35,7 @@ const TARGET_MODEL_TYPES = [
   { value: "dlrm_bid_shader", label: "Bid Pricer", trainable: true },
   { value: "deal_yield_manager_floor", label: "Yield Optimizer — Floor", trainable: true },
   { value: "deal_yield_manager_margin", label: "Yield Optimizer — Margin", trainable: true },
-  { value: "ncf_deal_manager", label: "Deal Scorer (parked — coming in a future release)", trainable: false },
+  { value: "ncf_deal_manager", label: "Deal Scorer (future)", trainable: false },
 ];
 
 // Traffic scenarios mirror the backend registry in orchestrator/loadtest.py
@@ -397,7 +397,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
             aria-label="Target model type for outcome capture"
             data-testid="loadtest-target-model-select"
           >
-            <option value="">None (latency/throughput only)</option>
+            {/*<option value="">None (latency/throughput only)</option>*/}
             {TARGET_MODEL_TYPES.map((m) => (
               <option key={m.value} value={m.value} disabled={!m.trainable}>{m.label}</option>
             ))}

@@ -671,33 +671,99 @@ _GPU_NODEGROUP = os.environ.get("GPU_NODEGROUP_NAME", "gpu-inference")
 _AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", os.environ.get("AWS_REGION", "us-east-1"))
 
 
+# Upper bound on a legitimate cold start, measured from the node group's last
+# scaling change: EC2 provisioning + node join, then the ~15GB
+# nvcr.io/nvidia/tritonserver image pull (~6 min observed on g5.xlarge).
+# Past this the pod is not "loading" any more -- something is wrong and the UI
+# must say so rather than showing an indefinite progress state.
+_TRITON_START_GRACE_S = 720
+
+
+def _humanize_duration(seconds: float) -> str:
+    """Coarse duration for operator-facing status text ("4d 17h", not "6666 min")."""
+    total = int(seconds)
+    if total < 3600:
+        return f"{max(1, total // 60)} min"
+    if total < 86400:
+        h, m = divmod(total // 60, 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, rem_h = divmod(total // 3600, 24)
+    return f"{d}d {rem_h}h" if rem_h else f"{d}d"
+
+
 async def gpu_status(request: Request) -> JSONResponse:
-    """GET /v1/gpu/status — return current GPU node group scaling state + Triton readiness."""
+    """GET /v1/gpu/status — return GPU node group scaling state + Triton readiness.
+
+    Reports a distinct `blocked` state when the node group has been settled at
+    desiredSize>0 for longer than a cold start can account for. Triton spent 4
+    days unschedulable (stale optimize Jobs held both GPUs) while this endpoint
+    reported only `tritonReady: false`, which the UI rendered as "starting" --
+    a permanent deadlock displayed as normal startup. The probe result is
+    returned as evidence so the UI can show why, not just that.
+    """
     import boto3
     try:
         eks = boto3.client("eks", region_name=_AWS_REGION)
         ng = eks.describe_nodegroup(clusterName=_EKS_CLUSTER, nodegroupName=_GPU_NODEGROUP)
         scaling = ng["nodegroup"]["scalingConfig"]
         ng_status = ng["nodegroup"]["status"]
+        desired = scaling["desiredSize"]
 
-        # Also check if Triton is actually serving (pod ready)
+        # Seconds since the node group's last scaling change. Server-side
+        # timestamp from EKS, so it survives orchestrator restarts and is
+        # consistent across replicas.
+        settled_for = None
+        modified_at = ng["nodegroup"].get("modifiedAt")
+        if modified_at is not None:
+            try:
+                settled_for = max(0.0, time.time() - modified_at.timestamp())
+            except AttributeError:
+                settled_for = max(0.0, time.time() - float(modified_at))
+
+        # Probe Triton, keeping the outcome as evidence rather than collapsing
+        # it to a bare bool.
         triton_ready = False
-        if scaling["desiredSize"] > 0:
+        triton_detail = None
+        if desired > 0:
             triton_url = os.environ.get("TRITON_URL", "triton-inference-server:8000")
             try:
                 async with httpx.AsyncClient(timeout=2.0) as tc:
                     resp = await tc.get(f"http://{triton_url}/v2/health/ready")
                     triton_ready = resp.status_code == 200
-            except Exception:
-                pass
+                    if not triton_ready:
+                        triton_detail = f"/v2/health/ready returned HTTP {resp.status_code}"
+            except Exception as exc:
+                triton_detail = f"{type(exc).__name__} connecting to {triton_url}"
+        else:
+            triton_detail = "GPU node group scaled to zero"
+
+        if desired == 0:
+            triton_state = "stopped"
+        elif ng_status == "UPDATING":
+            triton_state = "scaling_up" if desired > 0 else "scaling_down"
+        elif triton_ready:
+            triton_state = "ready"
+        elif settled_for is None or settled_for < _TRITON_START_GRACE_S:
+            triton_state = "starting"
+        else:
+            triton_state = "blocked"
+            triton_detail = (
+                f"Triton has not become ready in {_humanize_duration(settled_for)} since the GPU "
+                f"node group settled at {desired} node(s) — longer than a cold start takes. "
+                f"Last probe: {triton_detail}. Check: kubectl describe pod -l app=triton "
+                f"(a Pending pod usually means nothing has a free nvidia.com/gpu)."
+            )
 
         return JSONResponse({
             "status": ng_status,
-            "desiredSize": scaling["desiredSize"],
+            "desiredSize": desired,
             "minSize": scaling["minSize"],
             "maxSize": scaling["maxSize"],
-            "running": scaling["desiredSize"] > 0 and triton_ready,
+            "running": desired > 0 and triton_ready,
             "tritonReady": triton_ready,
+            "tritonState": triton_state,
+            "tritonDetail": triton_detail,
+            "secondsSinceNodegroupChange": int(settled_for) if settled_for is not None else None,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
