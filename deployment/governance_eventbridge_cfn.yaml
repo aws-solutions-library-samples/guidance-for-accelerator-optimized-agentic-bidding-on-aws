@@ -118,6 +118,15 @@ Parameters:
     Description: EventBridge Scheduler rate expression for scheduled retraining.
 
 Conditions:
+  # Base retraining/registration infrastructure. The single retraining-trigger
+  # Lambda, the registration Lambda, and the job-completion rule all handle
+  # EVERY model type, so they require only the NeMo-RL essentials: the training
+  # role, the buckets, the training image registry, and the DLRM/NCF model
+  # package groups. They are deliberately NOT gated on the Yield Optimizer's
+  # XGBoost config. Previously they were, which meant a missing
+  # XGBoostTrainingImageUri (e.g. when the sagemaker SDK wasn't available at
+  # deploy time to resolve it) silently removed the entire registration path and
+  # left completed DLRM/NCF training jobs with nothing to register them.
   HasRetrainingConfig: !And
     - !Not [!Equals [!Ref SageMakerTrainingExecutionRoleArn, '']]
     - !Not [!Equals [!Ref ModelBucketName, '']]
@@ -125,6 +134,15 @@ Conditions:
     - !Not [!Equals [!Ref TrainingImageRegistry, '']]
     - !Not [!Equals [!Ref DLRMModelPackageGroupName, '']]
     - !Not [!Equals [!Ref NCFModelPackageGroupName, '']]
+
+  # Yield Optimizer (XGBoost floor/margin) retraining is fully configured only
+  # when both yield model package groups AND the built-in XGBoost image URI are
+  # present. This gates nothing structurally (the shared Lambdas above serve all
+  # model types); it is surfaced as an output, and the Lambdas check the same
+  # values at runtime so a yield job is skipped honestly when they are unset,
+  # rather than failing DLRM/NCF alongside it.
+  HasYieldRetrainingConfig: !And
+    - !Condition HasRetrainingConfig
     - !Not [!Equals [!Ref DealYieldManagerFloorModelPackageGroupName, '']]
     - !Not [!Equals [!Ref DealYieldManagerMarginModelPackageGroupName, '']]
     - !Not [!Equals [!Ref XGBoostTrainingImageUri, '']]
@@ -470,7 +488,14 @@ Resources:
                       # XGBoostTrainingImageUri parameter) rather than
                       # guessed here -- SageMaker-owned account IDs per
                       # region are not something to hardcode.
-                      training_image = os.environ['XGBOOST_TRAINING_IMAGE_URI']
+                      training_image = os.environ.get('XGBOOST_TRAINING_IMAGE_URI', '')
+                      if not training_image:
+                          # Yield retraining is not fully configured on this
+                          # deployment (no built-in XGBoost image URI resolved).
+                          # Skip this model type honestly rather than starting a
+                          # job with an empty image; DLRM/NCF are unaffected.
+                          skipped[model_type] = 'xgboost_image_uri_not_configured'
+                          continue
                       hyperparameters = {
                           'base_model_version': base_version,
                           'max_depth': '6',
@@ -704,7 +729,15 @@ Resources:
                   customer_metadata[f'metric_{metric_name}'] = str(value)
 
               if shape == "xgboost":
-                  training_image = os.environ['XGBOOST_TRAINING_IMAGE_URI']
+                  training_image = os.environ.get('XGBOOST_TRAINING_IMAGE_URI', '')
+                  if not training_image:
+                      # Yield retraining is not fully configured (no built-in
+                      # XGBoost image URI on this deployment). Skip registration
+                      # honestly rather than calling create_model_package with an
+                      # empty image. DLRM/NCF registration is unaffected -- this
+                      # is the runtime half of the HasRetrainingConfig /
+                      # HasYieldRetrainingConfig decoupling.
+                      return {'status': 'skipped', 'reason': 'xgboost_image_uri_not_configured', 'job': job_name}
               else:
                   registry = os.environ['TRAINING_IMAGE_REGISTRY']
                   training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
@@ -932,3 +965,11 @@ Outputs:
       - HasRetrainingConfig
       - !GetAtt RetrainingRegistrationFunction.Arn
       - ''
+
+  YieldRetrainingConfigured:
+    Description: >-
+      Whether the Yield Optimizer (XGBoost floor/margin) retraining path is fully
+      configured (both yield model package groups and the built-in XGBoost image
+      URI are present). 'false' does NOT disable DLRM/NCF retraining/registration
+      -- only the yield path is skipped honestly at runtime.
+    Value: !If [HasYieldRetrainingConfig, 'true', 'false']

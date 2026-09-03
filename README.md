@@ -2,7 +2,7 @@
 
 Run AI models that price bids, activate audience segments, and manage private marketplace deals in real time — accelerated by NVIDIA GPUs, deployed on Amazon EKS.
 
-> 📄 **Full guidance document:** See [GUIDANCE.md](GUIDANCE.md) for the complete published guidance, including architecture details, model specifications, scaling scenarios, and Well-Architected analysis.
+> 📄 **Full guidance documents:** This Guidance is published in two parts. [GUIDANCE.md](GUIDANCE.md) covers **Part 1** — the real-time, GPU-accelerated bidding pipeline. [GUIDANCE-part2.md](GUIDANCE-part2.md) covers **Part 2** — the closed-loop learning system: bid-outcome capture, retraining (including the Yield Optimizer's XGBoost floor and margin models), and model-promotion governance. Each includes architecture details, model specifications, scaling scenarios, and Well-Architected analysis.
 
 ## Table of Contents
 
@@ -228,7 +228,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
 4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
 
-5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any single container — including either yield container, selectable independently. This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
+5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any single container — including either yield container, selectable independently. This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. A **Traffic scenario** selector shapes the synthetic requests each run generates — a balanced default, or recognisable demand shapes such as a Black Friday retail surge or NFL-Sunday sports traffic (each a weighted mix of publisher domains, content categories, devices, and deal-floor ranges). It shapes the request inputs the pipeline processes; it does not replay real traffic recorded during those events. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
 
 ## Go deeper
 
@@ -236,7 +236,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
 ![Architecture](assets/images/architecture.svg)
 
-An Amazon EKS cluster runs two node groups: a `g5`-family GPU node group (NVIDIA A10G, or the more powerful Amazon EC2 G7e) running NVIDIA Triton Inference Server, and a `c5.xlarge` CPU node group running the orchestrator and the bidding containers. Two containers — the bid pricer and the deal scorer — call Triton for GPU-accelerated inference; the audience activator and signals enricher are deterministic rule engines on CPU; the yield optimizer calls Triton's Forest Inference Library backend for its XGBoost model. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; an optional Amazon Bedrock AgentCore runtime exposes the same pipeline over MCP.
+An Amazon EKS cluster runs two node groups: a `g5`-family GPU node group (NVIDIA A10G, or the more powerful Amazon EC2 G7e) running NVIDIA Triton Inference Server, and a `c5.xlarge` CPU node group running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference — the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; an optional Amazon Bedrock AgentCore runtime exposes the same pipeline over MCP.
 
 Full component-by-component detail, model specifications, and a request-flow diagram: [assets/images/architecture.md](assets/images/architecture.md). Container-naming history (what changed, what didn't, and why): [RENAME_MAP.md](RENAME_MAP.md).
 
@@ -268,7 +268,7 @@ Running the GPU node 24/7 instead of on the included schedule raises the total t
 
 ```bash
 aws --version                                    # AWS CLI v2, with credentials configured
-pip install boto3 torch onnx onnxscript          # Python 3.11+
+pip install boto3 torch onnx onnxscript sagemaker  # Python 3.11+ (deploy.sh auto-installs sagemaker when Part 2 is enabled)
 brew install jq eksctl kubectl                   # or your Linux package manager
 docker buildx version                            # only needed for --local-build
 ```
@@ -337,8 +337,10 @@ The **Governance** page drives the whole loop from a load test. Each step gates 
 the previous one finishing, so the order matters:
 
 1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
-   outcomes for* (e.g. **Bid Pricer**), leave the variant on **Current (stable)**,
-   and run a batch. Only the selected target's responses are captured as outcomes.
+   outcomes for* (e.g. **Bid Pricer**) — the list shows only models that have a
+   training pipeline — leave the variant on **Current (stable)**, optionally pick a
+   **Traffic scenario** to shape the synthetic requests, and run a batch. Only the
+   selected target's responses are captured as outcomes.
 2. **Wait for the sweep — about 6 minutes.** Outcomes reach S3 through Kinesis
    Firehose, which buffers up to 300s by default
    (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into

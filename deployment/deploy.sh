@@ -51,7 +51,8 @@
 #
 # Prerequisites:
 #   - AWS CLI v2 with credentials
-#   - Python 3.11+ with boto3, torch, onnx, onnxscript
+#   - Python 3.11+ with boto3, torch, onnx, onnxscript (and sagemaker for the
+#     default Part 2 closed-loop stack — deploy.sh installs it automatically)
 #   - jq, eksctl, kubectl
 #   - Docker with buildx (only if using --local-build)
 # =============================================================================
@@ -307,6 +308,18 @@ if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
   ${PYTHON} -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"
 fi
 
+# sagemaker SDK: needed only for the Part 2 closed-loop path — resolving the
+# built-in XGBoost training image URI (below) and registering genesis model
+# versions (Step 5, register_genesis_models.py). It is NOT required for a
+# Part 1-only deploy, so it is installed here conditionally rather than added
+# to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
+# empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
+# the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
+if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! ${PYTHON} -c "import sagemaker" 2>/dev/null; then
+  log "Installing missing Python package: sagemaker (required for closed-loop retraining)"
+  ${PYTHON} -m pip install --quiet sagemaker || fail "pip install failed for: sagemaker (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
+fi
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account"
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -373,6 +386,13 @@ _XGB_URI_RE='^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/[^[:space:]]+$
 if [[ -n "${XGBOOST_TRAINING_IMAGE_URI}" && ! "${XGBOOST_TRAINING_IMAGE_URI}" =~ ${_XGB_URI_RE} ]]; then
   warn "Ignoring unexpected XGBoost training image URI from the sagemaker SDK (not a single-line ECR URI); on-demand yield retraining will report 503 until this resolves cleanly."
   XGBOOST_TRAINING_IMAGE_URI=""
+fi
+# Surface an empty resolution rather than letting it pass silently: with the
+# sagemaker SDK now installed above (when retraining is on), an empty value
+# here means the retrieve itself failed (e.g. region/version), which the UI
+# would otherwise only reveal as a 503 at "Train from load test" time.
+if [[ "${WITH_RETRAINING}" -eq 1 && -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
+  warn "Could not resolve the SageMaker built-in XGBoost training image URI; on-demand Yield Optimizer (floor/margin) training will report a 503 in the UI until this resolves. NeMo-RL models (Bid Pricer, Deal Scorer) are unaffected."
 fi
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
