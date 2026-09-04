@@ -365,31 +365,51 @@ def export_to_onnx(model: nn.Module, model_type: str, output_dir: str) -> str:
 
     output_path = os.path.join(output_dir, "model.onnx")
 
-    # Create dummy input matching the model's expected input shape.
-    # DLRMModel.forward() (models/__init__.py) slices a single combined
-    # tensor into dense [:NUM_DENSE] and sparse [NUM_DENSE:NUM_DENSE+NUM_SPARSE]
-    # — width 4+3=7, not 4. A width-4 dummy previously went unnoticed because
-    # earlier bugs (empty parquet glob, then an empty feature tensor) meant
-    # training always failed before reaching export.
     if model_type == "dlrm_bid_shader":
-        from models import NUM_DENSE, NUM_SPARSE
-        dummy = torch.randn(1, NUM_DENSE + NUM_SPARSE)
-        input_names = ["features"]
+        # Export the SERVING signature so the retrained artifact is loadable by
+        # dlrm_bid_shader_stable/_canary and compilable by the Model Optimizer:
+        # four named inputs (dense_features FP32 [b,4]; sparse_user/domain/device
+        # INT64 [b]) and a sigmoid'd ctr_prediction output. DLRMExportModel wraps
+        # the trained net (reusing its weights) and applies the sigmoid + I/O
+        # naming; see source/triton/export_models.py::export_dlrm, which this
+        # mirrors byte-for-byte so training output == served contract.
+        from models import DLRMExportModel, NUM_DENSE
+
+        export_model = DLRMExportModel(model).eval()
+        dense = torch.randn(1, NUM_DENSE)
+        s_user = torch.tensor([1], dtype=torch.int64)
+        s_domain = torch.tensor([1], dtype=torch.int64)
+        s_device = torch.tensor([1], dtype=torch.int64)
+
+        torch.onnx.export(
+            export_model,
+            (dense, s_user, s_domain, s_device),
+            output_path,
+            input_names=["dense_features", "sparse_user", "sparse_domain", "sparse_device"],
+            output_names=["ctr_prediction"],
+            dynamic_axes={
+                "dense_features": {0: "batch"},
+                "sparse_user": {0: "batch"},
+                "sparse_domain": {0: "batch"},
+                "sparse_device": {0: "batch"},
+                "ctr_prediction": {0: "batch"},
+            },
+            opset_version=17,
+            dynamo=False,
+        )
     elif model_type == "ncf_deal_manager":
         dummy = torch.randn(1, 2)  # [user_id, item_id] as floats for export
-        input_names = ["features"]
+        torch.onnx.export(
+            model,
+            dummy,
+            output_path,
+            input_names=["features"],
+            output_names=["output"],
+            dynamic_axes={"features": {0: "batch_size"}},
+            opset_version=17,
+        )
     else:
         raise ValueError(f"Unknown model_type for ONNX export: {model_type}")
-
-    torch.onnx.export(
-        model,
-        dummy,
-        output_path,
-        input_names=input_names,
-        output_names=["output"],
-        dynamic_axes={input_names[0]: {0: "batch_size"}},
-        opset_version=17,
-    )
 
     logger.info("Exported ONNX model to %s (%.2f MB)", output_path, os.path.getsize(output_path) / 1e6)
     return output_path

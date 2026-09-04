@@ -114,6 +114,7 @@ class ModelPromotionGovernanceAgent:
         ab_test_config: ABTestConfig | None = None,
         evaluation_interval_seconds: float = 600.0,
         collect_metrics: Callable[..., Any] | None = None,
+        stage_for_comparison: bool = False,
     ) -> GovernanceDecision:
         """Run the full validation pipeline for a new model version.
 
@@ -136,9 +137,18 @@ class ModelPromotionGovernanceAgent:
             evaluation_interval_seconds: How often to evaluate the AB test (default 600s).
             collect_metrics: Async callable that returns (control_data, treatment_data, guardrail_data).
                             If None, uses a no-op that returns empty data (for testing).
+            stage_for_comparison: When True (a load-test-triggered version), stop
+                            after optimize + canary-stage at 0% traffic and return a
+                            "staged" decision — no A/B test, no auto-promote, registry
+                            status left unchanged. The operator runs the comparison
+                            manually. When False (default; scheduled retraining), the
+                            full automated optimize → canary → A/B → promote/reject
+                            pipeline runs (Steps 2-6 below).
 
         Returns:
-            GovernanceDecision with decision, reason, and metrics.
+            GovernanceDecision with decision, reason, and metrics. ``decision`` is
+            "staged" in the stage_for_comparison path, else one of
+            "promote"/"reject"/"inconclusive".
         """
         # Default AB test configuration
         if ab_test_config is None:
@@ -175,6 +185,57 @@ class ModelPromotionGovernanceAgent:
                 model_type, version_arn, "reject", reason, decision.metrics
             )
             return decision
+
+        # Stage-only branch (load-test-triggered version): the operator wants to
+        # compare this version against the current one MANUALLY, so we stage it as
+        # the challenger canary and stop — no automated A/B, no auto-promote. It is
+        # deployed at 0% live traffic (the load-test challenger override still
+        # reaches it by variant, so real auction traffic is never affected), and
+        # the registry approval status is left unchanged (PendingManualApproval):
+        # staging is not an approval, and the operator's later Promote remains the
+        # real approval action. Scheduled retraining (stage_for_comparison=False)
+        # keeps the full automated pipeline below.
+        if stage_for_comparison:
+            try:
+                await self._canary_deployer.deploy_canary(
+                    model_name=model_type,
+                    artifact_uri=optimized_uri,
+                    initial_traffic_pct=0.0,
+                    canary_version_arn=version_arn,
+                )
+            except Exception as e:
+                reason = f"Canary staging failed: {e}"
+                logger.error(reason)
+                metrics = {"stage": "stage_for_comparison", "error": str(e)}
+                # A staging failure is operational, not a model-quality rejection,
+                # so the registry status is left untouched — the version stays
+                # eligible once the transient cause (e.g. optimizer capacity) clears.
+                await self._write_audit_record(
+                    model_type, version_arn, "reject", reason, metrics
+                )
+                return GovernanceDecision(
+                    decision="reject",
+                    reason=reason,
+                    model_type=model_type,
+                    version_arn=version_arn,
+                    metrics=metrics,
+                )
+
+            reason = (
+                "Staged as challenger canary for manual comparison "
+                "(load-test-triggered version); no automated A/B run."
+            )
+            metrics = {"stage": "staged_for_comparison", "canary_traffic_pct": 0.0}
+            await self._write_audit_record(
+                model_type, version_arn, "staged", reason, metrics
+            )
+            return GovernanceDecision(
+                decision="staged",
+                reason=reason,
+                model_type=model_type,
+                version_arn=version_arn,
+                metrics=metrics,
+            )
 
         # Step 2: Deploy as canary
         try:
