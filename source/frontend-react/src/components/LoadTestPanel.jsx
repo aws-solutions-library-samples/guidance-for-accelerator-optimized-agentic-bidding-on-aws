@@ -38,6 +38,15 @@ const TARGET_MODEL_TYPES = [
   { value: "ncf_deal_manager", label: "Deal Scorer (future)", trainable: false },
 ];
 
+// The select has no empty ("None") option, so the state must start on a real
+// option value. Defaulting to "" made the browser paint the first option
+// ("Bid Pricer") while the value stayed empty — so target_model_type was never
+// sent and runs silently captured no outcomes (leaving them ineligible for
+// comparison and training) even though the UI looked like a model was picked.
+// Derived from the list so it cannot drift if the order/entries change.
+const DEFAULT_TARGET_MODEL_TYPE =
+  (TARGET_MODEL_TYPES.find((m) => m.trainable) || {}).value || "";
+
 // Traffic scenarios mirror the backend registry in orchestrator/loadtest.py
 // (TRAFFIC_SCENARIO_KEYS). Each shapes the SYNTHETIC requests this run
 // generates — the mix of publisher domains, IAB content categories, devices,
@@ -96,7 +105,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   // run behaves exactly as before (no BidShadingOutcomeEvent emission, no version
   // capture). Selecting a model type + "challenger" forces that container's
   // traffic onto its canary variant for this run only.
-  const [targetModelType, setTargetModelType] = useState("");
+  const [targetModelType, setTargetModelType] = useState(DEFAULT_TARGET_MODEL_TYPE);
   const [targetVariant, setTargetVariant] = useState("current");
 
   // Notify parent of result/progress changes for main area display

@@ -285,15 +285,50 @@ if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
   command -v docker >/dev/null 2>&1 || fail "missing: docker (required for --local-build)"
 fi
 
-# Resolve Python 3 binary (prefer python3, fall back to python if it's 3.x)
+# Resolve a base Python 3 interpreter (prefer python3, fall back to python if 3.x).
 if command -v python3 >/dev/null 2>&1; then
-  PYTHON="python3"
-elif command -v python >/dev/null 2>&1 && python -c "import sys; assert sys.version_info >= (3, 11)" 2>/dev/null; then
-  PYTHON="python"
+  _BASE_PYTHON="python3"
+elif command -v python >/dev/null 2>&1 && python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
+  _BASE_PYTHON="python"
 else
   fail "missing: python3 (>= 3.11)"
 fi
-log "Using Python: $(${PYTHON} --version) ($(command -v ${PYTHON}))"
+
+# Run all Python through a virtualenv so this script never MODIFIES the caller's
+# system Python. Installing our deps into a shared system interpreter is what
+# caused the earlier failures: a system sagemaker v3 (plus sagemaker-mlops/
+# -train/-serve) shadowed the v2 `image_uris` this deploy needs, and pinning it
+# there produced sagemaker-core dependency conflicts. The venv is created with
+# --system-site-packages so it REUSES already-installed packages (torch, boto3,
+# the agentcore toolkit, ...) instead of refetching them, while anything we pip
+# install (e.g. sagemaker v2) lands in the venv and SHADOWS the system copy --
+# so the system site-packages are never changed. If a venv is already active,
+# it's respected.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  PYTHON="${_BASE_PYTHON}"
+  log "Using the active virtualenv Python: $(${PYTHON} --version 2>&1) ($(command -v ${PYTHON}))"
+elif "${_BASE_PYTHON}" -c "import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)" 2>/dev/null; then
+  # The resolved interpreter is itself a venv (not the system one) -- reuse it.
+  PYTHON="${_BASE_PYTHON}"
+  log "Using virtualenv Python: $(${PYTHON} --version 2>&1) ($(command -v ${PYTHON}))"
+else
+  DEPLOY_VENV="${SCRIPT_DIR}/.deploy-venv"
+  if [[ ! -x "${DEPLOY_VENV}/bin/python" ]]; then
+    log "Creating a deploy virtualenv at ${DEPLOY_VENV} (so this script installs its Python deps here, not into your system Python)"
+    "${_BASE_PYTHON}" -m venv --system-site-packages "${DEPLOY_VENV}" \
+      || fail "could not create a virtualenv at ${DEPLOY_VENV} (need the stdlib 'venv' module for ${_BASE_PYTHON})"
+  fi
+  PYTHON="${DEPLOY_VENV}/bin/python"
+  ${PYTHON} -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+  log "Using deploy virtualenv: $(${PYTHON} --version 2>&1) (${PYTHON})"
+fi
+
+# Directory holding the resolved interpreter, prepended to PATH when invoking
+# the child deploy_closed_loop.sh (which calls bare `python3`) so it uses the
+# same venv -- otherwise Phase 5 (register_genesis_models.py, its own XGBoost
+# image_uris resolution) would fall back to the system Python this venv exists
+# to avoid.
+PYTHON_BIN_DIR="$(cd "$(dirname "$(command -v "${PYTHON}" 2>/dev/null || echo "${PYTHON}")")" 2>/dev/null && pwd || true)"
 
 # Ensure required Python packages are available (install if missing)
 REQUIRED_PY_PACKAGES="torch onnx onnxscript boto3"
@@ -315,9 +350,16 @@ fi
 # to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
 # empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
 # the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
-if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! ${PYTHON} -c "import sagemaker" 2>/dev/null; then
-  log "Installing missing Python package: sagemaker (required for closed-loop retraining)"
-  ${PYTHON} -m pip install --quiet sagemaker || fail "pip install failed for: sagemaker (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
+#
+# The check imports `image_uris` specifically, NOT just `sagemaker`: the SDK's
+# v3 major version dropped the top-level `image_uris` module this project's
+# resolution relies on (`image_uris.retrieve`, also used by
+# register_genesis_models.py), so a python that has sagemaker v3 installed
+# would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
+# to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
+if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! ${PYTHON} -c "from sagemaker import image_uris" 2>/dev/null; then
+  log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
+  ${PYTHON} -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
 fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
@@ -368,16 +410,25 @@ YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manag
 # deploy_closed_loop.sh. `2>/dev/null` cannot help -- the noise is on stdout.
 # Redirecting stdout for the import+retrieve sends that logging to stderr
 # (where it is discarded) and leaves stdout carrying only the URI.
-XGBOOST_TRAINING_IMAGE_URI="$(${PYTHON} -c "
-import contextlib, sys
+# Import noise ("sagemaker.config INFO ..." on stdout) is swallowed into a
+# throwaway buffer so only the URI reaches real stdout; SAGEMAKER_SUPPRESS_V2_WARNING
+# keeps the SDK's v2 deprecation notice off stderr. Any REAL exception is written
+# to stderr and captured below, so an empty result is explained rather than
+# silently swallowed (the old `except: pass` hid, e.g., "No module named
+# 'sagemaker'" when deploy ran with an interpreter that lacked the SDK).
+_XGB_ERR_FILE="$(mktemp)"
+XGBOOST_TRAINING_IMAGE_URI="$(SAGEMAKER_SUPPRESS_V2_WARNING=1 ${PYTHON} -c "
+import contextlib, io, sys
 try:
-    with contextlib.redirect_stdout(sys.stderr):
+    with contextlib.redirect_stdout(io.StringIO()):
         from sagemaker import image_uris
         _uri = image_uris.retrieve(framework='xgboost', region='${AWS_REGION}', version='1.7-1')
     sys.stdout.write(_uri)
-except Exception:
-    pass
-" 2>/dev/null || true)"
+except Exception as e:
+    sys.stderr.write('%s: %s' % (type(e).__name__, e))
+" 2>"${_XGB_ERR_FILE}" || true)"
+_XGB_ERR="$(tr '\n' ' ' < "${_XGB_ERR_FILE}" 2>/dev/null | sed 's/  */ /g' | cut -c1-300)"
+rm -f "${_XGB_ERR_FILE}"
 # Second line of defense: only accept something that actually looks like an ECR
 # image URI on a single line. Anything else (a future SDK logging change, a
 # partial write) becomes empty, so training_trigger.py reports its honest 503
@@ -392,7 +443,10 @@ fi
 # here means the retrieve itself failed (e.g. region/version), which the UI
 # would otherwise only reveal as a 503 at "Train from load test" time.
 if [[ "${WITH_RETRAINING}" -eq 1 && -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
-  warn "Could not resolve the SageMaker built-in XGBoost training image URI; on-demand Yield Optimizer (floor/margin) training will report a 503 in the UI until this resolves. NeMo-RL models (Bid Pricer, Deal Scorer) are unaffected."
+  warn "Could not resolve the SageMaker built-in XGBoost training image URI${_XGB_ERR:+ (${_XGB_ERR})}; on-demand Yield Optimizer (floor/margin) training will report a 503 in the UI until this resolves. This does NOT block DLRM/NCF training or model registration."
+  if [[ "${_XGB_ERR}" == *"No module named"* || "${_XGB_ERR}" == *"sagemaker"* ]]; then
+    warn "  The sagemaker SDK is not importable for ${PYTHON} ($(command -v ${PYTHON})). Install it there (e.g. activate the venv used at deploy time, or '${PYTHON} -m pip install sagemaker') and re-run."
+  fi
 fi
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
@@ -1591,10 +1645,25 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 ]}"
 
 if aws iam get-policy --policy-arn "${CLOSED_LOOP_POLICY_ARN}" >/dev/null 2>&1; then
+  # IAM caps a managed policy at 5 versions. Once 5 exist, create-policy-version
+  # fails with LimitExceeded -- which was previously swallowed by `2>/dev/null
+  # || true`, silently pinning the policy to a STALE version. That is exactly
+  # how the orchestrator ended up without the deal-yield-manager CreateTrainingJob
+  # ARNs (yield "Train from load test" 403'd) even though this doc grants them.
+  # Prune the oldest non-default version(s) to make room, then update loudly.
+  while [[ "$(aws iam list-policy-versions --policy-arn "${CLOSED_LOOP_POLICY_ARN}" --query 'length(Versions)' --output text 2>/dev/null || echo 0)" -ge 5 ]]; do
+    OLDEST_VID="$(aws iam list-policy-versions --policy-arn "${CLOSED_LOOP_POLICY_ARN}" \
+      --query 'sort_by(Versions[?IsDefaultVersion==`false`], &CreateDate)[0].VersionId' --output text 2>/dev/null)"
+    [[ -z "${OLDEST_VID}" || "${OLDEST_VID}" == "None" ]] && break
+    log "  Pruning old closed-loop policy version ${OLDEST_VID} (IAM 5-version limit)"
+    aws iam delete-policy-version --policy-arn "${CLOSED_LOOP_POLICY_ARN}" --version-id "${OLDEST_VID}" \
+      || fail "could not prune old version ${OLDEST_VID} of ${CLOSED_LOOP_POLICY_NAME}"
+  done
   aws iam create-policy-version \
     --policy-arn "${CLOSED_LOOP_POLICY_ARN}" \
     --policy-document "${CLOSED_LOOP_POLICY_DOC}" \
-    --set-as-default 2>/dev/null || true
+    --set-as-default >/dev/null \
+    || fail "could not update ${CLOSED_LOOP_POLICY_NAME} (orchestrator would keep stale closed-loop permissions -- e.g. no yield-model training)"
 else
   aws iam create-policy \
     --policy-name "${CLOSED_LOOP_POLICY_NAME}" \
@@ -2054,6 +2123,7 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID}" \
   ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID}" \
   GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID}" \
+  PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
   "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} || {
     warn "Closed-loop deployment returned non-zero. Check output above for errors."
     warn "The core EKS deployment succeeded — retraining infra may need manual intervention."

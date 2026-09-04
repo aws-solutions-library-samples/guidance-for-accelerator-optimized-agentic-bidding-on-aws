@@ -41,6 +41,8 @@ __pycache__/
 
 # --- Virtual environments ---
 .venv/
+# Isolated virtualenv deploy.sh creates so it never installs into system Python.
+deployment/.deploy-venv/
 
 # --- Coverage ---
 .coverage
