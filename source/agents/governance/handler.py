@@ -227,6 +227,30 @@ async def _handle_event(payload: dict, invocation_start: float) -> JSONResponse:
     dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
     audit_table = dynamodb.Table(AUDIT_TABLE)
 
+    # A version whose training was triggered by a load test (the "Train from
+    # Load Test" path) is staged as a challenger canary for MANUAL comparison
+    # rather than run through the automated A/B-promote pipeline: the operator
+    # drives the comparison. The originating run id is recorded by the
+    # registration Lambda in CustomerMetadataProperties.load_test_run_id (empty
+    # for scheduled retraining, which keeps the automated pipeline). Prefer the
+    # event detail if it carries the id, else resolve it from the model package.
+    load_test_run_id = detail.get("LoadTestRunId", detail.get("load_test_run_id", ""))
+    if not load_test_run_id:
+        try:
+            pkg = sagemaker_client.describe_model_package(ModelPackageName=version_arn)
+            load_test_run_id = (pkg.get("CustomerMetadataProperties") or {}).get(
+                "load_test_run_id", ""
+            )
+        except Exception as exc:  # noqa: BLE001 — resolution failure must not fabricate intent
+            logger.warning(
+                "Could not resolve load_test_run_id for %s (%s); "
+                "treating as scheduled retraining (full automated pipeline).",
+                version_arn,
+                exc,
+            )
+            load_test_run_id = ""
+    stage_for_comparison = bool(load_test_run_id)
+
     model_optimizer, canary_deployer, guardrail_check, http_client = _build_pipeline_components(
         cloudwatch_client
     )
@@ -252,6 +276,7 @@ async def _handle_event(payload: dict, invocation_start: float) -> JSONResponse:
         version_arn=version_arn,
         artifact_uri=artifact_uri,
         collect_metrics=collect_metrics,
+        stage_for_comparison=stage_for_comparison,
     )
 
     # Reasoning layer: rationale from the REAL decision + metrics (never overrides it).

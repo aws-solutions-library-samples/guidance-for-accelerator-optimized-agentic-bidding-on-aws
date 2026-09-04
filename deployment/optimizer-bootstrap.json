@@ -14,6 +14,19 @@
       }
     },
     {
+      "_comment": "Pre-provisioned CANARY (challenger) slot for dlrm_bid_shader. Built from the SAME genesis ONNX as stable so the dlrm_bid_shader_canary Triton model exists and is ready from first deploy at 0% live traffic (router canary_traffic_pct='0'). A load-test-triggered retrain's engine is later swapped into this same output_uri by the governance agent's stage-only path. Profiles match dlrm_bid_shader_canary/config.pbtxt.",
+      "model_name": "dlrm_bid_shader_canary",
+      "source_model_uri": "s3://__MODEL_BUCKET__/onnx-source/dlrm_bid_shader/model.onnx",
+      "output_uri": "s3://__MODEL_BUCKET__/triton-models/dlrm_bid_shader_canary/1/model.plan",
+      "precision": "fp16",
+      "input_profiles": {
+        "dense_features": { "min": [1, 4], "opt": [8, 4], "max": [64, 4] },
+        "sparse_user": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_domain": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_device": { "min": [1], "opt": [8], "max": [64] }
+      }
+    },
+    {
       "model_name": "ncf_deal_manager",
       "source_model_uri": "s3://__MODEL_BUCKET__/onnx-source/ncf_deal_manager/model.onnx",
       "output_uri": "s3://__MODEL_BUCKET__/triton-models/ncf_deal_manager_stable/1/model.plan",

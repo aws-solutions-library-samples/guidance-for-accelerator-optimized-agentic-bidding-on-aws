@@ -9,6 +9,7 @@ import {
   GovernanceVerdictCard, SessionAuditTrail, RecommendationBadge,
 } from "./closedLoopUi.jsx";
 import LoadTestSweepStatus from "./LoadTestSweepStatus.jsx";
+import { COMPARABLE_MODEL_TYPES, isFilModel } from "../utils/comparableModels.js";
 
 // Default pipeline stages shown (all "done"/grey) before any scenario has run,
 // matching the prototype's always-visible pipeline bar at the top of the page.
@@ -20,17 +21,14 @@ const DEFAULT_PIPELINE_NODES = [
   { id: "audit", label: "Audit", service: "DynamoDB / Bedrock", icon: IconAudit, state: "event" },
 ];
 
-// Governance scenarios only exist for the two GPU-accelerated, canary-routed
-// models (per DESIGN_BRIEF.md — Wide&Deep is rule-based, no canary/A-B loop).
-// The model selector filters the scenario list, so picking a model actually
-// changes which real scenario/decision can run — not just a display label.
-// NCF still has full scenario support in the testing harness (no training
-// data needed there), so it stays in this general selector even though it's
-// parked for the training section (see TRAINING_MODEL_TYPES).
-const MODEL_TYPES = [
-  { key: "dlrm_bid_shader", label: "DLRM Bid Shader" },
-  { key: "ncf_deal_manager", label: "NCF Deal Manager" },
-];
+// The Governance panel's model selector is the shared comparison/canary model
+// list (COMPARABLE_MODEL_TYPES): Bid Pricer (DLRM) + the two Yield Optimizer
+// sub-models, with friendly names. This single selector drives the compare
+// card, the model registry view, and the scenario testing harness. NCF was
+// removed here (it is parked for training/canary); the yield models were added
+// so they are comparable. The scenario harness only has scenarios for the
+// canary-routed models, so yield selections show an honest empty scenario list.
+const MODEL_TYPES = COMPARABLE_MODEL_TYPES;
 
 // Training-specific model selector for the "Train from load test" card,
 // decoupled from MODEL_TYPES above (which drives the scenario testing
@@ -140,6 +138,17 @@ export default function GovernancePanel() {
   const [promoting, setPromoting] = useState(false);
   const [promotionResult, setPromotionResult] = useState(null);
   const [promotionError, setPromotionError] = useState(null);
+
+  // One-click "compare current vs. retrained". Yield: stage the latest
+  // registered version as the FIL canary (no compile). DLRM: the governance
+  // agent already staged the retrained version as the canary when its
+  // load-test-triggered training finished, so nothing is staged here. Then run
+  // a real challenger load test at the control run's scenario+preset (seed is
+  // fixed at 42 UI-wide, so control and challenger share the request stream)
+  // and compare. Every step is gated on a real poll — no fabricated progress.
+  const [retraining, setRetraining] = useState(false);
+  const [retrainStep, setRetrainStep] = useState("");
+  const [retrainError, setRetrainError] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -396,6 +405,119 @@ export default function GovernancePanel() {
       setPromoting(false);
     }
   }, [modelType, comparisonResult]);
+
+  const compareRetrained = useCallback(async () => {
+    setRetrainError(null);
+    setComparisonError(null);
+    setComparisonResult(null);
+    setPromotionResult(null);
+    setPromotionError(null);
+
+    // The current (control) run is the baseline we replay the challenger
+    // against; its scenario+preset drive the challenger run so the two are
+    // comparable on the same deterministic request stream.
+    const controlRunId = selectedCurrentRun;
+    const controlRun = currentRuns.find((r) => r.id === controlRunId);
+    if (!controlRunId || !controlRun) {
+      setRetrainError("Select a current-version run to compare the retrained model against.");
+      return;
+    }
+
+    setRetraining(true);
+    try {
+      // 1. Stage the challenger canary. Yield (FIL) stages the latest registered
+      //    version directly (no TensorRT compile). DLRM is already staged by the
+      //    governance agent on its load-test-triggered training completion.
+      if (isFilModel(modelType)) {
+        const latest = (models || [])[0];
+        if (!latest || !latest.model_package_arn) {
+          setRetrainError("No registered version is available to stage as the challenger.");
+          return;
+        }
+        setRetrainStep("Staging challenger canary…");
+        const stageResp = await authFetch("/api/v1/governance/stage-canary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_type: modelType, version_arn: latest.model_package_arn }),
+        });
+        if (!stageResp.ok) {
+          const d = await stageResp.json().catch(() => ({}));
+          setRetrainError(d.error || `Could not stage the challenger canary (HTTP ${stageResp.status}).`);
+          return;
+        }
+      }
+
+      // 2. Run the challenger load test against the canary at the control run's
+      //    scenario+preset.
+      setRetrainStep("Running challenger load test…");
+      const startResp = await authFetch("/api/v1/loadtest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          preset: controlRun.preset || "1k",
+          seed: 42,
+          duration_s: 30,
+          scenario: controlRun.scenario || "baseline",
+          target_model_type: modelType,
+          target_variant: "challenger",
+        }),
+      });
+      if (startResp.status === 409) {
+        setRetrainError("A load test is already running. Wait for it to finish, then try again.");
+        return;
+      }
+      if (!startResp.ok) {
+        const d = await startResp.json().catch(() => ({}));
+        // 422 no_canary_staged means the DLRM retrain is still compiling into the
+        // canary slot (or a load-test-triggered training hasn't run yet).
+        setRetrainError(
+          d.error || `Could not start the challenger run (HTTP ${startResp.status}).`
+        );
+        return;
+      }
+      const { id: challengerRunId } = await startResp.json();
+
+      // 3. Poll until the challenger run reaches a terminal state.
+      setRetrainStep("Running challenger load test…");
+      let terminal = null;
+      for (let i = 0; i < 180; i++) {
+        await new Promise((res) => setTimeout(res, 1000));
+        const pollResp = await authFetch(`/api/v1/loadtest/${challengerRunId}`);
+        if (!pollResp.ok) continue;
+        const status = await pollResp.json();
+        if (status.state && status.state !== "running") { terminal = status; break; }
+      }
+      if (!terminal) {
+        setRetrainError("The challenger run did not finish in time — check the Load Test panel.");
+        return;
+      }
+      if (terminal.state !== "complete") {
+        setRetrainError(`The challenger run ended with state "${terminal.state}".`);
+        return;
+      }
+
+      // 4. Compare the fresh challenger run against the control run.
+      setRetrainStep("Comparing…");
+      setSelectedChallengerRun(challengerRunId);
+      const cmpResp = await authFetch("/api/v1/governance/compare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_type: modelType,
+          current_run_id: controlRunId,
+          challenger_run_id: challengerRunId,
+        }),
+      });
+      const cmpData = await cmpResp.json();
+      if (cmpResp.ok) setComparisonResult(cmpData);
+      else setComparisonError(cmpData.error || `HTTP ${cmpResp.status}`);
+    } catch (e) {
+      setRetrainError(String(e));
+    } finally {
+      setRetrainStep("");
+      setRetraining(false);
+    }
+  }, [modelType, selectedCurrentRun, currentRuns, models]);
 
   useEffect(() => {
     if (revealTimer.current) clearInterval(revealTimer.current);
@@ -705,15 +827,11 @@ export default function GovernancePanel() {
         )}
       </div>
 
-      </section>
-
-      </div>
-
       {/* Compare load-test outcomes (FR-7/FR-8, Story 5) + Promote
-          (FR-9/FR-10, Story 6) — its own full-width row below the pipeline/train
-          row. Every result below is labeled by source — load-test-derived,
-          distinct from the automated pipeline's live-canary-CloudWatch-derived
-          decisions. */}
+          (FR-9/FR-10, Story 6) — sits directly under "Train from load test" in
+          the right column, so both fit beside the pipeline card on the left.
+          Every result below is labeled by source — load-test-derived, distinct
+          from the automated pipeline's live-canary-CloudWatch-derived decisions. */}
       <div className="cl-section-title">Compare load-test outcomes</div>
       <div className="cl-card sg-elevated" data-testid="governance-compare-card">
         {eligibleRunsError && (
@@ -776,11 +894,32 @@ export default function GovernancePanel() {
             className="btn btn-primary sg-interactive"
             data-testid="governance-compare-button"
             onClick={compareRuns}
-            disabled={!selectedCurrentRun || !selectedChallengerRun || comparing}
+            disabled={!selectedCurrentRun || !selectedChallengerRun || comparing || retraining}
           >
             {comparing ? <><span className="spinner" /> Comparing…</> : "Compare & Assess"}
           </button>
+          {/* One-click: stage the retrained model as the challenger canary
+              (yield) or use the agent-staged DLRM canary, run a challenger load
+              test at the current run's scenario+preset, then compare. */}
+          <button
+            className="btn btn-secondary sg-interactive"
+            data-testid="governance-compare-retrained-button"
+            onClick={compareRetrained}
+            disabled={!selectedCurrentRun || comparing || retraining}
+            title="Run the retrained model against the selected current run and compare"
+          >
+            {retraining ? <><span className="spinner" /> {retrainStep || "Working…"}</> : "Compare current vs. retrained"}
+          </button>
         </div>
+
+        {retraining && retrainStep && (
+          <div className="cl-control-note" data-testid="governance-retrain-progress">
+            {retrainStep}
+          </div>
+        )}
+        {retrainError && (
+          <div className="cl-honest cl-honest-block" data-testid="governance-retrain-error">{retrainError}</div>
+        )}
 
         {comparisonError && (
           <div className="cl-honest cl-honest-block">{comparisonError}</div>
@@ -823,6 +962,9 @@ export default function GovernancePanel() {
             )}
           </div>
         )}
+      </div>
+
+      </section>
       </div>
 
       <div className="cl-section-title">Model registry</div>

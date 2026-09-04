@@ -1,0 +1,62 @@
+# DLRM Bid Shader — CANARY engine (TensorRT).
+# The challenger slot, served behind the dlrm_bid_shader router at 0% live
+# traffic (canary_traffic_pct="0" in the router config) until an operator
+# comparison or the governance agent adjusts the split. Pre-provisioned from
+# genesis so the slot always exists and is ready: the Model Optimizer builds
+# this model.plan from the exported ONNX at deploy time (see
+# deployment/optimizer-bootstrap.json). A load-test-triggered retrain's engine
+# is swapped in here by the governance agent's stage-only path
+# (source/agents/governance/governance_agent.py) so it can be compared against
+# stable via a challenger load test. Identical I/O to dlrm_bid_shader_stable —
+# only the model name differs. Batch profile 1..64.
+
+name: "dlrm_bid_shader_canary"
+platform: "tensorrt_plan"
+max_batch_size: 64
+
+input [
+  {
+    name: "dense_features"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  },
+  {
+    name: "sparse_user"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_domain"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_device"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "ctr_prediction"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+  }
+]

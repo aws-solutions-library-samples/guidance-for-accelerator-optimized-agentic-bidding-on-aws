@@ -217,39 +217,84 @@ class TestOutcomeColumnSelection:
         assert "revenue" not in df.columns
 
 
-class TestExportToOnnxDummyInputShape:
-    """export_to_onnx()'s DLRM dummy input previously had width 4, but
-    DLRMModel.forward() requires width NUM_DENSE+NUM_SPARSE=7 — this bug was
-    unreachable until the parquet-glob and feature-selection bugs were fixed,
-    since training always failed before reaching export.
-
-    Asserts the dummy tensor shape passed to torch.onnx.export directly
-    (via a monkeypatched export call) rather than running a real ONNX
-    export, since torch's dynamo-based exporter is sensitive to whichever
-    `triton` import resolves first on sys.path in this dev environment
-    (this repo's own source/triton/ package vs. the PyPI compiler package)
-    — a local test-environment path collision, not a training-code
-    correctness question.
+class TestExportToOnnxServingSignature:
+    """export_to_onnx() for DLRM must emit the SERVING signature so a retrained
+    artifact is loadable by dlrm_bid_shader_stable/_canary and compilable by the
+    Model Optimizer: four named inputs (dense_features FP32 [b,4];
+    sparse_user/domain/device INT64 [b]) and a sigmoid'd ctr_prediction output —
+    matching source/triton/export_models.py::export_dlrm. (Previously it exported
+    a single width-7 ``features`` input named ``output``, which no served config
+    accepts.)
     """
 
-    def test_dlrm_dummy_width_matches_model_forward_requirement(self, tmp_path, monkeypatch):
+    def test_dlrm_export_passes_four_named_serving_inputs(self, tmp_path, monkeypatch):
         import train as train_module
-        from models import DLRMModel, NUM_DENSE, NUM_SPARSE
+        from models import DLRMModel, NUM_DENSE
 
         captured = {}
 
-        def _fake_onnx_export(model, dummy, output_path, **kwargs):
-            captured["dummy_shape"] = tuple(dummy.shape)
-            Path(output_path).write_bytes(b"fake-onnx-for-shape-test")
+        def _fake_onnx_export(model, args, output_path, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            Path(output_path).write_bytes(b"fake-onnx-for-signature-test")
 
         monkeypatch.setattr(train_module.torch.onnx, "export", _fake_onnx_export)
-        model = DLRMModel()
 
-        onnx_path = train_module.export_to_onnx(model, "dlrm_bid_shader", str(tmp_path))
+        onnx_path = train_module.export_to_onnx(DLRMModel(), "dlrm_bid_shader", str(tmp_path))
 
         assert os.path.exists(onnx_path)
-        assert captured["dummy_shape"] == (1, NUM_DENSE + NUM_SPARSE)
-        assert captured["dummy_shape"][1] == 7
+        args = captured["args"]
+        # Four positional inputs, not a single combined tensor.
+        assert isinstance(args, tuple) and len(args) == 4
+        dense, s_user, s_domain, s_device = args
+        assert tuple(dense.shape) == (1, NUM_DENSE)
+        assert dense.dtype == torch.float32
+        for s in (s_user, s_domain, s_device):
+            assert tuple(s.shape) == (1,)
+            assert s.dtype == torch.int64
+        assert captured["kwargs"]["input_names"] == [
+            "dense_features", "sparse_user", "sparse_domain", "sparse_device",
+        ]
+        assert captured["kwargs"]["output_names"] == ["ctr_prediction"]
+
+    def test_dlrm_export_real_onnx_graph_matches_serving_contract(self, tmp_path):
+        """Real ONNX export (tracing exporter, dynamo=False — no triton path
+        collision) and inspect the graph: the retrained model must expose the
+        exact input names/dtypes and output name the Triton config declares."""
+        import onnx
+
+        import train as train_module
+        from models import DLRMModel
+
+        onnx_path = train_module.export_to_onnx(DLRMModel(), "dlrm_bid_shader", str(tmp_path))
+        graph = onnx.load(onnx_path).graph
+
+        input_names = [i.name for i in graph.input]
+        assert input_names == [
+            "dense_features", "sparse_user", "sparse_domain", "sparse_device",
+        ]
+        assert [o.name for o in graph.output] == ["ctr_prediction"]
+
+        # elem_type: 1 = FLOAT, 7 = INT64 (onnx.TensorProto).
+        by_name = {i.name: i for i in graph.input}
+        assert by_name["dense_features"].type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+        for name in ("sparse_user", "sparse_domain", "sparse_device"):
+            assert by_name[name].type.tensor_type.elem_type == onnx.TensorProto.INT64
+
+    def test_dlrm_forward_is_seeded_deterministic(self):
+        """A seeded DLRMModel produces identical outputs across builds — the
+        exported engine is reproducible, not a moving target."""
+        from models import DLRMModel
+
+        x = torch.tensor([[0.5, 0.4, 0.1, 1.0, 3.0, 7.0, 2.0]], dtype=torch.float32)
+
+        torch.manual_seed(1234)
+        out_a = DLRMModel().eval()(x)
+        torch.manual_seed(1234)
+        out_b = DLRMModel().eval()(x)
+
+        assert torch.equal(out_a, out_b)
+        assert out_a.shape == (1,)
 
 
 class TestLoadHyperparametersDefaults:

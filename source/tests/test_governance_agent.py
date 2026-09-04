@@ -118,12 +118,18 @@ class MockCanaryDeployer:
         self.rollback_calls: list[str] = []
 
     async def deploy_canary(
-        self, model_name: str, artifact_uri: str, initial_traffic_pct: float
+        self,
+        model_name: str,
+        artifact_uri: str,
+        initial_traffic_pct: float,
+        *,
+        canary_version_arn: str | None = None,
     ) -> None:
         self.deploy_calls.append({
             "model_name": model_name,
             "artifact_uri": artifact_uri,
             "initial_traffic_pct": initial_traffic_pct,
+            "canary_version_arn": canary_version_arn,
         })
         if self._deploy_should_fail:
             raise RuntimeError("Canary load failed: health check timeout")
@@ -876,5 +882,89 @@ class TestDecisionMetrics:
             collect_metrics=_make_winning_collector(),
         )
 
-        assert result.metrics["stage"] == "nim_optimization"
+        assert result.metrics["stage"] == "model_optimization"
         assert "error" in result.metrics
+
+
+# ---------------------------------------------------------------------------
+# Tests: stage-only branch (load-test-triggered version, manual comparison)
+# ---------------------------------------------------------------------------
+
+
+class TestStageForComparison:
+    """A load-test-triggered version is staged as the challenger canary and
+    left for the operator to compare — no A/B, no auto-promote."""
+
+    @pytest.mark.asyncio
+    async def test_stage_only_optimizes_and_stages_at_zero_traffic(self):
+        """stage_for_comparison=True → optimize + deploy_canary(0%) with the
+        version ARN, decision 'staged', and NO promote/rollback/registry change."""
+        agent, nim, canary, _, registry, audit = _build_agent()
+
+        result = await agent.on_new_model_version(
+            model_type="dlrm_bid_shader",
+            version_arn="arn:aws:sagemaker:us-east-1:123:model-package/v1.7",
+            artifact_uri="s3://models/raw/dlrm/model.pt",
+            collect_metrics=_make_winning_collector(),
+            stage_for_comparison=True,
+        )
+
+        assert result.decision == "staged"
+        # Optimize still runs (the canary must be a real compiled engine).
+        assert len(nim.optimize_calls) == 1
+        # Canary staged at 0% live traffic, tagged with the version ARN.
+        assert len(canary.deploy_calls) == 1
+        assert canary.deploy_calls[0]["initial_traffic_pct"] == 0.0
+        assert (
+            canary.deploy_calls[0]["canary_version_arn"]
+            == "arn:aws:sagemaker:us-east-1:123:model-package/v1.7"
+        )
+        # No automated A/B outcome: never promoted or rolled back.
+        assert canary.promote_calls == []
+        assert canary.rollback_calls == []
+        # Staging is not an approval — registry status untouched.
+        assert registry.update_calls == []
+        # Exactly one audit record, documenting the staging.
+        assert len(audit.records) == 1
+        assert audit.records[0]["decision"] == "staged"
+
+    @pytest.mark.asyncio
+    async def test_stage_only_deploy_failure_rejects_without_registry_change(self):
+        """A staging failure is operational: reject decision, audit written, but
+        the registry approval status is left untouched (still eligible later)."""
+        agent, nim, canary, _, registry, audit = _build_agent(deploy_should_fail=True)
+
+        result = await agent.on_new_model_version(
+            model_type="dlrm_bid_shader",
+            version_arn="arn:aws:sagemaker:us-east-1:123:model-package/v1.7",
+            artifact_uri="s3://models/raw/dlrm/model.pt",
+            collect_metrics=_make_winning_collector(),
+            stage_for_comparison=True,
+        )
+
+        assert result.decision == "reject"
+        assert "staging failed" in result.reason.lower()
+        assert canary.promote_calls == []
+        assert registry.update_calls == []  # not marked Rejected on an ops failure
+        assert len(audit.records) == 1
+
+    @pytest.mark.asyncio
+    async def test_default_still_runs_full_pipeline(self):
+        """stage_for_comparison defaults to False → the automated
+        optimize → canary → A/B → promote pipeline is unchanged."""
+        agent, nim, canary, _, registry, audit = _build_agent()
+        config = _default_ab_config()
+
+        result = await agent.on_new_model_version(
+            model_type="dlrm_bid_shader",
+            version_arn="arn:aws:sagemaker:us-east-1:123:model-package/v1.1",
+            artifact_uri="s3://models/raw/dlrm/model.pt",
+            ab_test_config=config,
+            evaluation_interval_seconds=0.0,
+            collect_metrics=_make_winning_collector(),
+        )
+
+        assert result.decision == "promote"
+        assert canary.promote_calls == ["dlrm_bid_shader"]
+        # The full pipeline stages the canary at the A/B traffic %, not 0%.
+        assert canary.deploy_calls[0]["initial_traffic_pct"] == config.traffic_percentage
