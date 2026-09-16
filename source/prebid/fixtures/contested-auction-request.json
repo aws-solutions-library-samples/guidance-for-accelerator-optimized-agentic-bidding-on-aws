@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "The canonical request used to verify a CONTESTED auction: one impression that",
+    "both seats can bid on. Kept in the repo, not in /tmp, because a request that",
+    "only exists on someone's laptop cannot be part of a deployed capability.",
+    "",
+    "Every field below is load-bearing:",
+    "  cur: [\"USD\"]                  - the ARRAY form, which is what OpenRTB 2.x",
+    "                                   specifies and what Prebid Server sends. A",
+    "                                   bare string here would stop this fixture",
+    "                                   from catching a regression of the defect",
+    "                                   that made assert_supported_currency raise",
+    "                                   AttributeError and return 500.",
+    "  site.cat / imp.ext.artf.categories",
+    "                                 - 'home' is what makes camp-cedar eligible;",
+    "                                   without it artfhouse has nothing to bid.",
+    "  pmp.deals[].id                 - deal-home-premium is a REAL id from",
+    "                                   source/demand/artfhouse/catalog.py. An",
+    "                                   invented id returns no bid, which looks",
+    "                                   identical to a broken service.",
+    "  pmp.private_auction: 0         - open-market candidates may still compete,",
+    "                                   which is what gives the auction a second",
+    "                                   artfhouse bid alongside the deal bid.",
+    "  imp.ext.amt.placementId        - required by the AMT adapter's amt.json.",
+    "                                   Present so this same fixture works once the",
+    "                                   amt seat is injected; artfhouse never sees",
+    "                                   it, because Prebid rewrites the request per",
+    "                                   bidder.",
+    "  ext.prebid.returnallbidstatus  - populates ext.seatnonbid, which is where the",
+    "                                   LOSERS are reported. Without it a losing",
+    "                                   seat is indistinguishable from a seat that",
+    "                                   was never called.",
+    "  ext.prebid.multibid            - lets a seat return more than one bid, so a",
+    "                                   deal bid and an open-market bid from the",
+    "                                   same seat both survive to the response."
+  ],
+  "id": "contested-auction-verification",
+  "tmax": 1500,
+  "cur": ["USD"],
+  "test": 1,
+  "site": {
+    "id": "site-home",
+    "page": "https://example.com/home",
+    "cat": ["IAB10"],
+    "publisher": {"id": "pub-artf-demo"}
+  },
+  "device": {
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "ip": "203.0.113.10"
+  },
+  "user": {"id": "user-verification-1"},
+  "imp": [
+    {
+      "id": "imp-1",
+      "bidfloor": 1.0,
+      "bidfloorcur": "USD",
+      "banner": {
+        "w": 300,
+        "h": 250,
+        "format": [{"w": 300, "h": 250}]
+      },
+      "pmp": {
+        "private_auction": 0,
+        "deals": [
+          {"id": "deal-home-premium", "bidfloor": 5.0, "bidfloorcur": "USD"}
+        ]
+      },
+      "ext": {
+        "artf": {"categories": ["home"]},
+        "amt": {"placementId": "artf-verification-placement"}
+      }
+    }
+  ],
+  "ext": {
+    "prebid": {
+      "returnallbidstatus": true,
+      "multibid": [{"bidder": "artfhouse", "maxbids": 3}],
+      "targeting": {"includewinners": true, "includebidderkeys": true}
+    },
+    "artf": {"categories": ["home"]}
+  }
+}

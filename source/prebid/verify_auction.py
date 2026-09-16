@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Verify the deployed auction against a fixture kept in the repo.
+
+Companion to verify_symbols.py, which checks the injected Java sources agree on
+names. This one checks the RUNNING service: it posts
+fixtures/contested-auction-request.json and asserts what came back.
+
+Why it resolves everything at runtime
+-------------------------------------
+The endpoint, the token endpoint and the client credentials are read from the
+deployed CloudFormation stack and Secrets Manager. Nothing is hardcoded and
+nothing is expected to be pre-placed by hand, so this is runnable immediately
+after `deploy.sh --with-prebid` on an account that has never seen it.
+
+Why subprocess curl rather than urllib
+--------------------------------------
+Some Python installations (macOS python.org builds among them) have no usable CA
+bundle, and urllib then fails every HTTPS call with CERTIFICATE_VERIFY_FAILED.
+curl uses the system trust store and is already required by the deploy path, so
+using it keeps this script runnable in the same environments the deploy runs in.
+Verification that cannot run where the deploy runs is not verification.
+
+Usage
+-----
+    python3 source/prebid/verify_auction.py --prefix nv5 --region us-east-1
+
+Exit status is 0 only if every check passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+FIXTURE = Path(__file__).parent / "fixtures" / "contested-auction-request.json"
+
+# The catalog entries this fixture is built around. Asserted rather than
+# discovered, so a silent change to the catalog shows up here as a failure
+# instead of as a quietly weaker test.
+EXPECTED_DEAL_ID = "deal-home-premium"
+EXPECTED_DEAL_CRID = "cr-cedar-300x250"
+EXPECTED_DEAL_FLOOR = 5.0
+
+
+class CheckFailed(Exception):
+    pass
+
+
+def run(cmd: list[str], stdin: Optional[str] = None) -> str:
+    proc = subprocess.run(
+        cmd, input=stdin, capture_output=True, text=True, timeout=60
+    )
+    if proc.returncode != 0:
+        raise CheckFailed(
+            f"command failed ({proc.returncode}): {' '.join(cmd[:4])}...\n{proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
+
+
+def aws(args: list[str], region: str) -> str:
+    return run(["aws", *args, "--region", region, "--output", "json"])
+
+
+def stack_output(stack: str, key: str, region: str) -> str:
+    raw = aws(["cloudformation", "describe-stacks", "--stack-name", stack], region)
+    outputs = json.loads(raw)["Stacks"][0].get("Outputs", [])
+    for out in outputs:
+        if out["OutputKey"] == key:
+            return out["OutputValue"]
+    raise CheckFailed(f"stack {stack} has no output {key}")
+
+
+def get_token(stack: str, region: str, secret_id: str) -> str:
+    token_endpoint = stack_output(stack, "TokenEndpoint", region)
+    raw = aws(["secretsmanager", "get-secret-value", "--secret-id", secret_id], region)
+    creds = json.loads(json.loads(raw)["SecretString"])
+
+    body = run([
+        "curl", "-sS", "-X", "POST", token_endpoint,
+        "-u", f"{creds['client_id']}:{creds['client_secret']}",
+        "-H", "Content-Type: application/x-www-form-urlencoded",
+        "-d", "grant_type=client_credentials&scope=artf-demand/bid:read",
+    ])
+    parsed = json.loads(body)
+    if "access_token" not in parsed:
+        raise CheckFailed(f"no access_token from {token_endpoint}: {parsed}")
+    return parsed["access_token"]
+
+
+def post(endpoint: str, token: str, payload: dict) -> tuple[int, Any]:
+    """POST and return (status, parsed body). Status is read from curl, not guessed."""
+    out = run([
+        "curl", "-sS", "-X", "POST", endpoint,
+        "-H", f"Authorization: Bearer {token}",
+        "-H", "Content-Type: application/json",
+        "-w", "\n%{http_code}",
+        "--data", "@-",
+    ], stdin=json.dumps(payload))
+
+    body, _, status = out.rpartition("\n")
+    try:
+        parsed = json.loads(body) if body.strip() else None
+    except json.JSONDecodeError:
+        parsed = body
+    return int(status), parsed
+
+
+def load_fixture() -> dict:
+    payload = json.loads(FIXTURE.read_text())
+    # The _comment key documents the fixture for readers; it is not part of
+    # OpenRTB and is stripped rather than sent.
+    payload.pop("_comment", None)
+    return payload
+
+
+def bids_of(response: Any) -> list[dict]:
+    if not isinstance(response, dict):
+        return []
+    return [
+        bid
+        for seat in response.get("seatbid", []) or []
+        for bid in seat.get("bid", []) or []
+    ]
+
+
+def seats_of(response: Any) -> list[str]:
+    if not isinstance(response, dict):
+        return []
+    return [s.get("seat", "<unnamed>") for s in response.get("seatbid", []) or []]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prefix", default=os.environ.get("STACK_PREFIX", ""))
+    ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    ap.add_argument("--stack", default="")
+    ap.add_argument("--endpoint", default="", help="override the demand endpoint")
+    ap.add_argument(
+        "--expect-seats",
+        type=int,
+        default=1,
+        help=(
+            "minimum distinct seats required. Only meaningful with --endpoint pointed at "
+            "PREBID: the demand endpoint is a single bidder and can only ever answer as "
+            "one seat, so a contested auction has to be observed where the seats are "
+            "orchestrated, not at one of them"
+        ),
+    )
+    args = ap.parse_args()
+
+    pfx = f"{args.prefix}-" if args.prefix else ""
+    stack = args.stack or f"{pfx}prebid-artf"
+    secret_id = f"{pfx}prebid-artf-client"
+
+    print(f"Verifying the deployed auction (stack={stack}, region={args.region})")
+    print(f"  fixture: {FIXTURE.relative_to(Path(__file__).parents[2])}")
+
+    failures: list[str] = []
+
+    def check(name: str, fn) -> None:
+        try:
+            detail = fn()
+            print(f"  PASS  {name}" + (f" -- {detail}" if detail else ""))
+        except CheckFailed as exc:
+            print(f"  FAIL  {name} -- {exc}")
+            failures.append(name)
+
+    try:
+        endpoint = args.endpoint or stack_output(stack, "DemandEndpointUrl", args.region)
+        token = get_token(stack, args.region, secret_id)
+    except CheckFailed as exc:
+        print(f"  FAIL  resolve endpoint and token -- {exc}")
+        return 1
+    print(f"  endpoint: {endpoint}")
+
+    fixture = load_fixture()
+
+    # --- the contested auction itself -------------------------------------
+    status, response = post(endpoint, token, fixture)
+
+    def _http_200():
+        if status != 200:
+            raise CheckFailed(f"HTTP {status}, body {json.dumps(response)[:200]}")
+        return "HTTP 200"
+
+    check("the fixture is accepted", _http_200)
+
+    def _has_bids():
+        bids = bids_of(response)
+        if not bids:
+            raise CheckFailed("no bids in seatbid[]")
+        return f"{len(bids)} bid(s): " + ", ".join(
+            f"{b.get('crid')}@{b.get('price')}" for b in bids
+        )
+
+    check("the auction returns bids", _has_bids)
+
+    def _deal_bid():
+        for bid in bids_of(response):
+            if bid.get("dealid") == EXPECTED_DEAL_ID:
+                price = bid.get("price")
+                if price is None or float(price) < EXPECTED_DEAL_FLOOR:
+                    raise CheckFailed(
+                        f"deal bid {price} is below the deal floor {EXPECTED_DEAL_FLOOR}"
+                    )
+                if bid.get("crid") != EXPECTED_DEAL_CRID:
+                    raise CheckFailed(
+                        f"deal bid crid is {bid.get('crid')}, expected {EXPECTED_DEAL_CRID}"
+                    )
+                return f"{bid.get('crid')} at {price} on {EXPECTED_DEAL_ID}"
+        raise CheckFailed(f"no bid carried dealid {EXPECTED_DEAL_ID}")
+
+    check("the deal is bid at or above its floor", _deal_bid)
+
+    def _currency():
+        cur = response.get("cur") if isinstance(response, dict) else None
+        if cur != "USD":
+            raise CheckFailed(f"response cur is {cur!r}, expected 'USD'")
+        return "cur=USD"
+
+    check("the response prices in USD", _currency)
+
+    def _seats():
+        seats = seats_of(response)
+        distinct = sorted(set(seats))
+        if len(distinct) < args.expect_seats:
+            raise CheckFailed(
+                f"{len(distinct)} seat(s) {distinct}, expected at least {args.expect_seats}"
+            )
+        return f"{len(distinct)} seat(s): {distinct}"
+
+    # Reported unconditionally, asserted only against the value asked for. At the
+    # demand endpoint this is always one seat by construction; the contested-auction
+    # assertion belongs against Prebid, which is what orchestrates the seats.
+    check(f"at least {args.expect_seats} seat(s) competed", _seats)
+
+    # --- the currency contract, against the live service ------------------
+    # These exist because the array form of `cur` once raised AttributeError,
+    # became a 500, and produced an empty auction that looked like a broken
+    # service. Unit tests cover the function; these cover the deployment.
+    def _cur_string_still_works():
+        payload = dict(fixture, cur="USD")
+        st, _ = post(endpoint, token, payload)
+        if st != 200:
+            raise CheckFailed(f"bare-string cur returned HTTP {st}")
+        return "HTTP 200"
+
+    check("a bare-string cur is still accepted", _cur_string_still_works)
+
+    def _cur_list_with_usd_among_others():
+        payload = dict(fixture, cur=["EUR", "USD"])
+        st, _ = post(endpoint, token, payload)
+        if st != 200:
+            raise CheckFailed(f"cur ['EUR','USD'] returned HTTP {st}")
+        return "HTTP 200"
+
+    check("cur listing USD among others is accepted", _cur_list_with_usd_among_others)
+
+    def _cur_without_usd_refused():
+        payload = dict(fixture, cur=["EUR"])
+        st, body = post(endpoint, token, payload)
+        if st != 400:
+            raise CheckFailed(
+                f"cur ['EUR'] returned HTTP {st}; a currency we cannot price in must be "
+                f"refused, never silently rescaled"
+            )
+        return f"HTTP 400: {json.dumps(body)[:80]}"
+
+    check("cur without USD is refused, not rescaled", _cur_without_usd_refused)
+
+    print()
+    if failures:
+        print(f"{len(failures)} check(s) failed: {', '.join(failures)}")
+        return 1
+    print("All checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
