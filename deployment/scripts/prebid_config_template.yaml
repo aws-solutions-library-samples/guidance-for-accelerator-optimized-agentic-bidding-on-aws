@@ -79,6 +79,31 @@ adapters:
     # which is bounded by the auction tmax. No independent timeout is set here: two
     # independent timeouts produce a call the auction has already abandoned.
 
+  # The SECOND SEAT, so the auction is contested. This is the AWS Prebid guidance's
+  # own AMT adapter, injected from the fetched release at build time and pointed at
+  # the bidder simulator the same release provides.
+  #
+  # Its purpose is competition, not market data: the simulator answers with static
+  # creatives at fixed prices. What is real is the auction -- two seats submitting
+  # independently, Prebid comparing them against the same floor, one winner and a
+  # reported loser.
+  #
+  # The endpoint is substituted at deploy time for the same reason artfhouse's is.
+  # The adapter's own bidder-config/amt.yaml resolves
+  # ${AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT} from the container environment with NO
+  # default, so if that variable is ever unset the pod fails to start on an
+  # unresolved-placeholder error. The value here takes precedence, and deploy step 6
+  # refuses to proceed when the stack has not published it.
+  #
+  # With --no-simulator the bidder is not in the image at all, so `enabled` is
+  # substituted to false rather than leaving this block claiming a seat that cannot
+  # answer. Both values are placeholders so the shape of the file never changes
+  # between the two cases -- editing YAML structure per deployment mode is how
+  # config files drift into being untestable.
+  amt:
+    enabled: __AMT_ENABLED__
+    endpoint: "__AMT_SIMULATOR_ENDPOINT__"
+
   # The upstream default file enables appnexus, ix, openx, pubmatic and rubicon. They
   # are NOT re-enabled here: this deployment has no credentials for them and calling
   # them would produce timeouts that look like ARTF failures. Their absence is a

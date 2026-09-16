@@ -157,6 +157,15 @@ spec:
             # its own bidder endpoint.
             - name: ARTFHOUSE_DEMAND_ENDPOINT
               value: "__DEMAND_ENDPOINT__"
+            # The second seat's endpoint. The injected amt.yaml interpolates
+            # ${AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT} with NO default value, so if this
+            # variable is missing Spring fails placeholder resolution and the pod never
+            # starts -- an error about a missing property rather than about a bidder.
+            # Supplied even when the simulator is disabled, because the injected
+            # amt.yaml is on the classpath whenever the image carries the bidder, and
+            # placeholder resolution happens before anything consults `enabled`.
+            - name: AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT
+              value: "__AMT_SIMULATOR_ENDPOINT__"
             # entrypoint.sh reads ECS_CONTAINER_METADATA_URI_V4 to label log paths and
             # falls back to "default-container-id" when it is unset. Set explicitly to
             # empty so the fallback is a deliberate choice on EKS rather than an

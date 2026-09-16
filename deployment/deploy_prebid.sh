@@ -82,6 +82,20 @@ SKIP_BUILD=0
 ASSUME_YES=0
 DESTROY=0
 
+# A second bidder seat, so the auction is CONTESTED rather than a single seat
+# bidding against nothing. On by default: an auction with one seat has no winner
+# to speak of, and the release already carries both halves -- the AMT adapter and
+# the bidder simulator it calls.
+#
+# The value of the simulator's endpoint is NOT knowable at build time: the image is
+# built in step 5 and the stack that publishes the URL is created in step 6. Only
+# the DECISION is needed early, which is what this flag carries. The URL reaches
+# the pod as an environment variable, and step 6 fails if the stack did not
+# publish it -- because amt.yaml interpolates
+# ${AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT} with no default, so a registered amt
+# bidder with no endpoint is a pod that will not start.
+WITH_SIMULATOR=1
+
 # The cost of any node capacity the Prebid pods force. Passed to the disclosure
 # helper, which REQUIRES it: on a cluster without headroom it is the dominant term.
 # Left empty means "not yet known", and the disclosure then says so rather than
@@ -105,6 +119,7 @@ for arg in "$@"; do
     --start-at=*)      START_AT="${arg#--start-at=}" ;;
     --start-at)        ;;
     --skip-build)      SKIP_BUILD=1 ;;
+    --no-simulator)    WITH_SIMULATOR=0 ;;
     --yes|--non-interactive) ASSUME_YES=1 ;;
     --destroy)         DESTROY=1 ;;
     -h|--help)         sed -n '7,67p' "$0"; exit 0 ;;
@@ -353,10 +368,35 @@ publish_config_overlay() {
 
   # Rendered FIRST, unconditionally, because the render is what an existing object
   # has to be compared against.
+  # With the simulator disabled the amt seat is not in the image, so the block is
+  # rendered disabled and pointed at an address nothing resolves -- rather than left
+  # claiming a seat that cannot answer. A disabled adapter is never called, so the
+  # address is inert by construction and not a route anything can take.
+  local amt_enabled="false"
+  local amt_endpoint="http://amt-simulator.not-deployed.invalid/"
+  if [[ "${WITH_SIMULATOR}" -eq 1 && -n "${AMT_SIMULATOR_ENDPOINT:-}" ]]; then
+    amt_enabled="true"
+    amt_endpoint="${AMT_SIMULATOR_ENDPOINT}"
+  elif [[ "${WITH_SIMULATOR}" -eq 1 ]]; then
+    # The seat is wanted but nothing has published an endpoint for it. Rendered
+    # DISABLED rather than enabled-and-pointed-nowhere: a bidder configured with an
+    # address that does not resolve produces per-auction timeouts attributed to the
+    # seat, which reads as a flaky bidder rather than as a missing deployment.
+    #
+    # The pod still boots either way, because the manifest always supplies
+    # AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT and Spring resolves that placeholder
+    # before anything consults `enabled`.
+    warn "The amt seat was requested but no simulator endpoint is available, so it is"
+    warn "rendered DISABLED. The auction will have one seat (artfhouse) and no"
+    warn "competing bid. This is the expected state until the simulator is deployed."
+  fi
+
   local rendered="${WORK_DIR}/prebid-config.yaml"
   sed -e "s|__DEMAND_ENDPOINT__|${endpoint}|g" \
       -e "s|__CONFIG_BUCKET__|${bucket}|g" \
       -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+      -e "s|__AMT_ENABLED__|${amt_enabled}|g" \
+      -e "s|__AMT_SIMULATOR_ENDPOINT__|${amt_endpoint}|g" \
       "${CONFIG_TEMPLATE}" >"${rendered}"
 
   if grep -q '__[A-Z_]*__' "${rendered}"; then
@@ -804,6 +844,44 @@ if [[ "${START_AT}" -le 4 ]]; then
     warn "No ${PREBID_SRC} directory - nothing to inject."
   fi
 
+  # --------------------------------------------------- the release's AMT bidder
+  # The second seat. Its sources come from the release we already fetched, and are
+  # NEVER copied into source/prebid/: that directory is ours and MIT-0, the release
+  # is Apache-2.0, and vendoring it here would create a NOTICE obligation this repo
+  # does not carry. They live only in the throwaway build context.
+  #
+  # Placed in a SUBDIRECTORY rather than beside our files, because upstream's own
+  # copy-bidder-files.sh has exactly the same name as ours and a flat copy would
+  # have one silently overwrite the other -- and whichever won, the build would
+  # still succeed while injecting only half of what was intended.
+  #
+  # Our script places these files itself, per upstream's destination map. We do not
+  # invoke theirs: it resolves sources as ./amt-bidder/<file> relative to the
+  # checkout, which is a path that only exists because the Dockerfile copies the
+  # slot in wholesale, and our slot has a different internal shape.
+  AMT_SRC="${UPSTREAM_DIR}/source/loadtest/amt-bidder"
+  if [[ "${WITH_SIMULATOR}" -eq 1 ]]; then
+    if [[ -d "${AMT_SRC}" ]]; then
+      mkdir -p "${INJECT_DIR}/upstream-amt-bidder"
+      # Only the files the MAIN build needs. Test sources and upstream's append to
+      # src/test/resources/.../test-application.properties are deliberately left
+      # out: MVN_CLI_OPTIONS carries -Dmaven.test.skip so no test source is ever
+      # compiled, and that append would MODIFY an upstream file, which is the one
+      # thing the additions-only property forbids.
+      for f in amt.json amt.yaml AmtBidder.java AmtConfiguration.java ExtImpAmt.java; do
+        [[ -f "${AMT_SRC}/${f}" ]] \
+          || fail "The release is missing source/loadtest/amt-bidder/${f}, so the amt seat cannot be injected. Re-run with --no-simulator to deploy a single-seat auction."
+        cp "${AMT_SRC}/${f}" "${INJECT_DIR}/upstream-amt-bidder/${f}"
+      done
+      log "  Placed the release's AMT bidder (5 main sources) into upstream-amt-bidder/"
+    else
+      fail "No ${AMT_SRC} in the fetched release, so there is no second seat to inject. Re-run with --no-simulator for a single-seat auction."
+    fi
+  else
+    log "  --no-simulator: the amt seat is NOT injected. The auction will have one"
+    log "  seat (artfhouse) and therefore no competing bid."
+  fi
+
   # The build argument is only switched on when this script is present, so the
   # difference between an ARTF image and a stock one is a single observable fact
   # rather than an assumption.
@@ -1148,6 +1226,7 @@ if [[ "${START_AT}" -le 6 ]]; then
       -e "s|__DEMAND_ENDPOINT__|${DEMAND_ENDPOINT}|g" \
       -e "s|__ORCHESTRATOR_URL__|${ORCHESTRATOR_URL}|g" \
       -e "s|__ORCHESTRATOR_SCOPE__|${ORCHESTRATOR_SCOPE}|g" \
+      -e "s|__AMT_SIMULATOR_ENDPOINT__|${AMT_SIMULATOR_ENDPOINT:-http://amt-simulator.not-deployed.invalid/}|g" \
       "${K8S_MANIFEST}" >"${PROCESSED}"
 
   if grep -q '__[A-Z_]*__' "${PROCESSED}"; then

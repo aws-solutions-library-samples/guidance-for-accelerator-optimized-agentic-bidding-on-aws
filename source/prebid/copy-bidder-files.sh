@@ -166,6 +166,70 @@ else
   log "artfhouse adapter: not present in this build (hook only)"
 fi
 
+# ------------------------------------------------- the release's AMT bidder seat
+# The SECOND SEAT. Without it artfhouse bids against nothing and the "auction" has
+# a winner only in the trivial sense.
+#
+# These sources are the AWS Prebid guidance's own (Apache-2.0) and are never
+# vendored into this MIT-0 repo. deploy_prebid.sh copies them from the fetched
+# release into upstream-amt-bidder/ inside the throwaway build context, and only
+# when the simulator they call will exist -- amt.yaml interpolates
+# ${AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT} with NO default, so registering this
+# bidder without an endpoint yields a pod that cannot start.
+#
+# Placement follows upstream's own copy-bidder-files.sh destination map. Their
+# script is not invoked: it resolves sources as ./amt-bidder/<file> relative to the
+# checkout, and our slot has a different internal shape. Their append to
+# src/test/resources/.../test-application.properties is also deliberately not
+# reproduced -- it MODIFIES an upstream file, and the build skips tests anyway.
+#
+# A bidder needs all four artifact kinds present or startup fails, which is why
+# each destination is asserted after the copy rather than assumed.
+AMT_DIR="${SCRIPT_DIR}/upstream-amt-bidder"
+
+if [[ -d "${AMT_DIR}" ]]; then
+  log "amt bidder (second seat, from the upstream release):"
+
+  # Two NEW packages, and one file into the EXISTING upstream config package.
+  # `cp` of single files throughout: copy_tree removes its destination first,
+  # which would delete ~200 upstream adapter configurations.
+  amt_place() {
+    local file="$1" dest="$2" why="$3"
+    [[ -f "${AMT_DIR}/${file}" ]] || fail "${file} is absent from ${AMT_DIR} - ${why}"
+    mkdir -p "${dest}" || fail "could not create ${dest}"
+    cp "${AMT_DIR}/${file}" "${dest}/" || fail "could not copy ${file} to ${dest}"
+    [[ -f "${dest}/${file}" ]] || fail "copy reported success but ${dest}/${file} is absent"
+    log "  ${dest}/${file}"
+  }
+
+  amt_place AmtBidder.java \
+    "src/main/java/org/prebid/server/bidder/amt" \
+    "without the bidder there is nothing to call the simulator"
+  amt_place ExtImpAmt.java \
+    "src/main/java/org/prebid/server/proto/openrtb/ext/request/amt" \
+    "the bidder cannot deserialise imp.ext.amt without it"
+  amt_place AmtConfiguration.java \
+    "src/main/java/org/prebid/server/spring/config/bidder" \
+    "without the @Configuration the bidder is never registered"
+  amt_place amt.yaml \
+    "src/main/resources/bidder-config" \
+    "the @PropertySource reads it off the classpath and startup fails without it"
+  amt_place amt.json \
+    "src/main/resources/static/bidder-params" \
+    "BidderParamValidator requires one params schema per registered bidder"
+
+  # amt.yaml's endpoint is a Spring placeholder with no default. Asserting its
+  # presence here means the coupling is documented at the point of injection
+  # rather than discovered from a CrashLoopBackOff.
+  if grep -q 'AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT' src/main/resources/bidder-config/amt.yaml; then
+    log "  amt.yaml expects AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT in the pod environment"
+  else
+    log "  note: amt.yaml does not reference AMT_BIDDING_SERVER_SIMULATOR_ENDPOINT"
+  fi
+else
+  log "amt bidder: not injected - single-seat auction (artfhouse only)"
+fi
+
 # ---------------------------------------------------------------- final report
 log "injection complete. Maven will now compile:"
 find "src/main/java/${ARTF_PACKAGE}" -name '*.java' -type f | sort | sed 's/^/  /'
