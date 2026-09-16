@@ -1018,8 +1018,18 @@ if [[ "${START_AT}" -le 6 ]]; then
     DEMAND_ZIP="${WORK_DIR}/artfhouse-demand.zip"
     rm -f "${DEMAND_ZIP}"
     (cd "${REPO_ROOT}/source" && zip -qr "${DEMAND_ZIP}" demand -x '*__pycache__*' -x '*.pyc')
+    # The key must be a function of the demand SOURCE, not of IMAGE_TAG. IMAGE_TAG
+    # hashes the Prebid Java build context, so a Python-only change to source/demand
+    # left the key identical, CloudFormation saw no change to the function's Code
+    # property, and the Lambda kept running the previous package. Hashed over paths
+    # relative to source/ so the key does not move with the checkout directory.
+    DEMAND_HASH="$(cd "${REPO_ROOT}/source" \
+      && find demand -type f ! -name '*.pyc' ! -path '*__pycache__*' -print0 \
+      | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)"
+    [[ -n "${DEMAND_HASH}" ]] \
+      || fail "Could not hash source/demand. Refusing to upload under a fixed key, which would silently pin the Lambda to a stale package."
     DEMAND_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
-    DEMAND_KEY="prebid-lambda/${IMAGE_TAG}/artfhouse-demand.zip"
+    DEMAND_KEY="prebid-lambda/demand-${DEMAND_HASH}/artfhouse-demand.zip"
     aws s3 cp "${DEMAND_ZIP}" "s3://${DEMAND_BUCKET}/${DEMAND_KEY}" --region "${AWS_REGION}" >/dev/null \
       || fail "Could not upload the demand endpoint package"
     log "  Demand endpoint packaged to s3://${DEMAND_BUCKET}/${DEMAND_KEY}"

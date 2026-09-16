@@ -57,6 +57,40 @@ def test_unsupported_currency_raises_rather_than_rescaling():
         SERVICE.decide(request_with(cur="EUR"))
 
 
+def test_decide_accepts_the_openrtb_currency_ARRAY_end_to_end():
+    """The whole path, with the shape a real exchange sends.
+
+    Regression for the defect that made this endpoint answer every live auction with
+    a 500: ``cur`` is an array in OpenRTB 2.x and Prebid Server sends ``['USD']``, but
+    the currency check treated it as a string. Every unit test used a bare string, so
+    the suite was green while nothing worked end to end.
+
+    Asserted through ``decide`` rather than only on the helper, because the helper
+    passing in isolation is what the old tests already proved.
+    """
+    response = SERVICE.decide(
+        request_with(deals=[{"id": "deal-home-premium", "bidfloor": 2.0}], cur=["USD"])
+    )
+
+    bids = [bid for seat in response.get("seatbid", []) for bid in seat.get("bid", [])]
+    assert bids, "a spec-shaped request must produce bids"
+    # The response states ONE currency, which is correct: cur is an array on the
+    # request and a single string on the response.
+    assert response["cur"] == "USD"
+
+
+def test_decide_accepts_a_currency_array_that_also_allows_others():
+    response = SERVICE.decide(
+        request_with(deals=[{"id": "deal-home-premium", "bidfloor": 2.0}], cur=["EUR", "USD"])
+    )
+    assert [bid for seat in response.get("seatbid", []) for bid in seat.get("bid", [])]
+
+
+def test_decide_rejects_a_currency_array_without_the_supported_one():
+    with pytest.raises(CurrencyMismatch):
+        SERVICE.decide(request_with(cur=["EUR", "GBP"]))
+
+
 # --------------------------------------------------------------- the response
 
 

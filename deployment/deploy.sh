@@ -665,6 +665,14 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   for ATTACHED in $(aws iam list-attached-role-policies --role-name "${ROLE_NAME}" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
     aws iam detach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${ATTACHED}" 2>/dev/null || true
   done
+  # iam:DeleteRole fails with DeleteConflict while the role still has INLINE
+  # policies, and only attached MANAGED policies were detached above. Step 9
+  # puts the agent's permissions on this role inline (BidShadingAgentPermissions),
+  # so every prefixed teardown leaked the role: the failure was swallowed by
+  # `|| true` and the next deploy then hit EntityAlreadyExists on create-role.
+  for INLINE in $(aws iam list-role-policies --role-name "${ROLE_NAME}" --query 'PolicyNames[]' --output text 2>/dev/null); do
+    aws iam delete-role-policy --role-name "${ROLE_NAME}" --policy-name "${INLINE}" 2>/dev/null || true
+  done
   aws iam delete-role --role-name "${ROLE_NAME}" 2>/dev/null || true
 
   # --- Part 2 closed-loop resources (if deployed) ---
@@ -673,10 +681,48 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # JMESPath shape — the same quirk documented in deploy.sh's frontend .env
   # generation above. Use --output json + jq -r for a clean single scalar.
   say "Deleting closed-loop AgentCore runtimes..."
-  for RUNTIME_NAME in "${RUNTIME_NAME_PREFIX}AdaptiveBiddingStrategyAgent" "${RUNTIME_NAME_PREFIX}ModelPromotionGovernanceAgent"; do
+  # Runtime-name prefixing (RUNTIME_NAME_PREFIX) was added AFTER the first
+  # prefixed stacks were deployed, so a stack can legitimately own a runtime
+  # under either the prefixed name ("ads_AdaptiveBiddingStrategyAgent") or the
+  # legacy UNPREFIXED one ("AdaptiveBiddingStrategyAgent"). Looking only at the
+  # prefixed name printed "not found — nothing to destroy" and silently left
+  # those legacy runtimes running after teardown (confirmed live on prefix=ads).
+  #
+  # The unprefixed name is global, so it CANNOT be deleted on name alone — an
+  # unprefixed stack in the same account owns that exact name. Ownership is
+  # proven from the runtime's container image, which always carries this
+  # stack's (already-prefixed) ECR repo — see deploy_closed_loop.sh's
+  # ADAPTIVE_BIDDING_REPO / GOVERNANCE_REPO.
+  for RUNTIME_SPEC in \
+      "AdaptiveBiddingStrategyAgent:${STACK_NAME}-adaptive-bidding-agent" \
+      "ModelPromotionGovernanceAgent:${STACK_NAME}-model-promotion-governance-agent"; do
+    BASE_NAME="${RUNTIME_SPEC%%:*}"
+    OWNER_REPO="${RUNTIME_SPEC##*:}"
+    RUNTIME_NAME="${RUNTIME_NAME_PREFIX}${BASE_NAME}"
+
     RID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
       --query "agentRuntimes[?agentRuntimeName=='${RUNTIME_NAME}'].agentRuntimeId | [0]" \
       --output json 2>/dev/null | jq -r '. // empty')"
+
+    # Legacy fallback: only when this run IS prefixed (otherwise RUNTIME_NAME
+    # already equals BASE_NAME and there is nothing else to look for).
+    if [[ -z "${RID}" && -n "${RUNTIME_NAME_PREFIX}" ]]; then
+      LEGACY_RID="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+        --query "agentRuntimes[?agentRuntimeName=='${BASE_NAME}'].agentRuntimeId | [0]" \
+        --output json 2>/dev/null | jq -r '. // empty')"
+      if [[ -n "${LEGACY_RID}" ]]; then
+        LEGACY_IMAGE="$(aws bedrock-agentcore-control get-agent-runtime \
+          --agent-runtime-id "${LEGACY_RID}" --region "${AWS_REGION}" --output json 2>/dev/null \
+          | jq -r '.agentRuntimeArtifact.containerConfiguration.containerUri // empty')"
+        if [[ "${LEGACY_IMAGE}" == *"/${OWNER_REPO}:"* ]]; then
+          RID="${LEGACY_RID}"
+          RUNTIME_NAME="${BASE_NAME} (legacy unprefixed, owned by ${OWNER_REPO})"
+        else
+          warn "  Runtime ${BASE_NAME} exists but its image (${LEGACY_IMAGE:-unknown}) is not from ${OWNER_REPO} — belongs to another stack, leaving it alone"
+        fi
+      fi
+    fi
+
     if [[ -n "${RID}" ]]; then
       aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${RID}" --region "${AWS_REGION}" 2>/dev/null || true
       say "  Deleted runtime ${RID} (${RUNTIME_NAME})"

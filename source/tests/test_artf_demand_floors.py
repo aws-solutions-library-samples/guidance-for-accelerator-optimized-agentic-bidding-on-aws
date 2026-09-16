@@ -64,6 +64,50 @@ def test_other_currency_is_an_error_not_a_rescale():
         assert_supported_currency("EUR")
 
 
+# ---------------------------------------------------------------------------
+# cur AS AN ARRAY -- the OpenRTB shape, and the one that was broken.
+#
+# BidRequest.cur is an array in OpenRTB 2.x, so the list form is what every real
+# exchange sends; Prebid Server sends ['USD']. The function was typed Optional[str]
+# and called .upper() directly, so a real request raised AttributeError, the
+# handler's last-resort clause turned it into a 500, and Prebid recorded no bid.
+#
+# The tests above passed a bare string, so they agreed with the code rather than
+# with the protocol. These assert the protocol.
+# ---------------------------------------------------------------------------
+
+def test_currency_array_is_the_openrtb_shape_and_is_accepted():
+    # Regression: this raised AttributeError before the fix.
+    assert assert_supported_currency([SUPPORTED_CURRENCY]) is None
+    assert assert_supported_currency(["usd"]) is None
+
+
+def test_currency_array_is_satisfied_when_the_supported_one_is_among_the_allowed():
+    # cur lists what the exchange will accept. A request permitting EUR *and* USD
+    # permits USD, so rejecting it would refuse a request that allows us to bid.
+    assert assert_supported_currency(["EUR", "USD"]) is None
+    assert assert_supported_currency(["JPY", "GBP", "usd"]) is None
+
+
+def test_currency_array_without_the_supported_one_is_rejected():
+    with pytest.raises(CurrencyMismatch):
+        assert_supported_currency(["EUR", "GBP"])
+
+
+def test_an_empty_currency_array_states_no_restriction():
+    # Absence of a constraint is not a mismatch. Rejecting this would refuse a
+    # request that asked for nothing in particular.
+    assert assert_supported_currency([]) is None
+
+
+def test_a_non_currency_type_is_rejected_by_name():
+    # Fails with a message naming the type rather than an AttributeError from
+    # somewhere deeper, which is what made the original bug read as a 500.
+    with pytest.raises(CurrencyMismatch) as exc:
+        assert_supported_currency(42)
+    assert "array of ISO-4217" in str(exc.value)
+
+
 # ----------------------------------------------------------------- properties
 
 money = st.floats(min_value=0, max_value=1000, allow_nan=False, allow_infinity=False)

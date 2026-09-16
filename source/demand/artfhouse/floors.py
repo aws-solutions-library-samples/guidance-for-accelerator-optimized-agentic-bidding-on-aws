@@ -22,7 +22,7 @@ Two semantics are fixed here because leaving them implicit invites divergence:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Optional, Union
 
 
 class FloorSource(str, Enum):
@@ -52,15 +52,36 @@ class CurrencyMismatch(ValueError):
 SUPPORTED_CURRENCY = "USD"
 
 
-def assert_supported_currency(currency: Optional[str]) -> None:
+def assert_supported_currency(currency: Union[str, List[str], None]) -> None:
     """Reject a currency we cannot compare against, rather than rescaling silently.
 
     An absent currency is accepted as the default, matching OpenRTB, where ``cur``
     is optional and USD is the assumed default.
+
+    ``BidRequest.cur`` is an ARRAY in OpenRTB 2.x -- Prebid Server sends ``['USD']``.
+    The array lists the currencies the exchange will accept, so it is satisfied when
+    the supported one is among them; an empty array states no restriction. A bare
+    string is accepted too, because callers and fixtures use that form.
     """
     if currency is None:
         return
-    if currency.upper() != SUPPORTED_CURRENCY:
+
+    if isinstance(currency, str):
+        allowed = [currency]
+    elif isinstance(currency, (list, tuple)):
+        # An empty array constrains nothing, so there is nothing to mismatch.
+        if not currency:
+            return
+        allowed = [c for c in currency if isinstance(c, str)]
+    else:
+        # Naming the type keeps this a validation error. The original defect raised
+        # AttributeError from here, which the handler turned into a 500.
+        raise CurrencyMismatch(
+            f"cur must be an array of ISO-4217 codes, or a single code; "
+            f"got {type(currency).__name__}"
+        )
+
+    if not any(c.upper() == SUPPORTED_CURRENCY for c in allowed):
         raise CurrencyMismatch(
             f"this endpoint prices in {SUPPORTED_CURRENCY}; request asked for {currency!r}"
         )
