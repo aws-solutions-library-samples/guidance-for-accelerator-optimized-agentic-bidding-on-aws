@@ -1,0 +1,43 @@
+adapters:
+  artfhouse:
+    # Resolved from the container's environment, NOT substituted at build time.
+    #
+    # This file is baked into the image by copy-bidder-files.sh, which runs inside
+    # CodeBuild and does not know the demand endpoint's URL -- the API Gateway that
+    # serves it is created by the CloudFormation stack, after the build. A
+    # __DEMAND_ENDPOINT__ placeholder here would therefore survive verbatim into the
+    # image and every bid call would go to a literal "__DEMAND_ENDPOINT__".
+    #
+    # ARTFHOUSE_DEMAND_ENDPOINT is set on the pod by
+    # eks/prebid-server-deployment.yaml, from the stack output.
+    #
+    # NO DEFAULT, deliberately. An unset variable fails startup with "could not
+    # resolve placeholder ARTFHOUSE_DEMAND_ENDPOINT", which names the problem. An
+    # empty default would start a server whose every bid call fails against an empty
+    # URL -- the same fault, discovered later and less legibly.
+    #
+    # prebid-config.yaml may still set adapters.artfhouse.endpoint explicitly and
+    # takes precedence, which is what keeps FR-38's "edit the object, restart, no
+    # rebuild" true for the endpoint as well.
+    endpoint: ${ARTFHOUSE_DEMAND_ENDPOINT}
+    meta-info:
+      maintainer-email: artf-demo@example.com
+      # BANNER ONLY, and that is a decision rather than an omission.
+      #
+      # The demand endpoint's catalog carries a width and a height per campaign and
+      # returns neither `adm` nor `nurl`. Prebid's ResponseBidValidator rejects a
+      # VIDEO bid that is missing both, so declaring video support would advertise a
+      # media type whose bids would then be thrown away -- an adapter that looks more
+      # capable than it is, failing at the last step.
+      app-media-types:
+        - banner
+      site-media-types:
+        - banner
+      supported-vendors:
+      # No GVL vendor id: this is a demonstration seat, not a registered vendor.
+      # Claiming an id belonging to somebody else would be worse than declaring none.
+      vendor-id: 0
+    # No `usersync` block. This endpoint performs no user syncing -- it matches
+    # campaigns on deals and content categories carried on the request, and holds no
+    # user identity of its own. Wiring a syncer that syncs nothing would add a cookie
+    # surface for no purpose.

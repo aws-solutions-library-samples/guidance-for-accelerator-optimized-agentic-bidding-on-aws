@@ -83,6 +83,38 @@ export const SCENARIOS = [
     file: "isv-ecosystem.json",
     controls: ["bidFloor"],
   },
+  {
+    // The Auction Theater's flagship narrative. Its point is that the segments in
+    // the story are the ones the real containers return: Audience Taxonomy 350
+    // (Parenting), 354 (Parenting Babies and Toddlers), 98 (Parents with Children)
+    // and 7 (Age Range 35-39). 98 and 354 are reachable only from the audience
+    // data the exchange asserts on the request, never from the page's category --
+    // deriving a life stage from what someone read is the inference IAB's Special
+    // Category Data flag exists to discourage.
+    //
+    // No expecting-parent or maternity segment exists in Audience Taxonomy 1.1, so
+    // the story is written around the identifiers that do exist.
+    id: "parenting-narrative",
+    name: "Parenting Article — Full Sell-Side",
+    desc: "A parenting article declaring Content Taxonomy 3.1 category 192 with three private marketplace deals. The audience activator resolves real IAB Audience Taxonomy segments, the deal scorer matches deals to the household, the yield optimizer moves floor and margin, and the signals enricher attaches quality metrics.",
+    models: [
+      { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+      { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
+      { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
+      { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
+    ],
+    tags: [
+      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
+      { cls: "deal", label: "ACTIVATE_DEALS" },
+      { cls: "deal", label: "SUPPRESS_DEALS" },
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
+      { cls: "metric", label: "ADD_METRICS" },
+    ],
+    file: "parenting-narrative.json",
+    controls: ["bidFloor", "segThreshold", "explore"],
+  },
 ];
 
 export default function ScenarioCard({ scenario, isActive, isLoading, disabled, onSelect, onSend }) {

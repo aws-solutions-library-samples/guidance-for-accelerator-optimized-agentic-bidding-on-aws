@@ -58,12 +58,19 @@ export const CONTAINER_NAME_TO_STOP_ID = Object.freeze({
   "yield-optimizer-margin": "yield-margin",
 });
 
+// Job-oriented container labels, matching RawPanel.jsx's AGENT_LABELS,
+// ContainersPanel.jsx's and LoadTestPanel.jsx's CONTAINER_LABELS, and
+// RENAME_MAP.md. These four previously carried model-architecture names
+// (DLRM/Wide & Deep/NCF/Metrics), which named the model rather than the job the
+// container does and disagreed with every other lookup in the app. The model
+// architectures are still documented per container; they are not the container's
+// name. Stop ids themselves are unchanged internal keys.
 export const DISPLAY_NAME_BY_STOP_ID = Object.freeze({
   ssp: "SSP",
-  dlrm: "DLRM Bid Shader",
-  widedeep: "Wide & Deep",
-  ncf: "NCF Deal Mgr",
-  metrics: "Metrics Enricher",
+  dlrm: "Bid Pricer",
+  widedeep: "Audience Activator",
+  ncf: "Deal Scorer",
+  metrics: "Signals Enricher",
   "yield-floor": "Yield Optimizer — Floor",
   "yield-margin": "Yield Optimizer — Margin",
   dsp: "DSP",

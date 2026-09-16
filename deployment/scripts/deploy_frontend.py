@@ -170,7 +170,26 @@ def _build_and_upload_react(s3, bucket_name: str, react_dir: Path) -> None:
             ct = "text/javascript"
         elif path.suffix == ".css":
             ct = "text/css"
-        s3.upload_file(str(path), bucket_name, key, ExtraArgs={"ContentType": ct})
+        s3.upload_file(
+            str(path), bucket_name, key,
+            ExtraArgs={"ContentType": ct, "CacheControl": _cache_control(key)},
+        )
+
+
+def _cache_control(key: str) -> str:
+    """Cache-Control for a dist object.
+
+    index.html must revalidate on every load. It is the only file that names the
+    content-hashed bundle, so a browser holding a cached copy keeps loading the
+    previous bundle after a deploy — a CloudFront invalidation clears the edge
+    but not the client. Vite emits `assets/*` with a content hash in the
+    filename, so those are safe to pin immutable.
+    """
+    if key == "index.html" or key.endswith("/index.html"):
+        return "no-cache, must-revalidate"
+    if key.startswith("assets/"):
+        return "public, max-age=31536000, immutable"
+    return "public, max-age=3600"
 
 
 def _find_distribution(cf, *, primary_comment: str, fallback_comments: tuple[str, ...] = ()) -> dict | None:

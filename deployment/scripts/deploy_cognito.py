@@ -61,6 +61,14 @@ def _auth_role_name(stack_name: str) -> str:
 
 
 _INVOKE_POLICY_NAME = "closed-loop-agent-invoke"
+_CAPTION_POLICY_NAME = "caption-model-invoke"
+
+# Every inline policy this script may attach to the authenticated role.
+# ``destroy`` iterates this list: IAM refuses DeleteRole while any inline policy
+# remains, and the delete_role call below only warns on failure, so a policy
+# added without a matching entry here would leave an orphaned role behind
+# silently. Adding to this list is the whole registration step.
+_ROLE_INLINE_POLICIES = (_INVOKE_POLICY_NAME, _CAPTION_POLICY_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +236,49 @@ def _put_invoke_policy(iam, *, role_name: str, runtime_arns: list[str]) -> None:
         PolicyDocument=json.dumps(policy),
     )
     _LOG.info("Granted InvokeAgentRuntime on %d scoped resource(s).", len(resources))
+
+
+def _put_caption_policy(iam, *, role_name: str) -> None:
+    """Attach/replace the Bedrock invoke policy used by the Auction Theater captions.
+
+    The document is deliberately STATIC -- no account id, no region, no model id --
+    so this function makes no ``sts`` or ``bedrock`` calls and is region-independent.
+
+    The wildcard resource is a documented, user-directed exception to the project's
+    least-privilege rule, recorded in
+    and in business rule BR3-5. It is what makes the ``global.`` cross-Region
+    inference profile usable without the three-statement conditional policy pattern
+    (profile ARN, in-Region model ARN, and the global model ARN with a
+    ``aws:RequestedRegion: unspecified`` condition). Scoping it instead required
+    deriving a geography prefix from the deployment region and verifying the profile
+    at deploy time -- machinery whose only purpose was keeping a narrow grant correct
+    on a demo stack.
+
+    Blast radius: the browser role of a signed-in demo user can invoke any Bedrock
+    model in the account, bounded by that account's Bedrock quotas. No data access,
+    no write path, no other service.
+
+    ``bedrock:Invoke*`` covers Converse, ConverseStream, InvokeModel and
+    InvokeModelWithResponseStream, so moving the client to streaming later is a code
+    change rather than an IAM change.
+    """
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InvokeCaptionModel",
+                "Effect": "Allow",
+                "Action": "bedrock:Invoke*",
+                "Resource": "*",
+            }
+        ],
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName=_CAPTION_POLICY_NAME,
+        PolicyDocument=json.dumps(policy),
+    )
+    _LOG.info("Granted bedrock:Invoke* for Auction Theater captions.")
 
 
 def _write_outputs(outputs: dict) -> None:
@@ -405,6 +456,25 @@ def grant_agent_invoke(
     return outputs
 
 
+def grant_caption_invoke(*, stack_name: str, region: str) -> dict:
+    """Idempotently attach the Bedrock caption-invoke policy to the auth role.
+
+    Unlike ``grant_agent_invoke`` this has no dependency on the AgentCore runtimes,
+    so it runs in the base deploy immediately after the role is created. Gating it
+    behind ``--with-retraining`` would ship a theater whose captions never generate,
+    with no error anywhere but the browser console.
+    """
+    iam = boto3.client("iam", region_name=region)
+    role_name = _auth_role_name(stack_name)
+    # Verify the role exists (deploy must have run first).
+    iam.get_role(RoleName=role_name)
+    _put_caption_policy(iam, role_name=role_name)
+    outputs = _read_outputs()
+    outputs["CaptionInvokeGranted"] = True
+    _write_outputs(outputs)
+    return outputs
+
+
 def destroy(*, stack_name: str, region: str) -> None:
     """Delete the Identity Pool, authenticated role, and User Pool (best effort)."""
     cognito = boto3.client("cognito-idp", region_name=region)
@@ -423,10 +493,14 @@ def destroy(*, stack_name: str, region: str) -> None:
     # Authenticated role (delete inline policy first)
     role_name = _auth_role_name(stack_name)
     try:
-        try:
-            iam.delete_role_policy(RoleName=role_name, PolicyName=_INVOKE_POLICY_NAME)
-        except ClientError:
-            pass
+        # DeleteRole fails while ANY inline policy remains, and the delete_role
+        # call below only warns, so every policy this script can attach must be
+        # deleted here or the role is orphaned silently.
+        for policy_name in _ROLE_INLINE_POLICIES:
+            try:
+                iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+            except ClientError:
+                pass
         iam.delete_role(RoleName=role_name)
         _LOG.info("Deleted authenticated role: %s", role_name)
     except ClientError as exc:
@@ -446,7 +520,9 @@ def destroy(*, stack_name: str, region: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--action", required=True, choices=["deploy", "destroy", "grant-agent-invoke"]
+        "--action",
+        required=True,
+        choices=["deploy", "destroy", "grant-agent-invoke", "grant-caption-invoke"],
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", default="us-east-1")
@@ -465,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             adaptive_runtime_arn=args.adaptive_runtime_arn or None,
             governance_runtime_arn=args.governance_runtime_arn or None,
         )
+    elif args.action == "grant-caption-invoke":
+        grant_caption_invoke(stack_name=args.stack_name, region=args.region)
     elif args.action == "grant-agent-invoke":
         grant_agent_invoke(
             stack_name=args.stack_name,

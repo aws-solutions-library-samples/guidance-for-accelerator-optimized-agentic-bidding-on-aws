@@ -1,7 +1,7 @@
 import { isAuthConfigured, signOut, getCurrentUserEmail } from "../auth";
 import { useState, useEffect } from "react";
 
-export default function Header({ loading, error, onContainersClick, view, onViewChange }) {
+export default function Header({ loading, error, onContainersClick, view, onViewChange, onOpenTheater }) {
   const statusClass = error ? "err" : loading ? "warn" : "ok";
   const statusLabel = error ? "Error" : loading ? "Processing…" : "Connected";
   const [userEmail, setUserEmail] = useState(null);
@@ -46,6 +46,15 @@ export default function Header({ loading, error, onContainersClick, view, onView
             onClick={() => onViewChange("governance")}
           >
             Governance
+          </button>
+          {/* Navigates to a hash route rather than switching `view`, because the
+              theater is a full-screen surface rendered outside this layout. */}
+          <button
+            className="header-nav-link"
+            onClick={onOpenTheater}
+            data-testid="header-nav-theater"
+          >
+            Auction Theater
           </button>
         </nav>
         {userEmail && (

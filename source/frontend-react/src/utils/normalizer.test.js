@@ -188,3 +188,136 @@ describe("toMutationModel() — ADJUST_DEAL_FLOOR / ADJUST_DEAL_MARGIN payload e
     expect(m.payload).toEqual({ margin: { value: 0.15, calculation_type: 0 } });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Store-defined containers (the ARTF template, or a user's own).
+//
+// Same class of bug as the yield stop this file was written for, one step
+// further out: containerEntryToStop() used to `return null` for any name absent
+// from CONTAINER_NAME_TO_STOP_ID, and buildExplicitContainerStops() then skipped
+// it, so a seventh container was missing from the pipeline entirely. A
+// store-defined container's name is not knowable at build time, so there is no
+// map entry to add — the normalizer has to synthesize the stop and take the
+// label from the response.
+// ---------------------------------------------------------------------------
+
+describe("normalize() — store-defined (dynamic) containers", () => {
+  const SIX = [
+    { name: "dlrm-bid-shader", status: "ok", latency_ms: 10, mutations: [] },
+    { name: "widedeep-segment-activator", status: "ok", latency_ms: 8, mutations: [] },
+    { name: "ncf-deal-manager", status: "ok", latency_ms: 12, mutations: [] },
+    { name: "metrics-enricher", status: "ok", latency_ms: 5, mutations: [] },
+    { name: "yield-optimizer-floor", status: "ok", latency_ms: 21, mutations: [] },
+    { name: "yield-optimizer-margin", status: "ok", latency_ms: 19, mutations: [] },
+  ];
+
+  it("synthesizes a stop for a container it has no build-time entry for", () => {
+    const raw = makeRawWithContainers([
+      ...SIX,
+      { name: "artf-template", display_name: "ARTF Template", status: "no_mutations", latency_ms: 3, mutations: [] },
+    ]);
+
+    const result = normalize(raw, "grpc", {});
+    const stop = result.stops.find((s) => s.id === "dynamic:artf-template");
+
+    expect(stop).toBeDefined();
+    expect(stop.displayName).toBe("ARTF Template");
+    expect(stop.modelFamily).toBe("CUSTOM");
+    expect(stop.status).toBe("no_mutations");
+    expect(stop.latency).toEqual({ ms: 3, source: "orchestrator" });
+  });
+
+  it("appends dynamic stops after the six fixed ones so no existing position moves", () => {
+    const raw = makeRawWithContainers([
+      { name: "artf-template", display_name: "ARTF Template", status: "ok", latency_ms: 3, mutations: [] },
+      ...SIX,
+    ]);
+
+    const result = normalize(raw, "grpc", {});
+    // The template was FIRST in the response and still lands last but for dsp:
+    // the six keep their fixed slots regardless of response order.
+    expect(result.stops.map((s) => s.id)).toEqual([
+      "ssp", "dlrm", "widedeep", "ncf", "metrics", "yield-floor", "yield-margin",
+      "dynamic:artf-template", "dsp",
+    ]);
+  });
+
+  it("falls back to the internal name when no display name was sent", () => {
+    const raw = makeRawWithContainers([
+      { name: "my-container", status: "ok", latency_ms: 1, mutations: [] },
+    ]);
+
+    const stop = normalize(raw, "grpc", {}).stops.find((s) => s.id === "dynamic:my-container");
+    // The raw name, never an invented label.
+    expect(stop.displayName).toBe("my-container");
+  });
+
+  it("surfaces a dynamic container's mutations rather than discarding them", () => {
+    const cidsMutation = {
+      intent: 8, // ADD_CIDS
+      op: 1, // ADD
+      path: "/imp/imp-1/ext/cids",
+      ids: { id: ["cid-1", "cid-2"] },
+    };
+    const raw = makeRawWithContainers([
+      { name: "artf-template", display_name: "ARTF Template", status: "ok", latency_ms: 3, mutations: [cidsMutation] },
+    ]);
+
+    const stop = normalize(raw, "grpc", {}).stops.find((s) => s.id === "dynamic:artf-template");
+    expect(stop.mutations).toHaveLength(1);
+    expect(stop.mutations[0].intent).toBe("ADD_CIDS");
+    expect(stop.mutations[0].payload).toEqual({ id: ["cid-1", "cid-2"] });
+  });
+
+  it("prefers the response's display name over the build-time table for a known container", () => {
+    const raw = makeRawWithContainers([
+      { name: "dlrm-bid-shader", display_name: "Renamed Pricer", status: "ok", latency_ms: 10, mutations: [] },
+    ]);
+
+    const stop = normalize(raw, "grpc", {}).stops.find((s) => s.id === "dlrm");
+    expect(stop.displayName).toBe("Renamed Pricer");
+  });
+
+  it("still uses the build-time label when the orchestrator sends no display name", () => {
+    // An orchestrator build predating display_name must not lose its labels.
+    const raw = makeRawWithContainers([
+      { name: "dlrm-bid-shader", status: "ok", latency_ms: 10, mutations: [] },
+    ]);
+
+    const stop = normalize(raw, "grpc", {}).stops.find((s) => s.id === "dlrm");
+    expect(stop.displayName).toBe("Bid Pricer");
+  });
+
+  it("ignores a container entry with no usable name instead of synthesizing a stop", () => {
+    const raw = makeRawWithContainers([
+      { name: "", status: "ok", latency_ms: 1, mutations: [] },
+      { status: "ok", latency_ms: 1, mutations: [] },
+    ]);
+
+    const result = normalize(raw, "grpc", {});
+    expect(result.stops.filter((s) => s.id.startsWith("dynamic:"))).toHaveLength(0);
+  });
+
+  it("does not duplicate a dynamic stop when the same name appears twice", () => {
+    const raw = makeRawWithContainers([
+      { name: "artf-template", display_name: "ARTF Template", status: "ok", latency_ms: 3, mutations: [] },
+      { name: "artf-template", display_name: "ARTF Template", status: "unreachable", latency_ms: 9, mutations: [] },
+    ]);
+
+    const dynamic = normalize(raw, "grpc", {}).stops.filter((s) => s.id.startsWith("dynamic:"));
+    expect(dynamic).toHaveLength(1);
+    // First entry wins, matching buildExplicitContainerStops' behaviour for the
+    // six fixed stops.
+    expect(dynamic[0].status).toBe("ok");
+  });
+
+  it("carries the new statuses through verbatim without mapping them onto a guess", () => {
+    for (const status of ["disabled", "no_mutations", "unreachable", "error", "timeout", "skipped"]) {
+      const raw = makeRawWithContainers([
+        { name: "artf-template", status, latency_ms: 0, mutations: [] },
+      ]);
+      const stop = normalize(raw, "grpc", {}).stops.find((s) => s.id === "dynamic:artf-template");
+      expect(stop.status).toBe(status);
+    }
+  });
+});

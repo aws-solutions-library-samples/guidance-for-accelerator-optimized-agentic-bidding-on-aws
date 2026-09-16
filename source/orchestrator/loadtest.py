@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
+from orchestrator.container_registry import ERROR_STATUSES, RAN_STATUSES
 from orchestrator.deal_yield_feedback import emit_load_test_deal_yield_outcome
 from orchestrator.etl_trigger import SWEEP_DELAY_SECONDS, trigger_etl_sweep
 from orchestrator.loadtest_instrumentation import (
@@ -834,12 +835,23 @@ async def _run_load_test(
             for inv in invocations:
                 _progress_per_container_latencies[test_id][inv.name].append(inv.latency_ms)
                 _progress_per_container_mutations[test_id][inv.name] += len(inv.mutations)
-                if inv.status == "failed" or inv.status == "timeout":
+                # ERROR_STATUSES, not a literal pair. The orchestrator's status
+                # vocabulary now distinguishes "unreachable" and "error" from a
+                # timeout; both used to be reported as "ok" (the connect error
+                # was swallowed before the caller saw it), so this counter was
+                # blind to a container that was scaled to zero or had no Service
+                # endpoints -- precisely the failure a load test should catch.
+                if inv.status in ERROR_STATUSES:
                     _progress_errors[test_id] += 1
                 if (
                     target_container_name
                     and inv.name == target_container_name
-                    and inv.status == "ok"
+                    # RAN_STATUSES, not just "ok": a targeted container that
+                    # legitimately produced no mutations now reports
+                    # "no_mutations" and still carries a real model_version.
+                    # Matching only "ok" would silently stop capturing versions
+                    # for those requests.
+                    and inv.status in RAN_STATUSES
                 ):
                     per_request_versions.append(inv.model_version)
                     if target_model_type in (

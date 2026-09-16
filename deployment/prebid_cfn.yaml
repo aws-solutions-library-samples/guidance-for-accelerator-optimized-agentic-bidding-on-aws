@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: '2010-09-09'
+# CloudFormation caps Description at 1024 characters (confirmed by validate-template
+# rejecting a longer one), so the rationale lives here in comments instead.
+#
+# Everything in this template is NET-NEW and removable. Nothing existing is modified
+# except the additions made to the SHARED Cognito user pool, which is passed in as a
+# parameter and is NEVER deleted by this stack.
+#
+# Verified against the live pool before this template was written: no domain (Domain
+# and CustomDomain both null), ZERO resource servers, and one implicit-flow app client
+# with no secret. So the domain, resource servers, scopes and machine-to-machine
+# client below are all genuinely new -- and the DOMAIN IS REQUIRED rather than
+# optional, because the client_credentials grant is served only by Cognito's hosted
+# token endpoint at https://<domain>/oauth2/token.
+#
+# Two parties, two scopes, deliberately NOT shared:
+#   artf-orchestrator/mutations:write   the Prebid host calling POST /v1/mutations
+#   artf-demand/bid:read                the artfhouse adapter calling the demand API
+# Sharing one credential across both would undo the seller/buyer separation that
+# placing the demand endpoint outside the cluster exists to preserve.
+#
+# Requirements: FR-38, FR-39; U1-NFR-10 ... 14; SECURITY-06, SECURITY-07,
+# SECURITY-08, SECURITY-12.
+Description: >-
+  Feature-owned resources for the optional Prebid Server ARTF orchestrator
+  (deploy.sh --with-prebid): Cognito hosted domain, two resource servers and scopes, a
+  machine-to-machine app client, the credential secret, an IRSA role scoped to one
+  ServiceAccount and one secret, an ECR repository, and the artfhouse demand endpoint
+  (API Gateway HTTP API with a Cognito JWT authorizer, plus its Lambda). All net-new
+  and removable. The shared user pool is passed in and never deleted here.
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Prefix for resource names, matching deploy.sh's convention. Empty means no
+      prefix.
+
+  UserPoolId:
+    Type: String
+    Description: >-
+      The EXISTING, SHARED Cognito user pool. This stack adds a domain, resource
+      servers and an app client to it, and removes only those on delete. The pool
+      itself predates this feature and is never deleted here.
+
+  DomainPrefix:
+    Type: String
+    Description: >-
+      Globally unique (per region) prefix for the Cognito hosted domain. Derived
+      from the stack prefix and account by deploy_prebid.sh. A collision is reported
+      rather than retried blindly, because a silently different domain would leave
+      the token endpoint pointing somewhere unexpected.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+
+  ClusterOidcProviderArn:
+    Type: String
+    Description: >-
+      ARN of the EKS cluster's IAM OIDC provider, for the IRSA trust policy.
+
+  ClusterOidcIssuerHost:
+    Type: String
+    Description: >-
+      The cluster OIDC issuer WITHOUT the https:// scheme, e.g.
+      oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E. Used to
+      build the exact sub and aud conditions.
+
+  Namespace:
+    Type: String
+    Default: default
+    Description: Kubernetes namespace the Prebid Server pods run in.
+
+  ServiceAccountName:
+    Type: String
+    Default: prebid-artf-host-sa
+    Description: >-
+      The ServiceAccount permitted to assume the role. Named exactly in the trust
+      policy: a wildcard here would let ANY ServiceAccount on this shared cluster
+      read the seller's credential.
+
+  ConfigBucket:
+    Type: String
+    Description: >-
+      Bucket holding the Prebid configuration. The image entrypoint (bootstrap.sh in
+      the upstream release) fetches s3://<bucket>/prebid-server/default/ and
+      /current/ at pod start and EXITS 1 if the default prefix cannot be read, so
+      without this read grant the pod cannot start at all.
+
+  DemandLambdaS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Bucket holding the packaged demand endpoint. Empty deploys a placeholder that
+      returns 501, so the API and its authorizer can be verified before the real
+      package exists.
+
+  DemandLambdaS3Key:
+    Type: String
+    Default: ''
+    Description: Object key for the packaged demand endpoint.
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  HasDemandPackage: !And
+    - !Not [!Equals [!Ref DemandLambdaS3Bucket, '']]
+    - !Not [!Equals [!Ref DemandLambdaS3Key, '']]
+
+Resources:
+
+  # ------------------------------------------------------------------ Cognito
+  # The domain is what makes client_credentials possible at all. Verified absent on
+  # the live pool, so this creates it rather than adopting one.
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix
+      UserPoolId: !Ref UserPoolId
+
+  # One scope naming one capability, so a token cannot be reused for anything else.
+  OrchestratorResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      Identifier: artf-orchestrator
+      Name: ARTF orchestrator extension point
+      Scopes:
+        - ScopeName: 'mutations:write'
+          ScopeDescription: Request mutations from POST /v1/mutations
+
+  # A SEPARATE resource server for the buyer's demand endpoint. Distinct on purpose:
+  # the seller-side credential must not be able to call the buyer's API, and vice
+  # versa.
+  DemandResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      Identifier: artf-demand
+      Name: ARTF house demand endpoint
+      Scopes:
+        - ScopeName: 'bid:read'
+          ScopeDescription: Request bids from the artfhouse demand endpoint
+
+  # Machine-only client. No user flows and no callback URLs, so it cannot be used to
+  # authenticate as a person -- it is not an alternative route into the frontend.
+  PrebidHostClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - OrchestratorResourceServer
+      - DemandResourceServer
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-prebid-artf-host'
+        - 'prebid-artf-host'
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - 'artf-orchestrator/mutations:write'
+        - 'artf-demand/bid:read'
+      SupportedIdentityProviders:
+        - COGNITO
+      # One hour, Cognito's default for machine tokens. The hook caches until shortly
+      # before expiry; fetching one per auction would put an external HTTPS round trip
+      # on a path budgeted in tens of milliseconds.
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+      PreventUserExistenceErrors: ENABLED
+
+  # -------------------------------------------------------------------- Secret
+  # Referenced, never embedded in an image or committed. The client secret is
+  # resolved by deploy_prebid.sh after the client exists and written here; the
+  # template creates the container so teardown is a stack delete.
+  PrebidCredentialSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-prebid-artf-client'
+        - 'prebid-artf-client'
+      Description: >-
+        Cognito machine-to-machine client id and secret for the Prebid ARTF host.
+        Note: a Cognito app client secret cannot be rotated in place -- rotation means
+        creating a second client, updating this secret, restarting the pods, then
+        deleting the first. No automatic rotation is configured, because claiming it
+        without a custom rotation function would be false.
+
+  # ---------------------------------------------------------------------- IRSA
+  # The pod's identity. Trust is scoped to ONE ServiceAccount by exact match.
+  PrebidHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-prebid-artf-host-role'
+        - 'prebid-artf-host-role'
+      # Written as a Fn::Sub JSON STRING rather than a YAML map, because the IRSA
+      # condition keys are themselves built from the cluster's OIDC issuer host --
+      # and CloudFormation forbids intrinsic functions as map keys. Confirmed by
+      # validate-template rejecting the map form:
+      #   "map keys must be strings; received a map instead"
+      # The string form is the standard way round it and keeps the conditions exact.
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Federated": "${ClusterOidcProviderArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${ClusterOidcIssuerHost}:sub": "system:serviceaccount:${Namespace}:${ServiceAccountName}",
+                  "${ClusterOidcIssuerHost}:aud": "sts.amazonaws.com"
+                }
+              }
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: read-own-credential-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # One action, one resource. No DynamoDB, no EKS API, no iam:PassRole,
+              # no wildcards.
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PrebidCredentialSecret
+
+        - PolicyName: read-own-configuration-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The image entrypoint fetches its configuration from S3 itself. That is
+              # the upstream release's own operating model, and reusing it is what
+              # keeps "edit the object, restart the pod, no rebuild" true without this
+              # repository reimplementing the fetch.
+              #
+              # Scoped to the TWO prefixes it reads. Not the bucket: the same bucket
+              # carries CodeBuild source archives and the demand endpoint package,
+              # and the auction host has no business reading either.
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}/prebid-server/default/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}/prebid-server/current/*'
+                  # Prebid's own application-settings store, read by the running
+                  # server rather than by the entrypoint. Prebid REFUSES TO START
+                  # without at least one settings implementation:
+                  #
+                  #   IllegalArgumentException: At least one application settings
+                  #   implementation required
+                  #
+                  # The upstream default configured settings.s3 against the
+                  # solution's own bucket. Replacing that config wholesale (which
+                  # this topology must, because the default references
+                  # ${SETTINGS_S3_*} values nothing here creates) removed the only
+                  # implementation and left the server unbootable. It is configured
+                  # against these prefixes instead. They may be empty: lookups are
+                  # per-key and lazy, and enforce-valid-account is false, so nothing
+                  # is fetched for an ordinary auction.
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}/prebid-server/settings/*'
+              # `aws s3 cp --recursive` LISTS before it copies, so GetObject alone is
+              # not enough. The prefix condition keeps the listing to the same paths
+              # rather than the whole bucket.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}'
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'prebid-server/default/*'
+                      - 'prebid-server/current/*'
+                      - 'prebid-server/settings/*'
+      # No KMS statement: the secret uses the AWS-managed key, for which
+      # GetSecretValue is sufficient. A customer-managed key would need kms:Decrypt
+      # on that key ARN with a kms:ViaService condition -- and nothing broader.
+
+  # ----------------------------------------------------------------------- ECR
+  #
+  # THE ECR REPOSITORY IS NOT DECLARED HERE. It is created by deploy_prebid.sh in
+  # step 5, and this is an ordering constraint rather than a preference: the image
+  # is built and pushed in step 5, and this stack is not created until step 6. A
+  # repository owned by this template would not exist when the push needs it.
+  #
+  # Declaring it here as well gave one resource two owners, and CloudFormation
+  # rejected the stack before creating anything:
+  #
+  #   The following hook(s)/validation failed:
+  #   [AWS::EarlyValidation::ResourceExistenceCheck]
+  #
+  # The lifecycle policy that used to live here (keep the 5 most recent images)
+  # moved with the repository, so the retention behaviour was not lost in the move.
+  # Teardown deletes it in the --destroy path, since this stack no longer does.
+
+  # ------------------------------------------------- demand endpoint (buy side)
+  # Outside the seller's cluster on purpose: this represents the BUYER's demand, and
+  # placing it in the seller's cluster would collapse the party separation the
+  # demonstration exists to show.
+  DemandFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Nothing beyond logs. The demand endpoint reads no external store: its catalog
+      # is in code, which is what makes its decision a pure function of the request.
+
+  DemandFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artfhouse-demand'
+        - 'artfhouse-demand'
+      Runtime: python3.12
+      Handler: demand.artfhouse.handler.lambda_handler
+      Role: !GetAtt DemandFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 512
+      Code: !If
+        - HasDemandPackage
+        - S3Bucket: !Ref DemandLambdaS3Bucket
+          S3Key: !Ref DemandLambdaS3Key
+        # Placeholder: an HONEST 501, not a fake bid response. It lets the API and its
+        # authorizer be verified before the real package exists, without ever
+        # returning a synthetic auction result that could be mistaken for real.
+        - ZipFile: |
+            import json
+
+            def lambda_handler(event, context=None):
+                return {
+                    "statusCode": 501,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "error": "demand endpoint not deployed",
+                        "detail": "This is the placeholder created with the stack. "
+                                  "The real handler is packaged and deployed separately; "
+                                  "it returns no bids and no synthetic auction result.",
+                    }),
+                }
+
+  DemandApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artfhouse-demand-api'
+        - 'artfhouse-demand-api'
+      ProtocolType: HTTP
+      Description: >-
+        The artfhouse demand endpoint. Authenticated at the gateway with a Cognito JWT
+        authorizer on its own scope. A Lambda Function URL with no auth is excluded
+        outright; IAM auth was rejected as disproportionate, since SigV4 signing from a
+        Prebid Java adapter is far heavier than presenting a bearer token.
+
+  DemandAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref DemandApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      Name: cognito-jwt
+      JwtConfiguration:
+        # The audience for a client_credentials token is the app client id.
+        Audience:
+          - !Ref PrebidHostClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  DemandIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DemandApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DemandFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  DemandRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DemandApi
+      RouteKey: 'POST /openrtb2/auction'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref DemandAuthorizer
+      # The scope requirement is enforced here, not only in the token. Without it any
+      # valid pool token would be accepted and the separate scope would constrain
+      # nothing.
+      AuthorizationScopes:
+        - 'artf-demand/bid:read'
+      Target: !Sub 'integrations/${DemandIntegration}'
+
+  DemandStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref DemandApi
+      StageName: $default
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt DemandAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","integrationStatus":"$context.integration.status","responseLatency":"$context.responseLatency","authorizerError":"$context.authorizer.error"}
+
+  DemandAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !If
+        - HasStackPrefix
+        - !Sub '/aws/apigateway/${StackPrefix}-artfhouse-demand'
+        - '/aws/apigateway/artfhouse-demand'
+      RetentionInDays: 90
+
+  DemandInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DemandFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      # Scoped to this API only. Never a wildcard principal, and never a wildcard
+      # source.
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DemandApi}/*/*/openrtb2/auction'
+
+Outputs:
+  UserPoolDomainName:
+    Description: Cognito hosted domain prefix (token endpoint host)
+    Value: !Ref UserPoolDomain
+
+  TokenEndpoint:
+    Description: OAuth2 token endpoint for the client_credentials grant
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  PrebidHostClientId:
+    Description: Machine-to-machine app client id
+    Value: !Ref PrebidHostClient
+
+  OrchestratorScope:
+    Description: Scope the orchestrator must require on POST /v1/mutations
+    Value: 'artf-orchestrator/mutations:write'
+
+  DemandScope:
+    Description: Scope the artfhouse adapter presents to the demand endpoint
+    Value: 'artf-demand/bid:read'
+
+  CredentialSecretArn:
+    Description: ARN of the credential secret (the only secret the pod role can read)
+    Value: !Ref PrebidCredentialSecret
+
+  PrebidHostRoleArn:
+    Description: IRSA role ARN for the Prebid ServiceAccount annotation
+    Value: !GetAtt PrebidHostRole.Arn
+
+  ImageRepositoryUri:
+    Description: >-
+      ECR repository for the built Prebid Server image. Composed rather than read off
+      the resource, because deploy_prebid.sh owns the repository (see the ECR note
+      above) and this stack has no handle on it.
+    Value: !Sub
+      - '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}'
+      - RepoName: !If
+          - HasStackPrefix
+          - !Sub '${StackPrefix}-prebid-server'
+          - 'prebid-server'
+
+  DemandEndpointUrl:
+    Description: >-
+      The artfhouse demand endpoint. Supplied to the adapter as deployment-time
+      configuration, not compiled in, so the address resolves at deploy time.
+    Value: !Sub 'https://${DemandApi}.execute-api.${AWS::Region}.amazonaws.com/openrtb2/auction'
+
+  DemandFunctionName:
+    Description: Demand Lambda function name, for updating the package after the stack exists
+    Value: !Ref DemandFunction

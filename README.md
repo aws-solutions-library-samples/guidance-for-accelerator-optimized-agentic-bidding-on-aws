@@ -14,7 +14,9 @@ Run AI models that price bids, activate audience segments, and manage private ma
     - [Cost](#cost)
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
+    - [Building your own ARTF container](#building-your-own-artf-container)
     - [Part 2: closed-loop learning](#part-2-closed-loop-learning)
+    - [Variant: Prebid Server as a second ARTF host (sell side)](#variant-prebid-server-as-a-second-artf-host-sell-side)
     - [Next steps](#next-steps)
 5. [Cleanup](#cleanup)
 6. [Notices](#notices)
@@ -240,6 +242,8 @@ An Amazon EKS cluster runs two node groups: a `g5`-family GPU node group (NVIDIA
 
 Full component-by-component detail, model specifications, and a request-flow diagram: [assets/images/architecture.md](assets/images/architecture.md). Container-naming history (what changed, what didn't, and why): [RENAME_MAP.md](RENAME_MAP.md).
 
+**One architectural variant ships with this Guidance.** The topology above has a single ARTF host — the orchestrator, called directly. Adding `--with-prebid` deploys **Prebid Server into the same cluster as a second, independent host**, which calls that same orchestrator from inside a real auction and then resolves the auction itself. It is opt-in and additive: without the flag, nothing above changes. See [Variant: Prebid Server as a second ARTF host](#variant-prebid-server-as-a-second-artf-host-sell-side) for the architecture, a full page-load walkthrough, and what is and is not real about it.
+
 ### Cost
 
 Sample estimate for the default settings in `us-east-1`, assuming the included scheduled GPU shutdown (~260 GPU-hours/month). `deploy.sh` deploys Part 2 (closed-loop learning) by default, so this table includes both parts, tagged by which part each line item belongs to:
@@ -305,6 +309,55 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ```
 
 **Breaking change:** `deploy.sh --start-at` now takes a phase number 1–5 instead of the old internal step numbers. If you have scripts referencing the old numbering, see the old-step-to-new-phase mapping table in [RENAME_MAP.md](RENAME_MAP.md).
+
+### Building your own ARTF container
+
+The deployment includes a seventh container, **ARTF Template**, as the starting point for your own. It is built, deployed and wired to the orchestrator like the six shipped ones, but starts **inactive** and returns no mutations, so it changes nothing until you switch it on.
+
+Everything except the logic is already done: the gRPC/MCP/health server, the ECR repository, the Kubernetes Deployment/Service/HPA, orchestrator registration, a row in the Container Health panel, and an activation switch. Adding a container by hand means editing nine places across the orchestrator, the manifests, `deploy.sh` and the CodeBuild config, and then redeploying the orchestrator so it knows the container exists. This one is already in all nine.
+
+**Four steps:**
+
+1. **Write your logic** in `source/containers/artf_template/app.py`. There is one marked block, with a worked example, the intent-to-payload-field mapping, and pointers to the two containers worth copying.
+2. **Rebuild that one image**: `cd deployment && ./deploy.sh --start-at 2`
+3. **Restart that one Deployment**: `kubectl rollout restart deployment/artf-template`
+   Don't skip this. `deploy.sh` reuses the previous image tag when the registry already has it, so `kubectl apply` is a no-op when only the image *content* changed and the old pod keeps serving your old code.
+4. **Activate it** in the Container Health panel. No redeploy — the flag lives in a DynamoDB registry table, and every orchestrator replica picks it up within the cache TTL (30s by default; the UI tells you the window).
+
+Full walkthrough, including how to add a Triton model or a second container: [`source/containers/artf_template/README.md`](source/containers/artf_template/README.md).
+
+**Container statuses.** Activating a container that isn't working shouldn't look like one that's switched off, so the orchestrator reports these distinctly, per container, in every bid response and in the health panel:
+
+| Status | Meaning |
+|---|---|
+| `disabled` | Inactive. Not called. Not a failure |
+| `unreachable` | Active, but nothing answered — pod down, no Service endpoints, wrong port |
+| `error` | Answered, but the response was unusable |
+| `timeout` | Exceeded the request's `tmax` budget |
+| `no_mutations` | Ran, and returned nothing. What the unmodified template reports |
+| `ok` | Ran, and returned mutations |
+
+An inactive, absent, broken or slow container never breaks the flow: the other containers' mutations are still returned, and the HTTP status and response shape are unchanged.
+
+**Where the knobs live:**
+
+| Knob | Where | Default |
+|---|---|---|
+| Active / inactive | Container Health panel, or the `active` field on the DynamoDB record | inactive |
+| Display name, description | `display_name` / `description` on the record | seeded by `deploy.sh` |
+| Intents the orchestrator routes on | `intents` on the record (**authoritative**) | `["ADD_CIDS"]` |
+| Intent the container itself guards on | `ARTF_TEMPLATE_INTENT` in `deployment/eks/artf-containers-deployment.yaml` | `ADD_CIDS` |
+| Registry cache TTL (how fast a toggle takes effect) | `CONTAINER_REGISTRY_TTL` on the orchestrator | `30` seconds |
+| Registry table name | `CONTAINER_REGISTRY_TABLE` on the orchestrator, set by `deploy.sh` | `${STACK_NAME}-container-registry` |
+| Container endpoint | `endpoint` on the record; `ARTF_TEMPLATE_URL` as fallback | `http://artf-template:8081` |
+| Replica floor | `artf-template-hpa` `minReplicas` | `1` |
+| Request-handling threads | `ARTF_MUTATE_WORKERS` (shared by all containers) | `16` |
+
+The registry record is authoritative for routing. Changing only the env var leaves the orchestrator filtering on the old intent, so your container never gets called.
+
+`ADD_CIDS` is the default intent because it is the one intent in the ARTF enum that no shipped container implements — the template fills a gap rather than shadowing working code. Two containers *may* claim the same intent: both are called and both sets of mutations merge, which is a way to compare your implementation against a built-in. The panel flags a shared intent, because merge order then decides which value survives downstream.
+
+The six shipped containers stay defined in the orchestrator's code and cannot be renamed, re-targeted or deactivated from the UI or the registry table — the real-time bidding path is deliberately not UI-mutable.
 
 ### Part 2: closed-loop learning
 
@@ -390,6 +443,209 @@ Pricer and Deal Scorer are unaffected.
 
 See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 
+### Variant: Prebid Server as a second ARTF host (sell side)
+
+This Guidance's default topology has one ARTF host: the orchestrator, called directly over `POST /v1/mutations`. This variant adds a **second, independent host** — [Prebid Server](https://docs.prebid.org/prebid-server/overview/prebid-server-overview.html) Java — that calls the *same* orchestrator from *inside* a real auction, and resolves that auction itself.
+
+It is **opt-in and additive**. Without it, nothing in the topology above changes:
+
+```bash
+cd deployment
+./deploy.sh --with-prebid                  # with a fresh deployment
+./deploy_prebid.sh --prefix <prefix>       # onto an existing one
+```
+
+**Why this is worth having.** The default path proves the ARTF containers can transform a bid request. It cannot show *who calls ARTF in production*. Real sell-side infrastructure does not POST to a mutations endpoint out of band — it runs an auction, and enrichment happens on the auction's own critical path, inside the auction's own time budget. This variant puts ARTF exactly there, so the latency it costs is the latency the bidders lose.
+
+#### How it differs from the AWS Prebid guidance
+
+The upstream [Guidance for Deploying a Prebid Server on AWS](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) deploys Prebid Server to **ECS Fargate in its own VPC**. This variant deploys the same pinned upstream release into **the EKS cluster you already have**, beside the orchestrator and the ARTF containers.
+
+That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the orchestrator answers the Prebid pod in **8 ms**. Co-location is also closer to how a real bidding stack is laid out.
+
+**Nothing upstream is forked.** The pinned `prebid-server-java` release is fetched at deploy time and our sources are *added* to the checkout through the one extension point the upstream Dockerfile provides. The deploy proves it rather than asserting it — `diff -rq` against the pristine release reports **0 modified files, 0 removals, 5 additions**, and the deploy script prints `Upstream files modified by this step: 0 (additions only)` as it runs.
+
+#### The two integration points
+
+| Piece | Prebid extension point | What it does |
+|---|---|---|
+| **ARTF host module** (`artf-orchestrator`) | [`processed-auction-request` hook](https://docs.prebid.org/prebid-server/developers/add-a-module.html) | Calls the orchestrator's `POST /v1/mutations` and applies the returned mutations to the bid request, before any bidder is asked |
+| **`artfhouse` bid adapter** | [bid adapter](https://docs.prebid.org/prebid-server/developers/add-new-bidder-java.html) | Answers as a seat in the auction, translating to a demand endpoint that holds a campaign catalog |
+
+The module is the sell side: it mutates the request every bidder then sees. The adapter is the buy side: it bids into the auction the module just shaped. Keeping them separate is what makes the two parties distinguishable rather than one program talking to itself.
+
+```
++------------------------------------------------------------+
+|  Publisher page  (prebid.js in the browser)                |
++------------------------------------------------------------+
+     |
+     |  1. POST /openrtb2/auction   (OpenRTB 2.x)
+     v
++------------------------------------------------------------+
+|  Prebid Server (EKS, same cluster)                         |
+|                                                            |
+|  2. stage: processed-auction-request                       |
+|     +--------------------------------------------------+   |
+|     |  ARTF host module  'artf-orchestrator'           |   |
+|     |  budget check -> call -> apply mutations         |   |
+|     +--------------------------------------------------+   |
++------------------------------------------------------------+
+     |                                        ^
+     |  3. POST /v1/mutations                 |  4. mutations
+     |     Bearer (client_credentials)        |     + per-container status
+     v                                        |
++------------------------------------------------------------+
+|  Orchestrator (EKS)  -- the SAME one the UI calls          |
+|  fans out to the ARTF containers, merges, replies (8 ms)   |
++------------------------------------------------------------+
+     |
+     |  parallel
+     v
++------------------------------------------------------------+
+|  6 ARTF containers -> NVIDIA Triton (GPU)                  |
++------------------------------------------------------------+
+
+                 ... back in Prebid Server ...
+
++------------------------------------------------------------+
+|  5. bidder fan-out, on the ENRICHED request                |
+|     +--------------------------------------------------+   |
+|     |  'artfhouse' bid adapter                         |   |
+|     +--------------------------------------------------+   |
++------------------------------------------------------------+
+     |
+     |  6. OpenRTB request -> demand endpoint
+     v
++------------------------------------------------------------+
+|  artfhouse demand endpoint (API Gateway + Lambda)          |
+|  campaign catalog, deal matching, floor comparison         |
++------------------------------------------------------------+
+     |
+     |  7. seatbid  (or nothing, with reasons)
+     v
++------------------------------------------------------------+
+|  8. Prebid resolves: floors, currency, top bid per imp,    |
+|     targeting keys, ext.seatnonbid  -> response to page    |
++------------------------------------------------------------+
+```
+
+#### The full scenario: one page load, end to end
+
+What actually happens, in order, when a browser loads a page carrying prebid.js. Timings are measured from the deployed stack, not estimates.
+
+1. **The page loads.** prebid.js builds an OpenRTB 2.x bid request from the ad units on the page — sizes, the page URL, first-party signals, any PMP deals the publisher has attached to the impression — and posts it to Prebid Server's `POST /openrtb2/auction` with a `tmax` (the total time the page will wait; 1500 ms in our test request).
+
+2. **Prebid reaches the `processed-auction-request` stage.** This is *before* any bidder is called, which is the only place a request-side mutation can still affect every bidder equally. Prebid invokes the hooks named in its execution plan — here, `artf-orchestrator`.
+
+3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance and a reserve held back for bidder fan-out and auction resolution, and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget` — *not* an error, because nothing decided and nothing broke; the orchestrator was simply never asked.
+
+4. **The module calls the orchestrator.** `POST /v1/mutations` with a bearer token it already holds — a Cognito `client_credentials` token, refreshed on a timer, never fetched on the auction path. The orchestrator fans out to the six ARTF containers, four of which call Triton on the GPU, merges the results and replies in about **8 ms**, carrying per-container status:
+
+   ```
+   dlrm-bid-shader            skipped        (BID_SHADE is response-side; see below)
+   widedeep-segment-activator no_mutations   9.84 ms
+   ncf-deal-manager           error         16.71 ms
+   metrics-enricher           ok            10.79 ms
+   yield-optimizer-floor      error         15.20 ms
+   yield-optimizer-margin     error         15.94 ms
+   ```
+
+5. **The module applies the mutations to the bid request.** Segments onto `user.data`, deals activated or suppressed in `imp.pmp.deals`, quality metrics onto `imp.metric`, content ids, and deal floors — each write validated against what Prebid will actually accept, and each one either applied or **rejected with a reason**. A real run:
+
+   ```
+   success / update in 44 ms
+     outcome            mutations_returned      latency  36 ms
+     request_mutated    True
+     applied            1        by intent  {ADD_METRICS: 1}
+     rejected           0
+   ```
+
+6. **Prebid fans out to the bidders** — on the enriched request. Every bidder, including third-party ones you add, sees the ARTF-shaped request. This is the property that makes the integration production-shaped rather than a side channel.
+
+7. **The `artfhouse` adapter bids.** It forwards the enriched request to the demand endpoint, which holds a campaign catalog, matches deals on the impression, compares each campaign's CPM against the resolved floor, and returns a `seatbid` — or returns nothing, with a per-campaign exclusion reason (`below_floor`, `deal_suppressed`, `not_targeted`, `no_deal_on_impression`).
+
+8. **Prebid resolves the auction.** Price-floor enforcement, currency conversion, the top bid per impression, `hb_*` targeting keys, and [`ext.seatnonbid`](https://docs.prebid.org/prebid-server/endpoints/openrtb2/pbs-endpoint-auction.html) saying why each losing bid lost. The response goes back to prebid.js, which passes the winning bid to the page's ad server.
+
+**Cold start, stated because you will see it.** The first auction or two after a rollout time out at around 91 ms against the 100 ms ARTF budget — JVM warm-up and first-connection cost — then settle at **34–37 ms**. The hook reports that honestly as a timeout and the auction proceeds unmutated, which is the designed behaviour: a fault in the module never rejects an auction.
+
+#### What is real here, and what is not
+
+Worth being exact, because "we deployed Prebid" invites a bigger claim than the topology supports.
+
+**Real:** the auction mechanism, and all of Prebid's own logic — floor enforcement, currency, deal handling, top-bid selection, targeting keys, `ext.seatnonbid`. Real: the ARTF call, the GPU inference behind it, the mutations, and their application to the request. The winner is *computed*, not declared.
+
+**Not real:** multi-buyer competition. `artfhouse` is the only seat unless you add bidders, so there is no contested clearing price — the auction resolves a single seat against the publisher's floor. And the demand endpoint's campaign catalog is a fixture you control, so the auction *mechanism* is real while the *prices going into it* are yours. That is a genuine step up from the default path, which has no auction at all, and it still is not market data.
+
+**Not run:** the Java unit tests. The upstream image build passes `-Dmaven.test.skip`, so the module's and adapter's tests are compiled by no toolchain in the deploy path. What the deploy does verify is that the Java **compiles** (2057 source files) and that the classes are **in the shipped jar** — the failure mode this design guards against is an image that builds cleanly and contains none of your code.
+
+#### Three behaviours that look correct and are not
+
+Each of these produces a plausible-looking result while quietly doing the wrong thing, so they are configured for you and called out here.
+
+- **`ext.prebid.multibid` is required to see more than one campaign.** Without it Prebid keeps **one** bid per impression per seat and silently drops the rest. One campaign appears, and nothing indicates the others were discarded.
+- **Do not configure `low` price granularity.** There is no bid ceiling in Prebid Server 3.43.0 — a high bid is not dropped. What happens instead is that `hb_pb` is *clamped* to the top bucket, so the bid survives with a **misreported** targeting key. `low` tops out at 5.00; `medium` and above top out at 20.
+- **`BID_SHADE` cannot apply at this stage.** It addresses a bid in the auction *response*, and `processed-auction-request` runs before any `seatbid` exists. It is excluded from the module's intent set and rejected with a reason if requested — left in, it would be a silent no-op, which is why the Bid Pricer reports `skipped` above.
+
+One more, for anyone building on this: the demand endpoint's per-campaign **exclusion reasons cannot cross Prebid's `Bidder` contract**. `CompositeBidderResponse` carries bids, errors, FLEDGE configs and IGI — there is no response-`ext` channel, and an excluded campaign has no bid to attach to. They survive only in `ext.debug.httpcalls.artfhouse[].responsebody`, which is **account-gated** (a stricter gate than the `ext.prebid.trace` one on the hook's analytics tags). Read them from there or from the endpoint directly, never from `seatbid`.
+
+#### Authentication
+
+The orchestrator is a Cognito-protected service and the auction path is **not exempted from it** — exempting an endpoint to make a hot path cheaper is how an internal service ends up open.
+
+The Prebid host gets its own Cognito app client and a `client_credentials` grant scoped to `artf-orchestrator/mutations:write`. The module refreshes that token on a timer and reads it synchronously from memory, so no auction ever waits on token acquisition. When no valid token is held the call is reported as a **transport failure** — the call could not be made — rather than being retried on the auction's budget.
+
+Authorization on the orchestrator is a **list of mechanisms**, any one of which grants a request: `user_session` for the frontend's user token, and `machine_scope` for a scoped machine credential. Both are needed. A rule keyed only on scope would lock the UI out of itself, because a Cognito *user pool* access token can never carry a resource-server scope. A refusal names every mechanism tried and what each wanted:
+
+```
+403  no authorization mechanism granted this request --
+     user_session: not a user session (no username claim; this is a machine credential);
+     machine_scope: machine credential lacks the required scope (artf-orchestrator/mutations:write)
+```
+
+**Enforcement is opt-in and off by default.** `ARTF_MUTATIONS_REQUIRED_SCOPE` is empty unless you deploy with `--with-prebid`, and while it is empty no route is scope-protected and the orchestrator authorizes exactly as it did before this variant existed. `deploy_prebid.sh` sets it, `--destroy` clears it, and the deploy checks that the running orchestrator image actually contains the enforcement code — setting the variable on an older image is a silent no-op, and a control that reads as protection without being one is worse than none.
+
+> **The credential reaches the pod as a Kubernetes Secret, not through the AWS SDK.** The Prebid image is built from the pinned upstream release, whose pom declares only the AWS SDK's `s3` module — the jar carries no `secretsmanager` and no `sts`, so there is no client to call Secrets Manager with and no way to use the pod's IRSA identity. Adding either dependency would mean editing the upstream pom, which is a fork. So `deploy_prebid.sh` reads the secret with credentials that can and writes a Kubernetes Secret, referenced by `secretKeyRef` so the value never lands in a manifest. Secrets Manager remains the source of record; only the delivery route changed.
+
+#### Cost
+
+Everything runs on the cluster you already have, so there is no second VPC, no second NAT gateway, no ALB and no Fargate task.
+
+The deploy discloses cost **before** it provisions anything, and it will not accept that disclosure from a pipe. Known standing cost is **$0.40/month** — one Secrets Manager secret. Cognito domains, resource servers and app clients carry no standing charge; CodeBuild and the demand endpoint's API Gateway and Lambda are per-use and zero when idle. The disclosure also names what it *cannot* price: ECR image storage, which depends on the built image size and is unknown until the image exists. It says so rather than printing a total that looks complete.
+
+The upstream guidance's published ~$241.50/month figure describes **its** ECS Fargate deployment, not this one, and is not carried over.
+
+#### Where the knobs live
+
+| Knob | Where | Default |
+|---|---|---|
+| Deploy the variant at all | `deploy.sh --with-prebid`, or `deploy_prebid.sh` directly | off |
+| Prebid Server version | `GIT_TAG_VERSION` in the pinned upstream release's `docker-build-config.json` | `3.43.0` |
+| Upstream release pinned | `PINNED_VERSION` in `deployment/deploy_prebid.sh` | `v1.4.0` |
+| ARTF `tmax`, transport overhead, reserve | `hooks.artf-orchestrator.{tmax-ms,overhead-ms,reserve-ms}` in the config overlay | `100` / `20` / `60` ms |
+| Which ARTF intents are requested | `hooks.artf-orchestrator.intents` in the overlay | the seven request-side intents |
+| Token refresh check interval, timeout | `hooks.artf-orchestrator.{token-refresh-period-ms,token-timeout-ms}` | `60000` / `5000` ms |
+| Prebid config (floors, bidders, granularity, `multibid`) | `prebid-server/current/prebid-config.yaml` in the config bucket, then `kubectl rollout restart deployment/prebid-server` | rendered from `deployment/scripts/prebid_config_template.yaml` |
+| Orchestrator scope enforcement | `ARTF_MUTATIONS_REQUIRED_SCOPE` on the orchestrator Deployment | empty (inert) unless `--with-prebid` |
+| Demand endpoint campaign catalog | `source/demand/artfhouse/` | the bundled catalog |
+| Resume a failed deploy at a step | `deploy_prebid.sh --start-at N` (1-8), `--skip-build` | — |
+
+Editing the config overlay in S3 is the supported way to reconfigure; the deploy **never overwrites an existing overlay**, so your edits survive a redeploy. No rebuild is needed — just restart the Deployment.
+
+#### Teardown
+
+```bash
+cd deployment
+./deploy_prebid.sh --prefix <prefix> --destroy
+```
+
+Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to its pre-variant authorization behaviour — leaving it set would keep an existing component altered by a feature that is no longer installed. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
+
+#### Alternative: the upstream stack, standalone
+
+If you want Prebid Server in its own isolated VPC on ECS Fargate — with the upstream bidder simulator supplying competing demand, and its Glue/Athena/QuickSight analytics pipeline — deploy [the upstream guidance](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) separately with its own scripts. It is a self-contained CDK app; nothing here forks or vendors it. You would then need a network path between the two VPCs (VPC peering or an [AWS RTB Fabric](https://aws.amazon.com/rtb-fabric/) link — the orchestrator already records `network_path: "rtb-fabric"` when an `x-rtb-fabric-link-id` header is present) and service-to-service auth, which is the work this variant does for you in-cluster.
+
+**Licensing.** Prebid Server and the upstream AWS guidance are Apache-2.0; this Guidance is MIT-0. This variant copies no upstream source — it fetches a pinned release at deploy time and adds files to it — so the distinction stays a documentation matter. Vendor any of their source into this repo and Apache-2.0 attribution applies, including carrying forward their `NOTICE.txt`.
+
 ### Next steps
 
 - **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data — there's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
@@ -407,6 +663,8 @@ cd deployment
 The script prompts for confirmation — type `destroy` to proceed. Include the same `--prefix` used at deploy time to tear down a specific namespaced stack.
 
 `--destroy` removes the Kubernetes workloads, the EKS cluster (both node groups), the S3 model bucket, the DynamoDB load-test table, the CloudFront distribution and frontend bucket, the AgentCore runtime, the Cognito user pool, and the IAM policies/roles this Guidance created.
+
+**Deployed the [Prebid variant](#variant-prebid-server-as-a-second-artf-host-sell-side) too?** `--destroy` here covers most of it: the Kubernetes objects go with the cluster, and it deletes the `<prefix>-prebid-artf` stack explicitly if it exists. What it leaves behind is the **ECR repository and its images**, because this script retains ECR repositories by design. Run `./deploy_prebid.sh --prefix <prefix> --destroy` instead — or afterwards — to remove those too and to clear the orchestrator's `ARTF_MUTATIONS_REQUIRED_SCOPE`.
 
 **Retained by design:** Amazon ECR repositories persist across deployments so cached images survive between runs. Delete them manually from the ECR console or CLI if you no longer need them.
 

@@ -85,3 +85,8 @@ deployment/guidance-for-accelerator-optimized-agentic-bidding-on-aws.code-worksp
 Triton Publisher Yield Models.md
 ARTF — SSP_Publisher Intents.md
 deployment/output.txt
+
+# Written by deploy_prebid.sh step 8: a record of ONE deployment (cluster, ECR repo,
+# image digest, endpoints, account-specific names). Local state, not source -- committing
+# it would put one operator's account details in every other operator's checkout.
+.prebid-deployment.json

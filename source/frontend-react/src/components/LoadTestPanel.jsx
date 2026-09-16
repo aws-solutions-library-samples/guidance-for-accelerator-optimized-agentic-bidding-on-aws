@@ -746,9 +746,18 @@ function ContainerBreakdown({ containers }) {
           {rows.map((c) => (
             <tr key={c.name}>
               <td className="loadtest-breakdown-logo">
-                <img src={CONTAINER_LOGOS[c.name]} alt="" className="loadtest-container-logo" />
+                {/* A store-defined container has no logo, and inventing one would
+                    misattribute its provenance. The cell stays empty. */}
+                {CONTAINER_LOGOS[c.name] && (
+                  <img src={CONTAINER_LOGOS[c.name]} alt="" className="loadtest-container-logo" />
+                )}
               </td>
-              <td className="loadtest-breakdown-name">{CONTAINER_LABELS[c.name] || c.name}</td>
+              {/* display_name from the response first: a store-defined
+                  container's name is not known at build time, so
+                  CONTAINER_LABELS cannot resolve it. */}
+              <td className="loadtest-breakdown-name">
+                {c.display_name || CONTAINER_LABELS[c.name] || c.name}
+              </td>
               <td>{c.avg_latency_ms != null ? `${c.avg_latency_ms.toFixed(1)}ms` : "—"}</td>
               <td>{c.total_mutations != null ? c.total_mutations.toLocaleString() : "—"}</td>
             </tr>

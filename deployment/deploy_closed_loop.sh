@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# Requires real bash, not bash in POSIX mode. See the same guard in deploy.sh.
+if [ -z "${BASH_VERSION:-}" ] || { command -v shopt >/dev/null 2>&1 && shopt -qo posix; }; then
+  printf 'deploy_closed_loop.sh must be run with bash, not sh.\n\n  bash %s %s\n\n' "$0" "$*" >&2
+  exit 1
+fi
 # =============================================================================
 # deploy_closed_loop.sh — Deploy the Closed-Loop Learning System infrastructure
 #
@@ -561,11 +567,23 @@ _nemo_source_hash() {
   # for every possible source tree, which would have skipped every rebuild
   # forever. Sorted so the digest does not depend on traversal order; the
   # relative path is included so a rename alone changes the hash.
-  local f rel manifest=""
+  #
+  # Fed through a heredoc rather than `done < <(find ...)`. Process substitution is
+  # a bash extension that /bin/sh -- bash in POSIX mode -- rejects at PARSE time,
+  # which made this whole script unparseable when invoked as `sh`. A pipe is not an
+  # alternative: it would run the loop in a subshell and lose `manifest`. The
+  # `[ -n ]` guard is needed because a heredoc over empty output still yields one
+  # blank line, and an empty `find` result must leave `manifest` empty so the
+  # refusal below still triggers.
+  local f rel manifest="" _found=""
+  _found="$(find "${dir}" -type f ! -name '*.pyc' 2>/dev/null | LC_ALL=C sort)"
   while IFS= read -r f; do
+    [ -n "${f}" ] || continue
     rel="${f#"${dir}/"}"
     manifest+="${rel}:$(_nemo_sha256 < "${f}" | awk '{print $1}')"$'\n'
-  done < <(find "${dir}" -type f ! -name '*.pyc' 2>/dev/null | LC_ALL=C sort)
+  done <<MANIFEST_FILES
+${_found}
+MANIFEST_FILES
   # An empty manifest means the find matched nothing; refuse to return a hash
   # rather than hand back the empty-input digest as if it described real source.
   [[ -n "${manifest}" ]] || return 1

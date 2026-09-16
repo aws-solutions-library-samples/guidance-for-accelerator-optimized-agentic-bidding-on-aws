@@ -1,0 +1,60 @@
+{
+  "id": "sample-parenting-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-example-001"},
+  "applicable_intents": [
+    "ACTIVATE_SEGMENTS",
+    "ADD_METRICS",
+    "ACTIVATE_DEALS",
+    "SUPPRESS_DEALS",
+    "ADJUST_DEAL_FLOOR",
+    "ADJUST_DEAL_MARGIN"
+  ],
+  "bid_request": {
+    "id": "auction-parenting-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 300, "h": 250, "pos": 1},
+        "bidfloor": 2.60,
+        "bidfloorcur": "USD",
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {"id": "deal-parenting-premium", "bidfloor": 3.40, "at": 1},
+            {"id": "deal-family-network", "bidfloor": 2.10, "at": 2},
+            {"id": "deal-remnant-open", "bidfloor": 0.85, "at": 3}
+          ]
+        }
+      }
+    ],
+    "site": {
+      "id": "site-parenting-01",
+      "domain": "parenting-weekly.example",
+      "cat": ["192"],
+      "cattax": 9,
+      "page": "https://parenting-weekly.example/guides/first-year-sleep-routines"
+    },
+    "user": {
+      "id": "user-parenting-01",
+      "yob": 1989,
+      "gender": "F",
+      "data": [
+        {
+          "id": "data-provider-1",
+          "name": "Example DMP",
+          "segment": [
+            {"id": "seg-hh-parents", "name": "Parents with Children"},
+            {"id": "seg-int-babies", "name": "Parenting Babies and Toddlers"}
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+      "ip": "203.0.113.9",
+      "geo": {"country": "USA", "region": "NY"}
+    }
+  }
+}

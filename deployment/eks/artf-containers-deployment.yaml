@@ -748,3 +748,139 @@ spec:
           type: Utilization
           averageUtilization: 70
 
+
+---
+# ARTF Template — the starting point for a repo user's own container.
+#
+# Deployed and wired like the six above, but ships INACTIVE: its `active` flag
+# lives in the container-registry DynamoDB table (seeded false by deploy.sh) and
+# the orchestrator does not call it until it is switched on in the Container
+# Health panel. That is why it can be activated without a redeploy.
+#
+# No Triton dependency and no GPU: it ships as a pass-through returning no
+# mutations. A user who adds a model should move its key into
+# deploy.sh's tritonclient build case and register it in the orchestrator's
+# container_to_model map so the health panel probes the model too.
+#
+# See source/containers/artf_template/README.md for the implement-your-own
+# walkthrough. The rebuild-one-image + rollout-restart-one-deployment step
+# matters: deploy.sh reuses the previous image tag when the registry already has
+# it, so `kubectl apply` alone leaves the old pod serving old code.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: artf-template
+  labels:
+    app: artf
+    model: template
+spec:
+  # Matches the HPA's minReplicas, which is 1 here rather than the 2 the model
+  # containers use: this container is inactive by default and does no work until
+  # a user implements it, and the cpu-services node group has little headroom at
+  # full HPA scale-out across the other six.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artf
+      model: template
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: template
+    spec:
+      nodeSelector:
+        role: services
+      containers:
+        - name: template
+          image: __REGISTRY__/__STACK_NAME__-artf-template:__IMAGE_TAG__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            # The intent this container's own intent_applicable() guard checks,
+            # for callers that reach it directly. The AUTHORITATIVE filter is the
+            # `intents` list on its container-registry record, which is what the
+            # orchestrator matches against applicable_intents — change both, or
+            # the orchestrator keeps filtering on the old intent and never calls
+            # this container at all.
+            #
+            # ADD_CIDS is the default because it is the one intent in the ARTF
+            # enum that no container in this repo implements, so the template
+            # fills a gap rather than shadowing working code.
+            - name: ARTF_TEMPLATE_INTENT
+              value: "ADD_CIDS"
+          # Same CPU request/limit split as the other containers: the limit is
+          # well above the request so a burst is not clipped by CFS throttling
+          # (see the Bid Pricer comment above), while the request is what the
+          # scheduler and the HPA's 70% target work from. Memory is lower than
+          # the model containers' because there is no numpy/torch/tritonclient
+          # working set here.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artf-template
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: template
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: artf-template-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: artf-template
+  # minReplicas 1, unlike the other six. Their 2 is a load-test pre-warm (see
+  # the comments on the HPAs above); this container is inactive by default and
+  # is not part of a load test until a user activates it, so a warm floor of two
+  # would consume cpu-services capacity for no benefit. Raise it to 2 to match
+  # the others once your implementation is on the load-test path.
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -32,6 +32,23 @@ from starlette.routing import Route
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.artf_types import ContainerInvocationModel, Metadata, Mutation, RTBRequest, RTBResponse  # noqa: E402
+from orchestrator.container_registry import (  # noqa: E402
+    ERROR_STATUSES,
+    RAN_STATUSES,
+    SOURCE_CODE,
+    STATUS_DISABLED,
+    STATUS_SKIPPED,
+    STATUS_TIMEOUT,
+    ContainerCallOutcome,
+    ContainerRegistryStore,
+    RegistryEntry,
+    RegistryRecordNotFound,
+    RegistryStoreUnavailable,
+    derive_status,
+    merge_registry,
+    select_active,
+    shared_intents,
+)
 from shared.feedback_collector import FeedbackCollector  # noqa: E402
 from shared.signal_associator import SignalAssociator  # noqa: E402
 from orchestrator.signal_receiver import receive_signal as _receive_signal_handler  # noqa: E402
@@ -48,27 +65,41 @@ logger = logging.getLogger(__name__)
 
 _GRPC_METHOD = "/com.iabtechlab.bidstream.mutation.services.v1.RTBExtensionPoint/GetMutations"
 
+# ``display_name`` and ``description`` are served by GET /v1/containers so a
+# client does not have to carry a build-time label table. They matter because
+# store-defined containers (see orchestrator/container_registry.py) have names
+# that are not known when the frontend is built, so the API has to be the source
+# of labels for those; having the six built-ins answer the same way keeps one
+# code path instead of two. The display names match RENAME_MAP.md.
 CONTAINERS = [
     {
         "name": "dlrm-bid-shader",
+        "display_name": "Bid Pricer",
+        "description": "Prices the bid with the DLRM model on Triton.",
         "intents": {"BID_SHADE"},
         "grpc": os.environ.get("DLRM_GRPC", os.environ.get("DLRM_URL", "http://localhost:50061")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("DLRM_MCP", os.environ.get("DLRM_URL", "http://localhost:8091")),
     },
     {
         "name": "widedeep-segment-activator",
+        "display_name": "Audience Activator",
+        "description": "Activates IAB audience segments from bid-request signals (rule-based).",
         "intents": {"ACTIVATE_SEGMENTS"},
         "grpc": os.environ.get("WIDEDEEP_GRPC", os.environ.get("WIDEDEEP_URL", "http://localhost:50062")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("WIDEDEEP_MCP", os.environ.get("WIDEDEEP_URL", "http://localhost:8092")),
     },
     {
         "name": "ncf-deal-manager",
+        "display_name": "Deal Scorer",
+        "description": "Activates and suppresses deals with the NCF model on Triton.",
         "intents": {"ACTIVATE_DEALS", "SUPPRESS_DEALS"},
         "grpc": os.environ.get("NCF_GRPC", os.environ.get("NCF_URL", "http://localhost:50063")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("NCF_MCP", os.environ.get("NCF_URL", "http://localhost:8093")),
     },
     {
         "name": "metrics-enricher",
+        "display_name": "Signals Enricher",
+        "description": "Adds viewability and brand-safety metrics (rule-based).",
         "intents": {"ADD_METRICS"},
         "grpc": os.environ.get("METRICS_GRPC", os.environ.get("METRICS_URL", "http://localhost:50064")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("METRICS_MCP", os.environ.get("METRICS_URL", "http://localhost:8094")),
@@ -80,12 +111,16 @@ CONTAINERS = [
     # supported as single-value fallbacks for parity with the other four.
     {
         "name": "yield-optimizer-floor",
+        "display_name": "Yield Optimizer — Floor",
+        "description": "Sets the deal bid floor with an XGBoost/FIL model on Triton.",
         "intents": {"ADJUST_DEAL_FLOOR"},
         "grpc": os.environ.get("YIELD_FLOOR_GRPC", os.environ.get("YIELD_FLOOR_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("YIELD_FLOOR_MCP", os.environ.get("YIELD_FLOOR_URL", "http://localhost:8095")),
     },
     {
         "name": "yield-optimizer-margin",
+        "display_name": "Yield Optimizer — Margin",
+        "description": "Sets the deal margin with an XGBoost/FIL model on Triton.",
         "intents": {"ADJUST_DEAL_MARGIN"},
         "grpc": os.environ.get("YIELD_MARGIN_GRPC", os.environ.get("YIELD_MARGIN_URL", "http://localhost:50066")).replace("http://", "").rstrip("/"),
         "mcp": os.environ.get("YIELD_MARGIN_MCP", os.environ.get("YIELD_MARGIN_URL", "http://localhost:8096")),
@@ -93,13 +128,51 @@ CONTAINERS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Effective registry — the six above, plus whatever the store defines
+# ---------------------------------------------------------------------------
+#
+# The store half lets a container be described and switched on or off without
+# rebuilding this image. Lazily constructed so importing this module never needs
+# AWS credentials (same idiom as closed_loop_api._get_parameter_store).
+
+_REGISTRY_STORE: ContainerRegistryStore | None = None
+
+
+def _registry_store() -> ContainerRegistryStore:
+    global _REGISTRY_STORE
+    if _REGISTRY_STORE is None:
+        _REGISTRY_STORE = ContainerRegistryStore()
+    return _REGISTRY_STORE
+
+
+def _effective_registry() -> tuple[list[RegistryEntry], list[str]]:
+    """The merged registry: code-defined containers plus store-defined ones.
+
+    Reads through the store's TTL cache, so this costs at most one DynamoDB
+    Query per TTL window per replica however high the request rate — the bid
+    path never pays a per-request round trip for it. A store failure yields the
+    last known good records, and a store that has never been read yields none,
+    which merges to exactly the six code-defined containers.
+    """
+    return merge_registry(CONTAINERS, _registry_store().get_records())
+
+
 def _filter_containers(applicable_intents: list[str] | None) -> list[dict]:
-    """Filter CONTAINERS to only those whose intents overlap with applicable_intents.
-    If applicable_intents is None or empty, all containers are called (backward compat)."""
-    if not applicable_intents:
-        return CONTAINERS
-    requested = set(applicable_intents)
-    return [c for c in CONTAINERS if c["intents"] & requested]
+    """Active containers whose intents overlap ``applicable_intents``, as dicts.
+
+    Kept in its original shape and name because ``loadtest.py`` imports it and
+    passes its results straight to ``_call_container_timed``. It now consults the
+    merged registry, so an inactive container is excluded here too and a load
+    test never drives traffic at something the operator switched off.
+
+    Empty or absent ``applicable_intents`` still means "all intents apply".
+    Callers needing to know *why* a container was not called should use
+    ``select_active`` directly — this function only returns the ones to call.
+    """
+    entries, _ = _effective_registry()
+    to_call, _ = select_active(entries, applicable_intents)
+    return [e.as_container_dict() for e in to_call]
 
 
 
@@ -130,8 +203,16 @@ async def _call_grpc(target: str, payload_bytes: bytes, timeout_s: float) -> lis
 # MCP/JSON-RPC caller (fallback)
 # ---------------------------------------------------------------------------
 
-async def _call_mcp(client: httpx.AsyncClient, base_url: str, payload: dict, timeout_s: float) -> list[Mutation]:
-    """Call a container's extend_rtb tool via MCP JSON-RPC."""
+async def _call_mcp(
+    client: httpx.AsyncClient, base_url: str, payload: dict, timeout_s: float
+) -> ContainerCallOutcome:
+    """Call a container's extend_rtb tool via MCP JSON-RPC.
+
+    Returns a ``ContainerCallOutcome`` rather than a bare mutation list. It used
+    to swallow every failure and return ``[]``, which meant the caller could not
+    tell "nothing answered" from "answered with nothing" — and so labelled a
+    completely absent container as ``ok``.
+    """
     try:
         rpc_body = {
             "jsonrpc": "2.0",
@@ -140,22 +221,38 @@ async def _call_mcp(client: httpx.AsyncClient, base_url: str, payload: dict, tim
             "params": {"name": "extend_rtb", "arguments": payload},
         }
         resp = await client.post(f"{base_url}/mcp", json=rpc_body, timeout=timeout_s)
-        if resp.status_code == 200:
-            data = resp.json()
-            result = data.get("result", {})
-            # MCP returns content array with text containing the RTBResponse JSON
-            for content_item in result.get("content", []):
-                if content_item.get("type") == "text":
-                    rtb_resp = json.loads(content_item["text"])
-                    return [Mutation(**m) for m in rtb_resp.get("mutations", [])]
-            # If no content array, check if result itself has mutations (direct response)
-            if "mutations" in result:
-                return [Mutation(**m) for m in result.get("mutations", [])]
-        else:
-            print(f"[orchestrator] MCP to {base_url} returned {resp.status_code}: {resp.text[:200]}")
     except Exception as exc:
+        # Nothing answered on the wire.
         print(f"[orchestrator] MCP to {base_url} failed: {exc}")
-    return []
+        return ContainerCallOutcome(reached=False, error=type(exc).__name__)
+
+    if resp.status_code != 200:
+        print(f"[orchestrator] MCP to {base_url} returned {resp.status_code}: {resp.text[:200]}")
+        return ContainerCallOutcome(reached=True, error=f"MCP HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+        result = data.get("result", {})
+        # MCP returns a content array whose text holds the RTBResponse JSON.
+        for content_item in result.get("content", []):
+            if content_item.get("type") == "text":
+                rtb_resp = json.loads(content_item["text"])
+                mutations = [Mutation(**m) for m in rtb_resp.get("mutations", [])]
+                model_version = (rtb_resp.get("metadata") or {}).get("model_version", "") or ""
+                return ContainerCallOutcome(reached=True, mutations=mutations, model_version=model_version)
+        # Some implementations put mutations directly on the result.
+        if "mutations" in result:
+            mutations = [Mutation(**m) for m in result.get("mutations", [])]
+            return ContainerCallOutcome(reached=True, mutations=mutations)
+        # A 200 that carries neither shape is a protocol error, not an empty
+        # answer — saying "no mutations" here would misreport a broken container
+        # as a well-behaved one.
+        if data.get("error"):
+            return ContainerCallOutcome(reached=True, error=f"MCP error: {str(data['error'])[:120]}")
+        return ContainerCallOutcome(reached=True, error="MCP response carried no mutations field")
+    except Exception as exc:
+        print(f"[orchestrator] MCP response from {base_url} unparseable: {exc}")
+        return ContainerCallOutcome(reached=True, error=f"unparseable MCP response ({type(exc).__name__})")
 
 
 async def _call_http(client: httpx.AsyncClient, base_url: str, payload: dict, timeout_s: float) -> list[Mutation]:
@@ -183,8 +280,8 @@ async def _call_container(
     timeout_s: float,
     *,
     headers: dict[str, str] | None = None,
-) -> tuple[list[Mutation], str]:
-    """Call a container's /mutate REST endpoint (MCP fallback).
+) -> ContainerCallOutcome:
+    """Call a container's /mutate REST endpoint, falling back to MCP JSON-RPC.
 
     ``headers``, when provided, are forwarded on the REST call only — used
     exclusively by the orchestrator's load-test invocation path to set the
@@ -192,29 +289,57 @@ async def _call_container(
     orchestrator/loadtest_targeting.py). Never set by this function's other
     callers (get_mutations / real bid-serving).
 
-    Returns (mutations, model_version). model_version is the container's
-    per-request-resolved served model version (from RTBResponse.metadata),
-    or "" if the container didn't return one — never fabricated.
+    Returns a ``ContainerCallOutcome`` carrying whether anything answered, what
+    it returned, and any transport or protocol error. ``model_version`` is the
+    container's per-request-resolved served model version (from
+    RTBResponse.metadata), or "" if it didn't return one — never fabricated.
+
+    **A parsed 200 is definitive**, mutations or not. This function used to fall
+    through to the MCP attempt whenever the REST call returned zero mutations,
+    so a healthy container that legitimately produced nothing was called twice on
+    every request. It also made an empty result ambiguous, which is what allowed
+    an unreachable container to be reported as ``ok``.
     """
-    # Try simple REST /mutate first (most reliable)
+    rest_error: str | None = None
+    rest_reached = False
+
     try:
         resp = await client.post(
             f"{container['mcp']}/mutate", json=payload, timeout=timeout_s, headers=headers
         )
+        rest_reached = True
         if resp.status_code == 200:
-            data = resp.json()
-            mutations = [Mutation(**m) for m in data.get("mutations", [])]
-            model_version = (data.get("metadata") or {}).get("model_version", "")
-            if mutations:
-                return mutations, model_version
+            try:
+                data = resp.json()
+                mutations = [Mutation(**m) for m in data.get("mutations", [])]
+                model_version = (data.get("metadata") or {}).get("model_version", "") or ""
+                return ContainerCallOutcome(
+                    reached=True, mutations=mutations, model_version=model_version
+                )
+            except Exception as exc:
+                rest_error = f"unparseable /mutate response ({type(exc).__name__})"
+                print(f"[orchestrator] /mutate response from {container['mcp']} unparseable: {exc}")
+        else:
+            rest_error = f"/mutate HTTP {resp.status_code}"
     except Exception as exc:
+        rest_error = type(exc).__name__
         print(f"[orchestrator] REST /mutate to {container['mcp']} failed: {exc}")
 
     # Fallback to MCP JSON-RPC (no header support on this path today — the
     # load-test-only override only needs to work on the REST path, which is
     # the one load test's container calls exercise).
-    mutations = await _call_mcp(client, container["mcp"], payload, timeout_s)
-    return mutations, ""
+    mcp_outcome = await _call_mcp(client, container["mcp"], payload, timeout_s)
+    if mcp_outcome.reached and mcp_outcome.error is None:
+        return mcp_outcome
+
+    # Neither transport produced a usable answer. Preserve the distinction
+    # between "something answered badly" and "nothing answered at all", and
+    # report the REST error in preference to the MCP one since /mutate is the
+    # primary path.
+    return ContainerCallOutcome(
+        reached=rest_reached or mcp_outcome.reached,
+        error=rest_error or mcp_outcome.error or "no response",
+    )
 
 
 async def _call_container_timed(
@@ -229,36 +354,48 @@ async def _call_container_timed(
     """Wrap ``_call_container`` with a wall-clock timer and outcome status.
 
     Records ``latency_ms`` in every branch using ``time.monotonic()``.
-    Returns a ``ContainerInvocationModel`` with:
+    Returns a ``ContainerInvocationModel`` whose ``status`` comes from
+    ``derive_status`` over the real call outcome:
 
-    - ``status="ok"`` and the produced mutations on success,
-    - ``status="timeout"`` and ``mutations=[]`` on ``asyncio.TimeoutError``,
-    - ``status="failed"`` and ``mutations=[]`` on any other exception.
+    - ``ok`` — reached, returned mutations
+    - ``no_mutations`` — reached, deliberately returned none
+    - ``unreachable`` — nothing answered on the wire
+    - ``error`` — answered, but the response was unusable
+    - ``timeout`` — exceeded the request's tmax budget
+    - ``failed`` — retained for an unexpected exception in this wrapper itself
 
-    ``headers`` is forwarded to ``_call_container`` unchanged — see its
-    docstring for the load-test-only usage.
+    Before this, every one of the first four collapsed to ``ok``, so a container
+    that was scaled to zero or had no Service endpoints reported itself healthy
+    on every request.
+
+    ``container`` is a plain dict (``name``/``intents``/``grpc``/``mcp``, and
+    optionally ``display_name``) — the shape loadtest.py and its tests pass.
+    ``headers`` is forwarded to ``_call_container`` unchanged.
     """
     start = time.monotonic()
+    display_name = container.get("display_name") or ""
     try:
-        mutations, model_version = await asyncio.wait_for(
+        outcome = await asyncio.wait_for(
             _call_container(client, container, payload, payload_bytes, timeout_s, headers=headers),
             timeout=timeout_s,
         )
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
         return ContainerInvocationModel(
             name=container["name"],
-            status="ok",
+            status=derive_status(outcome),
             latency_ms=latency_ms,
-            mutations=mutations,
-            model_version=model_version,
+            mutations=outcome.mutations,
+            model_version=outcome.model_version,
+            display_name=display_name,
         )
     except asyncio.TimeoutError:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
         return ContainerInvocationModel(
             name=container["name"],
-            status="timeout",
+            status=STATUS_TIMEOUT,
             latency_ms=latency_ms,
             mutations=[],
+            display_name=display_name,
         )
     except Exception as exc:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -268,7 +405,59 @@ async def _call_container_timed(
             status="failed",
             latency_ms=latency_ms,
             mutations=[],
+            display_name=display_name,
         )
+
+
+# ---------------------------------------------------------------------------
+# Fan-out — one implementation, used by both the REST and MCP entry points
+# ---------------------------------------------------------------------------
+
+async def _fan_out(
+    payload: dict,
+    payload_bytes: bytes,
+    applicable_intents: list | None,
+    *,
+    timeout_s: float,
+    headers: dict[str, str] | None = None,
+) -> list[ContainerInvocationModel]:
+    """Call every active, intent-matching container and return one entry each.
+
+    Extracted because POST /v1/mutations and the MCP ``tools/call`` proxy each
+    carried their own copy of the filter + gather + backfill. Two copies is how
+    they drifted, and gating on activation state in only one of them would mean a
+    container the operator switched off still ran on the other path. One
+    implementation makes that impossible rather than merely unlikely.
+
+    Every registry entry appears in the result, in registry order, whatever
+    happened — containers that were not called get ``disabled`` or ``skipped``
+    with ``latency_ms=0``.
+    """
+    entries, _warnings = _effective_registry()
+    to_call, not_called = select_active(entries, applicable_intents)
+
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            _call_container_timed(
+                client, e.as_container_dict(), payload, payload_bytes, timeout_s, headers=headers
+            )
+            for e in to_call
+        ]
+        invocations: list[ContainerInvocationModel] = await asyncio.gather(*tasks)
+
+    by_name = {inv.name: inv for inv in invocations}
+    for entry, reason in not_called:
+        by_name[entry.name] = ContainerInvocationModel(
+            name=entry.name,
+            status=reason,
+            latency_ms=0,
+            mutations=[],
+            display_name=entry.display_name,
+        )
+
+    # Registry order is also the mutation attribution order, so it is preserved
+    # rather than following completion order.
+    return [by_name[e.name] for e in entries if e.name in by_name]
 
 
 # ---------------------------------------------------------------------------
@@ -283,30 +472,19 @@ async def get_mutations(request: Request) -> JSONResponse:
     payload = req.model_dump()
     payload_bytes = json.dumps(payload).encode()
 
-    # Only call containers whose intents match applicable_intents
+    # Only call containers that are active AND whose intents match
+    # applicable_intents. An inactive container is reported "disabled" and never
+    # invoked; one whose intents don't match is "skipped". Different facts, so
+    # different labels.
     applicable = getattr(req, "applicable_intents", None) or body.get("applicable_intents")
-    active_containers = _filter_containers(applicable)
 
     start = time.monotonic()
-    async with httpx.AsyncClient() as client:
-        tasks = [_call_container_timed(client, c, payload, payload_bytes, timeout_s) for c in active_containers]
-        invocations: list[ContainerInvocationModel] = await asyncio.gather(*tasks)
+    all_invocations = await _fan_out(
+        payload, payload_bytes, applicable, timeout_s=timeout_s
+    )
 
-    # For containers that were NOT called (filtered out), add a "skipped" entry
-    # so the frontend knows they weren't invoked (not that they failed).
-    active_names = {c["name"] for c in active_containers}
-    all_invocations = []
-    for c in CONTAINERS:
-        if c["name"] in active_names:
-            inv = next(i for i in invocations if i.name == c["name"])
-            all_invocations.append(inv)
-        else:
-            all_invocations.append(ContainerInvocationModel(
-                name=c["name"], status="skipped", latency_ms=0, mutations=[],
-            ))
-
-    # Preserve canonical CONTAINERS registry order for both the flattened
-    # mutations list and the per-container attribution surfaced via metadata.
+    # Preserve canonical registry order for both the flattened mutations list
+    # and the per-container attribution surfaced via metadata.
     all_mutations: list[Mutation] = [m for inv in all_invocations for m in inv.mutations]
 
     elapsed_ms = (time.monotonic() - start) * 1000
@@ -476,14 +654,49 @@ async def list_containers(request: Request) -> JSONResponse:
         "yield-optimizer-margin": "deal_yield_manager_margin",
     }
 
+    registry_entries, registry_warnings = _effective_registry()
+    intent_clashes = shared_intents(registry_entries)
+
     async with httpx.AsyncClient(timeout=2.0) as client:
-        for c in CONTAINERS:
+        for c in registry_entries:
+            # An inactive container is not probed. Probing it would cost the
+            # panel up to two seconds per container (this loop is sequential) to
+            # learn something the operator already decided, and reporting the
+            # result would claim a health verdict about a container that is
+            # deliberately out of the flow. "not_probed" is the truthful value
+            # for a check that did not run.
+            if not c.active:
+                results.append({
+                    "name": c.name,
+                    "displayName": c.display_name,
+                    "description": c.description,
+                    "intents": sorted(c.intents),
+                    "active": False,
+                    "configurable": c.configurable,
+                    "source": c.source,
+                    "grpc": c.grpc,
+                    "mcp": c.endpoint,
+                    "urlScope": "cluster-dns",
+                    "status": STATUS_DISABLED,
+                    "containerStatus": "not_probed",
+                    "inferenceStatus": "not_probed",
+                    "protocol": "none",
+                    "tritonModel": container_to_model.get(c.name),
+                    "evidence": {
+                        "httpProbe": None,
+                        "grpcProbe": None,
+                        "tritonModelProbes": [],
+                        "note": "Not probed: the container is inactive, so it is not called.",
+                    },
+                })
+                continue
+
             container_status = "unknown"
             protocol = "none"
             inference_status = "unknown"
 
             # Check container health via HTTP (MCP endpoint)
-            health_url = c["mcp"].rstrip("/") + "/health/ready"
+            health_url = c.endpoint.rstrip("/") + "/health/ready"
             http_probe = await _probe_http(client, health_url)
             if http_probe["ok"]:
                 container_status = "ready"
@@ -492,7 +705,7 @@ async def list_containers(request: Request) -> JSONResponse:
             # Check gRPC health if HTTP failed
             grpc_probe = None
             if container_status != "ready":
-                grpc_probe = await _probe_grpc(c["grpc"])
+                grpc_probe = await _probe_grpc(c.grpc)
                 if grpc_probe["ok"]:
                     container_status = "ready"
                     protocol = "grpc"
@@ -500,7 +713,12 @@ async def list_containers(request: Request) -> JSONResponse:
                     container_status = "unreachable"
 
             # Determine inference readiness (depends on Triton for GPU containers).
-            model_name = container_to_model.get(c["name"])
+            # A store-defined container has no entry in container_to_model, so
+            # .get() returns None and it takes the rules-based branch — correct,
+            # since a user's own container has no Triton model unless they add
+            # one, and inventing a model probe for it would report on something
+            # that does not exist.
+            model_name = container_to_model.get(c.name)
             if model_name is None:
                 # Rules-based container — no Triton dependency
                 inference_status = "ready" if container_status == "ready" else "unavailable"
@@ -522,9 +740,15 @@ async def list_containers(request: Request) -> JSONResponse:
                 overall = "degraded"
 
             entry = {
-                "name": c["name"],
-                "grpc": c["grpc"],
-                "mcp": c["mcp"],
+                "name": c.name,
+                "displayName": c.display_name,
+                "description": c.description,
+                "intents": sorted(c.intents),
+                "active": True,
+                "configurable": c.configurable,
+                "source": c.source,
+                "grpc": c.grpc,
+                "mcp": c.endpoint,
                 "urlScope": "cluster-dns",  # NOT reachable from a browser; resolves only inside the EKS cluster
                 "status": overall,
                 "containerStatus": container_status,
@@ -543,8 +767,16 @@ async def list_containers(request: Request) -> JSONResponse:
             }
             results.append(entry)
 
+    # Registry state as evidence, so the UI can say WHY a container is not
+    # configurable instead of just disabling a button. tableConfigured=false
+    # means the feature is off; tableReachable=false means it is on and broken.
+    registry_block = _registry_store().snapshot()
+    registry_block["warnings"] = registry_warnings
+    registry_block["sharedIntents"] = intent_clashes
+
     return JSONResponse({
         "containers": results,
+        "registry": registry_block,
         "triton": {
             "ready": triton_ready,
             "url": triton_url,
@@ -560,6 +792,94 @@ async def list_containers(request: Request) -> JSONResponse:
             "(<service>:<port>) and resolve only from inside the EKS cluster. "
             "Each entry's `evidence` includes the resolved IP, latency, HTTP "
             "status code, and timestamp from the orchestrator's probe."
+        ),
+    })
+
+
+async def set_container_active(request: Request) -> JSONResponse:
+    """POST /v1/containers/{name}/active — activate or deactivate a container.
+
+    Body: ``{"active": true|false}``.
+
+    Only store-defined containers can be toggled. A request naming one of the
+    six code-defined containers is refused with 409 rather than ignored, so the
+    caller learns the built-in bid path is not UI-mutable instead of watching a
+    switch silently spring back.
+
+    Fails closed: on any error the stored flag is left alone and the response
+    carries the real reason. The effect is not immediate — every orchestrator
+    replica reads the registry through a TTL cache, so the response reports the
+    window rather than implying the change is global at once.
+    """
+    name = request.path_params.get("name", "")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Request body must be JSON."}, status_code=400)
+
+    if not isinstance(body, dict) or not isinstance(body.get("active"), bool):
+        # No coercion of "true"/1 — an ambiguous request is rejected rather than
+        # guessed at, because guessing wrong silently changes bid behaviour.
+        return JSONResponse(
+            {"error": 'Body must be an object with a boolean "active" field.'},
+            status_code=400,
+        )
+    active = body["active"]
+
+    entries, _ = _effective_registry()
+    entry = next((e for e in entries if e.name == name), None)
+    if entry is None:
+        return JSONResponse(
+            {"error": f"No container named '{name}' in the registry."}, status_code=404
+        )
+    if not entry.configurable:
+        return JSONResponse(
+            {
+                "error": (
+                    f"'{name}' is a built-in container defined in the orchestrator's code. "
+                    f"Built-in containers cannot be renamed, re-targeted or deactivated from "
+                    f"the API."
+                ),
+                "source": entry.source,
+            },
+            status_code=409,
+        )
+
+    # CognitoAuthMiddleware has already validated the token and attached the
+    # claims as request.state.user (auth.py:174). This only reads the subject off
+    # them for provenance, and falls back to "unknown" rather than inventing an
+    # identity — the middleware can be bypassed for health paths, and a claim
+    # that is not there should not be filled in.
+    updated_by = "unknown"
+    claims = getattr(request.state, "user", None)
+    if isinstance(claims, dict):
+        updated_by = claims.get("sub") or claims.get("username") or claims.get("email") or "unknown"
+
+    store = _registry_store()
+    try:
+        record = store.set_active(name, active, updated_by=updated_by)
+    except RegistryRecordNotFound as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except RegistryStoreUnavailable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception as exc:  # defensive: never leak an unhandled 500 body
+        return JSONResponse(
+            {"error": f"Could not update '{name}': {type(exc).__name__}: {exc}"},
+            status_code=500,
+        )
+
+    ttl = int(store.ttl_seconds)
+    verb = "active" if active else "inactive"
+    return JSONResponse({
+        "ok": True,
+        "container": name,
+        "active": bool(record.get("active", active)),
+        "effectiveWithinSeconds": ttl,
+        "updatedAt": record.get("updated_at"),
+        "message": (
+            f"{entry.display_name or name} is now {verb}. Orchestrator replicas read the "
+            f"registry on a {ttl}s cache, so bid traffic reflects this within {ttl} seconds."
         ),
     })
 
@@ -615,26 +935,14 @@ async def mcp_proxy(request: Request) -> JSONResponse:
             payload = req.model_dump()
             payload_bytes = json.dumps(payload).encode()
 
-            # Only call containers whose intents match applicable_intents
+            # Same fan-out as POST /v1/mutations, including activation gating —
+            # one implementation, so this path cannot drift from that one.
             applicable = getattr(req, "applicable_intents", None) or arguments.get("applicable_intents")
-            active_containers = _filter_containers(applicable)
 
             start = time.monotonic()
-            async with httpx.AsyncClient() as client:
-                tasks = [_call_container_timed(client, c, payload, payload_bytes, timeout_s) for c in active_containers]
-                invocations: list[ContainerInvocationModel] = await asyncio.gather(*tasks)
-
-            # For containers that were NOT called, add a "skipped" entry
-            active_names = {c["name"] for c in active_containers}
-            all_invocations = []
-            for c in CONTAINERS:
-                if c["name"] in active_names:
-                    inv = next(i for i in invocations if i.name == c["name"])
-                    all_invocations.append(inv)
-                else:
-                    all_invocations.append(ContainerInvocationModel(
-                        name=c["name"], status="skipped", latency_ms=0, mutations=[],
-                    ))
+            all_invocations = await _fan_out(
+                payload, payload_bytes, applicable, timeout_s=timeout_s
+            )
 
             all_mutations: list[Mutation] = [m for inv in all_invocations for m in inv.mutations]
 
@@ -950,6 +1258,7 @@ def _closed_loop_routes(prefix: str) -> list:
 routes = [
     Route("/v1/mutations", get_mutations, methods=["POST"]),
     Route("/v1/containers", list_containers),
+    Route("/v1/containers/{name}/active", set_container_active, methods=["POST"]),
     Route("/v1/signals", receive_signal, methods=["POST"]),
     Route("/v1/gpu/status", gpu_status),
     Route("/v1/gpu/start", gpu_start, methods=["POST"]),
@@ -965,6 +1274,7 @@ routes = [
     # CloudFront proxies /api/* from the frontend
     Route("/api/v1/mutations", get_mutations, methods=["POST"]),
     Route("/api/v1/containers", list_containers),
+    Route("/api/v1/containers/{name}/active", set_container_active, methods=["POST"]),
     Route("/api/v1/signals", receive_signal, methods=["POST"]),
     Route("/api/v1/gpu/status", gpu_status),
     Route("/api/v1/gpu/start", gpu_start, methods=["POST"]),
@@ -979,6 +1289,7 @@ routes = [
     # RTB Fabric path — same handlers, different prefix for CloudFront routing
     Route("/fabric/v1/mutations", get_mutations, methods=["POST"]),
     Route("/fabric/v1/containers", list_containers),
+    Route("/fabric/v1/containers/{name}/active", set_container_active, methods=["POST"]),
     Route("/fabric/mcp", mcp_proxy, methods=["POST", "GET", "DELETE", "OPTIONS"]),
     Route("/fabric/health/ready", health),
 ]

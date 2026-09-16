@@ -1,0 +1,393 @@
+# prebid-config.yaml -- the `current/` overlay
+#
+# Uploaded by deploy_prebid.sh to
+#   s3://__CONFIG_BUCKET__/prebid-server/current/prebid-config.yaml
+#
+# ---------------------------------------------------------------------------------
+# THIS FILE REPLACES THE DEFAULT ONE. IT DOES NOT MERGE WITH IT.
+#
+# The image entrypoint (bootstrap.sh, from the pinned upstream release) does:
+#
+#   aws s3 cp s3://$BUCKET/prebid-server/default/ /prebid-configs --recursive
+#   aws s3 cp s3://$BUCKET/prebid-server/current/ /prebid-configs --recursive
+#
+# Two copies into ONE directory. Both prefixes carry a file named
+# prebid-config.yaml, so the second overwrites the first WHOLESALE -- there is no
+# YAML merge anywhere in that path. Anything present in the default file and absent
+# here is therefore GONE, not inherited.
+#
+# THAT IS DELIBERATE HERE, AND NECESSARY. The release's default config is written for
+# the upstream ECS topology and refers to infrastructure this deployment does not
+# create: ${CACHE_HOST} (Prebid Cache), ${SETTINGS_S3_ENDPOINT/BUCKET/REGION}
+# (the stored-request bucket), ${AMT_ADAPTER_ENABLED} and ${LOG_ANALYTICS_ENABLED}.
+# Spring fails to start on an unresolved placeholder, so inheriting that file would
+# not work -- replacing it is what makes the pod able to boot at all.
+#
+# The consequence, stated rather than discovered later: there is NO Prebid Cache and
+# NO stored-request/account store in this deployment. Features that depend on them
+# (VAST caching, AMP, stored requests) are unavailable. Auctions are not.
+# ---------------------------------------------------------------------------------
+#
+# S3 is the source of truth: edit this object and restart the deployment. No rebuild.
+#
+#   aws s3 cp <edited> s3://__CONFIG_BUCKET__/prebid-server/current/prebid-config.yaml
+#   kubectl rollout restart deployment/prebid-server
+#
+# Placeholders substituted at deploy time:
+#   __CONFIG_BUCKET__      S3 bucket holding this file
+#   __DEMAND_ENDPOINT__    artfhouse demand endpoint URL (API Gateway HTTP API)
+#
+# Environment variables referenced below are set on the container by
+# eks/prebid-server-deployment.yaml, except SSL_KEYSTORE_PATH and SSL_KEYSTORE_PASS,
+# which the image's own entrypoint.sh exports after generating a keystore.
+
+# Probed by the readiness, liveness and startup probes at GET /status.
+status-response: "ok"
+
+server:
+  # LOAD-BEARING. Reproduced from the upstream default because this file replaces it.
+  # The port and the TLS settings are what the probes and the Service target.
+  http:
+    enabled: true
+    port: 8443
+  ssl: true
+  jks-path: ${SSL_KEYSTORE_PATH}
+  jks-password: ${SSL_KEYSTORE_PASS}
+
+metrics:
+  logback:
+    enabled: true
+    name: METRICS
+    interval: 30
+
+adapters:
+  # The ARTF demand adapter. Named "artfhouse" throughout this feature.
+  #
+  # The endpoint arrives as deployment-time configuration rather than a compiled-in
+  # constant -- the same shape upstream adapters use -- so the same image can be
+  # pointed at a different demand endpoint without a rebuild. The value here takes
+  # precedence over the adapter's own bidder-config/artfhouse.yaml, which resolves
+  # ${ARTFHOUSE_DEMAND_ENDPOINT} from the container environment.
+  artfhouse:
+    enabled: true
+    endpoint: "__DEMAND_ENDPOINT__"
+    # The demand endpoint is authenticated (Cognito JWT, scope artf-demand/bid:read).
+    # The bearer token is attached by the adapter at call time from the credential
+    # read via IRSA; it is NOT configured here, and no credential belongs in this file.
+    #
+    # The adapter reads its timeout from Prebid's own per-bidder timeout handling,
+    # which is bounded by the auction tmax. No independent timeout is set here: two
+    # independent timeouts produce a call the auction has already abandoned.
+
+  # The upstream default file enables appnexus, ix, openx, pubmatic and rubicon. They
+  # are NOT re-enabled here: this deployment has no credentials for them and calling
+  # them would produce timeouts that look like ARTF failures. Their absence is a
+  # decision, not an omission.
+
+# =============================================================================
+# CACHE -- REQUIRED TO BOOT, AND DELIBERATELY POINTED AT NOTHING.
+#
+# NO PREBID CACHE IS DEPLOYED BY THIS TOPOLOGY. The upstream guidance deploys one
+# (source/infrastructure/prebid_server/cache_construct.py) and sets CACHE_HOST to
+# its CloudFront or ALB domain. This deployment does not, because the demonstration
+# is about ARTF mutation on the auction path and never asks for a cached creative.
+#
+# The block cannot simply be omitted. CoreCacheService is constructed
+# unconditionally, and with no scheme or host Prebid fails to start:
+#
+#   IllegalArgumentException: Could not get cache endpoint for prebid cache service
+#   Caused by: MalformedURLException: unknown protocol: null
+#
+# So the endpoint is well-formed but intentionally unroutable. `localhost` is chosen
+# for exactly that reason: nothing listens on it in this pod, so a request that
+# genuinely needs the cache fails immediately and visibly. Naming a plausible-looking
+# external domain instead would let a cache call appear configured when no cache
+# exists anywhere.
+#
+# Banner auctions without ext.prebid.cache never contact it, which is every request
+# this deployment makes. If you need caching, deploy a Prebid Cache and put its real
+# host here.
+# =============================================================================
+cache:
+  scheme: http
+  host: localhost
+  path: /cache
+  query: uuid=
+
+# NOTE ON `analytics`: the upstream default configures the psdoa analytics reporter
+# against the upstream solution's own datastore, which this topology does not create.
+# It is omitted rather than disabled -- its @ConditionalOnProperty on
+# analytics.psdoa.enabled then simply does not match and no bean is created. Setting
+# it to false would work too, but would imply the reporter is available and switched
+# off rather than absent. The ARTF hook reports through analytics TAGS on the auction
+# response, which need no reporter.
+
+settings:
+  # Carried forward from the upstream default, and required. Without it Prebid demands
+  # a stored account for the request's account id, and this deployment has no account
+  # store -- every auction would be rejected before a hook ever ran.
+  enforce-valid-account: false
+  generate-storedrequest-bidrequest-id: true
+
+  # ---------------------------------------------------------------------------
+  # AN APPLICATION SETTINGS IMPLEMENTATION IS MANDATORY.
+  #
+  # Prebid refuses to start without one:
+  #
+  #   java.lang.IllegalArgumentException:
+  #   At least one application settings implementation required
+  #
+  # This block is not decoration. Because this overlay REPLACES the upstream
+  # default file rather than merging with it, dropping the upstream's settings.s3
+  # block left the server with zero implementations and it crash-looped through
+  # CompositeApplicationSettings.
+  #
+  # s3 rather than filesystem: FileApplicationSettings calls readDirBlocking on
+  # every directory at construction and throws if one is absent, so it would need
+  # four directories and a parsable settings file created inside the container.
+  # The S3 implementation fetches per key and lazily, so these prefixes may be
+  # empty -- and with enforce-valid-account false, an ordinary auction reads none
+  # of them. It is also what the upstream deployment used, so this is the same
+  # mechanism pointed at this topology's bucket.
+  #
+  # Credentials come from the default provider chain, which resolves the pod's
+  # IRSA web identity token. prebid_cfn.yaml grants the role GetObject on
+  # prebid-server/settings/* and ListBucket for that prefix.
+  #
+  # All four directories are required: the class is @Validated with @NotBlank on
+  # accounts-dir, stored-imps-dir, stored-requests-dir AND stored-responses-dir,
+  # while only the first three gate the @ConditionalOnProperty -- so omitting
+  # stored-responses-dir activates the configuration and then fails validation.
+  # ---------------------------------------------------------------------------
+  s3:
+    endpoint: https://s3.__AWS_REGION__.amazonaws.com
+    region: __AWS_REGION__
+    bucket: __CONFIG_BUCKET__
+    force-path-style: false
+    accounts-dir: prebid-server/settings/accounts
+    stored-imps-dir: prebid-server/settings/stored-imps
+    stored-requests-dir: prebid-server/settings/stored-requests
+    stored-responses-dir: prebid-server/settings/stored-responses
+
+  # Account defaults, as a JSON string. This is how Prebid takes it
+  # (application.yaml: settings.default-account-config), not a YAML map.
+  #
+  # ---------------------------------------------------------------------------
+  # PRICE FLOORS ARE ENABLED, AND THAT REVERSES AN EARLIER DECISION.
+  #
+  # The design said to DISABLE Prebid's price-floors feature so the ARTF hook would
+  # be the single floor authority. Reading pbs-java 3.43.0 showed that would achieve
+  # the opposite: BasicPriceFloorEnforcer.shouldApplyEnforcement returns false when
+  # the account has price-floors disabled (BasicPriceFloorEnforcer.java:71-77), so
+  # disabling it switches off the only component that enforces ANY floor --
+  # including the ARTF one. The mutation would apply to the request and be unable to
+  # reject a single bid: a stack that looks healthy and does nothing.
+  #
+  # Single-authority is preserved by a different mechanism instead: fetch is off and
+  # no floor rules are defined, so the only floor in play is the one the hook writes
+  # to imp.bidfloor. FR-21's intent, by a route that actually works.
+  # ---------------------------------------------------------------------------
+  #
+  # enforce-deal-floors is set explicitly. Note it DEFAULTS TO TRUE in 3.43.0
+  # (application.yaml:191; docs/application-settings.md:44) -- the requirement that
+  # said otherwise was wrong for this version.
+  #
+  # THE REAL TRAP IS REQUEST-SIDE. Deal enforcement is
+  #   isTrue(request ext.prebid.floors.enforcement.floorDeals)
+  #     && isTrue(account enforce-deal-floors)
+  # (BasicPriceFloorEnforcer.java:204-212), and floorDeals has NO DEFAULT anywhere in
+  # the codebase. A request that omits it gets no deal-floor enforcement whatever this
+  # setting says. Setting it here is necessary and not sufficient; the scenario
+  # generator must send floorDeals: true.
+  default-account-config: >
+    {
+      "auction": {
+        "price-floors": {
+          "enabled": true,
+          "fetch": {
+            "enabled": false
+          },
+          "enforce-floors-rate": 100,
+          "enforce-deal-floors": true,
+          "use-dynamic-data": false,
+          "adjust-for-bid-adjustment": true
+        }
+      }
+    }
+
+gdpr:
+  default-value: 1
+  vendorlist:
+    v2:
+      cache-dir: /var/tmp/vendor2
+    v3:
+      cache-dir: /var/tmp/vendor3
+
+admin-endpoints:
+  logging-changelevel:
+    enabled: true
+    path: /logging/changelevel
+    on-application-port: true
+    protected: false
+
+hooks:
+  # Enables the module's beans. ArtfModuleConfiguration is annotated
+  # @ConditionalOnProperty(prefix = "hooks.artf-orchestrator", name = "enabled",
+  # havingValue = "true"), so with this false or absent NOTHING in the module is
+  # registered -- the module is not merely idle, it does not exist.
+  artf-orchestrator:
+    enabled: true
+
+    # The module's ENTIRE configuration surface: an endpoint, a credential, a timeout
+    # and an intent list. No model, framework or container name appears here (FR-5,
+    # BR-18) -- that is what makes this a general ARTF host rather than a bespoke
+    # client for one repository's containers.
+    extension-point-url: ${ARTF_EXTENSION_POINT_URL}
+    token-endpoint: ${ARTF_TOKEN_ENDPOINT}
+    scope: ${ARTF_SCOPE}
+
+    # PROVENANCE ONLY -- the module never reads this ARN. It cannot: the shipped jar has
+    # no `secretsmanager` AWS SDK module and no `sts`, so there is neither a client to
+    # call with nor a way to use the pod's IRSA identity, and adding either would mean
+    # editing the upstream pom (a fork). Recorded because it says WHERE the credential
+    # came from, which the running config would otherwise not reveal.
+    credential-secret-arn: ${ARTF_CREDENTIAL_SECRET_ARN}
+
+    # The credential itself, delivered from that secret via a Kubernetes Secret by
+    # deploy_prebid.sh. Secrets Manager remains the source of record; only the delivery
+    # route changed, because the JVM has no way to fetch it.
+    client-id: ${ARTF_CLIENT_ID}
+    client-secret: ${ARTF_CLIENT_SECRET}
+
+    # 100 ms matches the framework's own default (source/shared/artf_types.py:120).
+    # Not derived per request; the budget calculator's cap only ever tightens it.
+    tmax-ms: 100
+
+    # Transport allowance and the reserve set aside for bidder fan-out and auction
+    # resolution. Both are configurable defaults chosen to be SAFE, not measured
+    # figures -- the orchestrator records latency_ms in every branch, so they are to be
+    # validated against observed latency and adjusted.
+    overhead-ms: 20
+    reserve-ms: 60
+
+    # BID_SHADE is deliberately absent. It addresses a bid in the auction RESPONSE
+    # (/seatbid/{seat}/bid/{id}), and this hook runs at processed-auction-request
+    # before the bidder fan-out, where no seatbid exists. Including it would produce
+    # mutations that can only ever be rejected.
+    intents:
+      - ACTIVATE_SEGMENTS
+      - ACTIVATE_DEALS
+      - SUPPRESS_DEALS
+      - ADJUST_DEAL_FLOOR
+      - ADJUST_DEAL_MARGIN
+      - ADD_METRICS
+      - ADD_CIDS
+
+  # ---------------------------------------------------------------------------
+  # THE EXECUTION PLAN. Without it the module is present and NEVER INVOKED.
+  #
+  # Prebid does not infer invocation from a module being on the classpath. This is
+  # the single most likely way for this stack to look healthy while doing nothing.
+  #
+  # Written as a JSON STRING in a block scalar, not as nested YAML. The property is
+  # typed String and parsed with Jackson (HookStageExecutor.java:148-156), so a YAML
+  # map here fails to bind. Upstream's own sample uses the same shape
+  # (sample/configs/prebid-config-with-module.yaml:45).
+  #
+  # module-code and hook-impl-code must match ArtfModule.CODE and
+  # ArtfProcessedAuctionRequestHook.CODE exactly. A plan naming a hook that is not
+  # registered THROWS AT STARTUP (HookStageExecutor.java:169-177) -- which is the
+  # safer direction, and why naming the hook is preferable to omitting it.
+  # source/prebid/verify_symbols.py checks that the two agree.
+  #
+  # The group timeout bounds the hook independently of the auction deadline. 150 ms
+  # leaves room for the configured 100 ms tmax plus the 20 ms transport allowance.
+  # ---------------------------------------------------------------------------
+  host-execution-plan: >
+    {
+      "endpoints": {
+        "/openrtb2/auction": {
+          "stages": {
+            "processed-auction-request": {
+              "groups": [
+                {
+                  "timeout": 150,
+                  "hook-sequence": [
+                    {
+                      "module-code": "artf-orchestrator",
+                      "hook-impl-code": "artf-orchestrator-processed-auction-request"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+
+# ---------------------------------------------------------------------------------
+# TWO SETTINGS THAT ARE REQUEST-SIDE, NOT SERVER-SIDE
+#
+# Recorded here because the design listed them alongside the server settings, and a
+# reader looking for them in this file needs to know why they are not in it.
+#
+# 1. ext.prebid.returnallbidstatus (FR-20, BR-21)
+#    Populates ext.seatnonbid with per-candidate loss reasons, so a rejected candidate
+#    can be shown WITH a reason. It is read from the request
+#    (DebugResolver.shouldReturnAllBidStatus), so the scenario generator must set it.
+#
+# 2. ext.prebid.targeting.preferdeals (FR-18)
+#    Selects the highest-value deal ahead of a higher non-deal bid. Also request-side.
+#    Documented default is false (docs/application-settings.md:49).
+#
+# And a third, from the floors work above:
+#
+# 3. ext.prebid.floors.enforcement.floorDeals
+#    Required for deal-floor enforcement, with no default. See the note on
+#    default-account-config.
+#
+# A fourth, for reporting:
+#
+# 4. ext.prebid.trace: "verbose"
+#    The hook's analytics tags reach the client only at verbose trace level
+#    (HookDebugInfoEnricher.java:191-192). The trace level is read straight from the
+#    request with no account gate (DebugResolver.java:80-82), so this is sufficient --
+#    but without it the tags are absent entirely, and a consumer must render without
+#    them rather than treat their absence as a module failure.
+#
+# 5. ext.prebid.multibid  --  THE ONE MOST LIKELY TO BE MISSED
+#    Prebid keeps exactly ONE bid per impression per seat unless the request names the
+#    bidder here with a maxbids (BidResponseCreator.limitMultiBid; DEFAULT_BID_LIMIT_MIN
+#    is 1). The artfhouse endpoint returns one bid per eligible campaign in a single
+#    seat, so WITHOUT THIS every campaign but one is silently dropped -- and the
+#    response stays well formed, showing a single campaign, which looks correct.
+#
+#      "ext": { "prebid": { "multibid": [ { "bidder": "artfhouse", "maxbids": 5 } ] } }
+#
+#    maxbids is clamped to 1..9 silently (ExchangeService.java:129-130), and omitting
+#    it SKIPS the bidder entirely with a debug-only warning (:405-409).
+# ---------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------
+# PRICE GRANULARITY: DO NOT USE "low"
+#
+# Not a ceiling. There is NO bid price ceiling in pbs-java 3.43.0 --
+# ResponseBidValidator checks id, impid, crid, video adm/nurl and currency, and
+# AccountBidValidationConfig carries only banner_creative_max_size. A high-priced bid
+# is not discarded.
+#
+# What does happen is targeting-key clamping: CpmRange.fromCpmAsNumber returns the top
+# bucket's maximum for any price above it, keeping the bid. Top buckets are 20 for
+# medium/med/high/auto/dense and 5 for low (PriceGranularity.java:30-38).
+#
+# The catalog's highest declared CPM is 6.35, so nothing bites under any granularity
+# EXCEPT "low", where that campaign's hb_pb would read 5.00 -- a misreported targeting
+# key rather than a lost bid. No granularity is set here, so Prebid's own default
+# applies; the constraint is simply not to change it to "low".
+#
+# Recorded because an earlier version of this feature's design stated that a
+# configured bid ceiling would DISCARD bids above it, and that a ceiling had to exceed
+# 6.35. That is not true of this version, and a reader would have gone looking for a
+# setting that does not exist.
+# ---------------------------------------------------------------------------------

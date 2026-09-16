@@ -14,7 +14,7 @@
  * design). Returns null (a real "unknown", not a fabricated value) if the
  * path doesn't match this shape or the deal can't be found.
  */
-function _findOriginalDealBidfloor(result, path) {
+export function findOriginalDealBidfloor(result, path) {
   if (!path) return null;
   const match = /^\/imp\/([^/]+)\/deals\/([^/]+)$/.exec(path);
   if (!match) return null;
@@ -82,7 +82,7 @@ export function computeDiffRows(result) {
       // not { original, adjusted }. The "before" value comes from the
       // deal's original bidfloor in the submitted bid request, matched by
       // the mutation's path (/imp/{imp_id}/deals/{deal_id}).
-      const original = _findOriginalDealBidfloor(result, path);
+      const original = findOriginalDealBidfloor(result, path);
       const adjusted = m.payload.bidfloor;
       rows.push({
         path: path || "deal.bidfloor",

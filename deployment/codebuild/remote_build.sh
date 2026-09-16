@@ -51,6 +51,9 @@ display_name() {
     # display names (kept in step with deploy.sh's display_name()).
     yield-optimizer-floor)       echo "yield-optimizer-floor" ;;
     yield-optimizer-margin)      echo "yield-optimizer-margin" ;;
+    # The template container was named for its job from the start, so its key
+    # already IS its display name (kept in step with deploy.sh's display_name()).
+    artf-template)               echo "artf-template" ;;
     *)                           echo "$1" ;;
   esac
 }
@@ -216,6 +219,7 @@ REPOS=(
   "${STACK_NAME}-$(display_name metrics-enricher)"
   "${STACK_NAME}-$(display_name yield-optimizer-floor)"
   "${STACK_NAME}-$(display_name yield-optimizer-margin)"
+  "${STACK_NAME}-$(display_name artf-template)"
   "${STACK_NAME}-orchestrator"
   "${STACK_NAME}-agentcore"
 )

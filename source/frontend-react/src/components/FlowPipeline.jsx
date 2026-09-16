@@ -226,11 +226,16 @@ export default function FlowPipeline({ result, loading, error }) {
                 : 0;
               const hasMutations = mutationsByAgent[node.id]?.length > 0;
               const status = stop?.status || "idle";
+              // "no_mutations" means the container was reached and ran, and chose
+              // not to mutate. That is a container that participated, so it is
+              // rendered active alongside "ok" — treating it as inactive would
+              // read as "did not run", which is a different thing.
+              const ran = status === "ok" || status === "no_mutations";
 
               return (
                 <div
                   key={node.id}
-                  className={`agent-row ${status === "ok" ? "agent-row--active" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
+                  className={`agent-row ${ran ? "agent-row--active" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
                   data-node={node.id}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}

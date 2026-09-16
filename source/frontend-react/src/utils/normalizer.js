@@ -91,20 +91,57 @@ function makePlaceholderContainerStop(id) {
   };
 }
 
+// Prefix for stops synthesized from a container the frontend has no build-time
+// entry for. Namespaced so it can never collide with one of the six fixed stop
+// ids, and so downstream code can recognise a dynamic stop when it needs to.
+export const DYNAMIC_STOP_PREFIX = "dynamic:";
+
+export function isDynamicStopId(id) {
+  return typeof id === "string" && id.startsWith(DYNAMIC_STOP_PREFIX);
+}
+
 function containerEntryToStop(entry) {
-  const stopId = CONTAINER_NAME_TO_STOP_ID[entry?.name];
-  if (!stopId) return null;
+  const name = entry?.name;
+  if (typeof name !== "string" || name === "") return null;
+
+  const stopId = CONTAINER_NAME_TO_STOP_ID[name];
+  const latency = isFiniteNumber(entry.latency_ms)
+    ? { ms: entry.latency_ms, source: "orchestrator" }
+    : null;
+  const mutations = Array.isArray(entry.mutations)
+    ? entry.mutations.map(toMutationModel)
+    : [];
+  const status = typeof entry.status === "string" ? entry.status : "unknown";
+
+  // A container the frontend was not built with -- a store-defined one, e.g.
+  // the ARTF template or a user's own container. This used to `return null`,
+  // and buildExplicitContainerStops then dropped it, so such a container was
+  // absent from the pipeline entirely rather than merely unlabelled. Synthesize
+  // a stop instead, and take its label from the response since no build-time
+  // lookup can know the name.
+  if (!stopId) {
+    return {
+      id: `${DYNAMIC_STOP_PREFIX}${name}`,
+      // Falls back to the internal name, never to an invented label.
+      displayName: (typeof entry.display_name === "string" && entry.display_name) || name,
+      modelFamily: "CUSTOM",
+      status,
+      latency,
+      mutations,
+    };
+  }
+
   return {
     id: stopId,
-    displayName: DISPLAY_NAME_BY_STOP_ID[stopId],
+    // The response's display name wins so a renamed container shows its
+    // configured name; the build-time table is the fallback.
+    displayName:
+      (typeof entry.display_name === "string" && entry.display_name) ||
+      DISPLAY_NAME_BY_STOP_ID[stopId],
     modelFamily: STOP_MODEL_FAMILY[stopId],
-    status: typeof entry.status === "string" ? entry.status : "unknown",
-    latency: isFiniteNumber(entry.latency_ms)
-      ? { ms: entry.latency_ms, source: "orchestrator" }
-      : null,
-    mutations: Array.isArray(entry.mutations)
-      ? entry.mutations.map(toMutationModel)
-      : [],
+    status,
+    latency,
+    mutations,
   };
 }
 
@@ -172,12 +209,23 @@ export function extractTotalLatency(raw, browserObservedMs) {
 
 function buildExplicitContainerStops(containers) {
   const byId = {};
+  // Dynamic stops are collected separately and appended, so the six fixed stops
+  // keep their positions and no existing layout moves when a store-defined
+  // container appears or disappears.
+  const dynamic = [];
   for (const entry of containers) {
     const stop = containerEntryToStop(entry);
     if (!stop) continue;
+    if (isDynamicStopId(stop.id)) {
+      if (!dynamic.some((s) => s.id === stop.id)) dynamic.push(stop);
+      continue;
+    }
     if (!byId[stop.id]) byId[stop.id] = stop;
   }
-  return CONTAINER_STOP_IDS.map((id) => byId[id] ?? makePlaceholderContainerStop(id));
+  const fixed = CONTAINER_STOP_IDS.map((id) => byId[id] ?? makePlaceholderContainerStop(id));
+  // Registry order is the orchestrator's attribution order, so it is preserved
+  // rather than re-sorted here.
+  return [...fixed, ...dynamic];
 }
 
 function buildInferredContainerStops(mutations) {

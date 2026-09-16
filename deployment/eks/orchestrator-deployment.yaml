@@ -68,6 +68,29 @@ spec:
               value: "http://yield-optimizer-floor:8081"
             - name: YIELD_MARGIN_URL
               value: "http://yield-optimizer-margin:8081"
+            # ARTF Template container. Unlike the six above, this endpoint is a
+            # FALLBACK: the template is a store-defined container, so its real
+            # endpoint comes from its container-registry record. This value is
+            # used only if that record omits one.
+            - name: ARTF_TEMPLATE_URL
+              value: "http://artf-template:8081"
+            # Container registry table (base stack, created by deploy.sh Step
+            # 1.5). Holds store-defined containers: name, display name,
+            # description, intents, endpoint and the active flag the Container
+            # Health panel toggles. Read through a TTL cache, so a toggle costs
+            # the bid path one Query per TTL window per replica rather than a
+            # round trip per request.
+            #
+            # Unset means the feature is off: the orchestrator falls back to the
+            # six code-defined containers and reports the template as
+            # not-configurable with the real reason, rather than as an empty
+            # registry. Deliberately a base-stack table and NOT a partition of
+            # the closed-loop stack's parameter-store, which is optional.
+            - name: CONTAINER_REGISTRY_TABLE
+              value: "__CONTAINER_REGISTRY_TABLE__"
+            # CONTAINER_REGISTRY_TTL is intentionally not set here so the 30s
+            # default in orchestrator/container_registry.py applies. Set it to
+            # trade toggle responsiveness against DynamoDB read volume.
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
             - name: EKS_CLUSTER_NAME
@@ -80,6 +103,21 @@ spec:
               value: "__COGNITO_USER_POOL_ID__"
             - name: COGNITO_REGION
               value: "__REGION__"
+            # Scope required of a MACHINE credential on POST /v1/mutations.
+            #
+            # EMPTY BY DEFAULT, and empty means no scope authorization at all -- the
+            # orchestrator behaves exactly as it did before this variable existed.
+            # That is deliberate: the only machine caller is the optional Prebid ARTF
+            # host, so a stack deployed without --with-prebid must not acquire an
+            # authorization rule it has no client for.
+            #
+            # deploy.sh sets it only with --with-prebid; deploy_prebid.sh sets it when
+            # run standalone and clears it on --destroy.
+            #
+            # It never affects the frontend: a Cognito USER access token is authorized
+            # by the user_session mechanism, which does not consult scopes.
+            - name: ARTF_MUTATIONS_REQUIRED_SCOPE
+              value: "__ARTF_MUTATIONS_REQUIRED_SCOPE__"
             # Part 2 closed-loop demo API — DynamoDB tables created by
             # deploy_closed_loop.sh (closed_loop_cfn.yaml). deploy.sh substitutes
             # these with the stack-prefix-aware names (e.g. "dv2-parameter-store")

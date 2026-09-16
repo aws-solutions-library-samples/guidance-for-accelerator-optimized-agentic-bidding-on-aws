@@ -141,12 +141,25 @@ class ContainerInvocationModel(BaseModel):
     Captures which container was invoked during orchestration, its completion
     status, observed latency, and any mutations it contributed. Surfaced via
     ``Metadata.containers`` so UI clients can render the ARTF flow graph.
+
+    ``status`` is deliberately an unconstrained ``str`` rather than a Literal so
+    the vocabulary can widen without breaking older clients. The values the
+    orchestrator produces are defined in
+    ``orchestrator/container_registry.py``: ok, no_mutations, unreachable,
+    error, timeout, disabled, skipped.
+
+    ``display_name`` carries the container's human label so a consumer does not
+    have to resolve it from a build-time lookup table. That matters for
+    store-defined containers, whose names are not known when the frontend is
+    built — without it a user's own container cannot be labelled at all. Empty
+    for callers that do not set it, so existing readers are unaffected.
     """
     name: str
     status: str
     latency_ms: float
     mutations: list[Mutation] = []
     model_version: str = ""
+    display_name: str = ""
 
 
 class Metadata(BaseModel):

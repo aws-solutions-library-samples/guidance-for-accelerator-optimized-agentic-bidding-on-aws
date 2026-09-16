@@ -18,6 +18,35 @@ The underlying model architectures (DLRM, NCF/NeuMF, Wide & Deep) are unchanged 
 they're implementation detail, documented alongside each container, not the
 container's name. See [GUIDANCE.md](GUIDANCE.md) for the model-level detail.
 
+## The template container (`artf-template`)
+
+A seventh container ships as the starting point for a repo user's own. It was
+named for its job from the start, so unlike the four above it has **no old
+name** — its internal key, ECR repository, Kubernetes objects and display name
+are all `artf-template`, and `display_name()` lists it explicitly rather than
+leaving it to the identity fallback, for the same reason the two Yield Optimizer
+containers are listed.
+
+| Key | Display name | Source directory | What it does |
+| --- | --- | --- | --- |
+| `artf-template` | **`artf-template`** | `source/containers/artf_template/` | Nothing, until you implement it. Ships deployed but **inactive**, returning no mutations |
+
+It differs from the other six in three ways worth knowing:
+
+- **It is store-defined, not code-defined.** The six live in `CONTAINERS` in
+  `source/orchestrator/app.py`; this one lives as a record in the
+  `${STACK_NAME}-container-registry` DynamoDB table, which is what lets its name,
+  description, intents and active flag change without rebuilding the orchestrator
+  image. See `source/orchestrator/container_registry.py`.
+- **Its HPA floor is `minReplicas: 1`**, not the 2 the others use. That 2 is a
+  load-test pre-warm; an inactive container is not on the load-test path.
+- **It has no Triton model**, so it builds on the plain `source/Dockerfile` and has
+  no entry in the orchestrator's `container_to_model` map. Add a model and it
+  should move to `Dockerfile.triton-artf` and gain a map entry, matching
+  `deploy.sh`'s build cases.
+
+Walkthrough: [`source/containers/artf_template/README.md`](source/containers/artf_template/README.md).
+
 ## The Yield Optimizer split (`yield-optimizer` → two containers)
 
 Separately from the rename above, the Yield Optimizer became **two** containers,

@@ -1,5 +1,7 @@
 import { useState, useRef, useCallback } from "react";
 import Header from "./components/Header";
+import AuctionTheater from "./components/AuctionTheater";
+import { useHashRoute, THEATER_ROUTE } from "./hooks/useHashRoute";
 import Sidebar from "./components/Sidebar";
 import RawPanel from "./components/RawPanel";
 import ContainersPanel from "./components/ContainersPanel";
@@ -18,7 +20,7 @@ import {
   ComparisonLayout,
 } from "./components/comparison";
 
-function AppContent() {
+function AppContent({ onOpenTheater }) {
   const [showContainers, setShowContainers] = useState(false);
   const [view, setView] = useState("scenarios");
   const [lastPayload, setLastPayload] = useState(null);
@@ -113,6 +115,7 @@ function AppContent() {
         onContainersClick={() => setShowContainers(true)}
         view={view}
         onViewChange={setView}
+        onOpenTheater={onOpenTheater}
       />
       <div className="app-layout">
         {view !== "adaptive" && view !== "governance" && (
@@ -182,9 +185,21 @@ function AppContent() {
 }
 
 export default function App() {
+  // Hash routing rather than a router: CloudFront serves this bundle from S3
+  // with no 403/404 rewrite to index.html, so a real path like /theater would
+  // 404 at the origin. See hooks/useHashRoute.js.
+  const { route, navigate } = useHashRoute();
+
+  // The theater is a full-screen surface with no app chrome, so it renders
+  // outside ComparisonProvider and the app layout entirely. It submits once to
+  // one endpoint and has no use for comparison-mode state.
+  if (route === THEATER_ROUTE) {
+    return <AuctionTheater onExit={() => navigate("/")} />;
+  }
+
   return (
     <ComparisonProvider>
-      <AppContent />
+      <AppContent onOpenTheater={() => navigate(THEATER_ROUTE)} />
     </ComparisonProvider>
   );
 }

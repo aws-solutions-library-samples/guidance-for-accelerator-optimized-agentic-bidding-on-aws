@@ -9,6 +9,27 @@ transparent, inspectable rules over real bid-request signals:
 
 - IAB content-category → interest-segment mapping (site/app ``cat``)
 - Age bucketing from the user's year of birth (``user.yob``)
+
+Taxonomy support (see shared/iab_taxonomy):
+
+- The request's ``cattax`` selects which taxonomy its category codes belong to.
+  Absent or 1 keeps the legacy Content Taxonomy 1.0 behaviour unchanged; 7 and 9
+  resolve against Content Taxonomy 3.0/3.1 and emit real IAB Audience Taxonomy
+  1.1 segment identifiers. Content Taxonomy 2.x is unrecognised, because its
+  identifiers are not interchangeable with 3.x.
+- A content category carrying IAB's Special Category Data flag derives no
+  segment and contributes no score. That flag is a privacy control: it marks
+  categories that could be used to build sensitive profiles about a person, so
+  inferring a user interest segment from one is the pattern it warns against.
+- Age buckets are IAB Audience Taxonomy identifiers using the taxonomy's own
+  five-year ranges, replacing the ten-year ranges this container invented. This
+  applies on every path, including legacy requests, because the bucket format is
+  a property of the output space rather than of the incoming content taxonomy.
+
+Contextual segments (``ctx-``) and keyword-reclassified segments (``int-``) have
+no IAB equivalent and keep their vendor prefix. Standard and vendor identifiers
+share one mutation because ARTF's ``IDsPayload`` has no field for per-identifier
+provenance; the prefix is what distinguishes them.
 - Keyword matching against any first/third-party DMP segments already present
   on the request (``user.data[].segment[].name``)
 - Contextual signals: bid floor tier, mobile user-agent, video inventory
@@ -21,7 +42,6 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -29,8 +49,9 @@ from shared.artf_types import (
     IDsPayload, Intent, Metadata, Mutation, Operation,
     RTBRequest, RTBResponse, intent_applicable,
 )
+from shared import iab_taxonomy
 
-MODEL_VERSION = "segment-rules-v1"
+MODEL_VERSION = "segment-rules-v2-iab-taxonomy"
 ACTIVATION_THRESHOLD = 0.55
 
 # IAB content-category (tier-1) -> interest segment. Real IAB2 taxonomy codes.
@@ -59,14 +80,11 @@ _KEYWORD_SEGMENT_MAP: tuple[tuple[str, str], ...] = (
     ("tech", "int-tech"),
 )
 
-_AGE_BUCKETS: tuple[tuple[int, int, str], ...] = (
-    (18, 24, "demo-18-24"),
-    (25, 34, "demo-25-34"),
-    (35, 44, "demo-35-44"),
-    (45, 54, "demo-45-54"),
-)
-
 _MOBILE_UA_MARKERS = ("Mobile", "iPhone", "Android")
+
+# `_AGE_BUCKETS` is gone. Age buckets now come from IAB Audience Taxonomy 1.1's own
+# Age Range rows (see shared/iab_taxonomy), so they cannot drift from the standard,
+# and they are five-year ranges rather than the ten-year ranges invented here.
 
 
 def _score_segments(bid_request: dict, threshold: float = ACTIVATION_THRESHOLD) -> list[str]:
@@ -86,27 +104,60 @@ def _score_segments(bid_request: dict, threshold: float = ACTIVATION_THRESHOLD) 
     device = bid_request.get("device") or {}
     imps = bid_request.get("imp") or [{}]
 
-    # Rule 1: IAB content category -> interest segment
-    for cat in site.get("cat", []):
-        segment = _IAB_SEGMENT_MAP.get(cat)
-        if segment:
-            _bump(segment, 0.85)
+    # Rule 1: content category -> interest segment.
+    #
+    # Which taxonomy the codes belong to comes from the request's own `cattax`.
+    # The legacy path is preserved byte-for-byte so requests that do not declare a
+    # modern taxonomy behave exactly as before.
+    categories = [c for c in site.get("cat", []) if isinstance(c, str)]
+    taxonomy = iab_taxonomy.resolve_taxonomy(site.get("cattax"))
 
-    # Rule 2: age bucket from year of birth
-    yob = user.get("yob")
-    if isinstance(yob, int) and 1900 < yob <= datetime.now(timezone.utc).year:
-        age = datetime.now(timezone.utc).year - yob
-        for lo, hi, segment in _AGE_BUCKETS:
-            if lo <= age <= hi:
-                _bump(segment, 0.9)
-                break
+    if taxonomy == iab_taxonomy.TAXONOMY_CONTENT_1_0:
+        for cat in categories:
+            segment = _IAB_SEGMENT_MAP.get(cat)
+            if segment:
+                _bump(segment, 0.85)
+    elif taxonomy == iab_taxonomy.TAXONOMY_CONTENT_3_X:
+        # A withheld category contributes no score at all. It must not push a
+        # segment over the threshold that it is barred from deriving.
+        for outcome in iab_taxonomy.segments_for_categories(categories):
+            if outcome.disposition == iab_taxonomy.MAPPED and outcome.segment_id:
+                _bump(outcome.segment_id, 0.85)
+    # An unrecognised taxonomy derives nothing from categories. Every other rule
+    # below still runs, because they read fields unrelated to the content taxonomy.
 
-    # Rule 3: keyword match against existing DMP-provided segments (real
-    # first/third-party signal already on the request — we only reclassify it
-    # into our own segment taxonomy, we don't invent it).
+    # Rule 2: age bucket from year of birth.
+    #
+    # Emits an IAB Audience Taxonomy identifier using the taxonomy's own five-year
+    # ranges. This applies on every path, legacy included: the bucket format belongs
+    # to the output space, and `cattax` describes incoming *content* categories, so
+    # gating the demographic format on it would conflate two unrelated things.
+    age_segment = iab_taxonomy.age_bucket_id(user.get("yob"))
+    if age_segment:
+        _bump(age_segment, 0.9)
+
+    # Rule 3: reclassify audience data the request already carries.
+    #
+    # These are segments a first or third party has already asserted about the
+    # person. Translating someone else's assertion into the standard taxonomy is not
+    # an inference, which is why this rule can reach segments that Rule 1 must not:
+    # life-stage segments such as Audience Taxonomy 98 "Parents with Children" are
+    # reachable ONLY from asserted data. Deriving one from page content would be
+    # inferring a personal circumstance from what someone happened to read, which is
+    # the inference IAB's Special Category Data flag exists to discourage.
+    #
+    # A name that matches a taxonomy node exactly (after normalising case and
+    # separators) yields that real identifier. Anything else falls through to the
+    # keyword map, so names this taxonomy does not describe still activate a vendor
+    # segment as they did before.
     for provider in user.get("data", []):
         for seg in provider.get("segment", []):
-            name = (seg.get("name") or seg.get("id") or "").lower()
+            raw_name = seg.get("name") or seg.get("id") or ""
+            asserted = iab_taxonomy.segment_for_asserted_name(raw_name)
+            if asserted:
+                _bump(asserted, 0.75)
+                continue
+            name = raw_name.lower()
             for keyword, segment in _KEYWORD_SEGMENT_MAP:
                 if keyword in name:
                     _bump(segment, 0.75)

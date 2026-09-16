@@ -1,0 +1,221 @@
+# Prebid Server as the ARTF host, in the same cluster as the orchestrator and the
+# ARTF agent containers.
+#
+# Co-location is the point: the framework places agent containers inside the host
+# platform's infrastructure, and a host outside the cluster would reinstate the network
+# hop ARTF exists to remove.
+#
+# THIS FILE IS NOT APPLIED BY deploy.sh. That script applies an explicit named list of
+# manifests (deploy.sh:1950), so a file living here is only applied by
+# deploy_prebid.sh -- which is what keeps the feature opt-in. It IS however deleted by
+# `deploy.sh --destroy`, which removes this directory wholesale (deploy.sh:537), so
+# teardown of these objects comes for free.
+#
+# ---------------------------------------------------------------------------------
+# EVERY VALUE BELOW THAT LOOKS ARBITRARY WAS READ OUT OF THE PINNED UPSTREAM RELEASE
+#
+# The image is built from the upstream guidance's own build context, so its runtime
+# contract is upstream's, not ours. From v1.4.0's
+# deployment/ecr/prebid-server/{Dockerfile,bootstrap.sh,default-config/}:
+#
+#   - ENTRYPOINT is `sh ../bootstrap.sh`, which fetches configuration from S3 ITSELF,
+#     from s3://$DOCKER_CONFIGS_S3_BUCKET_NAME/prebid-server/default/ and
+#     .../current/, into /prebid-configs. It EXITS 1 if DOCKER_CONFIGS_S3_BUCKET_NAME
+#     is unset, or if any of entrypoint.sh, prebid-config.yaml, prebid-logging.xml or
+#     prebid-analytics-logging.xml is missing after the fetch.
+#     There is therefore NO init container here. One was drafted, and it was wrong
+#     twice over: it duplicated a fetch the image already performs, and it wrote to a
+#     path (/config) that nothing in the image reads.
+#
+#   - The server listens on 8443 over HTTPS, not 8080 over HTTP. entrypoint.sh
+#     generates a self-signed keystore and default-config/prebid-config.yaml sets
+#     server.http.port: 8443 with ssl: true. Probes therefore use scheme: HTTPS.
+#     The kubelet does not verify probe certificates, so the self-signed cert is fine.
+#
+#   - Admin endpoints are on 8060 (EXPOSE 8443 8060).
+#
+# Placeholders follow the repository convention and are substituted at deploy time:
+#   __PREBID_ROLE_ARN__   IRSA role from prebid_cfn.yaml
+#   __IMAGE__             fully qualified image reference, including tag
+#   __CONFIG_BUCKET__     S3 bucket holding prebid-server/{default,current}/
+#   __AWS_REGION__        region
+#   __TOKEN_ENDPOINT__    Cognito hosted token endpoint
+#   __CREDENTIAL_SECRET__ ARN of the credential secret
+#   __DEMAND_ENDPOINT__   artfhouse demand endpoint URL
+#   __ORCHESTRATOR_URL__  in-cluster orchestrator extension point
+#   __ORCHESTRATOR_SCOPE__ OAuth scope required by the orchestrator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prebid-artf-host-sa
+  annotations:
+    # IRSA. The trust policy in prebid_cfn.yaml names THIS ServiceAccount exactly, so
+    # no other ServiceAccount on this shared cluster can assume the role.
+    eks.amazonaws.com/role-arn: "__PREBID_ROLE_ARN__"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prebid-server
+  labels:
+    app: prebid-server
+    component: artf-host
+spec:
+  # ONE replica, stated as a decision with its consequence: a pod restart interrupts
+  # auctions. Acceptable for a demonstration; not a claim of availability. Raising it
+  # is a one-line change, and the pods fit -- measured headroom on this cluster was
+  # ~1.4-2.1 CPU and 4.2-4.8 Gi free per node across 4 x c5.xlarge.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prebid-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: prebid-server
+        component: artf-host
+    spec:
+      serviceAccountName: prebid-artf-host-sa
+      # NOT set to false. The orchestrator deployment sets
+      # automountServiceAccountToken: false, and copying that here would break IRSA --
+      # which depends on a projected service account token. The resulting failure
+      # reports an inability to read the secret, pointing at the credential rather
+      # than at the mount, so this is left explicit rather than inherited.
+      automountServiceAccountToken: true
+
+      containers:
+        - name: prebid-server
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 8060
+          env:
+            # The variable bootstrap.sh actually requires. Misname it and the container
+            # exits 1 on the first line of its own entrypoint.
+            - name: DOCKER_CONFIGS_S3_BUCKET_NAME
+              value: "__CONFIG_BUCKET__"
+            - name: AWS_REGION
+              value: "__AWS_REGION__"
+            - name: AWS_DEFAULT_REGION
+              value: "__AWS_REGION__"
+            # Where the ARTF hook calls. In-cluster service DNS: no VPC peering and no
+            # RTB Fabric link, and the orchestrator's Cognito JWT middleware still
+            # applies because it is enforced in the application rather than at an
+            # ingress.
+            - name: ARTF_EXTENSION_POINT_URL
+              value: "__ORCHESTRATOR_URL__"
+            - name: ARTF_TOKEN_ENDPOINT
+              value: "__TOKEN_ENDPOINT__"
+            - name: ARTF_SCOPE
+              value: "__ORCHESTRATOR_SCOPE__"
+            # A REFERENCE to the secret, for provenance. The module does NOT read it --
+            # see the credential below for why.
+            - name: ARTF_CREDENTIAL_SECRET_ARN
+              value: "__CREDENTIAL_SECRET__"
+            # ---------------------------------------------------------------------
+            # THE CREDENTIAL, from a Kubernetes Secret rather than from Secrets Manager.
+            #
+            # The pod CANNOT read Secrets Manager. The Prebid image is built from the
+            # pinned upstream release, whose pom declares only the AWS SDK's `s3`
+            # module: the jar ships s3, auth, regions and apache-client, and neither
+            # `secretsmanager` nor `sts`. With no sts the SDK cannot use this pod's
+            # IRSA web identity at all -- the container says so on startup:
+            #
+            #   To use web identity tokens, the 'sts' service module must be on the
+            #   class path.
+            #
+            # Adding either dependency means editing the upstream pom, which is a fork
+            # and is what U1-NFR-16 forbids. So deploy_prebid.sh reads the Secrets
+            # Manager value with credentials that CAN and writes this Kubernetes
+            # Secret. Secrets Manager stays the source of record; only the delivery
+            # route changed.
+            #
+            # Referenced, not inlined: the value never appears in this manifest, in the
+            # rendered copy under /tmp, or in `kubectl get deploy -o yaml`.
+            # ---------------------------------------------------------------------
+            - name: ARTF_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: prebid-artf-credential
+                  key: client_id
+            - name: ARTF_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: prebid-artf-credential
+                  key: client_secret
+            # The adapter's endpoint arrives as deployment-time configuration, not a
+            # compiled-in constant -- the same shape the upstream amt adapter uses for
+            # its own bidder endpoint.
+            - name: ARTFHOUSE_DEMAND_ENDPOINT
+              value: "__DEMAND_ENDPOINT__"
+            # entrypoint.sh reads ECS_CONTAINER_METADATA_URI_V4 to label log paths and
+            # falls back to "default-container-id" when it is unset. Set explicitly to
+            # empty so the fallback is a deliberate choice on EKS rather than an
+            # accident of a missing ECS variable.
+            - name: ECS_CONTAINER_METADATA_URI_V4
+              value: ""
+          # Sized against MEASURED headroom on this cluster rather than guessed.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1500m
+              memory: 2Gi
+          # A pod that is not ready receives no auction traffic; a wedged pod is
+          # replaced. scheme: HTTPS because the server is TLS-only on this port.
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 3
+          # The entrypoint fetches config from S3 and generates a keystore before the
+          # JVM starts. Without this, that startup work looks like a crash loop.
+          startupProbe:
+            httpGet:
+              path: /status
+              port: 8443
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prebid-server
+  labels:
+    app: prebid-server
+spec:
+  # ClusterIP, deliberately. No new external ingress into the cluster: scenarios reach
+  # Prebid from inside, and exposing an auction endpoint publicly would add an attack
+  # surface this feature does not need.
+  type: ClusterIP
+  selector:
+    app: prebid-server
+  ports:
+    # Published as 443, not 80. The backend is TLS-only, and advertising it on 80
+    # would make every caller's first request fail in a way that looks like the
+    # service is down.
+    - name: https
+      port: 443
+      targetPort: 8443

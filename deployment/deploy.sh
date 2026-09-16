@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+
+# This script requires real bash, not bash in POSIX mode. `sh deploy.sh` used to
+# fail with an opaque "syntax error near unexpected token `<'" pointing at a line
+# a thousand lines below anything the reader had done. That construct is gone, but
+# POSIX mode disables other bash behaviour too, so fail here with something
+# actionable rather than somewhere later with something puzzling.
+if [ -z "${BASH_VERSION:-}" ] || { command -v shopt >/dev/null 2>&1 && shopt -qo posix; }; then
+  printf 'deploy.sh must be run with bash, not sh.\n\n  bash %s %s\n\n' "$0" "$*" >&2
+  exit 1
+fi
 # =============================================================================
 # deploy.sh — Deploy the Accelerator-optimized Agentic Bidding solution to AWS
 #
@@ -79,11 +89,20 @@ display_name() {
     # fallback below so the mapping is obvious next to the other four.
     yield-optimizer-floor)       echo "yield-optimizer-floor" ;;
     yield-optimizer-margin)      echo "yield-optimizer-margin" ;;
+    # The template container was named for its job from the start, so its key
+    # already IS its display name. Listed explicitly for the same reason as the
+    # two above.
+    artf-template)               echo "artf-template" ;;
     *)                           echo "$1" ;;
   esac
 }
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
+# Auction Theater caption model. The `global.` inference profile is available in
+# every region, so this needs no per-region variation. Haiku 4.5 supports
+# INFERENCE_PROFILE only -- the bare model id is not a usable alternative.
+# Override to a us./eu./au./jp. profile for in-geography routing.
+CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID:-global.anthropic.claude-haiku-4-5-20251001-v1:0}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo latest)}"
@@ -101,6 +120,15 @@ VERBOSE=0
 # Part 2 closed-loop (NeMo-RL training, Model Registry, Glue ETL, the Adaptive
 # Bidding + Governance agents) is ON by default. Disable with --no-retraining.
 WITH_RETRAINING=1
+# Prebid Server as a second, sell-side ARTF host is OFF by default. Unlike
+# retraining it is opt-IN: it deploys a Cognito domain, an M2M client, a
+# Secrets Manager secret and an auction host pod, none of which the core
+# deployment needs. Without --with-prebid nothing below changes.
+WITH_PREBID=0
+# Scope the orchestrator requires of a MACHINE credential on POST /v1/mutations.
+# EMPTY unless --with-prebid, and empty means the orchestrator's authorization
+# behaves exactly as it did before this feature existed. Resolved after arg parsing.
+ARTF_MUTATIONS_REQUIRED_SCOPE=""
 LOCAL_BUILD=0
 NGC_SECRET="${NGC_SECRET:-}"
 NGC_KEY="${NGC_KEY:-}"
@@ -130,6 +158,8 @@ for arg in "$@"; do
     --export-only)      EXPORT_ONLY=1 ;;
     --with-retraining)  WITH_RETRAINING=1 ;;   # default; kept for back-compat
     --no-retraining|--skip-retraining) WITH_RETRAINING=0 ;;
+    --with-prebid)      WITH_PREBID=1 ;;       # opt-in; see Step 12
+    --no-prebid)        WITH_PREBID=0 ;;       # default; explicit for symmetry
     --remote-build)     LOCAL_BUILD=0 ;;
     --local-build)      LOCAL_BUILD=1 ;;
     --ngc-secret=*)     NGC_SECRET="${arg#--ngc-secret=}" ;;
@@ -206,6 +236,13 @@ fi
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
 if [[ -n "${STACK_PREFIX}" ]]; then
   STACK_NAME="${STACK_PREFIX}-${STACK_NAME}"
+fi
+# The orchestrator's machine-scope requirement is set ONLY when the Prebid ARTF host
+# is being deployed, because that host is its only machine caller. Without the flag
+# this stays empty, the orchestrator registers no protected routes, and its
+# authorization path is byte-identical to what it was before the Prebid feature.
+if [[ "${WITH_PREBID}" -eq 1 ]]; then
+  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"
 fi
 
 # Resolve the Bedrock model id for the Part 2 reasoning agents. Model access is
@@ -449,6 +486,14 @@ if [[ "${WITH_RETRAINING}" -eq 1 && -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
   fi
 fi
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
+# Container registry table — holds store-defined ARTF containers (name, display
+# name, description, intents, endpoint, active flag) so a container can be
+# described and switched on or off from the UI without rebuilding the
+# orchestrator image or redeploying the stack. Deliberately a BASE-stack table
+# created here rather than a partition of the closed-loop stack's
+# parameter-store: that stack is optional, and coupling the template container
+# to it would leave a base-stack user with no template at all.
+CONTAINER_REGISTRY_TABLE="${STACK_NAME}-container-registry"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
 # naming (HasStackPrefix condition). Only resolves to a real stream once
 # deploy_closed_loop.sh Step 1 creates it (--with-retraining, default on) —
@@ -466,13 +511,18 @@ log "EKS Cluster=${CLUSTER_NAME}  Model Bucket=${MODEL_BUCKET}"
 # Destroy
 # =========================================================================
 if [[ "${DESTROY}" -eq 1 ]]; then
+  # Defined before the warning below, which names it. Referenced-then-assigned would
+  # print an empty stack name in the one message whose job is to be exact.
+  PREBID_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}prebid-artf"
   warn "=== DESTROY ==="
-  warn "This will delete EVERYTHING deploy.sh + deploy_closed_loop.sh create for"
-  warn "this stack (prefix: ${STACK_PREFIX:-<none>}): EKS cluster, Triton models,"
-  warn "CloudFront, AgentCore runtimes, Cognito, DynamoDB tables, S3 buckets"
-  warn "(including the ones marked DeletionPolicy: Retain in the CFN templates),"
-  warn "SageMaker Model Registry, IAM policies/roles, ECR repos, and all Kubernetes"
-  warn "resources. NOTHING is retained — this is not reversible."
+  warn "This will delete EVERYTHING deploy.sh + deploy_closed_loop.sh +"
+  warn "deploy_prebid.sh create for this stack (prefix: ${STACK_PREFIX:-<none>}):"
+  warn "EKS cluster, Triton models, CloudFront, AgentCore runtimes, Cognito,"
+  warn "DynamoDB tables, S3 buckets (including the ones marked DeletionPolicy:"
+  warn "Retain in the CFN templates), SageMaker Model Registry, IAM policies/roles,"
+  warn "ECR repos, the Prebid ARTF host stack (${PREBID_STACK}) with its Cognito"
+  warn "domain, resource servers, M2M client and credential secret, and all"
+  warn "Kubernetes resources. NOTHING is retained — this is not reversible."
   read -r -p "Type 'destroy' to confirm: " CONFIRM
   [[ "${CONFIRM}" == "destroy" ]] || fail "aborted"
 
@@ -490,6 +540,10 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   GLUE_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}glue-etl"
   FEEDBACK_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}feedback-pipeline"
   CODEBUILD_STACK="${STACK_NAME}-codebuild"
+  # PREBID_STACK is set at the top of this block, because the DESTROY warning names it.
+  # It is the optional Prebid ARTF host stack from deploy_prebid.sh, and its delete
+  # below is guarded on the stack existing -- so --destroy stays true to its "NOTHING
+  # is retained" claim whether or not --with-prebid was ever used.
 
   # FR-12: --destroy's UX stays exactly as it was — its progress narration
   # uses say() (always-visible), not log() (verbose-gated), so teardown
@@ -633,6 +687,22 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   say "Deleting invocation stack (${GOVERNANCE_EVENTBRIDGE_STACK})..."
   aws cloudformation delete-stack --stack-name "${GOVERNANCE_EVENTBRIDGE_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+  # --- Prebid ARTF host stack. Deleted here, BEFORE the Cognito user pool is torn
+  # down further below: this stack owns a user pool domain, two resource servers and
+  # an app client that all hang off that pool, and deleting the pool first leaves the
+  # stack unable to delete its own children.
+  #
+  # The Kubernetes half needs nothing here — the wholesale
+  # `kubectl delete -f "${SCRIPT_DIR}/eks/"` above already covers
+  # eks/prebid-server-deployment.yaml. Verified rather than assumed: a client dry-run
+  # delete against that file resolves all three objects (ServiceAccount
+  # prebid-artf-host-sa, Deployment prebid-server, Service prebid-server) because
+  # their names are literal, not placeholder-substituted.
+  if aws cloudformation describe-stacks --stack-name "${PREBID_STACK}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    say "Deleting Prebid ARTF host stack (${PREBID_STACK})..."
+    aws cloudformation delete-stack --stack-name "${PREBID_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+    aws cloudformation wait stack-delete-complete --stack-name "${PREBID_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+  fi
 
   # --- SageMaker Model Registry: package groups must be emptied before
   # closed-loop-core's stack delete, or it fails DELETE_FAILED with "Model
@@ -767,6 +837,8 @@ VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
 VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
 VITE_COGNITO_REGION=${AWS_REGION}
 VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_BEDROCK_REGION=${AWS_REGION}
+VITE_CAPTION_INFERENCE_PROFILE_ID=${CAPTION_INFERENCE_PROFILE_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}
 VITE_GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}
 EOF
@@ -844,6 +916,7 @@ REPOS=(
   ${STACK_NAME}-$(display_name metrics-enricher)
   ${STACK_NAME}-$(display_name yield-optimizer-floor)
   ${STACK_NAME}-$(display_name yield-optimizer-margin)
+  ${STACK_NAME}-$(display_name artf-template)
   ${STACK_NAME}-orchestrator
   ${STACK_NAME}-agentcore
 )
@@ -877,6 +950,52 @@ if ! aws dynamodb describe-table --table-name "${LOADTEST_TABLE}" --region "${AW
   log "  Created DynamoDB table: ${LOADTEST_TABLE}"
 else
   log "  DynamoDB table exists: ${LOADTEST_TABLE}"
+fi
+
+# Container registry table. The partition key is a CONSTANT ("artf-containers")
+# and the sort key is the container name, so one Query returns every record and
+# no Scan is ever needed -- Scan is not granted to the orchestrator's node role
+# and this keeps it that way. SSE with the AWS-owned key rather than the
+# closed-loop stack's CMK, because that key belongs to an optional stack.
+if ! aws dynamodb describe-table --table-name "${CONTAINER_REGISTRY_TABLE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "${CONTAINER_REGISTRY_TABLE}" \
+    --attribute-definitions AttributeName=registry,AttributeType=S AttributeName=name,AttributeType=S \
+    --key-schema AttributeName=registry,KeyType=HASH AttributeName=name,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST \
+    --sse-specification Enabled=true \
+    --region "${AWS_REGION}" >/dev/null
+  log "  Created DynamoDB table: ${CONTAINER_REGISTRY_TABLE}"
+  aws dynamodb wait table-exists --table-name "${CONTAINER_REGISTRY_TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
+else
+  log "  DynamoDB table exists: ${CONTAINER_REGISTRY_TABLE}"
+fi
+
+# Seed the template container's record, guarded by attribute_not_exists so a
+# redeploy NEVER overwrites a display name, description, intent list or -- most
+# importantly -- an activation choice the user made in the UI. Ships inactive:
+# the container is deployed and reachable but out of the flow until switched on.
+# ConditionalCheckFailedException here means "already seeded", which is the
+# expected outcome on every deploy after the first, so it is not an error.
+if aws dynamodb put-item \
+  --table-name "${CONTAINER_REGISTRY_TABLE}" \
+  --region "${AWS_REGION}" \
+  --condition-expression "attribute_not_exists(#n)" \
+  --expression-attribute-names '{"#n":"name"}' \
+  --item '{
+    "registry":     {"S": "artf-containers"},
+    "name":         {"S": "artf-template"},
+    "display_name": {"S": "ARTF Template"},
+    "description":  {"S": "Template container. Deployed and wired but not implemented — returns no mutations. Edit source/containers/artf_template/app.py, rebuild that one image, restart that one Deployment, then activate here."},
+    "intents":      {"L": [{"S": "ADD_CIDS"}]},
+    "endpoint":     {"S": "http://artf-template:8081"},
+    "active":       {"BOOL": false},
+    "updated_at":   {"S": "'"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"'"},
+    "updated_by":   {"S": "deploy.sh"}
+  }' >/dev/null 2>&1; then
+  log "  Seeded registry record: artf-template (inactive)"
+else
+  log "  Registry record artf-template already present — left untouched"
 fi
 
 # =========================================================================
@@ -1086,7 +1205,7 @@ _source_hash() {
   case "${key}" in
     dlrm-bid-shader|ncf-deal-manager|yield-optimizer-floor|yield-optimizer-margin)
       paths=("${src}/triton/Dockerfile.triton-artf" "${src}/shared" "${src}/containers/${key//-/_}") ;;
-    widedeep-segment-activator|metrics-enricher)
+    widedeep-segment-activator|metrics-enricher|artf-template)
       paths=("${src}/Dockerfile" "${src}/shared" "${src}/containers/${key//-/_}") ;;
     orchestrator)
       # The three deployment/ files are listed individually because
@@ -1106,16 +1225,34 @@ _source_hash() {
     *)
       return 1 ;;
   esac
-  local f rel manifest=""
+  local f rel manifest="" _found=""
   for p in "${paths[@]}"; do
     if [[ -f "${p}" ]]; then
       rel="${p#${src}/}"
       manifest+="${rel}:$(_sha256 < "${p}" | awk '{print $1}')"$'\n'
     elif [[ -d "${p}" ]]; then
+      # Collected into a variable and fed through a heredoc rather than
+      # `done < <(find ...)`. Process substitution is a bash extension that
+      # /bin/sh -- bash in POSIX mode -- rejects at PARSE time, so its presence
+      # made the ENTIRE script unparseable when invoked as `sh deploy.sh`: it
+      # failed with a syntax error on this line before any phase ran.
+      #
+      # A pipe into the loop is not an alternative: it would run the loop in a
+      # subshell and lose `manifest`, which is why process substitution was used.
+      # The `[ -n ]` guard matters because a heredoc over an empty `find` result
+      # still yields one empty line, which would otherwise add a bogus entry.
+      #
+      # Verified output-identical to the previous form over nine cases, including
+      # every directory this function is called with, a missing path, a single
+      # file, a mixed set, and an empty directory.
+      _found="$(find "${p}" -type f | LC_ALL=C sort)"
       while IFS= read -r f; do
+        [ -n "${f}" ] || continue
         rel="${f#${src}/}"
         manifest+="${rel}:$(_sha256 < "${f}" | awk '{print $1}')"$'\n'
-      done < <(find "${p}" -type f | LC_ALL=C sort)
+      done <<MANIFEST_FILES
+${_found}
+MANIFEST_FILES
     fi
     # A path that is neither a file nor a directory (e.g. deleted) is silently
     # skipped — this only affects the resulting hash value, not correctness.
@@ -1177,11 +1314,14 @@ build_image_local() {
       docker buildx build --platform linux/amd64 --build-arg CONTAINER="containers/${key//-/_}" \
         -f "${src}/triton/Dockerfile.triton-artf" -t "${image}" --load "${src}"
       docker push "${image}" ;;
-    widedeep-segment-activator|metrics-enricher)
-      # Rule-based container — no Triton dependency (segment activation was
-      # switched from the Wide & Deep Triton model to deterministic rules; see
-      # source/containers/widedeep_segment_activator/app.py). Uses the plain
-      # ARTF Dockerfile like metrics-enricher.
+    widedeep-segment-activator|metrics-enricher|artf-template)
+      # No Triton dependency, so the plain ARTF Dockerfile rather than
+      # Dockerfile.triton-artf. Segment activation was switched from the Wide &
+      # Deep Triton model to deterministic rules (see
+      # source/containers/widedeep_segment_activator/app.py); metrics enrichment
+      # was always rules; and artf-template ships as a pass-through with no
+      # model at all. A user who adds a Triton model to the template should move
+      # its key to the tritonclient case above.
       log "  Building ${repo} (amd64)"
       docker buildx build --platform linux/amd64 \
         --build-arg CONTAINER="containers/${key//-/_}" --build-arg AGENT_NAME="${key}" \
@@ -1227,7 +1367,7 @@ build_image_local() {
 # with ensure_eks_cluster() below (FR-8) — building images has no dependency
 # on the cluster existing.
 build_images() {
-  STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher yield-optimizer-floor yield-optimizer-margin orchestrator model-optimizer)
+  STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher yield-optimizer-floor yield-optimizer-margin artf-template orchestrator model-optimizer)
   if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then STEP4_KEYS+=(agentcore); fi
 
   MISSING_KEYS=()
@@ -1563,7 +1703,15 @@ log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
 log "Step 7.5: Ensuring DynamoDB access for orchestrator"
 DYNAMO_POLICY_NAME="${STACK_NAME}-dynamo-loadtest-${STACK_UID}"
 DYNAMO_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DYNAMO_POLICY_NAME}"
-DYNAMO_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:PutItem\",\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:Scan\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${LOADTEST_TABLE}\"}]}"
+# Two statements, each scoped to one table ARN — no wildcard resource. The
+# registry statement grants UpdateItem (the activation toggle uses a SET
+# expression so it cannot clobber a display name or description written
+# concurrently) but deliberately NOT Scan: the table's constant partition key
+# means one Query returns every record.
+DYNAMO_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
+{\"Sid\":\"LoadTestHistory\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:PutItem\",\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:Scan\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${LOADTEST_TABLE}\"},\
+{\"Sid\":\"ContainerRegistry\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CONTAINER_REGISTRY_TABLE}\"}\
+]}"
 
 if aws iam get-policy --policy-arn "${DYNAMO_POLICY_ARN}" >/dev/null 2>&1; then
   aws iam create-policy-version \
@@ -1692,6 +1840,19 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
   --cloudfront-domain "${CF_DOMAIN:-localhost}"
+
+# Bedrock grant for the Auction Theater captions. Applied HERE, in the base
+# deploy, and not alongside the closed-loop agent grant: that one needs AgentCore
+# runtime ARNs so it lives behind --with-retraining, whereas this one needs
+# nothing but the role that was just created. Gating it the same way would ship a
+# theater whose captions never generate, with no error anywhere but the browser
+# console -- the fallback caption is correct, so nothing would look broken.
+log "  Granting Bedrock invoke for Auction Theater captions..."
+${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+  --action grant-caption-invoke \
+  --stack-name "${STACK_NAME}" \
+  --region "${AWS_REGION}" \
+  || warn "Caption grant failed - theater captions will fall back to factual text."
 
 COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
 COGNITO_USER_POOL_ID="$(jq -r '.UserPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
@@ -1838,8 +1999,10 @@ for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-
       -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
       -e "s|__ARTF_NODE_ROLE__|${ARTF_NODE_ROLE}|g" \
       -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
+      -e "s|__ARTF_MUTATIONS_REQUIRED_SCOPE__|${ARTF_MUTATIONS_REQUIRED_SCOPE}|g" \
       -e "s|__PARAMETER_STORE_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store|g" \
       -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
+      -e "s|__CONTAINER_REGISTRY_TABLE__|${CONTAINER_REGISTRY_TABLE}|g" \
       -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
       -e "s|__NCF_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager|g" \
       -e "s|__YIELD_FLOOR_MODEL_GROUP__|${YIELD_FLOOR_MODEL_GROUP}|g" \
@@ -1874,6 +2037,28 @@ for OBJ in "deployment/yield-optimizer" "service/yield-optimizer" "hpa/yield-hpa
   if kubectl get "${OBJ}" >/dev/null 2>&1; then
     kubectl delete "${OBJ}" --ignore-not-found >/dev/null 2>&1 && \
       say "  Removed pre-split ${OBJ} (replaced by yield-optimizer-floor/-margin)"
+  fi
+done
+
+# --- Force a rollout when only image CONTENT changed.
+# IMAGE_TAG is pinned to PREV_TAG from .image-outputs.json whenever the registry
+# matches, so a rebuild that changes only the source inside an image produces an
+# identical pod template. `kubectl apply` is then a no-op, and `imagePullPolicy:
+# Always` only takes effect for pods that are newly created -- so the old pod keeps
+# serving the old code while every step above reports success.
+#
+# That failure mode is silent, which is what makes it worth an unconditional
+# restart here rather than a conditional one: a restart of an unchanged deployment
+# costs one rolling replacement, whereas a missed restart costs a debugging session
+# against a container that looks deployed.
+#
+# Applies to the orchestrator too, which shares source/shared/ with the containers.
+log "  Rolling out containers so content-only changes take effect..."
+for DEPLOY in bid-pricer audience-activator deal-scorer signals-enricher \
+              yield-optimizer-floor yield-optimizer-margin artf-template orchestrator; do
+  if kubectl get "deployment/${DEPLOY}" >/dev/null 2>&1; then
+    kubectl rollout restart "deployment/${DEPLOY}" >/dev/null 2>&1 || \
+      warn "  Could not restart deployment/${DEPLOY}"
   fi
 done
 
@@ -1970,6 +2155,8 @@ VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
 VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
 VITE_COGNITO_REGION=${AWS_REGION}
 VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_BEDROCK_REGION=${AWS_REGION}
+VITE_CAPTION_INFERENCE_PROFILE_ID=${CAPTION_INFERENCE_PROFILE_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=
 VITE_GOVERNANCE_RUNTIME_ARN=
 EOF
@@ -2142,6 +2329,43 @@ else
   log "  Glue ETL, EventBridge scheduled retraining, and AgentCore agents."
 fi
 ok "Agents registered"
+
+# =========================================================================
+# Step 12 (optional): Deploy Prebid Server as the sell-side ARTF host
+#
+# Delegated, mirroring Step 11's call into deploy_closed_loop.sh. Everything
+# specific to Prebid lives in deploy_prebid.sh: this block only decides whether
+# to call it and passes through what it cannot discover for itself.
+#
+# --yes is passed because deploy.sh has already been invoked deliberately with
+# --with-prebid. deploy_prebid.sh still PRINTS its cost disclosure; it just does
+# not stop mid-deployment to ask a question the operator answered by adding the
+# flag. Run deploy_prebid.sh directly for the interactive confirmation.
+# =========================================================================
+if [[ "${WITH_PREBID}" -eq 1 ]]; then
+  log ""
+  log "Step 12: Deploying Prebid Server as the sell-side ARTF host (--with-prebid)"
+  log ""
+  PREBID_ARGS=""
+  if [[ -n "${STACK_PREFIX}" ]]; then
+    PREBID_ARGS="--prefix ${STACK_PREFIX}"
+  fi
+  PREBID_ARGS="${PREBID_ARGS} --cluster ${CLUSTER_NAME} --region ${AWS_REGION} --yes"
+  if [[ -n "${COGNITO_USER_POOL_ID:-}" ]]; then
+    PREBID_ARGS="${PREBID_ARGS} --user-pool-id ${COGNITO_USER_POOL_ID}"
+  fi
+  PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
+  "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} || {
+    warn "Prebid deployment returned non-zero. Check output above for errors."
+    warn "The core EKS deployment succeeded — the Prebid ARTF host may need attention."
+    warn "Re-run on its own: ${SCRIPT_DIR}/deploy_prebid.sh ${PREBID_ARGS}"
+  }
+else
+  log ""
+  log "  Skipping the Prebid ARTF host (pass --with-prebid to enable)."
+  log "  This includes: a pinned Prebid Server build, a Cognito domain and M2M client,"
+  log "  a Secrets Manager credential, and the artfhouse demand endpoint."
+fi
 
 # =========================================================================
 # Summary — always printed regardless of --verbose (FR-6: "print ONLY what

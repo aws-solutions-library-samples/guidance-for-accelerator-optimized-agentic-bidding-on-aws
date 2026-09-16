@@ -112,11 +112,16 @@ phases:
         fi
 
       # -----------------------------------------------------------------------
-      # Rule-based ARTF containers (amd64) — no Triton dependency.
+      # ARTF containers with no Triton dependency (amd64), built on the plain
+      # source/Dockerfile rather than Dockerfile.triton-artf.
       # widedeep-segment-activator was switched from the Wide & Deep Triton
       # model to deterministic rules (its ONNX graph could not be compiled to
       # a TensorRT engine, and it is slated to be replaced by a partner ISV
       # implementation). See source/containers/widedeep_segment_activator/app.py.
+      # metrics-enricher was always rules-based. artf-template ships as a
+      # pass-through with no model at all — a user who adds a Triton model to it
+      # should move its entry into the Triton group above, matching deploy.sh's
+      # build_image_local() cases.
       # -----------------------------------------------------------------------
       - |
         # entry format is CONTAINER_PATH:KEY:REPO_NAME:AGENT_NAME — KEY is the
@@ -125,7 +130,8 @@ phases:
         # build arg (see RENAME_MAP.md).
         for entry in \
           "containers/widedeep_segment_activator:widedeep-segment-activator:${STACK_NAME}-audience-activator:widedeep-segment-activator" \
-          "containers/metrics_enricher:metrics-enricher:${STACK_NAME}-signals-enricher:metrics-enricher"; do
+          "containers/metrics_enricher:metrics-enricher:${STACK_NAME}-signals-enricher:metrics-enricher" \
+          "containers/artf_template:artf-template:${STACK_NAME}-artf-template:artf-template"; do
 
           CONTAINER_PATH="$(echo "${entry}" | cut -d: -f1)"
           KEY="$(echo "${entry}" | cut -d: -f2)"

@@ -16,7 +16,13 @@ import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
-import { fromCognitoIdentityPool } from "@aws-sdk/credential-providers";
+// Imported from the specific provider package, not the `@aws-sdk/credential-providers`
+// umbrella. That umbrella re-exports Node-only providers -- `fromTokenFile` does
+// `import { readFileSync } from "node:fs"` -- which a browser target cannot resolve, so
+// Vite's dependency pre-bundling fails with `"fromTokenFile" is not exported`. `vite build`
+// tolerates it but `vite dev` does not, which made `npm run dev` unusable while production
+// builds still succeeded.
+import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-identity";
 import { getIdToken } from "./auth";
 
 // Configuration from Vite env vars (generated at deploy time by deploy_frontend.py).

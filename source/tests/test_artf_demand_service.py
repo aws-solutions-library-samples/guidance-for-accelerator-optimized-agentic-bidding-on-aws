@@ -1,0 +1,144 @@
+"""The service end to end, and the response contract the frontend reads."""
+
+import pytest
+
+from demand.artfhouse.exclusion import ExclusionReason
+from demand.artfhouse.floors import CurrencyMismatch
+from demand.artfhouse.service import DemandDecisionService, MalformedRequest, validate
+
+SERVICE = DemandDecisionService()
+
+
+def request_with(deals=(), floor=1.0, cur=None):
+    req = {
+        "id": "req-1",
+        "imp": [{"id": "imp-1", "bidfloor": floor, "pmp": {"deals": list(deals)}}],
+    }
+    if cur is not None:
+        req["cur"] = cur
+    return req
+
+
+def excluded_of(response):
+    return response.get("ext", {}).get("artf", {}).get("excluded", [])
+
+
+def bids_of(response):
+    seatbids = response.get("seatbid", [])
+    return seatbids[0]["bid"] if seatbids else []
+
+
+# ------------------------------------------------------------------ validation
+
+
+def test_validate_accepts_a_well_formed_request():
+    assert validate(request_with()) == []
+
+
+def test_validate_rejects_a_non_object():
+    assert validate("not a request") != []
+    assert validate(None) != []
+
+
+def test_validate_requires_an_id_and_impressions():
+    assert "request has no id" in validate({"imp": [{"id": "i"}]})
+    assert "request has no impressions" in validate({"id": "r"})
+
+
+def test_malformed_request_raises_rather_than_returning_an_empty_response():
+    # An empty bid response asserts that no campaign wished to offer. Returning it
+    # for an unparseable request would state something untrue about demand.
+    with pytest.raises(MalformedRequest):
+        SERVICE.decide({"imp": []})
+
+
+def test_unsupported_currency_raises_rather_than_rescaling():
+    with pytest.raises(CurrencyMismatch):
+        SERVICE.decide(request_with(cur="EUR"))
+
+
+# --------------------------------------------------------------- the response
+
+
+def test_every_considered_campaign_appears_as_a_bid_or_an_exclusion():
+    response = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
+    seen = {b["ext"]["prebid"]["artf"]["campaignId"] for b in bids_of(response)}
+    seen |= {e["campaignId"] for e in excluded_of(response)}
+    assert len(seen) == 5  # the whole catalog
+
+
+def test_a_suppressed_deal_is_distinguishable_from_a_below_floor_rejection():
+    deals = [
+        {"id": "deal-finance-pmp", "ext": {"artf": {"suppressed": True}}},
+        {"id": "deal-auto-brand", "bidfloor": 9.0},
+    ]
+    response = SERVICE.decide(request_with(deals))
+    reasons = {e["campaignId"]: e["exclusionReason"] for e in excluded_of(response)}
+    assert reasons["camp-harbour"] == ExclusionReason.DEAL_SUPPRESSED.value
+    assert reasons["camp-vantage"] == ExclusionReason.BELOW_FLOOR.value
+
+
+def test_the_excluded_block_is_present_when_a_campaign_made_no_offer():
+    # This block is what the frontend reads for never-offered candidates:
+    # ext.seatnonbid cannot carry them, because Prebid records no seatnonbid entry
+    # for a seat that did bid.
+    response = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
+    assert excluded_of(response)
+
+
+def test_a_response_with_no_bids_omits_seatbid_rather_than_sending_it_empty():
+    response = SERVICE.decide(request_with(floor=99.0))
+    assert "seatbid" not in response
+    assert excluded_of(response)
+
+
+def test_the_response_echoes_the_request_id_for_correlation():
+    response = SERVICE.decide(request_with())
+    assert response["id"] == "req-1"
+
+
+def test_the_response_states_its_currency():
+    assert SERVICE.decide(request_with())["cur"] == "USD"
+
+
+def test_no_winner_or_clearing_price_is_computed():
+    # Prebid resolves the auction. Nothing here may claim a winner.
+    response = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
+    text = repr(response)
+    assert "winner" not in text
+    assert "clearing" not in text
+    for bid in bids_of(response):
+        assert "targeting" not in bid.get("ext", {}).get("prebid", {})
+
+
+def test_the_same_request_yields_the_same_response():
+    first = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
+    second = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
+    assert first == second
+
+
+def test_a_floor_adjustment_admits_demand_the_original_floor_excluded():
+    """FR-42's shape: lowering the binding floor lets a campaign offer."""
+    high = SERVICE.decide(request_with([{"id": "deal-auto-brand", "bidfloor": 5.0}]))
+    low = SERVICE.decide(request_with([{"id": "deal-auto-brand", "bidfloor": 1.0}]))
+
+    high_reasons = {e["campaignId"]: e["exclusionReason"] for e in excluded_of(high)}
+    assert high_reasons["camp-vantage"] == ExclusionReason.BELOW_FLOOR.value
+
+    low_bidders = {b["ext"]["prebid"]["artf"]["campaignId"] for b in bids_of(low)}
+    assert "camp-vantage" in low_bidders
+
+
+def test_deal_suppression_removes_a_candidate_before_bidding():
+    """FR-43's shape: the campaign is present with a reason, not absent."""
+    plain = SERVICE.decide(request_with([{"id": "deal-finance-pmp"}]))
+    assert "camp-harbour" in {b["ext"]["prebid"]["artf"]["campaignId"] for b in bids_of(plain)}
+
+    suppressed = SERVICE.decide(
+        request_with([{"id": "deal-finance-pmp", "ext": {"artf": {"suppressed": True}}}])
+    )
+    assert "camp-harbour" not in {
+        b["ext"]["prebid"]["artf"]["campaignId"] for b in bids_of(suppressed)
+    }
+    reasons = {e["campaignId"]: e["exclusionReason"] for e in excluded_of(suppressed)}
+    assert reasons["camp-harbour"] == ExclusionReason.DEAL_SUPPRESSED.value
