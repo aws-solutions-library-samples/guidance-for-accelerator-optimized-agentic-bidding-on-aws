@@ -336,20 +336,23 @@ upload_default_config() {
 # wait -- as this script first did -- gave the pod no config it could boot from and
 # the wait could never succeed.
 #
-# Uploads ONLY if absent. Overwriting on every deploy would silently discard the
-# operator's edits, and editing this object is the documented way to reconfigure
-# (FR-38). That also makes this safe to call twice, which is why step 7 still calls
-# it and simply reports.
+# Editing this object is the documented way to reconfigure (FR-38), so a blind
+# overwrite on every deploy would discard the operator's work. But uploading only
+# when absent -- what this did originally -- meant a change to CONFIG_TEMPLATE
+# reached a fresh account and silently never reached an already-deployed cluster.
+#
+# So the object carries a `rendered-sha` metadata stamp of the render that produced
+# it. Stamp still matches the bytes: nobody edited it, replace it. Stamp missing or
+# no longer matching: an operator owns it, leave it and say plainly what is
+# therefore not applied. Either way this is safe to call twice, which is why step 7
+# still calls it and simply reports.
 # ---------------------------------------------------------------------------
 publish_config_overlay() {
   local bucket="$1"
   local endpoint="$2"
 
-  if aws s3api head-object --bucket "${bucket}" --key "${CONFIG_KEY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log "  s3://${bucket}/${CONFIG_KEY} already exists - left untouched, so operator edits survive a redeploy."
-    return 0
-  fi
-
+  # Rendered FIRST, unconditionally, because the render is what an existing object
+  # has to be compared against.
   local rendered="${WORK_DIR}/prebid-config.yaml"
   sed -e "s|__DEMAND_ENDPOINT__|${endpoint}|g" \
       -e "s|__CONFIG_BUCKET__|${bucket}|g" \
@@ -362,7 +365,68 @@ publish_config_overlay() {
     fail "Refusing to upload a configuration with unsubstituted placeholders"
   fi
 
-  aws s3 cp "${rendered}" "s3://${bucket}/${CONFIG_KEY}" --region "${AWS_REGION}" >/dev/null \
+  local render_sha
+  render_sha="$(shasum -a 256 "${rendered}" | cut -d' ' -f1)"
+
+  if aws s3api head-object --bucket "${bucket}" --key "${CONFIG_KEY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    # An object exists. "Upload only if absent" -- what this did before -- meant a
+    # change to CONFIG_TEMPLATE reached a fresh account and silently never reached an
+    # already-deployed cluster, so a newly registered bidder would simply not appear.
+    # But blind overwriting would discard the operator edits that FR-38 makes the
+    # documented way to reconfigure.
+    #
+    # Distinguish the two by stamping our own render on the object as user metadata.
+    # If the stamp still matches the object's bytes, nobody has edited it since we
+    # wrote it, and replacing it loses nothing.
+    local stamped live_sha
+    stamped="$(aws s3api head-object --bucket "${bucket}" --key "${CONFIG_KEY}" \
+      --region "${AWS_REGION}" --query 'Metadata."rendered-sha"' --output text 2>/dev/null || echo '')"
+    aws s3 cp "s3://${bucket}/${CONFIG_KEY}" "${WORK_DIR}/live-config.yaml" \
+      --region "${AWS_REGION}" --quiet 2>/dev/null \
+      || fail "Could not read the live configuration overlay to compare against"
+    live_sha="$(shasum -a 256 "${WORK_DIR}/live-config.yaml" | cut -d' ' -f1)"
+
+    if [[ -n "${stamped}" && "${stamped}" != "None" && "${stamped}" == "${live_sha}" ]]; then
+      if [[ "${live_sha}" == "${render_sha}" ]]; then
+        log "  s3://${bucket}/${CONFIG_KEY} already matches this render - nothing to change."
+        return 0
+      fi
+      aws s3 cp "${rendered}" "s3://${bucket}/${CONFIG_KEY}" --region "${AWS_REGION}" \
+        --metadata "rendered-sha=${render_sha}" >/dev/null \
+        || fail "Could not update the configuration overlay"
+      log "  Configuration overlay UPDATED from the template (it was unmodified since the last deploy)."
+      return 0
+    fi
+
+    # Objects uploaded before stamping existed carry no stamp, so every deployment
+    # made by the earlier code would warn forever. When such an object's bytes are
+    # already identical to the render, it IS our render and only the stamp is
+    # missing: adopt it in place. That leaves the content untouched and confines the
+    # warning below to files somebody has genuinely edited.
+    if [[ "${live_sha}" == "${render_sha}" ]]; then
+      aws s3 cp "${rendered}" "s3://${bucket}/${CONFIG_KEY}" --region "${AWS_REGION}" \
+        --metadata "rendered-sha=${render_sha}" >/dev/null \
+        || fail "Could not stamp the existing configuration overlay"
+      log "  s3://${bucket}/${CONFIG_KEY} already matched this render; recorded the stamp so"
+      log "  future template changes can be applied automatically. Content unchanged."
+      return 0
+    fi
+
+    # Either the object predates this stamping AND differs from the render, or its
+    # bytes no longer match its stamp. Both mean someone owns this file.
+    warn "s3://${bucket}/${CONFIG_KEY} has been modified outside this script (or predates"
+    warn "stamping), so it was LEFT UNTOUCHED and any template change is NOT applied."
+    warn "Anything the template adds - a newly registered bidder among them - is absent"
+    warn "from this deployment until the render is adopted. To see the difference and"
+    warn "then adopt it:"
+    warn "  aws s3 cp s3://${bucket}/${CONFIG_KEY} /tmp/live-prebid-config.yaml --region ${AWS_REGION}"
+    warn "  diff /tmp/live-prebid-config.yaml ${rendered}"
+    warn "  aws s3 cp ${rendered} s3://${bucket}/${CONFIG_KEY} --region ${AWS_REGION} --metadata rendered-sha=${render_sha}"
+    return 0
+  fi
+
+  aws s3 cp "${rendered}" "s3://${bucket}/${CONFIG_KEY}" --region "${AWS_REGION}" \
+    --metadata "rendered-sha=${render_sha}" >/dev/null \
     || fail "Could not upload the configuration overlay"
   log "  Uploaded the configuration OVERLAY to s3://${bucket}/${CONFIG_KEY}"
   warn "That overlay REPLACES the release default file - the entrypoint copies"
@@ -1282,6 +1346,21 @@ if [[ "${START_AT}" -le 8 ]]; then
   IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
     --image-ids "imageTag=${IMAGE_TAG}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
   [[ "${IMAGE_DIGEST}" == "None" ]] && IMAGE_DIGEST=""
+
+  # These are normally resolved in step 6. Entering at step 7 or 8 skips that, and
+  # recording them as null would overwrite a correct record with a WORSE one -- the
+  # file then reports the deployment has no token endpoint and no required scope,
+  # which reads as a misconfiguration rather than as an artifact of where the run
+  # started. Backfill from the stack so the record is the same wherever we entered.
+  for _out in TOKEN_ENDPOINT:TokenEndpoint DEMAND_ENDPOINT:DemandEndpointUrl \
+              ORCHESTRATOR_SCOPE:OrchestratorScope; do
+    _var="${_out%%:*}"
+    if [[ -z "${!_var:-}" ]]; then
+      _val="$(stack_output "${PREBID_STACK}" "${_out#*:}" 2>/dev/null || echo '')"
+      [[ "${_val}" == "None" ]] && _val=""
+      printf -v "${_var}" '%s' "${_val}"
+    fi
+  done
 
   python3 - <<PY >"${RECORD_FILE}"
 import json
