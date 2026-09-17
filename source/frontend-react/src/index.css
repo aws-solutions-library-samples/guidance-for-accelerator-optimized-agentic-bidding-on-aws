@@ -3985,6 +3985,52 @@ h1, h2, h3, .sg-display {
 .th-offer-NotAttempted .th-offer-campaign,
 .th-offer-NotAttempted .th-offer-price { color: var(--th-ink-2); }
 
+/* Folded groups for everything that did not bid. Quieter than a bid row and set
+   apart from them, so the bids read as the content and these as the footnote. */
+.th-offers-group {
+  border: 1px solid var(--th-hair);
+  border-radius: var(--th-radius-sm);
+  background: var(--th-panel);
+}
+.th-offers-group-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+/* The default triangle is replaced with one that reads in both states. */
+.th-offers-group-summary::-webkit-details-marker { display: none; }
+.th-offers-group-summary::before {
+  content: "▸";
+  position: absolute;
+  margin-left: -9px;
+  color: var(--th-ink-3);
+  font-size: 9px;
+}
+.th-offers-group[open] > .th-offers-group-summary::before { content: "▾"; }
+.th-offers-group-summary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(107, 63, 181, 0.35);
+  border-radius: var(--th-radius-sm);
+}
+.th-offers-group-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--th-ink-2);
+  padding-left: 4px;
+}
+.th-offers-group-breakdown {
+  font-size: 10px;
+  color: var(--th-ink-3);
+  padding-left: 4px;
+}
+.th-offers-group-rows { padding: 0 8px 9px; }
+/* Rows inside a group sit on the group's panel, so they lose their own fill. */
+.th-offers-group-rows .th-offer { background: var(--th-canvas); }
+.th-offers-group-rows .th-offer-NotAttempted { background: var(--th-panel-2); }
+
 /* The outcome, set apart from the candidate rows: the winning deal leads, the
    campaign and cleared price support it. */
 .th-offers-winner,

@@ -46,6 +46,8 @@ function AuctionFaultNotice({ fault }) {
 
 export function OffersPanel({ viewModel, revealed, auctionFault }) {
   const offers = viewModel?.offers ?? [];
+  const bidRows = viewModel?.bidRows ?? [];
+  const groups = viewModel?.groups ?? [];
   const winner = viewModel?.winner ?? null;
 
   return (
@@ -84,15 +86,55 @@ export function OffersPanel({ viewModel, revealed, auctionFault }) {
           {offers.length === 0 ? (
             <div className="th-empty">No offers in this response</div>
           ) : (
-            <div className="th-rows">
-              {offers.map((offer) => (
-                <OfferRow
-                  key={offer.key}
-                  offer={offer}
-                  isWinner={winner != null && winner.offerKey === offer.key}
-                />
+            <>
+              {/*
+                The bids, on their own rows. Nothing that did not bid appears
+                between them: a summary line interleaved with real offers breaks
+                the scan the column exists to support.
+              */}
+              {bidRows.length > 0 ? (
+                <div className="th-rows" data-testid="offers-panel-bids">
+                  {bidRows.map((offer) => (
+                    <OfferRow
+                      key={offer.key}
+                      offer={offer}
+                      isWinner={winner != null && winner.offerKey === offer.key}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="th-empty" data-testid="offers-panel-no-bids">
+                  No seat bid on this impression
+                </div>
+              )}
+
+              {/*
+                Everything that did not bid, grouped, AFTER all of the bids.
+                `<details>` rather than component state: it is keyboard operable and
+                screen-reader announced without any of that being implemented here,
+                and the group's own count is visible while collapsed, so nothing is
+                hidden — only folded.
+              */}
+              {groups.map((group) => (
+                <details
+                  key={group.id}
+                  className={`th-offers-group th-offers-group-${group.id}`}
+                  data-testid={`offers-group-${group.id}`}
+                >
+                  <summary className="th-offers-group-summary">
+                    <span className="th-offers-group-label">{group.label}</span>
+                    <span className="th-offers-group-breakdown">
+                      {group.breakdown.map((b) => `${b.count} ${b.label}`).join(" · ")}
+                    </span>
+                  </summary>
+                  <div className="th-rows th-offers-group-rows">
+                    {group.rows.map((offer) => (
+                      <OfferRow key={offer.key} offer={offer} isWinner={false} />
+                    ))}
+                  </div>
+                </details>
               ))}
-            </div>
+            </>
           )}
 
           {/*

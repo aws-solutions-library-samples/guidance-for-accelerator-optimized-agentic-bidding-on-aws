@@ -278,3 +278,117 @@ describe("OffersPanel seat-level non-bids", () => {
     expect(q("offers-panel-winner").textContent).toMatch(/cleared at \$7\.20/);
   });
 });
+
+
+// Grouped non-bids render AFTER every bid, never between them. A summary line
+// interleaved with real offers breaks the scan the column exists to support.
+describe("OffersPanel grouped non-bids", () => {
+  const WITH_GROUPS = {
+    cur: "USD",
+    seatbid: [
+      {
+        seat: "artfhouse",
+        bid: [
+          {
+            id: "w",
+            impid: "imp-1",
+            price: 4.1,
+            dealid: "deal-parenting-premium",
+            adomain: ["brightstart.example"],
+            ext: { prebid: { targeting: { hb_bidder: "artfhouse", hb_pb: "4.10" } } },
+          },
+          { id: "l", impid: "imp-1", price: 3.05, adomain: ["familynetwork.example"] },
+        ],
+      },
+    ],
+    ext: {
+      seatnonbid: [{ seat: "amt", nonbid: [{ impid: "imp-1", statuscode: 0 }] }],
+      artf: {
+        excluded: [
+          { campaignId: "c1", campaignName: "Openfield", exclusionReason: "below_floor", impId: "imp-1" },
+          { campaignId: "c2", campaignName: "Cedar", exclusionReason: "no_deal_on_impression", impId: "imp-1" },
+          { campaignId: "c3", campaignName: "Skyline", exclusionReason: "media_type_unsupported", impId: "imp-1" },
+        ],
+      },
+    },
+  };
+
+  const vm = () => buildOfferViewModel(WITH_GROUPS);
+
+  it("shows the bids on their own rows and nothing else at the top level", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    const bids = q("offers-panel-bids");
+    expect(bids.querySelectorAll(".th-offer")).toHaveLength(2);
+    expect(bids.textContent).toMatch(/brightstart\.example/);
+    expect(bids.textContent).toMatch(/familynetwork\.example/);
+    expect(bids.textContent).not.toMatch(/Cedar|Skyline|Openfield/);
+  });
+
+  // The explicit instruction: not in between valid rows.
+  it("places every group after all of the bids in document order", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    const bids = q("offers-panel-bids");
+    for (const group of qa(".th-offers-group")) {
+      // DOCUMENT_POSITION_FOLLOWING (4) means the group comes after the bids block.
+      const rel = bids.compareDocumentPosition(group);
+      expect(rel & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it("renders a group per kind, each with its count and breakdown", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    expect(q("offers-group-decision").textContent).toMatch(
+      /1 campaign stopped by a sell-side decision/,
+    );
+    expect(q("offers-group-ineligible").textContent).toMatch(
+      /2 campaigns not eligible for this impression/,
+    );
+    expect(q("offers-group-ineligible").textContent).toMatch(/1 no deal on the impression/);
+    expect(q("offers-group-ineligible").textContent).toMatch(/1 creative format/);
+    expect(q("offers-group-no_bid").textContent).toMatch(/1 seat returned no bid/);
+    expect(q("offers-group-no_bid").textContent).toMatch(/1 amt/);
+  });
+
+  it("keeps the rows and their reasons inside the group, not discarded", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    const ineligible = q("offers-group-ineligible");
+    expect(ineligible.querySelectorAll(".th-offer")).toHaveLength(2);
+    expect(ineligible.textContent).toMatch(/Cedar/);
+    expect(ineligible.textContent).toMatch(/no slot this campaign's creative could fill/i);
+  });
+
+  it("starts collapsed, and the count is legible while collapsed", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    for (const group of qa(".th-offers-group")) {
+      expect(group.open).toBe(false);
+      expect(group.querySelector("summary").textContent.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("says so when no seat bid at all, rather than showing an empty bid block", () => {
+    const noBids = {
+      ext: {
+        artf: {
+          excluded: [{ campaignId: "c", campaignName: "C", exclusionReason: "not_targeted" }],
+        },
+      },
+    };
+    render(<OffersPanel viewModel={buildOfferViewModel(noBids)} revealed />);
+    expect(q("offers-panel-no-bids")).not.toBeNull();
+    expect(q("offers-panel-bids")).toBeNull();
+    expect(q("offers-group-ineligible")).not.toBeNull();
+  });
+
+  it("renders no group markup when every row bid", () => {
+    const allBid = {
+      seatbid: [
+        {
+          seat: "s",
+          bid: [{ id: "a", impid: "i", price: 2, ext: { prebid: { targeting: { hb_bidder: "s" } } } }],
+        },
+      ],
+    };
+    render(<OffersPanel viewModel={buildOfferViewModel(allBid)} revealed />);
+    expect(qa(".th-offers-group")).toHaveLength(0);
+  });
+});
