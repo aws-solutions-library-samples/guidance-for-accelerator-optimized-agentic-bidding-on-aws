@@ -162,8 +162,13 @@ def test_the_auction_is_returned_unchanged(monkeypatch):
     # Prebid's own seatbid, untouched: no bid added, no price altered.
     assert payload["seatbid"] == AUCTION["seatbid"]
     assert payload["cur"] == "USD"
-    # And the request reached Prebid as given.
-    assert client.posted["json"] == VALID_REQUEST
+    # The request reached Prebid as given, apart from the bidder enablement and
+    # debug flag the orchestrator adds -- covered by the preparation tests below.
+    sent = client.posted["json"]
+    assert sent["id"] == VALID_REQUEST["id"]
+    assert sent["imp"][0]["id"] == VALID_REQUEST["imp"][0]["id"]
+    assert sent["ext"]["prebid"]["debug"] == 1
+    assert set(sent) - set(VALID_REQUEST) == {"ext"}
 
 
 def test_metadata_states_where_the_numbers_came_from(monkeypatch):
@@ -236,3 +241,216 @@ def test_a_rejection_from_prebid_is_surfaced_with_its_status(monkeypatch):
     # Prebid's own account of the refusal is preserved for diagnosis.
     assert payload["status"] == 400
     assert payload["response"] == {"message": "invalid request"}
+
+
+# ---------------------------------------------------------------------------
+# PER-CAMPAIGN EXCLUSIONS.
+#
+# A bidder's own response body is not part of an OpenRTB bid response: Prebid
+# returns bids, and the artfhouse adapter extracts bids and nothing else. So the
+# demand endpoint's account of WHICH campaign lost and WHY reaches us only inside
+# ext.debug.httpcalls.artfhouse[].responsebody, which is why the orchestrator asks
+# Prebid for debug output.
+#
+# The distinction these tests protect: an EMPTY list asserts "nothing was
+# excluded", while an ABSENT list means "we could not tell". Rendering the second
+# as the first would put a false statement on screen.
+# ---------------------------------------------------------------------------
+
+EXCLUSIONS = [
+    {"campaignId": "camp-harbour", "exclusionReason": "no_deal_on_impression"},
+    {"campaignId": "camp-vantage", "exclusionReason": "no_deal_on_impression"},
+]
+
+
+def _auction_with_httpcalls(responsebody, bidder="artfhouse"):
+    return {
+        "id": "req-1",
+        "seatbid": [{"seat": "artfhouse", "bid": [{"crid": "c", "price": 1.0}]}],
+        "ext": {"debug": {"httpcalls": {bidder: [{"status": 200, "responsebody": responsebody}]}}},
+    }
+
+
+def test_debug_is_requested_so_the_exclusions_can_arrive(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    run(auction_api.run_auction_handler(FakeRequest(dict(VALID_REQUEST))))
+
+    assert client.posted["json"]["ext"]["prebid"]["debug"] == 1
+
+
+def test_requesting_debug_does_not_mutate_the_caller_s_request(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, dict(AUCTION))))
+
+    original = {"id": "req-1", "imp": [{"id": "imp-1"}], "ext": {"prebid": {"targeting": {}}}}
+    snapshot = json.loads(json.dumps(original))
+
+    run(auction_api.run_auction_handler(FakeRequest(original)))
+
+    assert original == snapshot
+
+
+def test_exclusions_are_lifted_from_the_demand_response(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    body = json.dumps({"ext": {"artf": {"excluded": EXCLUSIONS}}})
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, _auction_with_httpcalls(body))))
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
+
+    assert payload["ext"]["artf"]["excluded"] == EXCLUSIONS
+    assert payload["artf_meta"]["excluded_source"].startswith("artfhouse response")
+
+
+def test_an_empty_exclusion_list_is_preserved_as_empty(monkeypatch):
+    # "Nothing was excluded" is a real answer and must survive as [], not become
+    # absent -- the screen can then say so truthfully.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    body = json.dumps({"ext": {"artf": {"excluded": []}}})
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, _auction_with_httpcalls(body))))
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
+
+    assert payload["ext"]["artf"]["excluded"] == []
+    assert payload["artf_meta"]["excluded_source"].startswith("artfhouse response")
+
+
+@pytest.mark.parametrize(
+    "auction,expected_reason",
+    [
+        ({"id": "r", "ext": {}}, "no httpcalls"),
+        ({"id": "r", "ext": {"debug": {"httpcalls": {"amt": [{"status": 200}]}}}},
+         "artfhouse was not called"),
+    ],
+)
+def test_no_exclusion_list_is_reported_as_unavailable(monkeypatch, auction, expected_reason):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, auction)))
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
+
+    # Absent, NOT an empty list: the difference between "could not tell" and
+    # "nothing was excluded".
+    assert "excluded" not in (payload.get("ext") or {}).get("artf", {})
+    assert payload["artf_meta"]["excluded_source"].startswith("unavailable")
+    assert expected_reason in payload["artf_meta"]["excluded_source"]
+
+
+def test_an_unparseable_demand_response_does_not_invent_exclusions(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    _patch_client(
+        monkeypatch, FakeClient(FakeResponse(200, _auction_with_httpcalls("<not json>")))
+    )
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
+
+    assert "excluded" not in (payload.get("ext") or {}).get("artf", {})
+    assert payload["artf_meta"]["excluded_source"].startswith("unavailable")
+
+
+# ---------------------------------------------------------------------------
+# PREPARING AN ARTF SCENARIO FOR AN AUCTION.
+#
+# Prebid routes an impression to a bidder only when imp.ext.<bidder> is present --
+# that key is how a publisher's prebid.js config declares which bidders to call.
+# The ARTF scenarios are bidstream requests with no such keys, so submitted
+# verbatim they reach NO bidder and return an empty auction that reads as "nobody
+# wanted this impression".
+#
+# What these tests pin down is the boundary: enablement is added, and nothing that
+# constitutes an ANSWER is. No bid, no price, no campaign, no deal, no category.
+# ---------------------------------------------------------------------------
+
+def test_both_seats_are_enabled_on_a_bare_impression():
+    # The shape of source/frontend-react/public/samples/banner-basic.json: an imp
+    # with no ext at all.
+    body = {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 1.0, "banner": {"w": 300, "h": 250}}]}
+    out, prepared = auction_api._prepare_for_auction(body)
+
+    ext = out["imp"][0]["ext"]
+    assert ext["artfhouse"] == {}
+    assert ext["amt"]["placementId"] == "artf-imp-1"
+    assert out["ext"]["prebid"]["returnallbidstatus"] is True
+    assert len(prepared) == 3
+
+
+def test_preparation_adds_nothing_that_constitutes_a_bid():
+    body = {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 1.0}]}
+    out, _ = auction_api._prepare_for_auction(body)
+
+    imp = out["imp"][0]
+    # No price, no creative, no deal, no campaign, and no category invented.
+    assert "pmp" not in imp
+    assert imp["bidfloor"] == 1.0
+    assert "artf" not in imp["ext"]
+    assert "data" not in imp["ext"]
+    assert "seatbid" not in out
+
+
+def test_existing_bidder_params_are_left_alone():
+    # A caller that already declared its own params keeps them: preparation fills
+    # gaps, it does not overwrite intent.
+    body = {
+        "id": "r",
+        "imp": [{"id": "imp-1", "ext": {"amt": {"placementId": "mine"}, "artfhouse": {"x": 1}}}],
+    }
+    out, prepared = auction_api._prepare_for_auction(body)
+
+    assert out["imp"][0]["ext"]["amt"] == {"placementId": "mine"}
+    assert out["imp"][0]["ext"]["artfhouse"] == {"x": 1}
+    assert not any("ext.amt" in p or "ext.artfhouse" in p for p in prepared)
+
+
+def test_categories_are_relocated_not_invented():
+    body = {"id": "r", "imp": [{"id": "imp-1", "ext": {"artf": {"categories": ["home"]}}}]}
+    out, prepared = auction_api._prepare_for_auction(body)
+
+    # Same value, new location -- the one Prebid preserves.
+    assert out["imp"][0]["ext"]["data"]["artf"]["categories"] == ["home"]
+    assert any("data.artf.categories" in p for p in prepared)
+
+
+def test_an_impression_without_categories_gains_none():
+    body = {"id": "r", "imp": [{"id": "imp-1"}]}
+    out, prepared = auction_api._prepare_for_auction(body)
+
+    assert "data" not in out["imp"][0]["ext"]
+    assert not any("categories" in p for p in prepared)
+
+
+def test_an_existing_data_location_is_not_overwritten():
+    body = {
+        "id": "r",
+        "imp": [{
+            "id": "imp-1",
+            "ext": {
+                "artf": {"categories": ["home"]},
+                "data": {"artf": {"categories": ["finance"]}},
+            },
+        }],
+    }
+    out, _ = auction_api._prepare_for_auction(body)
+
+    # The Prebid-safe location is authoritative; the legacy one does not clobber it.
+    assert out["imp"][0]["ext"]["data"]["artf"]["categories"] == ["finance"]
+
+
+def test_preparation_is_reported_so_it_is_visible(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, dict(AUCTION))))
+
+    body = {"id": "r", "imp": [{"id": "imp-1"}]}
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(body))))
+
+    prepared = payload["artf_meta"]["prepared"]
+    assert any("artfhouse" in p for p in prepared)
+    assert any("amt" in p for p in prepared)
+
+
+def test_preparation_does_not_mutate_the_caller_s_request():
+    body = {"id": "r", "imp": [{"id": "imp-1", "ext": {"artf": {"categories": ["home"]}}}]}
+    snapshot = json.loads(json.dumps(body))
+    auction_api._prepare_for_auction(body)
+    assert body == snapshot

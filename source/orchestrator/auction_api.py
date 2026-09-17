@@ -116,6 +116,9 @@ async def run_auction_handler(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    body, prepared = _prepare_for_auction(body)
+    body = _with_debug_enabled(body)
+
     started = time.monotonic()
     try:
         # verify=False: see the module docstring -- Prebid presents a certificate it
@@ -168,6 +171,7 @@ async def run_auction_handler(request: Request) -> JSONResponse:
         )
 
     if isinstance(auction, dict):
+        excluded, excluded_source = _lift_artf_exclusions(auction)
         auction["artf_meta"] = {
             "source": "prebid",
             "endpoint": url,
@@ -179,5 +183,149 @@ async def run_auction_handler(request: Request) -> JSONResponse:
                     if seat.get("seat")
                 }
             ),
+            # Where the exclusion list came from, or why there is none. A consumer
+            # showing "no campaign was excluded" needs to know the difference
+            # between an empty list and an unavailable one.
+            "excluded_source": excluded_source,
+            # What this endpoint added to the request before submitting it. Listed
+            # so a reader can see that the auction was ENABLED, not authored.
+            "prepared": prepared,
         }
+        if excluded is not None:
+            auction.setdefault("ext", {}).setdefault("artf", {})["excluded"] = excluded
     return JSONResponse(auction)
+
+
+def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
+    """Make an ARTF-shaped bid request runnable as a Prebid auction.
+
+    WHAT THIS DOES, AND WHAT IT REFUSES TO DO
+
+    Prebid routes an impression to a bidder only when `imp.ext.<bidder>` is
+    present -- that key is how a publisher's prebid.js configuration declares which
+    bidders to call. The ARTF scenarios are bidstream requests and carry no such
+    keys, so submitted verbatim they reach NO bidder and return an empty auction
+    that looks like nobody wanted the impression.
+
+    So this adds the bidder enablement a publisher's page would have supplied, and
+    NOTHING else. It does not add a bid, a price, a campaign, a deal, or a category:
+    what each seat then bids is entirely the bidders' own answer. Everything added
+    is listed in artf_meta.prepared so it is visible rather than implied.
+
+    It also moves `imp.ext.artf.categories` to `imp.ext.data.artf.categories`,
+    because Prebid deletes unrecognised `imp.ext` keys as unknown bidder names --
+    the same relocation the demand endpoint reads. The VALUE is untouched; only its
+    location changes, so a scenario that declares categories keeps them and one
+    that declares none gains none.
+    """
+    prepared: list[str] = []
+    out = dict(body)
+    imps = []
+
+    for imp in out.get("imp") or []:
+        imp = dict(imp)
+        ext = dict(imp.get("ext") or {})
+
+        if "artfhouse" not in ext:
+            # Empty on purpose: the adapter takes no parameters. Presence is what
+            # routes the impression to it.
+            ext["artfhouse"] = {}
+            prepared.append(f"imp[{imp.get('id')}].ext.artfhouse (enable the ARTF seat)")
+
+        if "amt" not in ext:
+            # placementId is required by the AMT adapter's params schema
+            # (minLength 1). Derived from the impression id so it is stable and
+            # traceable; the simulator does not vary its answer by placement.
+            ext["amt"] = {"placementId": f"artf-{imp.get('id') or 'imp'}"}
+            prepared.append(f"imp[{imp.get('id')}].ext.amt.placementId (enable the simulator seat)")
+
+        artf = ext.get("artf")
+        if isinstance(artf, dict) and artf.get("categories"):
+            data = dict(ext.get("data") or {})
+            data_artf = dict(data.get("artf") or {})
+            if not data_artf.get("categories"):
+                data_artf["categories"] = artf["categories"]
+                data["artf"] = data_artf
+                ext["data"] = data
+                prepared.append(
+                    f"imp[{imp.get('id')}].ext.data.artf.categories "
+                    f"(moved from imp.ext.artf, which Prebid drops)"
+                )
+
+        imp["ext"] = ext
+        imps.append(imp)
+
+    if imps:
+        out["imp"] = imps
+
+    ext = dict(out.get("ext") or {})
+    prebid = dict(ext.get("prebid") or {})
+    if "returnallbidstatus" not in prebid:
+        # Without it a seat that was called and did not bid is indistinguishable
+        # from a seat that was never called, so the losers cannot be shown.
+        prebid["returnallbidstatus"] = True
+        prepared.append("ext.prebid.returnallbidstatus (report the seats that did not bid)")
+    ext["prebid"] = prebid
+    out["ext"] = ext
+
+    return out, prepared
+
+
+def _with_debug_enabled(body: dict) -> dict:
+    """Ask Prebid for its debug output, which is what carries the exclusions.
+
+    A bidder's own response body is not part of an OpenRTB bid response: Prebid
+    returns bids, and the artfhouse adapter's makeBids extracts bids and nothing
+    else. So the per-campaign exclusion reasons the demand endpoint reports --
+    which campaign lost, and why -- reach us only inside
+    ext.debug.httpcalls.artfhouse[].responsebody.
+
+    Set here rather than left to the caller because the screen this feeds always
+    needs the losers, and a request that forgot the flag would silently show an
+    auction with no explanation of who was excluded.
+
+    Copied shallowly, with ext and ext.prebid copied too, so a caller's dict is not
+    mutated as a side effect of being posted.
+    """
+    out = dict(body)
+    ext = dict(out.get("ext") or {})
+    prebid = dict(ext.get("prebid") or {})
+    prebid["debug"] = 1
+    ext["prebid"] = prebid
+    out["ext"] = ext
+    return out
+
+
+def _lift_artf_exclusions(auction: dict) -> tuple[Optional[list], str]:
+    """Pull the demand endpoint's own exclusion list out of Prebid's debug output.
+
+    Returns (excluded, source). `excluded` is None when the list is genuinely
+    unavailable, never [] -- an empty list asserts "nothing was excluded", which is
+    a different claim from "we could not tell".
+
+    This is the demand endpoint's own account of its decision, carried verbatim by
+    Prebid. Nothing here reconstructs or infers a reason: if the response does not
+    contain one, none is reported.
+    """
+    debug = (auction.get("ext") or {}).get("debug") or {}
+    httpcalls = debug.get("httpcalls") or {}
+    if not httpcalls:
+        return None, "unavailable: prebid returned no httpcalls"
+
+    calls = httpcalls.get("artfhouse") or []
+    if not calls:
+        return None, "unavailable: artfhouse was not called"
+
+    for call in calls:
+        raw = call.get("responsebody")
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        artf = (parsed.get("ext") or {}).get("artf") or {}
+        if "excluded" in artf:
+            return artf["excluded"], "artfhouse response, via prebid debug httpcalls"
+
+    return None, "unavailable: no artf exclusion list in the artfhouse response"

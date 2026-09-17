@@ -118,3 +118,20 @@ export const capturedBidResponse = Object.freeze({
 export function isFixtureResponse(bidResponse) {
   return bidResponse?.[FIXTURE_MARKER] === true;
 }
+
+/**
+ * True only for a response that came from a real exchange.
+ *
+ * The orchestrator writes `artf_meta.source = "prebid"` on the path that actually
+ * posts to Prebid, so this is the one positive signal that a response is live.
+ * Everything else — a 501 body, an error payload, a fixture, a partially built
+ * object — is not an auction result and must not be shown as one.
+ *
+ * Checked positively rather than by ruling out the fixture: "not the fixture" is
+ * true of every malformed thing as well, so it would let a non-auction through.
+ */
+export function isLiveAuctionResponse(bidResponse) {
+  if (!bidResponse || typeof bidResponse !== "object") return false;
+  if (bidResponse[FIXTURE_MARKER] === true) return false;
+  return bidResponse.artf_meta?.source === "prebid";
+}

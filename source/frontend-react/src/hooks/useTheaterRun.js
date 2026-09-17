@@ -9,6 +9,7 @@
 import { useState, useCallback, useRef } from "react";
 import { useOrchestratorClientWithBase } from "./useOrchestratorClientWithBase.js";
 import { buildBeats, buildScenarioContext } from "../utils/theaterBeats.js";
+import { isLiveAuctionResponse } from "../utils/bidResponseFixture.js";
 
 export const RUN_IDLE = "idle";
 export const RUN_SUBMITTING = "submitting";
@@ -22,6 +23,10 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
   const [context, setContext] = useState(null);
   const [beats, setBeats] = useState(null);
   const [error, setError] = useState(null);
+  // The live auction, when Prebid is deployed. Stays null otherwise, and the
+  // offers panel then falls back to the captured fixture and says so (FR-31).
+  // Never set from anything but a real auction response.
+  const [bidResponse, setBidResponse] = useState(null);
   // Guards against a slow earlier submission overwriting a later one.
   const runTokenRef = useRef(0);
 
@@ -34,6 +39,35 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setError(null);
   }, []);
 
+  // Runs the scenario's OpenRTB request as a real auction, if one is available.
+  //
+  // Deliberately quiet on failure. Prebid is optional: when it is not deployed the
+  // endpoint answers 501, which is not an error in this run's terms — the
+  // orchestrator still applied the mutations the walkthrough describes. So a
+  // failure here leaves bidResponse null and the offers panel falls back to the
+  // captured fixture, which carries its own notice. Nothing synthesises an
+  // auction, and no fixture is ever labelled live.
+  const runAuction = useCallback(async (payload, token) => {
+    const bidRequest = payload?.bid_request;
+    if (!bidRequest?.imp?.length) return;
+
+    try {
+      const resp = await fetch(`${baseUrl}/v1/auction/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bidRequest),
+      });
+      if (!resp.ok) return;             // 501 when Prebid is absent; nothing to show
+      const auction = await resp.json();
+      if (token !== runTokenRef.current) return;
+      // Only a response that actually came from an exchange is used.
+      if (!isLiveAuctionResponse(auction)) return;
+      setBidResponse(auction);
+    } catch {
+      // Network failure: same reasoning. The fixture notice is the honest fallback.
+    }
+  }, [baseUrl]);
+
   const start = useCallback(async (scenario) => {
     const token = ++runTokenRef.current;
     setScenarioId(scenario?.id ?? null);
@@ -43,6 +77,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setBeats(null);
     setError(null);
     setContext(null);
+    setBidResponse(null);
 
     try {
       const resp = await fetch(`/samples/${scenario.file}?t=${Date.now()}`);
@@ -65,6 +100,13 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
       setBeats(buildBeats(payload, result));
       setStatus(RUN_READY);
+
+      // The auction runs AFTER the walkthrough is ready, and its failure is not
+      // the run's failure: the mutations the beats describe did happen. An
+      // unavailable auction leaves bidResponse null, and the offers panel then
+      // shows the captured fixture with its own notice rather than presenting a
+      // fixture as live.
+      void runAuction(payload, token);
       return result;
     } catch (err) {
       if (token !== runTokenRef.current) return null;
@@ -72,7 +114,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
       setStatus(RUN_FAILED);
       return null;
     }
-  }, [submit]);
+  }, [submit, runAuction]);
 
-  return { status, scenarioId, context, beats, error, start, reset };
+  return { status, scenarioId, context, beats, error, bidResponse, start, reset };
 }
