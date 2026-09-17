@@ -433,10 +433,17 @@ hooks:
 # bucket's maximum for any price above it, keeping the bid. Top buckets are 20 for
 # medium/med/high/auto/dense and 5 for low (PriceGranularity.java:30-38).
 #
-# The catalog's highest declared CPM is 6.35, so nothing bites under any granularity
-# EXCEPT "low", where that campaign's hb_pb would read 5.00 -- a misreported targeting
-# key rather than a lost bid. No granularity is set here, so Prebid's own default
-# applies; the constraint is simply not to change it to "low".
+# The catalog's highest declared CPM is 13.40 (camp-meridian-guaranteed, which
+# transacts on yield-optimizer's deal-guaranteed-premium against a 12.00 deal floor).
+# That is under 20, so nothing bites under any granularity EXCEPT "low", where the top
+# bucket is 5 and every campaign above it -- now several, since the video campaigns
+# were added for the shipped scenarios -- would report hb_pb as 5.00. That is a
+# misreported targeting key rather than a lost bid. No granularity is set here, so
+# Prebid's own default applies; the constraint is simply not to change it to "low".
+#
+# The figure was 6.35 while the catalog held only the five original banner campaigns.
+# It is asserted in test_artf_demand_bids.py so this comment cannot drift from it
+# silently.
 #
 # Recorded because an earlier version of this feature's design stated that a
 # configured bid ceiling would DISCARD bids above it, and that a ceiling had to exceed

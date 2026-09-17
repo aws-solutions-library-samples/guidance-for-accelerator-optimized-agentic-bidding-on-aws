@@ -103,6 +103,26 @@ def _targets(campaign: Campaign, categories: tuple[str, ...]) -> bool:
     return any(c in campaign.target_categories for c in categories)
 
 
+def _media_types_of(imp: dict) -> tuple[str, ...]:
+    """The media types the impression actually offers a slot for.
+
+    Read from the OpenRTB objects themselves -- an imp declares a slot by carrying
+    `banner`, `video`, `audio` or `native`. An imp with none of them offers nothing
+    placeable, which is treated as no restriction rather than as a silent exclusion
+    of the whole catalog, so a malformed request fails visibly elsewhere instead of
+    presenting as "no demand".
+    """
+    present = tuple(k for k in ("banner", "video", "audio", "native") if (imp or {}).get(k))
+    return present
+
+
+def _placeable(campaign: Campaign, media_types: tuple[str, ...]) -> bool:
+    """Whether the impression has a slot this campaign's creative could fill."""
+    if not media_types:
+        return True
+    return campaign.media_type in media_types
+
+
 def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
     """One Candidate per considered campaign, in catalog order.
 
@@ -111,10 +131,22 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
     deals = _deals_on(imp)
     deals_by_id = {d.get("id"): d for d in deals if d.get("id")}
     categories = _categories_of(imp)
+    media_types = _media_types_of(imp)
 
     candidates: list[Candidate] = []
 
     for campaign in catalog.all():
+        # Checked FIRST, and before the deal lookup, because it is the most
+        # fundamental reason: a creative that cannot be placed in any slot on this
+        # impression is not a near miss on price or targeting. Reporting
+        # "below_floor" for a video campaign on a banner-only slot would name a
+        # reason that had nothing to do with why it lost.
+        if not _placeable(campaign, media_types):
+            candidates.append(
+                Candidate(campaign, None, ExclusionReason.MEDIA_TYPE_UNSUPPORTED)
+            )
+            continue
+
         matching = [deals_by_id[d] for d in campaign.deal_ids if d in deals_by_id]
 
         if not matching:

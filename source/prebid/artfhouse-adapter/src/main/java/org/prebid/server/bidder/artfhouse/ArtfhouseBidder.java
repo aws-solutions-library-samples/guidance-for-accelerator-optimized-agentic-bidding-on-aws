@@ -168,6 +168,33 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
     }
 
     /**
+     * The media type of a bid, taken from what the bid DECLARES.
+     *
+     * <p>OpenRTB 2.6 {@code bid.mtype} is the field for this: 1 banner, 2 video, 3 audio,
+     * 4 native. This was previously hardcoded to {@code banner}, which was correct only
+     * for as long as the demand endpoint's catalog held nothing else. Once it carried
+     * video creatives for the video deals the scenarios declare, a hardcoded type meant a
+     * video bid was announced to the auction as a banner -- so it would have been placed
+     * in, or rejected from, the wrong slot for a reason no log would explain.
+     *
+     * <p>An absent or unrecognised {@code mtype} falls back to banner, which is what every
+     * bid from this endpoint was before the field existed, so an older endpoint paired with
+     * a newer adapter keeps working rather than losing its bids.
+     */
+    private static BidType resolveBidType(Bid bid) {
+        final Integer mtype = bid.getMtype();
+        if (mtype == null) {
+            return BidType.banner;
+        }
+        return switch (mtype) {
+            case 2 -> BidType.video;
+            case 3 -> BidType.audio;
+            case 4 -> BidType.xNative;
+            default -> BidType.banner;
+        };
+    }
+
+    /**
      * Map the response's single seatbid to {@link BidderBid}s.
      *
      * <p>The currency comes from the response, not from an assumption. The endpoint states
@@ -194,7 +221,7 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
                 bids.add(BidderBid.builder()
                         .bid(bid)
                         .seat(seatBid.getSeat())
-                        .type(BidType.banner)
+                        .type(resolveBidType(bid))
                         .bidCurrency(currency)
                         .build());
             }

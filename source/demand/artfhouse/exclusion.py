@@ -15,10 +15,19 @@ from enum import Enum
 
 
 class ExclusionReason(str, Enum):
-    """The four reasons a considered campaign produced no offer."""
+    """The reasons a considered campaign produced no offer."""
 
     DEAL_SUPPRESSED = "deal_suppressed"
     """The Deal Scorer suppressed the deal this campaign would have used."""
+
+    MEDIA_TYPE_UNSUPPORTED = "media_type_unsupported"
+    """The impression offers no slot this campaign's creative could fill.
+
+    A video-only slot cannot show a banner, and a banner-only slot cannot play
+    video. Before this reason existed every campaign was implicitly a banner and
+    offered on anything, so a banner creative was bid into video slots -- an offer
+    that could never have rendered.
+    """
 
     BELOW_FLOOR = "below_floor"
     """The campaign's CPM did not clear the binding floor."""

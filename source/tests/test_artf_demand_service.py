@@ -95,10 +95,21 @@ def test_decide_rejects_a_currency_array_without_the_supported_one():
 
 
 def test_every_considered_campaign_appears_as_a_bid_or_an_exclusion():
+    # Derived from the catalog rather than a literal count: the point is that the
+    # response ACCOUNTS FOR every campaign, which must keep holding as campaigns
+    # are added. A hardcoded number turns growing the catalog into a test failure
+    # that says nothing about the property.
+    from demand.artfhouse.catalog import CampaignCatalog
+
+    expected = {c.campaign_id for c in CampaignCatalog().all()}
+
+    # request_with builds an impression that declares NO media slot, which is
+    # treated as no restriction, so every campaign is considered and the accounting
+    # covers the whole catalog.
     response = SERVICE.decide(request_with([{"id": "deal-home-premium"}]))
     seen = {b["ext"]["prebid"]["artf"]["campaignId"] for b in bids_of(response)}
     seen |= {e["campaignId"] for e in excluded_of(response)}
-    assert len(seen) == 5  # the whole catalog
+    assert seen == expected
 
 
 def test_a_suppressed_deal_is_distinguishable_from_a_below_floor_rejection():

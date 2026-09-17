@@ -41,6 +41,10 @@ class Bid:
     #: Which floor the price had to clear, for the response's supporting detail.
     binding_floor: float
     floor_bound_by: str
+    #: "banner" or "video", carried from the campaign. Emitted as OpenRTB `mtype`.
+    media_type: str = "banner"
+    #: Creative duration in seconds. Video only.
+    duration: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -114,10 +118,18 @@ def build(
                 height=campaign.height,
                 binding_floor=floor.value if floor else 0.0,
                 floor_bound_by=floor.bound_by.value if floor else "impression",
+                media_type=campaign.media_type,
+                duration=campaign.duration,
             )
         )
 
     return BuildResult(bids=tuple(bids), exclusions=tuple(exclusions))
+
+
+#: OpenRTB 2.6 mtype codes. Only the two this catalog produces are mapped, so an
+#: unmapped media type raises here rather than being emitted as a silent default
+#: that the exchange would then treat as a banner.
+_MTYPE = {"banner": 1, "video": 2}
 
 
 def to_seatbid(bids: tuple[Bid, ...]) -> dict:
@@ -138,6 +150,15 @@ def to_seatbid(bids: tuple[Bid, ...]) -> dict:
                 "crid": b.creative_id,
                 "w": b.width,
                 "h": b.height,
+                # OpenRTB 2.6 mtype: 1 banner, 2 video, 3 audio, 4 native. Stated
+                # rather than left to the exchange to infer -- an adapter that has
+                # to guess will guess one value for every bid, and a video bid
+                # reported as a banner cannot render.
+                "mtype": _MTYPE[b.media_type],
+                # Video only. A slot declares minduration/maxduration, and a bid
+                # that does not say how long its creative runs cannot be checked
+                # against them.
+                **({"dur": b.duration} if b.duration is not None else {}),
                 "ext": {
                     "prebid": {
                         "artf": {

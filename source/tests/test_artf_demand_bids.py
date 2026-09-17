@@ -110,9 +110,38 @@ def test_no_bid_carries_a_dealid_key_when_there_is_no_deal():
 
 
 def test_catalogue_maximum_is_exposed_so_the_ceiling_can_be_derived():
-    # BR-19: the adapter's ceiling must exceed this, or an eligible bid is emitted
-    # here and silently dropped by Prebid's price-range filter.
-    assert highest_declared_cpm(CATALOG) == 6.35
+    # The exact value is asserted as a canary: it changes only when a campaign's
+    # price changes, and the two properties below depend on what it is.
+    assert highest_declared_cpm(CATALOG) == 13.40
+
+
+def test_the_highest_price_stays_inside_the_targeting_bucket_range():
+    """What actually bites in pbs-java 3.43.0, which has NO price ceiling.
+
+    ResponseBidValidator checks id, impid, crid, video adm/nurl and currency, and
+    AccountBidValidationConfig carries only banner_creative_max_size -- a high-priced
+    bid is not discarded. What happens instead is targeting-key clamping:
+    CpmRange.fromCpmAsNumber returns the TOP BUCKET'S MAXIMUM for any price above it,
+    keeping the bid but misreporting hb_pb.
+
+    Top bucket is 20 for medium/med/high/auto/dense, and 5 for "low"
+    (PriceGranularity.java:30-38). No granularity is configured, so Prebid's default
+    applies and the constraint is simply that the catalog stay under 20.
+    """
+    assert highest_declared_cpm(CATALOG) < 20.0
+
+
+def test_prices_above_five_are_the_reason_low_granularity_is_ruled_out():
+    """Kept as a live count rather than prose, because the number grew.
+
+    When the catalog topped out at 6.35 exactly one campaign sat above the "low"
+    top bucket of 5. The video campaigns added for the shipped scenarios put several
+    there, so choosing "low" would now misreport hb_pb for more of the catalog than
+    it used to -- worth being able to see, not just assert.
+    """
+    above_low_bucket = [c for c in CATALOG.all() if c.declared_cpm > 5.0]
+    assert above_low_bucket, "expected some campaign above the low top bucket"
+    assert len(above_low_bucket) >= 4
 
 
 # ----------------------------------------------------------------- properties

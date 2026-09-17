@@ -47,6 +47,17 @@ class Campaign:
     open_market: bool = False
     #: Content categories it will bid on. Empty means no category restriction.
     target_categories: tuple[str, ...] = field(default_factory=tuple)
+    #: What the creative IS: "banner" or "video".
+    #:
+    #: Load-bearing, not decoration. An impression that offers only a video slot
+    #: cannot show a banner, so a banner campaign must not offer on it -- and until
+    #: this field existed every campaign was implicitly a banner and would offer on
+    #: anything. The bid also has to declare it: OpenRTB 2.6 `mtype` is how the
+    #: exchange learns a bid's media type, and without it the adapter has to guess.
+    media_type: str = "banner"
+    #: Creative duration in seconds. Video only; ignored for banner. Video slots
+    #: state minduration/maxduration, and a creative outside that range cannot run.
+    duration: Optional[int] = None
 
 
 #: The highest CPM any campaign declares. The adapter's bid ceiling MUST exceed
@@ -115,6 +126,160 @@ _CAMPAIGNS: tuple[Campaign, ...] = (
         declared_cpm=2.05,
         deal_ids=(),
         open_market=True,
+    ),
+
+    # -----------------------------------------------------------------------
+    # CAMPAIGNS FOR THE DEALS THE SHIPPED SCENARIOS ACTUALLY CARRY.
+    #
+    # The five campaigns above transact on deal-home-premium, deal-retail-run,
+    # deal-auto-brand and deal-finance-pmp. NONE of those ids appears in
+    # source/frontend-react/public/samples/, which carries deal-premium-auto,
+    # deal-parenting-premium, deal-premium-video and so on. So on every shipped
+    # scenario this seat could only ever offer camp-openfield at 2.05 open-market
+    # and lose to the simulator's 3.25 -- the deal path, which is the point of the
+    # ARTF story, never ran outside a hand-built request.
+    #
+    # Each campaign below transacts on one scenario deal. The prices are authored,
+    # like every price in this catalog, and are set ABOVE the binding floor for
+    # their impression -- the higher of the impression floor and the deal floor --
+    # because a campaign priced under the floor is excluded and demonstrates
+    # nothing. The floors they are set against are stated per campaign so the
+    # relationship is checkable rather than asserted; test_artf_demand_catalog.py
+    # verifies it against the scenario files themselves.
+    # -----------------------------------------------------------------------
+
+    # --- isv-ecosystem: banner 970x250, imp floor 4.00, private auction ---
+    Campaign(
+        campaign_id="camp-autoline-premium",
+        campaign_name="Autoline Premium",
+        adomain="autoline.example",
+        creative_id="cr-autoline-970x250",
+        width=970,
+        height=250,
+        declared_cpm=7.20,          # deal floor 6.00 binds
+        deal_ids=("deal-premium-auto",),
+        target_categories=("automotive",),
+    ),
+    Campaign(
+        campaign_id="camp-autoline-standard",
+        campaign_name="Autoline Standard",
+        adomain="autoline.example",
+        creative_id="cr-autoline-standard-970x250",
+        width=970,
+        height=250,
+        declared_cpm=4.60,          # imp floor 4.00 binds, above the 3.50 deal floor
+        deal_ids=("deal-standard-auto",),
+        target_categories=("automotive",),
+    ),
+
+    # --- parenting-narrative: banner 300x250, imp floor 2.60, open auction ---
+    Campaign(
+        campaign_id="camp-brightstart",
+        campaign_name="Brightstart Family",
+        adomain="brightstart.example",
+        creative_id="cr-brightstart-300x250",
+        width=300,
+        height=250,
+        declared_cpm=4.10,          # deal floor 3.40 binds
+        deal_ids=("deal-parenting-premium",),
+        target_categories=("parenting", "family"),
+    ),
+    Campaign(
+        campaign_id="camp-familynet",
+        campaign_name="Family Network Collective",
+        adomain="familynetwork.example",
+        creative_id="cr-familynet-300x250",
+        width=300,
+        height=250,
+        declared_cpm=3.05,          # imp floor 2.60 binds, above the 2.10 deal floor
+        deal_ids=("deal-family-network",),
+        target_categories=("parenting", "family"),
+    ),
+    Campaign(
+        campaign_id="camp-remnant-open",
+        campaign_name="Remnant Open Exchange",
+        adomain="remnantopen.example",
+        creative_id="cr-remnant-300x250",
+        width=300,
+        height=250,
+        declared_cpm=2.75,          # imp floor 2.60 binds, far above the 0.85 deal floor
+        deal_ids=("deal-remnant-open",),
+    ),
+
+    # --- video-deals: video 640x480, 15-30s, imp floor 8.00, private auction ---
+    Campaign(
+        campaign_id="camp-skyline-video",
+        campaign_name="Skyline Premium Video",
+        adomain="skylinevideo.example",
+        creative_id="cr-skyline-640x480",
+        width=640,
+        height=480,
+        declared_cpm=11.50,         # deal floor 10.00 binds
+        deal_ids=("deal-premium-video",),
+        media_type="video",
+        duration=30,
+    ),
+    Campaign(
+        campaign_id="camp-skyline-standard",
+        campaign_name="Skyline Standard Video",
+        adomain="skylinevideo.example",
+        creative_id="cr-skyline-standard-640x480",
+        width=640,
+        height=480,
+        declared_cpm=8.75,          # imp floor 8.00 binds, above the 5.00 deal floor
+        deal_ids=("deal-standard-video",),
+        media_type="video",
+        duration=15,
+    ),
+    Campaign(
+        campaign_id="camp-video-remnant",
+        campaign_name="Video Remnant Pool",
+        adomain="videoremnant.example",
+        creative_id="cr-video-remnant-640x480",
+        width=640,
+        height=480,
+        declared_cpm=8.10,          # imp floor 8.00 binds, far above the 0.50 deal floor
+        deal_ids=("deal-remnant",),
+        media_type="video",
+        duration=15,
+    ),
+
+    # --- yield-optimizer: video 1280x720, 15-30s, imp floor 6.00, private auction ---
+    Campaign(
+        campaign_id="camp-meridian-guaranteed",
+        campaign_name="Meridian Guaranteed",
+        adomain="meridianmedia.example",
+        creative_id="cr-meridian-1280x720",
+        width=1280,
+        height=720,
+        declared_cpm=13.40,         # deal floor 12.00 binds
+        deal_ids=("deal-guaranteed-premium",),
+        media_type="video",
+        duration=30,
+    ),
+    Campaign(
+        campaign_id="camp-meridian-midtier",
+        campaign_name="Meridian Mid-tier",
+        adomain="meridianmedia.example",
+        creative_id="cr-meridian-midtier-1280x720",
+        width=1280,
+        height=720,
+        declared_cpm=6.80,          # imp floor 6.00 binds, above the 3.25 deal floor
+        deal_ids=("deal-open-midtier",),
+        media_type="video",
+        duration=15,
+    ),
+    Campaign(
+        campaign_id="camp-meridian-remnant",
+        campaign_name="Meridian Remnant",
+        adomain="meridianmedia.example",
+        creative_id="cr-meridian-remnant-1280x720",
+        width=1280,
+        height=720,
+        declared_cpm=6.20,          # imp floor 6.00 binds, far above the 0.75 deal floor
+        deal_ids=("deal-open-remnant",),
+        media_type="video",
+        duration=15,
     ),
 )
 
