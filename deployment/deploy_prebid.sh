@@ -1016,6 +1016,29 @@ if [[ "${START_AT}" -le 4 ]]; then
     echo "amt-bidder/copy-bidder-files.sh absent" >"${WORK_DIR}/no_artf_code.txt"
   fi
 
+  # ------------------------------------------------- structural check, pre-build
+  # Run against the PREPARED SLOT, so it sees the set of bidders that will actually
+  # be compiled -- ours plus the release's -- rather than only the one that lives in
+  # this repo. A name disagreement between a bidder's four registration artifacts is
+  # a STARTUP failure, so catching it here costs seconds instead of a five-minute
+  # build followed by a CrashLoopBackOff.
+  #
+  # Advisory: it needs a prebid-server-java checkout to resolve upstream imports, and
+  # this script does not fetch one. When it is unavailable the build proceeds -- the
+  # Maven compile is the authority on whether the Java is correct.
+  if [[ -n "${PBSJ_CHECKOUT:-}" && -f "${PBSJ_CHECKOUT}/pom.xml" ]]; then
+    if python3 "${REPO_ROOT}/source/prebid/verify_symbols.py" "${PBSJ_CHECKOUT}" \
+         --slot "${INJECT_DIR}" >"${WORK_DIR}/verify_symbols.txt" 2>&1; then
+      log "  Structural check passed for every injected bidder"
+    else
+      warn "Structural check FAILED. The build would compile and the pod would fail to start:"
+      sed 's/^/    /' "${WORK_DIR}/verify_symbols.txt" | tail -20 >&2
+      fail "Refusing to build. Fix the reported problems, or unset PBSJ_CHECKOUT to skip this check."
+    fi
+  else
+    log "  Structural check skipped: set PBSJ_CHECKOUT to a prebid-server-java checkout to enable it"
+  fi
+
   # No upstream file is edited: additions only, which is what makes "no fork" a
   # checkable property rather than a claim.
   log "  Upstream files modified by this step: 0 (additions only)"

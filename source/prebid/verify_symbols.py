@@ -29,6 +29,10 @@ import re
 import sys
 from pathlib import Path
 
+#: The prepared amt-bidder/ injection directory, set from --slot. None means only
+#: this repo's own bidder sources are inspected.
+INJECTION_SLOT: Path | None = None
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 JAVA_ROOTS = [
     REPO_ROOT / "source" / "prebid" / "artf-hook" / "src" / "main" / "java",
@@ -330,29 +334,150 @@ def check_bidder_name_agreement() -> list[str]:
     Skipped silently when the adapter is absent, so this checker still works for a
     hook-only tree.
     """
+    roots = _bidder_roots(INJECTION_SLOT)
+    if not roots:
+        print("  no bidder sources found, skipped")
+        return []
+
+    problems: list[str] = []
+    for label, config_java, resource_root in roots:
+        problems.extend(_check_one_bidder(label, config_java, resource_root))
+    return problems
+
+
+def _bidder_roots(slot: Path | None = None) -> list[tuple[str, Path, Path]]:
+    """Every injected bidder's (label, @Configuration file, resource search root).
+
+    Discovered rather than listed, so a bidder added to the injection slot is checked
+    without editing this file -- the failure being guarded against is a NEW bidder
+    whose four artifacts disagree, and a hardcoded list would simply not look at it.
+
+    WHERE THE BIDDERS ACTUALLY ARE
+
+    Only OURS lives in this repo. The release's AMT bidder is copied into the
+    throwaway build context at deploy time and never into the tree, for licensing
+    reasons, so pointing this at source/prebid/ alone would check one of the two
+    bidders that end up in the image and report success. Pass `--slot <dir>` (the
+    prepared amt-bidder/ injection directory) to check the set that is really built.
+
+    Two layouts are handled because the sources differ: ours is a Maven-style tree,
+    the release's is a flat directory -- which is why resources are searched
+    recursively rather than addressed by a fixed path.
+    """
+    import re as _re
+
+    search_dirs: list[Path] = []
+    prebid_src = REPO_ROOT / "source" / "prebid"
+    if prebid_src.is_dir():
+        search_dirs += [d for d in prebid_src.iterdir() if d.is_dir()]
+    if slot is not None and slot.is_dir():
+        search_dirs += [d for d in slot.iterdir() if d.is_dir()]
+
+    found: list[tuple[str, Path, Path]] = []
+    seen: set[str] = set()
+    for directory in sorted(set(search_dirs)):
+        for config_java in sorted(directory.rglob("*Configuration.java")):
+            text = config_java.read_text(encoding="utf-8")
+            if not _re.search(r"BIDDER_NAME\s*=\s*\"", text):
+                continue
+            # The slot contains a copy of our own adapter as well, so the same
+            # bidder would otherwise be reported twice.
+            key = config_java.name
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((directory.name, config_java, directory))
+    return found
+
+
+def _find_one(root: Path, filename: str) -> Path | None:
+    """The single file with this name under root, or None.
+
+    Searched rather than addressed by a fixed path because the two bidder layouts
+    differ: ours is a Maven tree, the release's AMT bidder is a flat directory.
+    """
+    matches = sorted(root.rglob(filename))
+    return matches[0] if matches else None
+
+
+def check_no_upstream_source_in_repo() -> list[str]:
+    """Nothing from the upstream release may live in source/prebid/.
+
+    This repository is MIT-0; the AWS Prebid guidance release is Apache-2.0.
+    Vendoring its files here would create a NOTICE obligation this repo does not
+    carry, so the release's AMT bidder is copied into the throwaway BUILD CONTEXT at
+    deploy time and never into the tree.
+
+    Checked by FILENAME rather than by content, because a copy that had been
+    reformatted or partially edited would still be the same file for licensing
+    purposes -- and a content hash would quietly stop matching the moment anyone
+    touched it.
+
+    upstream-amt-bidder/ is exempt: deploy_prebid.sh creates it inside the build
+    context, and a developer who has run a local build may have one lying under
+    source/prebid/. It is gitignored; this check reports it if it is ever tracked.
+    """
+    import subprocess
+
+    upstream_filenames = {
+        "AmtBidder.java",
+        "AmtBidderTest.java",
+        "AmtConfiguration.java",
+        "AmtTest.java",
+        "ExtImpAmt.java",
+        "amt.json",
+        "amt.yaml",
+        "test-amt-bid-request.json",
+        "test-amt-bid-response.json",
+        "test-auction-amt-request.json",
+        "test-auction-amt-response.json",
+    }
+
+    problems: list[str] = []
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "source/prebid"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"could not list tracked files to check for vendored upstream source: {exc}"]
+
+    if tracked.returncode != 0:
+        return [f"git ls-files failed: {tracked.stderr.strip()}"]
+
+    for line in tracked.stdout.splitlines():
+        name = line.rsplit("/", 1)[-1]
+        if name in upstream_filenames:
+            problems.append(
+                f"{line} is an upstream release file tracked in this repo. It is "
+                f"Apache-2.0 and this repo is MIT-0; it belongs in the build context "
+                f"only, placed by deploy_prebid.sh"
+            )
+
+    if not problems:
+        print(f"  no upstream release file is tracked under source/prebid/")
+    return problems
+
+
+def _check_one_bidder(label: str, config_java: "Path", resource_root: "Path") -> list[str]:
+    """The four-way name check for one bidder."""
     import re as _re
 
     import yaml
-
-    adapter = REPO_ROOT / "source" / "prebid" / "artfhouse-adapter"
-    config_java = (
-        adapter / "src/main/java/org/prebid/server/spring/config/bidder/ArtfhouseConfiguration.java"
-    )
-    if not config_java.is_file():
-        print("  adapter absent, skipped")
-        return []
 
     problems: list[str] = []
     source = config_java.read_text(encoding="utf-8")
 
     name_match = _re.search(r'BIDDER_NAME\s*=\s*"([^"]+)"', source)
     if not name_match:
-        return ["ArtfhouseConfiguration has no BIDDER_NAME constant"]
+        return [f"{config_java.name} has no BIDDER_NAME constant"]
     name = name_match.group(1)
 
     prefix_match = _re.search(r'@ConfigurationProperties\("adapters\.([^"]+)"\)', source)
     if not prefix_match:
-        problems.append("ArtfhouseConfiguration has no @ConfigurationProperties(\"adapters.<name>\")")
+        problems.append(
+            f"{config_java.name} has no @ConfigurationProperties(\"adapters.<name>\")"
+        )
     elif prefix_match.group(1) != name:
         problems.append(
             f"@ConfigurationProperties prefix 'adapters.{prefix_match.group(1)}' does not match "
@@ -361,15 +486,17 @@ def check_bidder_name_agreement() -> list[str]:
 
     property_source = _re.search(r'classpath:/bidder-config/([^"]+)\.yaml', source)
     if not property_source:
-        problems.append("ArtfhouseConfiguration has no @PropertySource for a bidder-config yaml")
+        problems.append(
+            f"{config_java.name} has no @PropertySource for a bidder-config yaml"
+        )
     elif property_source.group(1) != name:
         problems.append(
             f"@PropertySource names bidder-config/{property_source.group(1)}.yaml but BIDDER_NAME "
             f"is '{name}'"
         )
 
-    yaml_path = adapter / "src/main/resources/bidder-config" / f"{name}.yaml"
-    if not yaml_path.is_file():
+    yaml_path = _find_one(resource_root, f"{name}.yaml")
+    if yaml_path is None:
         problems.append(f"missing bidder-config/{name}.yaml -- the @PropertySource would fail at startup")
     else:
         adapters = (yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}).get("adapters") or {}
@@ -385,8 +512,8 @@ def check_bidder_name_agreement() -> list[str]:
                     f"placeholder, which nothing substitutes inside the image"
                 )
 
-    params_path = adapter / "src/main/resources/static/bidder-params" / f"{name}.json"
-    if not params_path.is_file():
+    params_path = _find_one(resource_root, f"{name}.json")
+    if params_path is None:
         problems.append(
             f"missing static/bidder-params/{name}.json -- BidderParamValidator requires one "
             f"per registered bidder, so the server would not start"
@@ -399,7 +526,12 @@ def check_bidder_name_agreement() -> list[str]:
         except _json.JSONDecodeError as exc:
             problems.append(f"static/bidder-params/{name}.json is not valid JSON: {exc}")
 
-    print(f"  bidder name '{name}' agrees across all four registration artifacts")
+    # Only claimed when it is true. Printing it unconditionally put "agrees across
+    # all four registration artifacts" directly above the list of ways it did not.
+    if not problems:
+        print(f"  [{label}] bidder name '{name}' agrees across all four registration artifacts")
+    else:
+        print(f"  [{label}] bidder name '{name}' does NOT agree -- {len(problems)} problem(s)")
     return problems
 
 
@@ -412,6 +544,20 @@ def main() -> int:
         print(f"error: {checkout} is not a prebid-server-java checkout", file=sys.stderr)
         return 2
 
+    # --slot <dir>: the prepared amt-bidder/ injection directory. Only OUR bidder
+    # lives in this repo; the release's is copied into the build context at deploy
+    # time, so without this the check would inspect one of the two bidders that end
+    # up in the image and report success.
+    global INJECTION_SLOT
+    for i, arg in enumerate(sys.argv):
+        if arg == "--slot" and i + 1 < len(sys.argv):
+            INJECTION_SLOT = Path(sys.argv[i + 1])
+        elif arg.startswith("--slot="):
+            INJECTION_SLOT = Path(arg.split("=", 1)[1])
+    if INJECTION_SLOT is not None and not INJECTION_SLOT.is_dir():
+        print(f"error: --slot {INJECTION_SLOT} is not a directory", file=sys.stderr)
+        return 2
+
     files = java_files()
     print(f"Checking {len(files)} Java files against {checkout}")
 
@@ -422,6 +568,7 @@ def main() -> int:
         ("own imports resolve", check_own_imports),
         ("module/hook codes match the config", check_codes_match_config),
         ("bidder name agrees across registration artifacts", check_bidder_name_agreement),
+        ("no upstream release source is vendored here", check_no_upstream_source_in_repo),
     ):
         print(f"- {name}")
         all_problems.extend(check())
