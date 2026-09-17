@@ -616,6 +616,17 @@ if [[ "${DESTROY}" -eq 1 ]]; then
         || "${KUBECTL[@]}" set env deployment/orchestrator -n "${NAMESPACE}" \
              "ARTF_MUTATIONS_REQUIRED_SCOPE=" >/dev/null 2>&1 \
         || warn "Could not clear ARTF_MUTATIONS_REQUIRED_SCOPE on the orchestrator. Clear it by hand, or the mutations routes keep requiring a scope no deployed client holds."
+
+      # And the live-auction switch. Left set, the orchestrator would keep pointing at
+      # a Service that no longer exists, so the auction route would fail with a
+      # connection error instead of reporting that Prebid is not deployed. Removing it
+      # returns the route to its honest 501.
+      log "Clearing the orchestrator's live-auction endpoint..."
+      "${KUBECTL[@]}" set env deployment/orchestrator -n "${NAMESPACE}" \
+        PREBID_AUCTION_URL- >/dev/null 2>&1 \
+        || "${KUBECTL[@]}" set env deployment/orchestrator -n "${NAMESPACE}" \
+             "PREBID_AUCTION_URL=" >/dev/null 2>&1 \
+        || warn "Could not clear PREBID_AUCTION_URL on the orchestrator. Clear it by hand, or the auction route reports a connection failure rather than 'not deployed'."
     fi
   else
     warn "No usable kubectl context; skipping the Kubernetes half. Re-run with a context configured if pods remain."
@@ -1502,6 +1513,28 @@ if [[ "${START_AT}" -le 6 ]]; then
     else
       warn "No orchestrator deployment in namespace ${NAMESPACE}; scope enforcement not enabled."
     fi
+  fi
+
+  # ---------------------------------------------------------------------------
+  # THE SWITCH THAT LETS THE BROWSER SEE A LIVE AUCTION.
+  #
+  # Prebid is a ClusterIP Service with no public address, so the browser cannot call
+  # it. The orchestrator can, and it already owns the only public path the frontend
+  # uses. Setting this variable is what turns /v1/auction/run from an honest 501 into
+  # a real auction; --destroy removes it again, the same mechanism as the scope above.
+  #
+  # Deployment state rather than a runtime probe: probing the Service per request
+  # would make the answer depend on cluster conditions at that instant, so a
+  # transient failure would read as "Prebid was never deployed".
+  # ---------------------------------------------------------------------------
+  if "${KUBECTL[@]}" get deployment orchestrator -n "${NAMESPACE}" >/dev/null 2>&1; then
+    PREBID_AUCTION_URL="https://prebid-server.${NAMESPACE}.svc.cluster.local/openrtb2/auction"
+    log "  Pointing the orchestrator's live-auction route at ${PREBID_AUCTION_URL}"
+    "${KUBECTL[@]}" set env deployment/orchestrator -n "${NAMESPACE}" \
+      "PREBID_AUCTION_URL=${PREBID_AUCTION_URL}" >/dev/null \
+      || warn "Could not set PREBID_AUCTION_URL on the orchestrator. The auction route will keep reporting 'not_configured' and returning 501, which is honest but means the theater shows no live auction."
+  else
+    warn "No orchestrator deployment in namespace ${NAMESPACE}; the live-auction route was not pointed at Prebid."
   fi
 fi
 

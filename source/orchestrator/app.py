@@ -1255,6 +1255,41 @@ def _closed_loop_routes(prefix: str) -> list:
     ]
 
 
+# Live auction through Prebid Server. Prebid is a ClusterIP Service with no public
+# address, so the browser cannot reach it; the orchestrator makes the hop on the
+# `/api/*` path the frontend already uses. Registered UNCONDITIONALLY when the module
+# imports: the routes exist whether or not Prebid is deployed, and report that
+# honestly, because a missing route and an undeployed exchange are different facts
+# and a 404 would not distinguish them.
+_AUCTION_AVAILABLE = False
+try:
+    try:
+        from orchestrator.auction_api import (  # noqa: E402
+            auction_status_handler as auction_status,
+            run_auction_handler as auction_run,
+        )
+    except ImportError:
+        from auction_api import (  # noqa: E402
+            auction_status_handler as auction_status,
+            run_auction_handler as auction_run,
+        )
+    _AUCTION_AVAILABLE = True
+except Exception as _auction_exc:  # pragma: no cover - depends on image contents
+    logging.getLogger(__name__).warning(
+        "Live auction API unavailable (routes disabled): %s", _auction_exc
+    )
+
+
+def _auction_routes(prefix: str) -> list:
+    """Build the live-auction routes under a given prefix ('' or '/api')."""
+    if not _AUCTION_AVAILABLE:
+        return []
+    return [
+        Route(f"{prefix}/v1/auction/status", auction_status, methods=["GET"]),
+        Route(f"{prefix}/v1/auction/run", auction_run, methods=["POST"]),
+    ]
+
+
 routes = [
     Route("/v1/mutations", get_mutations, methods=["POST"]),
     Route("/v1/containers", list_containers),
@@ -1301,6 +1336,11 @@ routes += _closed_loop_routes("/api")
 # Governance training-trigger routes (Train-from-Load-Test feature, Unit 2).
 routes += _governance_routes("")
 routes += _governance_routes("/api")
+
+# Both prefixes, for the same reason the others use both: CloudFront routes /api/*
+# to this service, while in-cluster callers use the bare path.
+routes += _auction_routes("")
+routes += _auction_routes("/api")
 
 app = Starlette(routes=routes)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
