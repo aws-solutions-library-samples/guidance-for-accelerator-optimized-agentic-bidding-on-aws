@@ -13,7 +13,7 @@
         "bidfloor": 4.00,
         "bidfloorcur": "USD",
         "pmp": {
-          "private_auction": true,
+          "private_auction": 1,
           "deals": [
             {"id": "deal-premium-auto", "bidfloor": 6.00, "at": 1},
             {"id": "deal-standard-auto", "bidfloor": 3.50, "at": 2}

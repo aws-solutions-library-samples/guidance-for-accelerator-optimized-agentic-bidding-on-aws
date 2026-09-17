@@ -149,8 +149,19 @@ async def run_auction_handler(request: Request) -> JSONResponse:
     try:
         auction = response.json()
     except ValueError:
-        # Reported as what it is. Inventing a bid response here would put a
-        # fabricated auction on the screen.
+        # A rejection is reported as a rejection even when its body is plain text.
+        # Prebid answers a malformed bid request with 400 and a bare sentence, and
+        # calling that "non-JSON" buries the actual reason -- which is the one thing
+        # the caller needs, since the fault is in the request they sent.
+        if response.status_code != 200:
+            return JSONResponse(
+                {
+                    "error": "prebid_rejected_request",
+                    "status": response.status_code,
+                    "detail": response.text[:400],
+                },
+                status_code=502,
+            )
         return JSONResponse(
             {
                 "error": "prebid_returned_non_json",

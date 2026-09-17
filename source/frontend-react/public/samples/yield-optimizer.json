@@ -18,7 +18,7 @@
         },
         "bidfloor": 6.00,
         "pmp": {
-          "private_auction": true,
+          "private_auction": 1,
           "deals": [
             {"id": "deal-guaranteed-premium", "bidfloor": 12.00, "at": 1},
             {"id": "deal-open-midtier", "bidfloor": 3.25, "at": 2},

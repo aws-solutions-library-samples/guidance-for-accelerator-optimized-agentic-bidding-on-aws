@@ -454,3 +454,35 @@ def test_preparation_does_not_mutate_the_caller_s_request():
     snapshot = json.loads(json.dumps(body))
     auction_api._prepare_for_auction(body)
     assert body == snapshot
+
+
+def test_a_plain_text_rejection_is_reported_as_a_rejection(monkeypatch):
+    # Prebid answers a malformed bid request with 400 and a bare sentence, not
+    # JSON. Calling that "non-JSON" buries the reason, which is the one thing the
+    # caller needs since the fault is in the request they sent. Example:
+    # a scenario carried pmp.private_auction as a JSON boolean where OpenRTB
+    # specifies an integer, and Prebid rejected the whole request.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    message = (
+        "Invalid request format: Error decoding bidRequest: Cannot deserialize value "
+        "of type `java.lang.Integer` from Boolean value"
+    )
+    _patch_client(monkeypatch, FakeClient(FakeResponse(400, None, text=message)))
+
+    response = run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST)))
+    payload = body_of(response)
+
+    assert response.status_code == 502
+    assert payload["error"] == "prebid_rejected_request"
+    assert payload["status"] == 400
+    # The reason survives to the caller rather than being replaced by a category.
+    assert "java.lang.Integer" in payload["detail"]
+
+
+def test_a_non_json_body_with_a_200_is_still_reported_as_non_json(monkeypatch):
+    # The other branch: a 200 whose body is not a bid response at all.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, None, text="<html>nope</html>")))
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
+    assert payload["error"] == "prebid_returned_non_json"
