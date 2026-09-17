@@ -240,8 +240,35 @@ settings:
       }
     }
 
+# =============================================================================
+# GDPR -- OUT OF SCOPE UNLESS THE REQUEST SAYS OTHERWISE.
+#
+# `default-value` is what Prebid assumes when a request carries NO GDPR signal:
+# no `regs.ext.gdpr`, no `user.ext.consent`. The release's default config ships
+# `1`, meaning "assume in scope".
+#
+# That default makes this deployment's auctions EMPTY. In scope with no consent
+# string, TCF purpose 2 (basic ads) is not established, so Prebid blocks every
+# bidder BEFORE calling it and returns no seatbid at all. The evidence is exact:
+# every bidder appeared in ext.seatnonbid with statuscode 204, which
+# BidRejectionReason defines as REQUEST_BLOCKED_PRIVACY -- "the bidder was not
+# called due to GDPR purpose 2" -- and the demand endpoint's Lambda recorded zero
+# invocations for the same auctions.
+#
+# Set to 0 because this topology serves SYNTHETIC requests: there is no real user,
+# no EU personal data, and no consent to represent. The alternative -- putting a
+# TCF consent string into the request fixture -- would mean fabricating a user's
+# legal consent to make a demo produce bids, which is not a thing a test artifact
+# should assert.
+#
+# A DEPLOYMENT THAT SERVES REAL EU TRAFFIC MUST SET THIS BACK TO 1 and pass a real
+# consent string, and must register a host vendor id (the startup log warns
+# "gdpr.host-vendor-id not specified. Will skip host company GDPR checks").
+# Requests that DO carry a GDPR signal are still honoured either way: this value
+# only decides the no-signal case.
+# =============================================================================
 gdpr:
-  default-value: 1
+  default-value: 0
   vendorlist:
     v2:
       cache-dir: /var/tmp/vendor2

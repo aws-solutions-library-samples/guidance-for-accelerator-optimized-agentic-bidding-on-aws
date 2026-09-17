@@ -1299,12 +1299,17 @@ if [[ "${START_AT}" -le 6 ]]; then
   TOKEN_ENDPOINT="$(stack_output "${PREBID_STACK}" TokenEndpoint)"
   DEMAND_ENDPOINT="$(stack_output "${PREBID_STACK}" DemandEndpointUrl)"
   ORCHESTRATOR_SCOPE="$(stack_output "${PREBID_STACK}" OrchestratorScope)"
+  DEMAND_SCOPE="$(stack_output "${PREBID_STACK}" DemandScope)"
+  # The pod requests BOTH scopes in one client_credentials grant, space-delimited as
+  # OAuth2 specifies, because the hook and the adapter share a single TokenCache but
+  # call two different authorities.
+  ARTF_TOKEN_SCOPES="${ORCHESTRATOR_SCOPE} ${DEMAND_SCOPE}"
   # An empty value here would be substituted into the manifest as an empty string and
   # the pod would start with, say, no scope at all -- which reads as "no scope
   # required" rather than as a deployment fault.
   for pair in "PrebidHostRoleArn:${PREBID_ROLE_ARN}" "CredentialSecretArn:${CREDENTIAL_SECRET}" \
               "TokenEndpoint:${TOKEN_ENDPOINT}" "DemandEndpointUrl:${DEMAND_ENDPOINT}" \
-              "OrchestratorScope:${ORCHESTRATOR_SCOPE}"; do
+              "OrchestratorScope:${ORCHESTRATOR_SCOPE}" "DemandScope:${DEMAND_SCOPE}"; do
     value="${pair#*:}"
     [[ -n "${value}" && "${value}" != "None" ]] \
       || fail "Stack output ${pair%%:*} is empty. The manifest cannot be wired without it."
@@ -1333,6 +1338,7 @@ if [[ "${START_AT}" -le 6 ]]; then
       -e "s|__DEMAND_ENDPOINT__|${DEMAND_ENDPOINT}|g" \
       -e "s|__ORCHESTRATOR_URL__|${ORCHESTRATOR_URL}|g" \
       -e "s|__ORCHESTRATOR_SCOPE__|${ORCHESTRATOR_SCOPE}|g" \
+      -e "s|__ARTF_TOKEN_SCOPES__|${ARTF_TOKEN_SCOPES}|g" \
       -e "s|__AMT_SIMULATOR_ENDPOINT__|${AMT_SIMULATOR_ENDPOINT:-http://amt-simulator.not-deployed.invalid/}|g" \
       "${K8S_MANIFEST}" >"${PROCESSED}"
 

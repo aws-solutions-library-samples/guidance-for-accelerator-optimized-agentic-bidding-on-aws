@@ -21,6 +21,12 @@
     "  pmp.private_auction: 0         - open-market candidates may still compete,",
     "                                   which is what gives the auction a second",
     "                                   artfhouse bid alongside the deal bid.",
+    "  imp.ext.artfhouse: {}          - REQUIRED, and empty on purpose. Prebid routes",
+    "                                   an impression to a bidder only when",
+    "                                   imp.ext.<bidder> is PRESENT; the adapter takes",
+    "                                   no parameters, but without this key artfhouse",
+    "                                   is never called and appears in neither",
+    "                                   seatbid nor seatnonbid.",
     "  imp.ext.amt.placementId        - required by the AMT adapter's amt.json.",
     "                                   Present so this same fixture works once the",
     "                                   amt seat is injected; artfhouse never sees",
@@ -66,7 +72,7 @@
         ]
       },
       "ext": {
-        "artf": {"categories": ["home"]},
+        "artfhouse": {},
         "amt": {"placementId": "artf-verification-placement"}
       }
     }

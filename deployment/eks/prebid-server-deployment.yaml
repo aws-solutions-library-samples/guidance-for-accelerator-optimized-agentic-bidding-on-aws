@@ -115,8 +115,16 @@ spec:
               value: "__ORCHESTRATOR_URL__"
             - name: ARTF_TOKEN_ENDPOINT
               value: "__TOKEN_ENDPOINT__"
+            # BOTH scopes, space-delimited as OAuth2 requires. This pod talks to TWO
+            # authorities: the hook calls the orchestrator, which requires
+            # artf-orchestrator/mutations:write, and the artfhouse adapter calls the
+            # demand endpoint, which requires artf-demand/bid:read. They share one
+            # TokenCache, so a token minted for only the orchestrator scope was
+            # presented to the demand endpoint, whose Cognito authorizer refused it --
+            # the adapter's call never reached the Lambda (zero invocations) and Prebid
+            # recorded artfhouse as statuscode 102, ERROR_INVALID_BID_RESPONSE.
             - name: ARTF_SCOPE
-              value: "__ORCHESTRATOR_SCOPE__"
+              value: "__ARTF_TOKEN_SCOPES__"
             # A REFERENCE to the secret, for provenance. The module does NOT read it --
             # see the credential below for why.
             - name: ARTF_CREDENTIAL_SECRET_ARN
