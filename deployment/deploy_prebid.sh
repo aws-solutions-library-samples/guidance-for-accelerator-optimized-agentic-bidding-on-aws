@@ -336,6 +336,100 @@ upload_default_config() {
 }
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# deploy_amt_simulator -- the second auction seat's demand, in-cluster.
+#
+# Sets AMT_SIMULATOR_ENDPOINT on success. A single seat bidding against nothing
+# has a winner only in the trivial sense, so this is what makes the auction
+# contested.
+#
+# WHY IN-CLUSTER AND NOT API GATEWAY + LAMBDA
+#
+# The caller is Prebid's `amt` adapter, used UNMODIFIED, and it builds its request
+# with BidderUtil.defaultRequest(...) -- default headers only, no bearer token, no
+# API key, no signature. So a public endpoint for it could not authenticate its
+# caller and would have to accept unauthenticated bid requests from anyone. A
+# ClusterIP Service has no public surface to authenticate, and Prebid is already
+# in this cluster.
+#
+# WHY A ConfigMap AND A STOCK IMAGE
+#
+# The release ships the simulator as a Lambda handler that reads only `body` from
+# its event and imports nothing outside the standard library. Mounting it beside a
+# thin wrapper of ours on a stock Python image avoids an ECR repository, a
+# CodeBuild project and a second image build on every deploy, for something that
+# is not on the ARTF request path.
+#
+# The release's handler is NEVER copied into this repository: it is Apache-2.0 and
+# this repo is MIT-0. It is read from the fetched release at deploy time.
+# ---------------------------------------------------------------------------
+deploy_amt_simulator() {
+  AMT_SIMULATOR_ENDPOINT=""
+
+  if [[ "${WITH_SIMULATOR}" -ne 1 ]]; then
+    log "  --no-simulator: no second seat is deployed."
+    return 0
+  fi
+
+  local sim_src="${UPSTREAM_DIR}/source/loadtest/bidder_simulator/lambdas/loadtest_bidder"
+  local wrapper="${REPO_ROOT}/source/prebid/amt-simulator/server.py"
+
+  for f in "${sim_src}/handler.py" "${sim_src}/bid_response.json" "${wrapper}"; do
+    [[ -f "${f}" ]] || {
+      warn "Cannot deploy the bid simulator: ${f} is missing."
+      warn "The auction will have one seat and no competing bid."
+      return 0
+    }
+  done
+
+  if [[ ${#KUBECTL[@]} -eq 1 ]]; then
+    resolve_kube_context || {
+      warn "No usable kubectl context; the bid simulator was not deployed."
+      return 0
+    }
+  fi
+
+  # --dry-run=client | apply is the idempotent create-or-update for a ConfigMap:
+  # `create` alone fails once it exists, and this must be re-runnable.
+  "${KUBECTL[@]}" create configmap amt-simulator-code -n "${NAMESPACE}" \
+    --from-file="handler.py=${sim_src}/handler.py" \
+    --from-file="bid_response.json=${sim_src}/bid_response.json" \
+    --from-file="server.py=${wrapper}" \
+    --dry-run=client -o yaml \
+    | "${KUBECTL[@]}" apply -f - >/dev/null \
+    || { warn "Could not write the amt-simulator-code ConfigMap; no second seat."; return 0; }
+
+  local processed="/tmp/${CLUSTER_NAME}-amt-simulator.yaml"
+  sed -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+      "${SCRIPT_DIR}/eks/amt-simulator-deployment.yaml" >"${processed}"
+
+  if grep -q '__[A-Z_]*__' "${processed}"; then
+    grep -o '__[A-Z_]*__' "${processed}" | sort -u >&2
+    fail "Refusing to apply the simulator manifest with unsubstituted placeholders"
+  fi
+
+  "${KUBECTL[@]}" apply -f "${processed}" >/dev/null \
+    || { warn "kubectl apply failed for the bid simulator; no second seat."; return 0; }
+
+  # The ConfigMap content changes without the Deployment's spec changing, so
+  # `apply` alone would leave the old pod serving the previous code -- the same
+  # trap the Prebid rollout documents.
+  "${KUBECTL[@]}" rollout restart deployment/amt-simulator -n "${NAMESPACE}" >/dev/null 2>&1 || true
+
+  if "${KUBECTL[@]}" rollout status deployment/amt-simulator -n "${NAMESPACE}" --timeout=180s >/dev/null 2>&1; then
+    AMT_SIMULATOR_ENDPOINT="http://amt-simulator.${NAMESPACE}.svc.cluster.local/amt-exchange"
+    log "  Bid simulator ready at ${AMT_SIMULATOR_ENDPOINT} (cluster-internal only)"
+  else
+    # Left EMPTY on purpose. An endpoint reported for a pod that never became
+    # ready would enable the seat and turn every auction into a per-bidder
+    # timeout, which reads as a flaky bidder rather than a failed deployment.
+    warn "The bid simulator did not become ready within 180s, so no endpoint is"
+    warn "reported and the amt seat stays disabled. Investigate with:"
+    warn "  kubectl logs deployment/amt-simulator -n ${NAMESPACE}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # publish_config_overlay -- render and upload current/prebid-config.yaml.
 #
 # MUST run BEFORE the Kubernetes manifest is applied. The pod's entrypoint copies
@@ -504,6 +598,13 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     # Created by this script, not by the stack, so the stack's deletion does not remove it.
     # A stale credential Secret left in the namespace would outlive the app client it names.
     "${KUBECTL[@]}" delete secret prebid-artf-credential -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+
+    # The second seat's demand. Created by this script rather than by the stack,
+    # so the stack's deletion does not take it, and a simulator left running
+    # after teardown would outlive the Prebid deployment that was its only caller.
+    "${KUBECTL[@]}" delete deployment amt-simulator -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+    "${KUBECTL[@]}" delete service    amt-simulator -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+    "${KUBECTL[@]}" delete configmap  amt-simulator-code -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
 
     # Return the orchestrator to its pre-Prebid authorization behaviour. Leaving the
     # requirement in place would keep an existing component altered by a feature that
@@ -1215,6 +1316,12 @@ if [[ "${START_AT}" -le 6 ]]; then
   # own default-config/ BEFORE the deployment is applied -- otherwise the first thing
   # the pod does is fail, with an error about a missing file rather than about ordering.
   upload_default_config "${CONFIG_BUCKET}"
+
+  # ------------------------------------------------- the second seat's demand
+  # Deployed BEFORE the manifest is rendered and before the config overlay is
+  # published, because both need its address. The address is deterministic
+  # (a ClusterIP Service name), so nothing has to be read back to learn it.
+  deploy_amt_simulator
 
   PROCESSED="/tmp/${CLUSTER_NAME}-prebid-server-deployment.yaml"
   sed -e "s|__PREBID_ROLE_ARN__|${PREBID_ROLE_ARN}|g" \
