@@ -3,15 +3,25 @@
   "tmax": 100,
   "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
   "originator": {"type": "TYPE_SSP", "id": "ssp-example-001"},
-  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "ADD_METRICS"],
+  "applicable_intents": [
+    "ACTIVATE_SEGMENTS",
+    "ACTIVATE_DEALS",
+    "ADD_METRICS"
+  ],
   "bid_request": {
-    "id": "auction-123",
+    "id": "auction-banner-open-001",
     "imp": [
       {
         "id": "imp-1",
         "banner": {"w": 300, "h": 250, "pos": 1},
-        "bidfloor": 1.50,
-        "bidfloorcur": "USD"
+        "bidfloor": 1.90,
+        "bidfloorcur": "USD",
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {"id": "deal-remnant-open", "bidfloor": 1.50, "at": 3}
+          ]
+        }
       }
     ],
     "site": {

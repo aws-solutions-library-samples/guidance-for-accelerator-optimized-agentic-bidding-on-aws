@@ -69,7 +69,7 @@ describe('DemoSequenceOrchestrator', () => {
   describe('buildSequenceForResult()', () => {
     it('produces timeline step first with correct annotation', () => {
       const result = createMockResult({ totalLatencyMs: 200 });
-      const scenario = SCENARIOS[0]; // banner-basic
+      const scenario = SCENARIOS[0]; // whichever scenario is first; this test is not specific to one
       const steps = orchestrator.buildSequenceForResult(result, scenario);
 
       expect(steps[0]).toEqual({

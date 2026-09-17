@@ -324,6 +324,34 @@ body {
   opacity: 0.85;
 }
 .scenario p { font-size: clamp(11px, 1vw, 13px); color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
+
+/* Every scenario is a publisher bid request, described the way the sell side reads
+   one: the page, the audience asserted on it, the demand eligible to compete. A
+   definition list, because the three keys label their values. */
+.scenario-brief {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  row-gap: 3px;
+  margin: 0 0 8px;
+  font-size: clamp(11px, 1vw, 12px);
+  line-height: 1.5;
+}
+.scenario-brief dt {
+  font-size: clamp(9px, 0.75vw, 10px);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  /* Aligns the key with the first line of its value rather than the cell centre. */
+  padding-top: 2px;
+  white-space: nowrap;
+}
+.scenario-brief dd {
+  margin: 0;
+  color: var(--text-secondary);
+}
 .scenario.disabled {
   opacity: 0.5;
   pointer-events: none;
@@ -3621,8 +3649,11 @@ h1, h2, h3, .sg-display {
 }
 .th-ribbon-scene {
   display: flex;
-  gap: 26px;
-  flex: 1;
+  /* Five items now (publisher, page, content, audience, deals), so the gap is
+     narrower than the three-item version and wraps rather than overflowing. */
+  gap: 18px;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
   justify-content: center;
   min-width: 0;
 }
@@ -3705,7 +3736,28 @@ h1, h2, h3, .sg-display {
   box-shadow: 0 4px 20px rgba(107, 63, 181, 0.12);
 }
 .th-scenario-name { font-size: 13px; font-weight: 700; }
-.th-scenario-desc { font-size: 11px; color: var(--th-ink-2); line-height: 1.45; }
+.th-scenario-desc {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--th-ink-2);
+  line-height: 1.45;
+}
+/* Spans rather than a dl: the chooser row is a <button>, whose content model is
+   phrasing content, and dl/dt/dd are flow content. */
+.th-scenario-facet { display: block; }
+.th-scenario-facet-key {
+  display: inline-block;
+  min-width: 62px;
+  margin-right: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  vertical-align: baseline;
+}
 .th-chooser-actions { display: flex; gap: 10px; }
 .th-chooser-exit { margin-top: 8px; }
 

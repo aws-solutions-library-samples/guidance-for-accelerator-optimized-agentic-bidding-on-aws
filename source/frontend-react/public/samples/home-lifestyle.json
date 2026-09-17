@@ -1,0 +1,64 @@
+{
+  "id": "sample-home-lifestyle-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-example-001"},
+  "applicable_intents": [
+    "ACTIVATE_SEGMENTS",
+    "ADD_METRICS",
+    "ACTIVATE_DEALS",
+    "SUPPRESS_DEALS"
+  ],
+  "bid_request": {
+    "id": "auction-home-lifestyle-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 300, "h": 250, "pos": 1},
+        "bidfloor": 2.50,
+        "bidfloorcur": "USD",
+        "ext": {
+          "artf": {
+            "categories": ["home", "lifestyle"]
+          }
+        },
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {"id": "deal-home-premium", "bidfloor": 3.00, "at": 2},
+            {"id": "deal-retail-run", "bidfloor": 2.60, "at": 2},
+            {"id": "deal-auto-brand", "bidfloor": 1.50, "at": 2},
+            {"id": "deal-remnant-open", "bidfloor": 1.00, "at": 3}
+          ]
+        }
+      }
+    ],
+    "site": {
+      "id": "site-home-01",
+      "domain": "hearth-and-home.example",
+      "cat": ["283"],
+      "cattax": 9,
+      "page": "https://hearth-and-home.example/guides/small-space-living-room-layouts"
+    },
+    "user": {
+      "id": "user-home-01",
+      "yob": 1986,
+      "data": [
+        {
+          "id": "data-provider-1",
+          "name": "Example DMP",
+          "segment": [
+            {"id": "seg-461", "name": "Interior Decorating"},
+            {"id": "seg-460", "name": "Home Improvement"},
+            {"id": "seg-142", "name": "First Time Homeowner"}
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      "ip": "203.0.113.24",
+      "geo": {"country": "USA", "region": "WA"}
+    }
+  }
+}

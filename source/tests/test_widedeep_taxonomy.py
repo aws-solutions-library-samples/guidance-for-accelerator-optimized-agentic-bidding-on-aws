@@ -33,7 +33,9 @@ LEGACY_BASELINE = {
         "non_age": ["ctx-mobile", "int-sports"],
         "old_age": ["demo-35-44"],
     },
-    "bid-shading.json": {"non_age": [], "old_age": []},
+    # bid-shading.json was removed with the BID_SHADE scenario. Its captured
+    # baseline was an empty segment list, so it never constrained the legacy map
+    # in the first place; the remaining four fixtures still do.
     "isv-ecosystem.json": {
         "non_age": ["ctx-mobile", "ctx-premium", "int-auto", "int-sports"],
         "old_age": ["demo-35-44"],

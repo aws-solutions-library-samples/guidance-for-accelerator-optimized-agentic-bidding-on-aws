@@ -7,7 +7,23 @@ import { ValueVisual, UNKNOWN } from "./theaterVisualisers.jsx";
 
 /* ------------------------------------------------------------------ ribbon */
 
-/** Publisher, page and content, entirely from real request fields (FR-13). */
+/**
+ * Names of audience segments the request itself asserted, in request order.
+ *
+ * Only the `data segment` signals qualify. Year of birth and gender are also
+ * request-borne, but they are raw demographic fields the request card already
+ * shows, not audience assertions.
+ */
+function assertedSegmentNames(context) {
+  return (context?.userSignals ?? [])
+    .filter((s) => s?.label === "data segment" && typeof s.value === "string" && s.value)
+    .map((s) => s.value);
+}
+
+/**
+ * Publisher, page, content, audience and deals, entirely from real request
+ * fields (FR-13).
+ */
 export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
   const items = [
     { key: "publisher", label: "Publisher", value: context?.publisher },
@@ -18,6 +34,20 @@ export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
       value: context?.contentCategories?.length
         ? context.contentCategories.join(", ")
         : null,
+    },
+    // Audience and Deals complete the three things a bid request is read for:
+    // the page, the audience asserted on it, and the demand eligible to compete.
+    // Both come from the SUBMITTED request, so this is what the exchange sent --
+    // never a segment a container went on to contribute (BR-23).
+    {
+      key: "audience",
+      label: "Audience",
+      value: assertedSegmentNames(context).join(", ") || null,
+    },
+    {
+      key: "deals",
+      label: "Deals",
+      value: context?.deals?.length ? String(context.deals.length) : null,
     },
   ];
 

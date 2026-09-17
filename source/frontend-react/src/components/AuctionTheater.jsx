@@ -85,7 +85,20 @@ export default function AuctionTheater({ onExit }) {
               <button key={s.id} type="button" className="th-scenario"
                 onClick={() => run.start(s)}>
                 <span className="th-scenario-name">{s.name}</span>
-                <span className="th-scenario-desc">{s.desc}</span>
+                {/* A scenario is a publisher bid request, so it is described the way
+                    the sell side reads one: the page, the audience asserted on it,
+                    and the demand eligible to compete. */}
+                <span className="th-scenario-desc">
+                  <span className="th-scenario-facet">
+                    <span className="th-scenario-facet-key">Page</span>{s.page}
+                  </span>
+                  <span className="th-scenario-facet">
+                    <span className="th-scenario-facet-key">Audience</span>{s.audience}
+                  </span>
+                  <span className="th-scenario-facet">
+                    <span className="th-scenario-facet-key">Demand</span>{s.demand}
+                  </span>
+                </span>
               </button>
             ))}
           </div>

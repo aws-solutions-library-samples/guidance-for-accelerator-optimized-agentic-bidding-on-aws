@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from demand.artfhouse.catalog import CampaignCatalog
+from demand.artfhouse.eligibility import evaluate
 from demand.artfhouse.exclusion import ExclusionReason
 from demand.artfhouse.service import DemandDecisionService
 
@@ -72,6 +73,15 @@ def test_every_scenario_deal_has_a_campaign(scenario, imp, deal):
 
 @pytest.mark.parametrize("scenario,imp,deal", deal_slots(), ids=lambda v: v if isinstance(v, str) else "")
 def test_every_scenario_deal_campaign_clears_the_binding_floor(scenario, imp, deal):
+    """A deal on an impression must be winnable, or excluded for a stated reason.
+
+    Placing a deal whose campaign cannot clear the floor is a design slip: the deal
+    reads as demand on the request and produces nothing. But a campaign turned away
+    EARLIER in evaluate() -- by media type or by targeting -- is a different case,
+    and one the scenarios use deliberately: home-lifestyle puts an automotive deal
+    on a home page precisely so targeting is visible as the reason. So the check is
+    against the reason evaluate() actually gives, not against price alone.
+    """
     campaign = CATALOG.by_deal(deal.get("id"))
     assert campaign is not None
 
@@ -81,10 +91,20 @@ def test_every_scenario_deal_campaign_clears_the_binding_floor(scenario, imp, de
     deal_floor = float(deal.get("bidfloor") or 0.0)
     binding = max(imp_floor, deal_floor)
 
-    assert campaign.declared_cpm >= binding, (
+    if campaign.declared_cpm >= binding:
+        return
+
+    candidate = next(
+        c for c in evaluate(imp, CATALOG) if c.campaign.campaign_id == campaign.campaign_id
+    )
+    assert candidate.excluded_because in (
+        ExclusionReason.MEDIA_TYPE_UNSUPPORTED,
+        ExclusionReason.NOT_TARGETED,
+        ExclusionReason.DEAL_SUPPRESSED,
+    ), (
         f"{scenario}: {campaign.campaign_id} declares {campaign.declared_cpm} but the "
-        f"binding floor is {binding} (imp {imp_floor}, deal {deal_floor}), so it is "
-        f"excluded below_floor and never appears"
+        f"binding floor is {binding} (imp {imp_floor}, deal {deal_floor}), and nothing "
+        f"turned it away first -- so the deal is on the impression only to be priced out"
     )
 
 

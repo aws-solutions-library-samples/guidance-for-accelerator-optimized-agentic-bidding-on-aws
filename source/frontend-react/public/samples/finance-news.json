@@ -1,0 +1,62 @@
+{
+  "id": "sample-finance-news-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-example-001"},
+  "applicable_intents": [
+    "ACTIVATE_SEGMENTS",
+    "ADD_METRICS",
+    "ADJUST_DEAL_FLOOR",
+    "ADJUST_DEAL_MARGIN"
+  ],
+  "bid_request": {
+    "id": "auction-finance-news-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 300, "h": 250, "pos": 1},
+        "bidfloor": 2.20,
+        "bidfloorcur": "USD",
+        "ext": {
+          "artf": {
+            "categories": ["finance"]
+          }
+        },
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {"id": "deal-finance-pmp", "bidfloor": 3.50, "at": 1},
+            {"id": "deal-home-premium", "bidfloor": 3.00, "at": 2},
+            {"id": "deal-remnant-open", "bidfloor": 1.00, "at": 3}
+          ]
+        }
+      }
+    ],
+    "site": {
+      "id": "site-finance-01",
+      "domain": "market-ledger.example",
+      "cat": ["410"],
+      "cattax": 9,
+      "page": "https://market-ledger.example/analysis/rate-decision-what-it-means-for-savers"
+    },
+    "user": {
+      "id": "user-finance-01",
+      "yob": 1974,
+      "data": [
+        {
+          "id": "data-provider-1",
+          "name": "Example DMP",
+          "segment": [
+            {"id": "seg-538", "name": "Personal Investing"},
+            {"id": "seg-540", "name": "Retirement Planning"}
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "ip": "203.0.113.55",
+      "geo": {"country": "USA", "region": "IL"}
+    }
+  }
+}

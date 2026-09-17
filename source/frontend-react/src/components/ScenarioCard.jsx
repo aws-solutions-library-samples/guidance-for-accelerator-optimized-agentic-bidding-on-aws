@@ -11,92 +11,64 @@ const AGE_RANGES = ["18–24", "25–34", "35–44", "45–54", "55–64", "65+"
 // "rules" rather than a model_type, since they have no trained model or
 // Triton dependency (see containers/widedeep_segment_activator/app.py).
 export const SCENARIOS = [
+  // Every scenario is a PUBLISHER BID REQUEST, and each is framed the same way:
+  // the page it came from, the audience the exchange asserted on it, and the demand
+  // that is eligible to compete for it. The three together are what the sell side
+  // actually decides on, so they are the three things a reader needs.
+  //
+  // The demand line is not decoration. A scenario is only interesting if its deal
+  // ids, sizes, media type and floors line up with the campaign catalog in
+  // source/demand/artfhouse/catalog.py -- a page whose category matches nothing
+  // produces one open-market bid and a folded list of ineligible campaigns. Each
+  // `demand` line below was verified against the live exchange, and the contest it
+  // states is the contest that runs.
   {
-    id: "yield-optimizer",
-    name: "PMP Deals — Yield Optimizer",
-    desc: "Sports video impression with 3 private marketplace deals (guaranteed, open mid-tier, open remnant). The yield optimizer predicts a floor-price multiplier and margin adjustment per deal via an XGBoost model on Triton's FIL backend.",
-    models: [
-      { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
-      { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
-    ],
-    tags: [
-      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
-      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
-    ],
-    file: "yield-optimizer.json",
-    controls: ["bidFloor", "explore"],
-  },
-  {
-    id: "banner-basic",
-    name: "Banner Ad — Segment Activation",
-    desc: "ESPN sports page with a 300×250 banner. The audience activator activates audience segments via rules, the signals enricher adds viewability scores.",
+    id: "home-lifestyle",
+    name: "Home & Lifestyle — Four-Way Deal Contest",
+    page: "A small-space living room guide, declaring Content Taxonomy 3.1 category 283 Interior Decorating. 300x250, and the impression carries home and lifestyle targeting categories.",
+    audience: "Interior Decorating and Home Improvement, plus First Time Homeowner — a household life stage, so it is reachable only from the data the exchange asserted, never from the page.",
+    demand: "Four deals on the impression. Cedar & Co takes it at $6.35 on the premium home deal; Northlake and the remnant pool bid and lose. Vantage Motorsport holds an auto deal here and is turned away by targeting rather than by price, and the open-market campaign falls under the $2.50 floor.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
-      { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
-    ],
-    tags: [
-      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
-      { cls: "metric", label: "ADD_METRICS" },
-    ],
-    file: "banner-basic.json",
-    controls: ["bidFloor", "ageRange", "segThreshold"],
-  },
-  {
-    id: "bid-shading",
-    name: "Bid Shading — Bid Pricer Optimization",
-    desc: "Nike DSP bid response at $7.50. The bid pricer predicts CTR and shades the bid down to save budget without losing win rate.",
-    models: [{ key: "dlrm_bid_shader", label: "DLRM Bid Shader" }],
-    tags: [{ cls: "shade", label: "BID_SHADE" }],
-    file: "bid-shading.json",
-    controls: ["shadeFactor", "convValue"],
-  },
-  {
-    id: "video-deals",
-    name: "Video + PMP Deals — Deal Scorer",
-    desc: "Video impression with 3 private marketplace deals. The deal scorer scores user-deal relevance, activates matches, suppresses poor fits.",
-    models: [
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
       { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
     ],
     tags: [
+      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
       { cls: "deal", label: "ACTIVATE_DEALS" },
       { cls: "deal", label: "SUPPRESS_DEALS" },
       { cls: "metric", label: "ADD_METRICS" },
     ],
-    file: "video-deals.json",
-    controls: ["bidFloor", "ageRange", "numDeals", "segThreshold"],
+    file: "home-lifestyle.json",
+    controls: ["bidFloor", "segThreshold"],
   },
   {
-    id: "full-pipeline",
-    name: "SSP Enrichment — 3 Containers",
-    desc: "CNN sports page triggering the SSP-side enrichment containers: segment activation, deal scoring, and signal enrichment in one fan-out. Bid shading is a DSP-side decision made downstream, not something the SSP would request.",
+    id: "finance-news",
+    name: "Finance Vertical — One Endemic Buyer",
+    page: "A rate-decision analysis declaring Content Taxonomy 3.1 category 410 Personal Investing. 300x250, and the impression carries finance targeting.",
+    audience: "Personal Investing and Retirement Planning, a reader in the 50-54 bracket in Illinois.",
+    demand: "The scenario where page context decides the auction. Harbour Financial wins at $4.20 on its PMP deal — but Cedar & Co also holds a deal on this impression at $6.35, the highest declared price in the catalog, and targeting is the only thing that stops it. Change the impression's category and the outcome changes. The remnant pool and an outside buyer bid and lose; the open-market campaign falls under the $2.20 floor.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
-      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+      { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
+      { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
       { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
     ],
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
-      { cls: "deal", label: "ACTIVATE_DEALS" },
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
       { cls: "metric", label: "ADD_METRICS" },
     ],
-    file: "isv-ecosystem.json",
-    controls: ["bidFloor"],
+    file: "finance-news.json",
+    controls: ["bidFloor", "explore"],
   },
   {
-    // The Auction Theater's flagship narrative. Its point is that the segments in
-    // the story are the ones the real containers return: Audience Taxonomy 350
-    // (Parenting), 354 (Parenting Babies and Toddlers), 98 (Parents with Children)
-    // and 7 (Age Range 35-39). 98 and 354 are reachable only from the audience
-    // data the exchange asserts on the request, never from the page's category --
-    // deriving a life stage from what someone read is the inference IAB's Special
-    // Category Data flag exists to discourage.
-    //
-    // No expecting-parent or maternity segment exists in Audience Taxonomy 1.1, so
-    // the story is written around the identifiers that do exist.
     id: "parenting-narrative",
     name: "Parenting Article — Full Sell-Side",
-    desc: "A parenting article declaring Content Taxonomy 3.1 category 192 with three private marketplace deals. The audience activator resolves real IAB Audience Taxonomy segments, the deal scorer matches deals to the household, the yield optimizer moves floor and margin, and the signals enricher attaches quality metrics.",
+    page: "A first-year sleep guide on a parenting title declaring Content Taxonomy 3.1 category 192, 300x250.",
+    audience: "Parents with Children and Parenting Babies and Toddlers. Both are reachable only from the data the exchange asserted, never inferred from what the reader was reading.",
+    demand: "Three household deals. Brightstart Family wins at $4.10 on the premium parenting deal, the family network and remnant pools bid and lose, and one campaign is turned away by the floor the yield optimizer set.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
@@ -114,6 +86,86 @@ export const SCENARIOS = [
     ],
     file: "parenting-narrative.json",
     controls: ["bidFloor", "segThreshold", "explore"],
+  },
+  {
+    id: "yield-optimizer",
+    name: "CTV Guaranteed — PMP Yield Optimizer",
+    page: "A 1280x720 connected-TV slot on a sports property, sold through three private marketplace deals.",
+    audience: "A household segment on a large-format living-room device.",
+    demand: "Guaranteed, open mid-tier and open remnant deals. Meridian Guaranteed wins at $13.40; the mid-tier and remnant tiers bid and lose, as does an outside buyer. The yield optimizer predicts a floor multiplier and a margin adjustment per deal on Triton's FIL backend.",
+    models: [
+      { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
+      { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
+    ],
+    tags: [
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
+    ],
+    file: "yield-optimizer.json",
+    controls: ["bidFloor", "explore"],
+  },
+  {
+    id: "video-deals",
+    name: "Mid-roll Video — Outside Bidder Wins",
+    page: "A 640x480 mid-roll on a streaming property, offered through three private marketplace deals at premium, standard and remnant tiers.",
+    audience: "A viewer segment resolved from the request, then scored against each deal in turn by the deal scorer. All three video campaigns take any category, so here the audience colours the story rather than deciding it.",
+    demand: "The scenario an SSP least wants to see: all three house deals bid — $11.50, $8.75 and $8.10 — and an outside buyer takes the impression at $12.50 over the top of them. It is also the scenario that declares the most intents, so the walkthrough is the longest.",
+    models: [
+      { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+      { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
+      { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
+      { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
+    ],
+    tags: [
+      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
+      { cls: "deal", label: "ACTIVATE_DEALS" },
+      { cls: "deal", label: "SUPPRESS_DEALS" },
+      { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
+      { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
+      { cls: "metric", label: "ADD_METRICS" },
+    ],
+    file: "video-deals.json",
+    controls: ["bidFloor", "ageRange", "numDeals", "segThreshold", "explore"],
+  },
+  {
+    id: "banner-basic",
+    name: "Open Market — No Premium Demand",
+    page: "An NBA article on a sports title, 300x250 on an iPhone. It still declares the legacy Content Taxonomy 1.0, so it is also the scenario that exercises the old category map.",
+    audience: "Sports Enthusiast, asserted by the publisher's data provider, on a reader in Illinois.",
+    demand: "The thin end of the market: one remnant deal and open-market buyers. An outside buyer takes it at $3.25 over both house offers — what an impression looks like when no premium deal applies to it.",
+    models: [
+      { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+      { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
+    ],
+    tags: [
+      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
+      { cls: "deal", label: "ACTIVATE_DEALS" },
+      { cls: "metric", label: "ADD_METRICS" },
+    ],
+    file: "banner-basic.json",
+    controls: ["bidFloor", "ageRange", "segThreshold"],
+  },
+  {
+    id: "full-pipeline",
+    name: "Two Impressions — SSP Enrichment Fan-out",
+    page: "An automotive review page offering two slots at once: a 970x250 leaderboard and a 300x600 rail.",
+    audience: "An in-market automotive segment, resolved once and applied to both impressions.",
+    demand: "The leaderboard is a deal-only impression and Autoline Premium takes it at $7.20; Autoline Standard bids $4.60 and loses. The rail admits nobody: every candidate is turned away, and the outside buyer's price falls under both floors.",
+    models: [
+      { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
+      { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
+    ],
+    tags: [
+      { cls: "seg", label: "ACTIVATE_SEGMENTS" },
+      { cls: "deal", label: "ACTIVATE_DEALS" },
+      { cls: "metric", label: "ADD_METRICS" },
+      { cls: "metric", label: "ADD_CIDS" },
+    ],
+    file: "isv-ecosystem.json",
+    controls: ["bidFloor"],
   },
 ];
 
@@ -187,7 +239,14 @@ export default function ScenarioCard({ scenario, isActive, isLoading, disabled, 
           ))}
         </div>
       )}
-      <p>{scenario.desc}</p>
+      <dl className="scenario-brief" data-testid="scenario-brief">
+        <dt>Page</dt>
+        <dd>{scenario.page}</dd>
+        <dt>Audience</dt>
+        <dd>{scenario.audience}</dd>
+        <dt>Demand</dt>
+        <dd>{scenario.demand}</dd>
+      </dl>
       <div className="tags">
         {scenario.tags.map((tag, i) => (
           <span key={i} className={`tag ${tag.cls}`}>{tag.label}</span>

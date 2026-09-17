@@ -27,7 +27,7 @@ _SAMPLES = os.path.join(_ROOT, "frontend-react", "public", "samples")
 # Captured from the pre-change implementation against the real fixture files.
 LEGACY_BASELINE = {
     "banner-basic.json": {"brand_safety": 1.0, "viewability": [0.5]},
-    "bid-shading.json": {"brand_safety": 1.0, "viewability": [0.5]},
+    # bid-shading.json was removed with the BID_SHADE scenario.
     "isv-ecosystem.json": {"brand_safety": 0.8666666666666667, "viewability": [0.55, 0.55]},
     "video-deals.json": {"brand_safety": 1.0, "viewability": [0.62]},
     "yield-optimizer.json": {"brand_safety": 1.0, "viewability": [0.62]},
