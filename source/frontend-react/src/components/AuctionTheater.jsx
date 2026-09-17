@@ -9,25 +9,22 @@
 // exactly the state that moving forwards to the same index produces, so there is
 // no reset-and-replay step and no possibility of residue.
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { SCENARIOS } from "./ScenarioCard.jsx";
 import { useTheaterRun, RUN_IDLE, RUN_SUBMITTING, RUN_READY, RUN_FAILED } from "../hooks/useTheaterRun.js";
 import { useBeatStepper } from "../hooks/useBeatStepper.js";
 import { useBeatCaption } from "../hooks/useBeatCaption.js";
 import { visibleValues, cardStateFor, BEAT_RECAP } from "../utils/theaterBeats.js";
 import { factualCaption } from "../utils/theaterCaptions.js";
-import { illustrativeOutcomeFor } from "../utils/theaterIllustrative.js";
 import { buildOfferViewModel } from "../utils/offerPresentationService.js";
 import { capturedBidResponse } from "../utils/bidResponseFixture.js";
 import {
   TheaterSceneRibbon,
   TheaterRequestCard,
-  TheaterBuySidePanel,
   TheaterCaption,
   TheaterSeamArrow,
   TheaterControls,
 } from "./TheaterPanels.jsx";
-import { TheaterModeSelector, THEATER_MODES } from "./TheaterModeSelector.jsx";
 import { OffersPanel } from "./OffersPanel.jsx";
 import { SellSideDecisionsPanel } from "./SellSideDecisionsPanel.jsx";
 
@@ -55,10 +52,6 @@ export default function AuctionTheater({ onExit }) {
 
   const sawOrigin = !!beats && index >= 0;
   const atRecap = currentBeat?.kind === BEAT_RECAP;
-  const outcome = useMemo(() => illustrativeOutcomeFor(run.scenarioId), [run.scenarioId]);
-
-  // Sell is the only built mode; buy renders disabled with its reason (FR-23).
-  const [mode, setMode] = useState("sell");
 
   // The offers column derives entirely from a bid response. Until the Prebid stack
   // is deployed that response is the captured fixture, and the notice the panel
@@ -133,12 +126,6 @@ export default function AuctionTheater({ onExit }) {
 
       {run.status === RUN_READY ? (
         <>
-          <TheaterModeSelector
-            mode={mode}
-            availableModes={THEATER_MODES}
-            onChange={setMode}
-          />
-
           <div className="th-columns">
             <SellSideDecisionsPanel
               values={visible}
@@ -156,16 +143,14 @@ export default function AuctionTheater({ onExit }) {
               />
             </div>
             {/*
-              Right column by mode. OffersPanel and TheaterBuySidePanel are
-              siblings, not one replacing the other: in sell mode the column shows
-              real offers under one seat; the buy-side panel keeps its illustrative
-              fixture bidders and its unconditional label.
+              Right column: the offers returned under one seat, with each
+              candidate's outcome and, where it made no offer, its reason.
             */}
-            {mode === "sell" ? (
-              <OffersPanel viewModel={offerViewModel} revealed={atRecap} />
-            ) : (
-              <TheaterBuySidePanel outcome={outcome} revealed={atRecap} />
-            )}
+            <OffersPanel
+              viewModel={offerViewModel}
+              revealed={atRecap}
+              auctionFault={run.auctionFault}
+            />
           </div>
 
           <TheaterSeamArrow movement={currentBeat?.movement} active />

@@ -51,6 +51,16 @@ PREBID_AUCTION_URL_ENV = "PREBID_AUCTION_URL"
 # tighter client timeout here would report that as an orchestrator failure.
 HOP_TIMEOUT_S = 15.0
 
+#: The seats this endpoint enables on an ARTF request. Named once: the imp-level
+#: enablement below and the multibid request both need the same list, and a seat
+#: enabled without a multibid entry silently loses its non-winning bids.
+_BIDDERS = ("artfhouse", "amt")
+
+#: Bids kept per seat per impression. Above 1 so a seat's losing offers survive into
+#: the response; bounded so a bidder returning a long list cannot make the response
+#: unbounded. Matches the ceiling the repo's own diagnostic fixture uses.
+_MAX_BIDS_PER_BIDDER = 3
+
 
 def prebid_auction_url() -> Optional[str]:
     value = (os.environ.get(PREBID_AUCTION_URL_ENV) or "").strip()
@@ -183,6 +193,9 @@ async def run_auction_handler(request: Request) -> JSONResponse:
 
     if isinstance(auction, dict):
         excluded, excluded_source = _lift_artf_exclusions(auction)
+        # `body` is the prepared request, so the floors reported are the ones Prebid
+        # enforced -- including any a container raised.
+        observed_count = _annotate_seat_nonbids(auction, body)
         auction["artf_meta"] = {
             "source": "prebid",
             "endpoint": url,
@@ -198,6 +211,10 @@ async def run_auction_handler(request: Request) -> JSONResponse:
             # showing "no campaign was excluded" needs to know the difference
             # between an empty list and an unavailable one.
             "excluded_source": excluded_source,
+            # How many seat non-bids carry an observed price and floor. Zero with a
+            # non-empty seatnonbid means the debug block did not name the seat's
+            # price, which a consumer should report as unknown rather than absent.
+            "seat_nonbids_annotated": observed_count,
             # What this endpoint added to the request before submitting it. Listed
             # so a reader can see that the auction was ENABLED, not authored.
             "prepared": prepared,
@@ -276,6 +293,43 @@ def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
         # from a seat that was never called, so the losers cannot be shown.
         prebid["returnallbidstatus"] = True
         prepared.append("ext.prebid.returnallbidstatus (report the seats that did not bid)")
+
+    if "targeting" not in prebid:
+        # Prebid emits seatbid[].bid[].ext.prebid.targeting ONLY when the request
+        # asks for targeting, and `includewinners` is what puts the unprefixed
+        # hb_bidder / hb_pb / hb_deal keys on the top bid for each impression. Those
+        # keys ARE the winner: Prebid resolves the auction, and this is where it
+        # records the result. Without them the response carries bids and no statement
+        # of which one won, so a consumer either reports no winner or has to rank the
+        # bids itself -- and ranking them itself would be inventing an auction result
+        # that the exchange did not give.
+        #
+        # Requested here rather than in each scenario payload: the scenarios are ARTF
+        # bidstream requests, and this is a requirement of running one as an auction,
+        # exactly like the bidder enablement above. Every scenario needs it, and one
+        # that forgot it would silently render as an unsold impression.
+        #
+        # Only includewinners is set. includebidderkeys defaults to true, which adds
+        # each seat's own hb_pb_BIDDER keys; harmless, and useful for diagnosis.
+        prebid["targeting"] = {"includewinners": True}
+        prepared.append("ext.prebid.targeting.includewinners (mark the winning bid)")
+
+    if "multibid" not in prebid and _BIDDERS:
+        # Prebid keeps ONE bid per bidder per impression unless asked otherwise, and
+        # silently discards the rest -- they appear in neither `seatbid` nor
+        # `ext.seatnonbid`, so a real losing offer leaves no trace at all. Verified on
+        # the deployed stack: artfhouse bid 7.20 on deal-premium-auto and 4.60 on
+        # deal-standard-auto for the same impression; without multibid only the 7.20
+        # survived the response, and the 4.60 offer was unreportable.
+        #
+        # A losing offer is the substance of this column, so the offers it shows must
+        # include the ones that lost.
+        prebid["multibid"] = [{"bidder": name, "maxbids": _MAX_BIDS_PER_BIDDER} for name in _BIDDERS]
+        prepared.append(
+            f"ext.prebid.multibid (keep up to {_MAX_BIDS_PER_BIDDER} bids per seat, "
+            f"so a seat's losing offers are still reported)"
+        )
+
     ext["prebid"] = prebid
     out["ext"] = ext
 
@@ -340,3 +394,118 @@ def _lift_artf_exclusions(auction: dict) -> tuple[Optional[list], str]:
             return artf["excluded"], "artfhouse response, via prebid debug httpcalls"
 
     return None, "unavailable: no artf exclusion list in the artfhouse response"
+
+
+def _seat_returned_prices(auction: dict) -> dict[tuple[str, str], float]:
+    """What each seat actually returned, per impression, from Prebid's debug output.
+
+    WHY THIS IS NEEDED
+
+    Prebid reports a seat that bid unusably as NonBidReason 0 -- NO_BID -- and
+    nothing more. So a seat whose bid was below the impression's floor and a seat
+    that genuinely answered with nothing are the same entry in `ext.seatnonbid`, and
+    a viewer is told only "no bid" for what may be the most interesting decision on
+    the screen: the floor turning demand away.
+
+    The bidder's own response body IS available, in `ext.debug.httpcalls[seat][]`,
+    because this endpoint asks for debug. That is where the price it offered lives.
+
+    WHAT THIS IS NOT
+
+    This reads a number the bidder sent. It does not decide, and must not be used to
+    claim, WHY Prebid dropped the bid: Prebid said NO_BID, and only Prebid knows
+    whether the floor, a validation rule or something else discarded it. The price is
+    evidence for the reader, not a verdict from us.
+
+    Keyed by (seat, impid). A price appearing twice for one key keeps the first,
+    since a later duplicate is not more authoritative than an earlier one.
+    """
+    debug = (auction.get("ext") or {}).get("debug") or {}
+    httpcalls = debug.get("httpcalls") or {}
+    prices: dict[tuple[str, str], float] = {}
+
+    for seat, calls in httpcalls.items():
+        for call in calls or []:
+            raw = call.get("responsebody")
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            for seatbid in parsed.get("seatbid") or []:
+                for bid in (seatbid or {}).get("bid") or []:
+                    impid = bid.get("impid")
+                    price = bid.get("price")
+                    # bool is a subclass of int; a JSON `true` here is not a price.
+                    if not impid or isinstance(price, bool) or not isinstance(price, (int, float)):
+                        continue
+                    prices.setdefault((seat, impid), float(price))
+
+    return prices
+
+
+def _imp_floors(request_body: dict) -> dict[str, float]:
+    """Each impression's floor, from the request as submitted.
+
+    The floor is `imp.bidfloor` on the request Prebid was given -- which is the
+    request AFTER the ARTF containers mutated it, so a floor a container raised is
+    the floor reported here. That is the point: the sell-side decision and the
+    demand it turned away are the same story.
+    """
+    floors: dict[str, float] = {}
+    for imp in request_body.get("imp") or []:
+        impid = imp.get("id")
+        floor = imp.get("bidfloor")
+        if not impid or isinstance(floor, bool) or not isinstance(floor, (int, float)):
+            continue
+        floors[impid] = float(floor)
+    return floors
+
+
+def _annotate_seat_nonbids(auction: dict, request_body: dict) -> int:
+    """Attach the observed price and floor to each seat-level non-bid.
+
+    Writes `ext.artf.observed = {returnedPrice, impFloor, currency, source}` onto the
+    nonbid entry, leaving every field Prebid set untouched. `ext.artf` is used because
+    it is already this repo's namespace on a nonbid, and `observed` is a sibling of
+    the campaign identity the demand endpoint puts there -- so a consumer reading one
+    is not broken by the other.
+
+    An entry gets no `observed` block when either number is missing, rather than a
+    partial one: "returned 2.75 against a floor of null" invites the reader to fill
+    in the blank themselves.
+
+    Returns the number of entries annotated, for artf_meta.
+    """
+    prices = _seat_returned_prices(auction)
+    floors = _imp_floors(request_body)
+    if not prices or not floors:
+        return 0
+
+    currency = auction.get("cur") or None
+    annotated = 0
+
+    for seatnonbid in (auction.get("ext") or {}).get("seatnonbid") or []:
+        seat = (seatnonbid or {}).get("seat")
+        for entry in (seatnonbid or {}).get("nonbid") or []:
+            impid = entry.get("impid")
+            price = prices.get((seat, impid))
+            floor = floors.get(impid)
+            if price is None or floor is None:
+                continue
+            ext = dict(entry.get("ext") or {})
+            artf = dict(ext.get("artf") or {})
+            artf["observed"] = {
+                "returnedPrice": price,
+                "impFloor": floor,
+                "currency": currency,
+                "source": "bidder response, via prebid debug httpcalls",
+            }
+            ext["artf"] = artf
+            entry["ext"] = ext
+            annotated += 1
+
+    return annotated

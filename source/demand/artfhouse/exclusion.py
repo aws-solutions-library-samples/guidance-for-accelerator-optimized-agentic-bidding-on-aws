@@ -1,9 +1,17 @@
 """Why a campaign made no offer.
 
-A CLOSED set of exactly four members. Closed rather than a free string so the
+A CLOSED set of exactly five members. Closed rather than a free string so the
 distinction between a suppressed deal and a below-floor rejection cannot be lost
 to a typo, and so the frontend can render every case exhaustively instead of
 falling back to an "other" bucket.
+
+ADDING A MEMBER IS A TWO-SIDED CHANGE. The frontend renders these by name, from
+its own map in `frontend-react/src/utils/outcomeClassifier.js`, and a reason it
+does not know falls to a catch-all that prints "No offer -- no reason reported" --
+so a campaign whose reason WAS reported renders as though none was. That is what
+happened when MEDIA_TYPE_UNSUPPORTED was added here and not there: 12 of 30
+excluded campaigns on the isv-ecosystem scenario claimed no reason existed.
+`test_exclusion_reason_parity.py` now fails if the two sides drift again.
 
 TRANSPORT FAILURE IS DELIBERATELY NOT A MEMBER. If the endpoint is unreachable,
 no campaign was considered and no campaign declined -- there is simply no answer.

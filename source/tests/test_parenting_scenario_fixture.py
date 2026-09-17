@@ -223,7 +223,11 @@ class TestScenarioCardWiring:
         for intent in payload["applicable_intents"]:
             assert intent in block, f"card does not tag {intent}"
 
-    def test_the_illustrative_outcome_is_keyed_on_this_scenario(self):
-        path = os.path.join(_ROOT, "frontend-react", "src", "utils", "theaterIllustrative.js")
-        with open(path, encoding="utf-8") as handle:
-            assert '"parenting-narrative"' in handle.read()
+    # REMOVED: test_the_illustrative_outcome_is_keyed_on_this_scenario.
+    #
+    # It asserted that `utils/theaterIllustrative.js` held a fixture bidder set keyed
+    # on this scenario. That module served the Theater's buy-side column, which was
+    # removed along with the sell/buy toggle -- the offers column now renders the live
+    # Prebid auction, so there is no per-scenario fixture outcome to key on. The test
+    # is deleted rather than pointed at something else, because its subject no longer
+    # exists.

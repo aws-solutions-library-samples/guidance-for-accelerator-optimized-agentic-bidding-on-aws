@@ -373,7 +373,12 @@ def test_both_seats_are_enabled_on_a_bare_impression():
     assert ext["artfhouse"] == {}
     assert ext["amt"]["placementId"] == "artf-imp-1"
     assert out["ext"]["prebid"]["returnallbidstatus"] is True
-    assert len(prepared) == 3
+    assert out["ext"]["prebid"]["targeting"]["includewinners"] is True
+    assert out["ext"]["prebid"]["multibid"] == [
+        {"bidder": "artfhouse", "maxbids": 3},
+        {"bidder": "amt", "maxbids": 3},
+    ]
+    assert len(prepared) == 5
 
 
 def test_preparation_adds_nothing_that_constitutes_a_bid():
@@ -486,3 +491,240 @@ def test_a_non_json_body_with_a_200_is_still_reported_as_non_json(monkeypatch):
 
     payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST))))
     assert payload["error"] == "prebid_returned_non_json"
+
+
+# --------------------------------------------------------------------------- #
+# Targeting: without it Prebid states no winner, and every scenario reads unsold.
+#
+# The scenario payloads under source/frontend-react/public/samples/ carry no
+# ext.prebid at all. Prebid emits seatbid[].bid[].ext.prebid.targeting only when
+# the request asks for targeting, so before this was added every live auction
+# returned bids that no consumer could attribute a win to -- and the theater
+# rendered "No winning offer" on all six scenarios while the auction itself was
+# working. Verified against the deployed server: identical request, targeting
+# absent -> no bid carries targeting; targeting requested -> the top bid carries
+# hb_bidder / hb_pb / hb_deal.
+# --------------------------------------------------------------------------- #
+
+
+def test_targeting_is_requested_so_prebid_names_a_winner():
+    body = {"id": "r", "imp": [{"id": "imp-1", "banner": {"w": 300, "h": 250}}]}
+    out, prepared = auction_api._prepare_for_auction(body)
+    assert out["ext"]["prebid"]["targeting"] == {"includewinners": True}
+    assert any("includewinners" in note for note in prepared)
+
+
+def test_a_callers_own_targeting_is_never_overwritten():
+    # An operator asking for a different price granularity or preferdeals keeps it;
+    # this layer supplies a default, it does not impose a policy.
+    body = {
+        "id": "r",
+        "imp": [{"id": "imp-1"}],
+        "ext": {"prebid": {"targeting": {"includewinners": False, "preferdeals": True}}},
+    }
+    out, prepared = auction_api._prepare_for_auction(body)
+    assert out["ext"]["prebid"]["targeting"] == {
+        "includewinners": False,
+        "preferdeals": True,
+    }
+    assert not any("includewinners" in note for note in prepared)
+
+
+def test_targeting_request_adds_no_bid_and_no_price():
+    body = {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 2.5}]}
+    out, _ = auction_api._prepare_for_auction(body)
+    # Asking to be told the winner is not the same as supplying one.
+    assert "seatbid" not in out
+    assert out["imp"][0]["bidfloor"] == 2.5
+    assert "pricegranularity" not in out["ext"]["prebid"]["targeting"]
+
+
+def test_the_callers_dict_is_not_mutated_by_preparation():
+    body = {"id": "r", "imp": [{"id": "imp-1"}]}
+    auction_api._prepare_for_auction(body)
+    assert "ext" not in body
+    assert body["imp"][0] == {"id": "imp-1"}
+
+
+# --------------------------------------------------------------------------- #
+# Seat non-bid annotation: the price a seat returned, against the floor it faced.
+#
+# Prebid reports a seat whose bid was unusable as NonBidReason 0 (NO_BID) and says
+# nothing else, so "the floor turned this demand away" and "the seat answered with
+# nothing" arrive identical. The bidder's own response IS in ext.debug.httpcalls,
+# so the price is recoverable. Verified live: in isv-ecosystem the amt simulator
+# returned 3.25 for imp-1 (floor 4.00) and 2.75 for imp-2 (floor 3.00), and Prebid
+# reported both as statuscode 0.
+#
+# What is deliberately NOT done: claiming the floor was the cause. Prebid said
+# NO_BID. These tests pin the numbers and the absence of a verdict.
+# --------------------------------------------------------------------------- #
+
+
+def _auction_with_debug(sim_bids, *, seat="amt", nonbids=(("imp-1", 0),), cur="USD"):
+    """An auction response shaped like Prebid's, with a debug httpcalls block."""
+    return {
+        "id": "r",
+        "cur": cur,
+        "seatbid": [],
+        "ext": {
+            "seatnonbid": [
+                {"seat": seat, "nonbid": [{"impid": i, "statuscode": c} for i, c in nonbids]}
+            ],
+            "debug": {
+                "httpcalls": {
+                    seat: [
+                        {
+                            "uri": "http://amt-simulator/amt-exchange",
+                            "responsebody": json.dumps(
+                                {"seatbid": [{"bid": [dict(b) for b in sim_bids]}]}
+                            ),
+                        }
+                    ]
+                }
+            },
+        },
+    }
+
+
+REQUEST_TWO_IMPS = {
+    "id": "r",
+    "imp": [{"id": "imp-1", "bidfloor": 4.0}, {"id": "imp-2", "bidfloor": 3.0}],
+}
+
+
+def test_seat_nonbid_carries_the_price_it_returned_and_the_floor_it_faced():
+    auction = _auction_with_debug(
+        [{"impid": "imp-1", "price": 3.25}, {"impid": "imp-2", "price": 2.75}],
+        nonbids=(("imp-1", 0), ("imp-2", 0)),
+    )
+    count = auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS)
+    assert count == 2
+
+    entries = auction["ext"]["seatnonbid"][0]["nonbid"]
+    by_imp = {e["impid"]: e["ext"]["artf"]["observed"] for e in entries}
+    assert by_imp["imp-1"]["returnedPrice"] == 3.25
+    assert by_imp["imp-1"]["impFloor"] == 4.0
+    assert by_imp["imp-2"]["returnedPrice"] == 2.75
+    assert by_imp["imp-2"]["impFloor"] == 3.0
+    assert by_imp["imp-1"]["currency"] == "USD"
+    assert "debug httpcalls" in by_imp["imp-1"]["source"]
+
+
+def test_the_annotation_states_no_reason_and_no_verdict():
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
+    auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS)
+    observed = auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]["observed"]
+    # Two numbers and their provenance. No exclusionReason, no "below_floor", no
+    # claim about why Prebid dropped the bid -- Prebid said NO_BID and only Prebid
+    # knows whether the floor or a validation rule discarded it.
+    assert set(observed) == {"returnedPrice", "impFloor", "currency", "source"}
+    assert "exclusionReason" not in auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]
+
+
+def test_prebids_own_fields_on_the_nonbid_are_left_alone():
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
+    auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS)
+    entry = auction["ext"]["seatnonbid"][0]["nonbid"][0]
+    assert entry["impid"] == "imp-1"
+    assert entry["statuscode"] == 0
+
+
+def test_a_campaign_identity_already_on_the_nonbid_survives_annotation():
+    # The demand endpoint puts campaign identity in the same ext.artf namespace.
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}], seat="artfhouse")
+    auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"] = {
+        "artf": {"campaignId": "camp-x", "campaignName": "Camp X", "exclusionReason": "below_floor"}
+    }
+    auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS)
+    artf = auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]
+    assert artf["campaignId"] == "camp-x"
+    assert artf["exclusionReason"] == "below_floor"
+    assert artf["observed"]["returnedPrice"] == 3.25
+
+
+def test_no_annotation_when_the_floor_is_unknown():
+    # An imp with no bidfloor: half an observation is worse than none, because
+    # "returned 3.25 against a floor of —" reads as a floor that was looked up and
+    # came back empty.
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
+    count = auction_api._annotate_seat_nonbids(auction, {"id": "r", "imp": [{"id": "imp-1"}]})
+    assert count == 0
+    assert "ext" not in auction["ext"]["seatnonbid"][0]["nonbid"][0]
+
+
+def test_no_annotation_when_the_debug_block_is_absent():
+    auction = {
+        "id": "r",
+        "ext": {"seatnonbid": [{"seat": "amt", "nonbid": [{"impid": "imp-1", "statuscode": 0}]}]},
+    }
+    assert auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS) == 0
+    assert "ext" not in auction["ext"]["seatnonbid"][0]["nonbid"][0]
+
+
+def test_a_price_is_matched_to_its_own_seat_only():
+    # Two seats, one price each. Keying on impid alone would attribute amt's price
+    # to artfhouse's non-bid on the same impression.
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}], seat="amt")
+    auction["ext"]["seatnonbid"].append(
+        {"seat": "artfhouse", "nonbid": [{"impid": "imp-1", "statuscode": 0}]}
+    )
+    auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS)
+    amt, artfhouse = auction["ext"]["seatnonbid"]
+    assert amt["nonbid"][0]["ext"]["artf"]["observed"]["returnedPrice"] == 3.25
+    assert "ext" not in artfhouse["nonbid"][0]
+
+
+def test_a_boolean_price_is_not_a_price():
+    # json true is an int subclass in Python; it must not become a CPM.
+    auction = _auction_with_debug([{"impid": "imp-1", "price": True}])
+    assert auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS) == 0
+
+
+def test_unparseable_debug_body_annotates_nothing_and_does_not_raise():
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
+    auction["ext"]["debug"]["httpcalls"]["amt"][0]["responsebody"] = "not json"
+    assert auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS) == 0
+
+
+def test_floors_come_from_the_prepared_request_so_a_raised_floor_is_the_one_reported():
+    # A container raising the floor to 9.00 before the auction means 9.00 is what the
+    # demand faced, and 9.00 is what a reader must be shown.
+    auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
+    auction_api._annotate_seat_nonbids(auction, {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 9.0}]})
+    observed = auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]["observed"]
+    assert observed["impFloor"] == 9.0
+
+
+def test_the_handler_wires_the_annotation_and_reports_the_count(monkeypatch):
+    # The unit tests above call _annotate_seat_nonbids directly, which passes whether
+    # or not the handler ever calls it. This one goes through run_auction_handler.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    auction = _auction_with_debug(
+        [{"impid": "imp-1", "price": 3.25}], nonbids=(("imp-1", 0),)
+    )
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, auction)))
+
+    request = {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 4.0}]}
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(request))))
+
+    assert payload["artf_meta"]["seat_nonbids_annotated"] == 1
+    observed = payload["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]["observed"]
+    assert observed["returnedPrice"] == 3.25
+    assert observed["impFloor"] == 4.0
+
+
+def test_the_count_is_zero_rather_than_absent_when_nothing_could_be_annotated(monkeypatch):
+    # Zero with a non-empty seatnonbid tells a consumer the debug block did not name
+    # the price, which is different from there being no non-bids.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    auction = {
+        "id": "r",
+        "ext": {"seatnonbid": [{"seat": "amt", "nonbid": [{"impid": "imp-1", "statuscode": 0}]}]},
+    }
+    _patch_client(monkeypatch, FakeClient(FakeResponse(200, auction)))
+    payload = body_of(
+        run(auction_api.run_auction_handler(FakeRequest({"id": "r", "imp": [{"id": "imp-1", "bidfloor": 4.0}]})))
+    )
+    assert payload["artf_meta"]["seat_nonbids_annotated"] == 0
+    assert payload["ext"]["seatnonbid"][0]["nonbid"][0] == {"impid": "imp-1", "statuscode": 0}

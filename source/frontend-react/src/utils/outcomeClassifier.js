@@ -44,20 +44,38 @@ export const OUTCOME = Object.freeze({
   REJECTED_BELOW_FLOOR: "rejected_below_floor",
   NOT_OFFERED: "not_offered",
   UNAVAILABLE: "unavailable",
+  NO_BID: "no_bid",
 });
 
-/** Prebid seatnonbid status codes this surface understands. */
+/**
+ * Prebid seatnonbid status codes this surface understands.
+ *
+ * NO_BID is 0 in Prebid's NonBidReason: the seat WAS called and returned nothing
+ * the auction could use. It belongs in AUCTION_OUTCOME, not NOT_ATTEMPTED —
+ * reporting an attempted seat as "not attempted" says the opposite of what
+ * happened, and it is the most common non-bid there is, so it must not sit in the
+ * catch-all rendering "unrecognised status 0".
+ */
 export const STATUS = Object.freeze({
+  NO_BID: 0,
   TIMEOUT: 101,
   BELOW_FLOOR: 301,
 });
 
-/** ARTF exclusion reasons emitted by the demand endpoint (U2). */
+/**
+ * ARTF exclusion reasons emitted by the demand endpoint (U2).
+ *
+ * Must stay in step with `source/demand/artfhouse/exclusion.py`. A reason absent
+ * here does not render as itself — it falls to the catch-all and prints "No offer —
+ * no reason reported", so a campaign whose reason WAS reported reads as one that
+ * gave none. `source/tests/test_exclusion_reason_parity.py` fails on drift.
+ */
 export const EXCLUSION = Object.freeze({
   DEAL_SUPPRESSED: "deal_suppressed",
   BELOW_FLOOR: "below_floor",
   NOT_TARGETED: "not_targeted",
   NO_DEAL_ON_IMPRESSION: "no_deal_on_impression",
+  MEDIA_TYPE_UNSUPPORTED: "media_type_unsupported",
 });
 
 /** Hook outcomes that mean enrichment never happened (U3). */
@@ -84,6 +102,10 @@ const HUMAN_REASON = new Map([
   [EXCLUSION.BELOW_FLOOR, "CPM below the resolved floor"],
   [EXCLUSION.NOT_TARGETED, "Targeting did not match this impression"],
   [EXCLUSION.NO_DEAL_ON_IMPRESSION, "No deal for this campaign on the impression"],
+  [
+    EXCLUSION.MEDIA_TYPE_UNSUPPORTED,
+    "The impression offers no slot this campaign's creative could fill",
+  ],
   [HOOK_OUTCOME.TIMEOUT, "Enrichment timed out"],
   [HOOK_OUTCOME.TRANSPORT_FAILURE, "Enrichment could not be reached"],
   [
@@ -93,6 +115,31 @@ const HUMAN_REASON = new Map([
 ]);
 
 /**
+ * The reason line for a NO_BID, using the observed evidence when it exists.
+ *
+ * `observed` is what the orchestrator SAW — the price the seat returned for this
+ * impression, read out of Prebid's own debug httpcalls, and the impression's floor,
+ * read out of the request. Both are quoted values, neither is derived.
+ *
+ * The wording stops at the observation. Prebid reported NO_BID, not a floor
+ * rejection, so stating "rejected below floor" would put a reason in Prebid's mouth
+ * that Prebid did not give. Showing the two numbers lets a reader draw the
+ * conclusion the numbers support without the UI asserting it.
+ */
+function noBidReason(observed) {
+  const returned = observed?.returnedPrice;
+  const floor = observed?.impFloor;
+  if (typeof returned !== "number" || typeof floor !== "number") {
+    return "The seat was called and returned no usable bid";
+  }
+  const cur = observed.currency ? ` ${observed.currency}` : "";
+  return (
+    `The seat returned ${returned.toFixed(2)}${cur} for this impression, ` +
+    `whose floor was ${floor.toFixed(2)}${cur}`
+  );
+}
+
+/**
  * Map a status code and an exclusion reason to an outcome and its category.
  *
  * Total by construction: the final branch is a catch-all that yields
@@ -100,7 +147,7 @@ const HUMAN_REASON = new Map([
  * unrecognised input is still legible rather than blank (BR-9).
  */
 export function classify(seatNonBidCode, exclusionReason, opts = {}) {
-  const { offered = false, markedWinner = false } = opts;
+  const { offered = false, markedWinner = false, observed = null } = opts;
 
   if (markedWinner) {
     return { outcome: OUTCOME.WON, category: CATEGORY.WON, reason: null };
@@ -141,6 +188,13 @@ export function classify(seatNonBidCode, exclusionReason, opts = {}) {
   }
 
   // Status codes, when no ARTF reason accompanied them.
+  if (seatNonBidCode === STATUS.NO_BID) {
+    return {
+      outcome: OUTCOME.NO_BID,
+      category: CATEGORY.AUCTION_OUTCOME,
+      reason: noBidReason(observed),
+    };
+  }
   if (seatNonBidCode === STATUS.BELOW_FLOOR) {
     return {
       outcome: OUTCOME.REJECTED_BELOW_FLOOR,

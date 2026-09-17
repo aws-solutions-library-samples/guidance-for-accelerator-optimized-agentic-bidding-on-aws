@@ -49,12 +49,24 @@ class Bid:
 
 @dataclass(frozen=True)
 class Exclusion:
-    """One campaign that made no offer, and why."""
+    """One campaign that made no offer on one impression, and why.
+
+    PER IMPRESSION, like Bid. A campaign is considered once per impression and can be
+    excluded for different reasons on each -- ineligible on a video slot, below floor
+    on a banner one -- so an exclusion without its impression is not a whole fact.
+
+    Omitting imp_id made a two-impression request emit the same campaign twice,
+    byte-identical: 30 entries for 16 campaigns on the isv-ecosystem scenario, 14 of
+    them exact duplicates. The consumer could neither tell them apart nor say which
+    impression either referred to, and the offers column keys its rows on campaign
+    plus deal, so the two collided on one key as well.
+    """
 
     campaign_id: str
     campaign_name: str
     deal_id: Optional[str]
     reason: ExclusionReason
+    imp_id: str
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,7 @@ def build(
                     campaign_name=campaign.campaign_name,
                     deal_id=candidate.deal_id,
                     reason=candidate.excluded_because,
+                    imp_id=imp_id,
                 )
             )
             continue
@@ -100,6 +113,7 @@ def build(
                     campaign_name=campaign.campaign_name,
                     deal_id=candidate.deal_id,
                     reason=ExclusionReason.BELOW_FLOOR,
+                    imp_id=imp_id,
                 )
             )
             continue
@@ -248,6 +262,10 @@ def to_excluded_ext(exclusions: tuple[Exclusion, ...]) -> list[dict]:
             "campaignName": e.campaign_name,
             "dealId": e.deal_id,
             "exclusionReason": e.reason.value,
+            # The impression this exclusion is about. Without it a multi-impression
+            # request emits the same campaign once per impression with nothing to
+            # distinguish the entries.
+            "impId": e.imp_id,
         }
         for e in exclusions
     ]

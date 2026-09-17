@@ -3838,48 +3838,220 @@ h1, h2, h3, .sg-display {
 .th-contrib-name { font-weight: 600; color: var(--th-ink); }
 .th-contrib-count { color: var(--th-ink-3); }
 
-/* ---------------------------------------------------------------- buy side */
+/* ------------------------------------------------------------ offers column */
 
-/* Unconditional: there is no state in which the fixture values become real. */
-.th-illustrative {
+.th-col-offers {
+  background: linear-gradient(180deg, var(--th-buy-soft) 0%, #fff 55%);
+  border-left: 1px solid var(--th-hair);
+}
+.th-col-offers .th-col-title { color: var(--th-buy); }
+
+/* The notice states the provenance of every value below it, so it is set at the
+   body scale rather than shrunk to a footnote. */
+.th-offers-notice {
   font-size: 11px;
   line-height: 1.5;
+  border-radius: var(--th-radius-sm);
+  padding: 8px 10px;
+  margin: 0;
+}
+.th-offers-notice-illustrative {
   color: #7a4b00;
   background: #fff8e6;
   border: 1px solid #f0d9a3;
+}
+.th-offers-notice-declared_inventory {
+  color: var(--th-ink-2);
+  background: var(--th-panel);
+  border: 1px solid var(--th-hair);
+}
+
+/* A fault reads as a fault: red, not the neutral grey of an expected absence. */
+.th-offers-fault {
+  font-size: 11px;
+  line-height: 1.5;
   border-radius: var(--th-radius-sm);
-  padding: 9px 11px;
+  padding: 8px 10px;
   margin: 0;
 }
-.th-bidder {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-areas: "name bid" "kind bid";
-  gap: 2px 10px;
+.th-offers-fault-failed {
+  color: #8c1d18;
+  background: #fdeceb;
+  border: 1px solid #f2b8b5;
+}
+.th-offers-fault-not_deployed {
+  color: var(--th-ink-2);
+  background: var(--th-panel-2);
+  border: 1px solid var(--th-hair-2);
+}
+
+/* Holds the column's place until the enrichment beats have run. */
+.th-offers-pending {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--th-ink-3);
+  background: var(--th-panel);
+  border: 1px dashed var(--th-hair-2);
+  border-radius: var(--th-radius-sm);
   padding: 10px 12px;
+}
+
+.th-offer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "campaign price"
+    "deal     outcome"
+    "reason   reason";
+  align-items: baseline;
+  column-gap: 12px;
+  row-gap: 2px;
+  padding: 9px 11px 9px 12px;
   background: var(--th-canvas);
   border: 1px solid var(--th-hair);
+  /* The left rule carries the category. The text mark inside the row carries it
+     as well, so the distinction survives greyscale and colour-blindness. */
+  border-left-width: 3px;
+  border-left-color: var(--th-hair-2);
   border-radius: var(--th-radius-sm);
 }
-.th-bidder.is-winner {
-  border-color: var(--th-gold);
-  background: linear-gradient(180deg, var(--th-gold-soft) 0%, #fff 60%);
+.th-offer-campaign {
+  grid-area: campaign;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
 }
-.th-bidder-name { grid-area: name; font-size: 12px; font-weight: 700; }
-.th-bidder-kind { grid-area: kind; font-size: 11px; color: var(--th-ink-3); }
-.th-bidder-bid {
-  grid-area: bid;
-  align-self: center;
+.th-offer-deal {
+  grid-area: deal;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--th-ink-3);
+  overflow-wrap: anywhere;
+}
+.th-offer-price {
+  grid-area: price;
+  justify-self: end;
   font-family: var(--font-mono, monospace);
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
 }
-.th-clearing {
+.th-offer-outcome {
+  grid-area: outcome;
+  justify-self: end;
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.th-offer-mark {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--th-ink-3);
+}
+/* The reason is the whole point of a no-offer row, so it takes its own line
+   rather than trailing the outcome as an aside. */
+.th-offer-reason {
+  grid-area: reason;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--th-hair);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--th-ink-2);
+}
+
+.th-offer-Won,
+.th-offer.is-winner {
+  border-color: var(--th-gold);
+  border-left-color: var(--th-gold);
+  background: linear-gradient(180deg, var(--th-gold-soft) 0%, #fff 60%);
+}
+.th-offer-Won .th-offer-price { color: var(--th-gold); }
+.th-offer-AuctionOutcome { border-left-color: var(--th-buy); }
+.th-offer-ArtfDecision { border-left-color: var(--th-enrich); }
+.th-offer-ArtfDecision .th-offer-mark { color: var(--th-enrich); }
+.th-offer-InfrastructureFailure { border-left-color: #b3261e; }
+.th-offer-InfrastructureFailure .th-offer-mark { color: #b3261e; }
+.th-offer-NotAttempted {
+  border-left-style: dashed;
+  background: var(--th-panel);
+}
+.th-offer-NotAttempted .th-offer-campaign,
+.th-offer-NotAttempted .th-offer-price { color: var(--th-ink-2); }
+
+/* The outcome, set apart from the candidate rows: the winning deal leads, the
+   campaign and cleared price support it. */
+.th-offers-winner,
+.th-offers-unsold {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 10px;
+  row-gap: 3px;
+  align-items: baseline;
+  margin-top: auto;
+  padding: 11px 12px;
+  border-radius: var(--th-radius-sm);
   font-size: 12px;
-  padding: 8px 11px;
-  border-top: 1px solid var(--th-hair);
+}
+.th-offers-winner {
+  border: 1px solid var(--th-gold);
+  background: linear-gradient(180deg, var(--th-gold-soft) 0%, #fff 70%);
+}
+.th-offers-winner .th-row-val {
+  font-size: 13px;
+  color: var(--th-gold);
+  overflow-wrap: anywhere;
+}
+.th-offers-winner-campaign {
+  grid-column: 2;
+  font-size: 12px;
+  font-weight: 600;
+}
+.th-offers-winner-price {
+  grid-column: 2;
+  font-size: 10px;
+  color: var(--th-ink-3);
+}
+.th-offers-unsold {
+  border: 1px dashed var(--th-hair-2);
+  background: var(--th-panel);
+}
+.th-offers-unsold .th-row-val {
+  font-family: inherit;
+  font-weight: 400;
+  text-align: left;
+  color: var(--th-ink-3);
+}
+
+/* ------------------------------------------------- sell column, with wrapper */
+
+/* SellSideDecisionsPanel wraps the sell column so it can append consequences.
+   The wrapper is the grid child, so it has to carry the cell's sizing. */
+.th-col-sell-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  background: linear-gradient(180deg, var(--th-sell-soft) 0%, #fff 55%);
+  border-right: 1px solid var(--th-hair);
+}
+.th-col-sell-wrap > .th-col-sell {
+  overflow: visible;
+  background: none;
+  border-right: none;
+  flex: none;
+}
+.th-consequences {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 18px 16px;
 }
 
 /* ------------------------------------------------------------- visualisers */

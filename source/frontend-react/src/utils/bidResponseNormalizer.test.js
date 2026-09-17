@@ -170,3 +170,250 @@ describe("properties", () => {
     );
   });
 });
+
+// The winner marker is the UNPREFIXED targeting key, not "targeting exists".
+//
+// `includebidderkeys` defaults to true, so in a contested auction every seat's top
+// bid carries a targeting object of its own hb_pb_BIDDER keys. Testing only for a
+// non-empty object therefore marks every seat as the winner, and which one wins
+// becomes whichever the array happens to list first. Prebid's documented signal is
+// the absence of a bidder suffix: "values without prefixes on the winning bids only".
+//
+// Shapes below are the deployed server's actual output for a two-seat auction on
+// source/frontend-react/public/samples/yield-optimizer.json.
+describe("resolveWinner across two seats", () => {
+  const TWO_SEATS = {
+    seatbid: [
+      {
+        seat: "artfhouse",
+        bid: [
+          {
+            id: "b-artf",
+            impid: "imp-1",
+            price: 13.4,
+            dealid: "deal-guaranteed-premium",
+            ext: {
+              prebid: {
+                targeting: {
+                  hb_pb: "13.40",
+                  hb_bidder: "artfhouse",
+                  hb_deal: "deal-guaranteed-premium",
+                  hb_pb_artfhouse: "13.40",
+                  hb_bidder_artfhouse: "artfhouse",
+                },
+              },
+            },
+          },
+        ],
+      },
+      {
+        seat: "amt",
+        bid: [
+          {
+            id: "b-amt",
+            impid: "imp-1",
+            price: 12.5,
+            // Loser: bidder-suffixed keys only.
+            ext: { prebid: { targeting: { hb_pb_amt: "12.50", hb_bidder_amt: "amt" } } },
+          },
+        ],
+      },
+    ],
+  };
+
+  it("marks only the bid carrying the unprefixed keys", () => {
+    const offers = normalizeOffers(TWO_SEATS);
+    expect(offers.filter((o) => o.markedWinner === true)).toHaveLength(1);
+    expect(resolveWinner(offers).clearedPrice).toBe(13.4);
+    expect(resolveWinner(offers).dealId).toBe("deal-guaranteed-premium");
+  });
+
+  it("does not treat a loser's own bidder keys as a win", () => {
+    const offers = normalizeOffers(TWO_SEATS);
+    const loser = offers.find((o) => o.price === 12.5);
+    expect(loser.markedWinner).toBe(false);
+  });
+
+  it("picks the winner by the marker, not by array order or by price", () => {
+    // Winner listed second AND cheaper: neither position nor price may decide it.
+    const reordered = { seatbid: [...TWO_SEATS.seatbid].reverse() };
+    expect(resolveWinner(normalizeOffers(reordered)).clearedPrice).toBe(13.4);
+  });
+
+  it("reports no winner when no bid carries the unprefixed keys", () => {
+    // What every scenario returned before the orchestrator requested targeting:
+    // real bids, and nothing saying which one won.
+    const noTargeting = {
+      seatbid: [
+        { seat: "artfhouse", bid: [{ id: "a", impid: "imp-1", price: 13.4 }] },
+        { seat: "amt", bid: [{ id: "b", impid: "imp-1", price: 12.5 }] },
+      ],
+    };
+    const offers = normalizeOffers(noTargeting);
+    expect(offers).toHaveLength(2);
+    expect(resolveWinner(offers)).toBeNull();
+  });
+
+  it("ignores an empty targeting object", () => {
+    const offers = normalizeOffers({
+      seatbid: [{ seat: "s", bid: [{ id: "a", impid: "i", price: 1, ext: { prebid: { targeting: {} } } }] }],
+    });
+    expect(resolveWinner(offers)).toBeNull();
+  });
+});
+
+
+// A seatnonbid entry is SEAT-level. OpenRTB gives it an impid and a status code and
+// nothing else; only this repo's demand endpoint adds a campaign to it. Dropping the
+// seat rendered those rows "unknown" while the response named them plainly.
+//
+// Shape below is the deployed response for isv-ecosystem, verbatim.
+describe("seat-level non-bids", () => {
+  const LIVE = {
+    cur: "USD",
+    seatbid: [],
+    ext: {
+      seatnonbid: [
+        {
+          seat: "amt",
+          nonbid: [
+            {
+              impid: "imp-1",
+              statuscode: 0,
+              ext: {
+                artf: {
+                  observed: {
+                    returnedPrice: 3.25,
+                    impFloor: 4.0,
+                    currency: "USD",
+                    source: "bidder response, via prebid debug httpcalls",
+                  },
+                },
+              },
+            },
+            { impid: "imp-2", statuscode: 0 },
+          ],
+        },
+      ],
+    },
+  };
+
+  it("carries the seat that did not bid", () => {
+    const offers = normalizeOffers(LIVE);
+    expect(offers).toHaveLength(2);
+    expect(offers.every((o) => o.seat === "amt")).toBe(true);
+  });
+
+  it("carries the observed price and floor when the orchestrator supplied them", () => {
+    const [first, second] = normalizeOffers(LIVE);
+    expect(first.observed).toEqual({
+      returnedPrice: 3.25,
+      impFloor: 4.0,
+      currency: "USD",
+      source: "bidder response, via prebid debug httpcalls",
+    });
+    // No observed block on the second: it must be null, not a partial object.
+    expect(second.observed).toBeNull();
+  });
+
+  it("still reports no price on the row itself — a non-bid has none", () => {
+    expect(normalizeOffers(LIVE).every((o) => o.price === null)).toBe(true);
+  });
+
+  it("rejects a half-populated observed block rather than rendering a blank half", () => {
+    const partial = {
+      ext: {
+        seatnonbid: [
+          {
+            seat: "amt",
+            nonbid: [{ impid: "i", statuscode: 0, ext: { artf: { observed: { impFloor: 3.0 } } } }],
+          },
+        ],
+      },
+    };
+    expect(normalizeOffers(partial)[0].observed).toBeNull();
+  });
+
+  it("gives bids their seat too, and no observed block", () => {
+    const offers = normalizeOffers({
+      seatbid: [{ seat: "artfhouse", bid: [{ id: "b", impid: "i", price: 7.2 }] }],
+    });
+    expect(offers[0].seat).toBe("artfhouse");
+    expect(offers[0].observed).toBeNull();
+  });
+
+  it("gives an endpoint exclusion no seat — it happened before any seat bid", () => {
+    const offers = normalizeOffers({
+      ext: { artf: { excluded: [{ campaignId: "c", campaignName: "C", exclusionReason: "not_targeted" }] } },
+    });
+    expect(offers[0].seat).toBeNull();
+  });
+});
+
+
+// A campaign is considered once per impression, so the same campaign and deal
+// legitimately appear more than once in ext.artf.excluded. The endpoint now stamps
+// impId; the key must be unique either way, because two rows sharing a React key is
+// a reconciliation fault rather than a cosmetic one.
+//
+// Live evidence: isv-ecosystem returned 30 entries for 16 campaigns across 2
+// impressions, 14 of them byte-identical, all keyed identically.
+describe("excluded rows across impressions", () => {
+  const SAME_CAMPAIGN_TWICE = {
+    ext: {
+      artf: {
+        excluded: [
+          {
+            campaignId: "camp-cedar",
+            campaignName: "Cedar & Co Furnishings",
+            dealId: null,
+            exclusionReason: "no_deal_on_impression",
+            impId: "imp-1",
+          },
+          {
+            campaignId: "camp-cedar",
+            campaignName: "Cedar & Co Furnishings",
+            dealId: null,
+            exclusionReason: "media_type_unsupported",
+            impId: "imp-2",
+          },
+        ],
+      },
+    },
+  };
+
+  it("keeps both rows and gives them distinct keys", () => {
+    const offers = normalizeOffers(SAME_CAMPAIGN_TWICE);
+    expect(offers).toHaveLength(2);
+    expect(new Set(offers.map((o) => o.key)).size).toBe(2);
+  });
+
+  it("carries the impression each exclusion is about", () => {
+    const offers = normalizeOffers(SAME_CAMPAIGN_TWICE);
+    expect(offers.map((o) => o.impId)).toEqual(["imp-1", "imp-2"]);
+  });
+
+  it("keeps each impression's own reason rather than collapsing them", () => {
+    const offers = normalizeOffers(SAME_CAMPAIGN_TWICE);
+    expect(offers[0].exclusionReason).toBe("no_deal_on_impression");
+    expect(offers[1].exclusionReason).toBe("media_type_unsupported");
+  });
+
+  it("keys stay unique even when the endpoint sends no impId", () => {
+    // The defect as it shipped: byte-identical entries. Uniqueness must not depend
+    // on the very field whose absence caused the collision.
+    const noImpId = {
+      ext: {
+        artf: {
+          excluded: [
+            { campaignId: "c", campaignName: "C", dealId: null, exclusionReason: "not_targeted" },
+            { campaignId: "c", campaignName: "C", dealId: null, exclusionReason: "not_targeted" },
+          ],
+        },
+      },
+    };
+    const offers = normalizeOffers(noImpId);
+    expect(offers).toHaveLength(2);
+    expect(new Set(offers.map((o) => o.key)).size).toBe(2);
+  });
+});

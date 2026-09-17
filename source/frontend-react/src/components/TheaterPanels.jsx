@@ -187,50 +187,6 @@ export function TheaterSellSidePanel({ values, revealed }) {
   );
 }
 
-/* ----------------------------------------------------------- buy side panel */
-
-/**
- * The one part of this surface not derived from the response.
- *
- * The illustrative label is unconditional: there is no state in which these
- * values become real, so there is no state in which the label should be absent
- * (BR-30). No bid, winner or clearing price is computed here or anywhere else in
- * this unit; the values arrive as a fixture (BR-31).
- */
-export function TheaterBuySidePanel({ outcome, revealed }) {
-  return (
-    <div className={`th-col th-col-buy${revealed ? " is-live" : ""}`}>
-      <div className="th-col-head">
-        <span className="th-col-title">Buy side</span>
-        <span className="th-col-sub">Competing campaigns</span>
-      </div>
-
-      <p className="th-illustrative" data-testid="theater-buy-side-illustrative-label">
-        Illustrative example. This system transforms bid requests; it does not run
-        an auction, so these bidders and this clearing price are fixture values,
-        not measured outcomes. Everything in the centre and left columns is real.
-      </p>
-
-      {(outcome?.bidders ?? []).map((b, i) => (
-        <div key={b.name} className={`th-bidder${outcome.winnerIndex === i ? " is-winner" : ""}`}>
-          <span className="th-bidder-name">{b.name}</span>
-          <span className="th-bidder-kind">{b.kind}</span>
-          <span className="th-bidder-bid">
-            {b.bid == null ? "no bid" : `$${b.bid.toFixed(2)}`}
-          </span>
-        </div>
-      ))}
-
-      {outcome?.clearingPrice != null ? (
-        <div className="th-clearing">
-          <span className="th-row-key">Clearing price</span>
-          <span className="th-row-val">${outcome.clearingPrice.toFixed(2)}</span>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 /* -------------------------------------------------------------- caption */
 
 /**

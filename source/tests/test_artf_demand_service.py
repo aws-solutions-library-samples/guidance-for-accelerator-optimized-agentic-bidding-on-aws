@@ -1,5 +1,7 @@
 """The service end to end, and the response contract the frontend reads."""
 
+import json
+
 import pytest
 
 from demand.artfhouse.exclusion import ExclusionReason
@@ -274,3 +276,78 @@ def test_the_data_location_wins_when_both_are_present():
     }
     response = SERVICE.decide({"id": "req-cat", "imp": [imp]})
     assert "cr-cedar-300x250" not in crids_of(response)
+
+
+# --------------------------------------------------------------------------- #
+# Exclusions are per (campaign, impression).
+#
+# `decide` loops the impressions and concatenates each one's exclusions. Without
+# imp_id on the entry, a two-impression request emitted the same campaign twice with
+# nothing to tell the entries apart: 30 entries for 16 campaigns on the
+# isv-ecosystem scenario, 14 of them byte-identical. The offers column keys its rows
+# on campaign plus deal, so those pairs collided on one React key as well.
+# --------------------------------------------------------------------------- #
+
+
+def _two_imp_request():
+    """Two banner impressions, distinct ids, floors low enough to admit bids."""
+    return {
+        "id": "req-2imp",
+        "cur": ["USD"],
+        "imp": [
+            {"id": "imp-1", "bidfloor": 0.5, "banner": {"w": 300, "h": 250}},
+            {"id": "imp-2", "bidfloor": 0.5, "banner": {"w": 300, "h": 600}},
+        ],
+    }
+
+
+def _excluded(response):
+    return ((response.get("ext") or {}).get("artf") or {}).get("excluded") or []
+
+
+def test_every_exclusion_names_the_impression_it_is_about():
+    response = DemandDecisionService().decide(_two_imp_request())
+    excluded = _excluded(response)
+    assert excluded, "expected some campaign to be excluded on a two-impression request"
+    assert all(e.get("impId") for e in excluded)
+    assert {e["impId"] for e in excluded} <= {"imp-1", "imp-2"}
+
+
+def test_the_same_campaign_on_two_impressions_yields_two_distinguishable_entries():
+    excluded = _excluded(DemandDecisionService().decide(_two_imp_request()))
+    by_campaign: dict[str, list[dict]] = {}
+    for entry in excluded:
+        by_campaign.setdefault(entry["campaignId"], []).append(entry)
+
+    repeated = {cid: rows for cid, rows in by_campaign.items() if len(rows) > 1}
+    assert repeated, "expected at least one campaign excluded on both impressions"
+    for cid, rows in repeated.items():
+        imps = [r["impId"] for r in rows]
+        assert len(set(imps)) == len(imps), f"{cid} has two entries for the same impression"
+        # The defect: entries that were identical in every field.
+        assert len({json.dumps(r, sort_keys=True) for r in rows}) == len(rows), (
+            f"{cid} produced byte-identical exclusion entries"
+        )
+
+
+def test_a_single_impression_request_still_names_its_impression():
+    request = {
+        "id": "req-1imp",
+        "cur": ["USD"],
+        "imp": [{"id": "only-imp", "bidfloor": 0.5, "banner": {"w": 300, "h": 250}}],
+    }
+    excluded = _excluded(DemandDecisionService().decide(request))
+    assert excluded
+    assert {e["impId"] for e in excluded} == {"only-imp"}
+
+
+def test_the_exclusion_entry_shape_is_exactly_what_the_frontend_reads():
+    excluded = _excluded(DemandDecisionService().decide(_two_imp_request()))
+    for entry in excluded:
+        assert set(entry) == {
+            "campaignId",
+            "campaignName",
+            "dealId",
+            "exclusionReason",
+            "impId",
+        }

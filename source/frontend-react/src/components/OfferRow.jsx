@@ -11,7 +11,6 @@
 
 import { CATEGORY } from "../utils/outcomeClassifier.js";
 
-const SUBTLE = { fontSize: "10px", color: "var(--text-muted)" };
 const UNKNOWN = "unknown";
 
 /** Text marker per category — the non-colour half of the distinction. */
@@ -29,12 +28,27 @@ const OUTCOME_LABEL = Object.freeze({
   rejected_below_floor: "Rejected below floor",
   not_offered: "No offer",
   unavailable: "No offer",
+  no_bid: "No bid returned",
 });
+
+/**
+ * Who this row is about.
+ *
+ * A campaign name when there is one. Otherwise the SEAT, because a seat-level
+ * non-bid has no campaign and the response names the seat plainly — rendering it
+ * "unknown" discards an identity we were given. The suffix keeps the two readable
+ * as different kinds of thing, so a seat is never mistaken for a campaign.
+ */
+function identityOf(offer) {
+  if (offer.campaignName != null) return offer.campaignName;
+  if (offer.seat != null) return `${offer.seat} (seat)`;
+  return UNKNOWN;
+}
 
 export function OfferRow({ offer, isWinner }) {
   const { outcome } = offer;
   const category = outcome?.category ?? CATEGORY.NOT_ATTEMPTED;
-  const idForTest = offer.campaignId ?? "unknown";
+  const idForTest = offer.campaignId ?? offer.seat ?? "unknown";
 
   return (
     <div
@@ -42,11 +56,9 @@ export function OfferRow({ offer, isWinner }) {
       data-testid={`offer-row-${idForTest}`}
       data-category={category}
     >
-      <span className="th-offer-campaign">{offer.campaignName ?? UNKNOWN}</span>
+      <span className="th-offer-campaign">{identityOf(offer)}</span>
 
-      <span className="th-offer-deal" style={SUBTLE}>
-        {offer.dealId ?? "no deal"}
-      </span>
+      <span className="th-offer-deal">{offer.dealId ?? "no deal"}</span>
 
       <span className="th-offer-price">
         {offer.price == null ? "no bid" : `$${offer.price.toFixed(2)}`}
@@ -54,17 +66,11 @@ export function OfferRow({ offer, isWinner }) {
 
       <span className="th-offer-outcome" data-testid={`offer-row-outcome-${idForTest}`}>
         {OUTCOME_LABEL[outcome?.outcome] ?? "No offer"}
-        <span className="th-offer-mark" style={SUBTLE}>
-          {CATEGORY_MARK[category]}
-        </span>
+        <span className="th-offer-mark">{CATEGORY_MARK[category]}</span>
       </span>
 
       {outcome?.reason ? (
-        <span
-          className="th-offer-reason"
-          style={SUBTLE}
-          data-testid={`offer-row-reason-${idForTest}`}
-        >
+        <span className="th-offer-reason" data-testid={`offer-row-reason-${idForTest}`}>
           {outcome.reason}
         </span>
       ) : null}

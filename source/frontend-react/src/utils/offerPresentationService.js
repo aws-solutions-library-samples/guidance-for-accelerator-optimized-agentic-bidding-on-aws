@@ -53,6 +53,7 @@ export function buildOfferViewModel(bidResponse) {
     const outcome = classify(row.statusCode, row.exclusionReason, {
       offered: row.offered,
       markedWinner: row.markedWinner,
+      observed: row.observed,
     });
     return { ...row, outcome };
   });

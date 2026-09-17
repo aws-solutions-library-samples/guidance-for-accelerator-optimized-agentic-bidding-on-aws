@@ -43,12 +43,26 @@ function artfExtOf(entry) {
 }
 
 /**
- * Prebid marks the bid it resolved as winning by attaching targeting to it.
+ * Prebid's own winner marker: the UNPREFIXED targeting keys.
+ *
+ * Two request flags produce targeting, and they mean different things
+ * (docs.prebid.org, openrtb2 auction endpoint, "Ad Server Targeting"):
+ *   includewinners     → `hb_pb`, `hb_bidder`, `hb_size` on the top bid per imp
+ *   includebidderkeys  → `hb_pb_BIDDER`, `hb_size_BIDDER` on each bidder's top bid
+ *
+ * Both default to true, so in a two-seat auction EVERY seat's top bid carries a
+ * targeting object and "targeting is non-empty" marks every seat as the winner.
+ * The documented winner signal is the absence of a bidder suffix — "values without
+ * prefixes on the winning bids only".
+ *
  * This module reads that marker; it never ranks bids itself (BR-18, FR-17).
  */
+const WINNER_KEYS = Object.freeze(["hb_bidder", "hb_pb"]);
+
 function isMarkedWinner(bid) {
   const targeting = bid?.ext?.prebid?.targeting;
-  return targeting != null && Object.keys(targeting).length > 0;
+  if (targeting == null || typeof targeting !== "object") return false;
+  return WINNER_KEYS.some((key) => targeting[key] != null);
 }
 
 function offerFromBid(bid, seat) {
@@ -57,6 +71,7 @@ function offerFromBid(bid, seat) {
     key: `bid:${seat ?? "seat"}:${bid?.id ?? bid?.impid ?? "unknown"}:${bid?.dealid ?? "nodeal"}`,
     campaignId: artf?.campaignId ?? bid?.crid ?? UNKNOWN_FIELD,
     campaignName: artf?.campaignName ?? bid?.adomain?.[0] ?? UNKNOWN_FIELD,
+    seat: seat ?? UNKNOWN_FIELD,
     dealId: bid?.dealid ?? UNKNOWN_FIELD,
     impId: bid?.impid ?? UNKNOWN_FIELD,
     price: typeof bid?.price === "number" ? bid.price : UNKNOWN_FIELD,
@@ -64,6 +79,7 @@ function offerFromBid(bid, seat) {
     markedWinner: isMarkedWinner(bid),
     statusCode: UNKNOWN_FIELD,
     exclusionReason: UNKNOWN_FIELD,
+    observed: null,
   };
 }
 
@@ -73,15 +89,43 @@ function offerFromNonBid(entry, seat) {
     key: `nonbid:${seat ?? "seat"}:${entry?.impid ?? "unknown"}:${artf?.campaignId ?? "unknown"}`,
     campaignId: artf?.campaignId ?? UNKNOWN_FIELD,
     campaignName: artf?.campaignName ?? UNKNOWN_FIELD,
+    // The seat that did not bid. Read because a seatnonbid entry frequently carries
+    // NO campaign identity — OpenRTB's seatnonbid is seat-level, and only this
+    // repo's own demand endpoint adds an ext.artf campaign to it. Dropping the seat
+    // rendered those rows "unknown" while the response named them plainly.
+    seat: seat ?? UNKNOWN_FIELD,
     dealId: artf?.dealId ?? UNKNOWN_FIELD,
     impId: entry?.impid ?? UNKNOWN_FIELD,
     price: UNKNOWN_FIELD,
     offered: false,
     markedWinner: false,
-    // Prebid's seatnonbid status code. 301 below floor, 101 timeout.
+    // Prebid's seatnonbid status code. 0 no bid, 101 timeout, 301 below floor.
     statusCode: typeof entry?.statuscode === "number" ? entry.statuscode : UNKNOWN_FIELD,
     // The ARTF exclusion reason from the demand endpoint, when present.
     exclusionReason: artf?.exclusionReason ?? UNKNOWN_FIELD,
+    // The price this seat returned and the floor it faced, lifted by the
+    // orchestrator from Prebid's debug httpcalls. Evidence, not a verdict: Prebid
+    // said NO_BID and did not say the floor was the cause.
+    observed: normalizeObserved(artf?.observed),
+  };
+}
+
+/**
+ * The observed block, or null.
+ *
+ * Both numbers are required. A half-populated block would render as "returned 2.75
+ * against a floor of —", which reads as a measurement that was taken and came back
+ * empty rather than one that was never available.
+ */
+function normalizeObserved(observed) {
+  const price = observed?.returnedPrice;
+  const floor = observed?.impFloor;
+  if (typeof price !== "number" || typeof floor !== "number") return null;
+  return {
+    returnedPrice: price,
+    impFloor: floor,
+    currency: observed?.currency ?? UNKNOWN_FIELD,
+    source: observed?.source ?? UNKNOWN_FIELD,
   };
 }
 
@@ -93,9 +137,19 @@ function offerFromNonBid(entry, seat) {
  */
 function offerFromExcluded(entry, index) {
   return {
-    key: `excluded:${entry?.campaignId ?? `unknown-${index}`}:${entry?.dealId ?? "nodeal"}`,
+    // The index is part of the key, not decoration. A campaign is excluded once per
+    // impression, so the same campaign and deal legitimately appear more than once;
+    // impId distinguishes them when the endpoint stamps it, and the index keeps the
+    // key unique even when it does not. Two rows sharing a key is a React
+    // reconciliation fault, not a cosmetic one.
+    key: `excluded:${index}:${entry?.campaignId ?? "unknown"}:${entry?.impId ?? "noimp"}:${
+      entry?.dealId ?? "nodeal"
+    }`,
     campaignId: entry?.campaignId ?? UNKNOWN_FIELD,
     campaignName: entry?.campaignName ?? UNKNOWN_FIELD,
+    // No seat: this is the demand endpoint's own account of a campaign it did not
+    // offer, which happened before any seat was involved.
+    seat: UNKNOWN_FIELD,
     dealId: entry?.dealId ?? UNKNOWN_FIELD,
     impId: entry?.impId ?? UNKNOWN_FIELD,
     price: UNKNOWN_FIELD,
@@ -103,6 +157,7 @@ function offerFromExcluded(entry, index) {
     markedWinner: false,
     statusCode: UNKNOWN_FIELD,
     exclusionReason: entry?.exclusionReason ?? UNKNOWN_FIELD,
+    observed: null,
   };
 }
 

@@ -120,4 +120,161 @@ describe("OffersPanel", () => {
     render(<OffersPanel viewModel={buildOfferViewModel({})} revealed />);
     expect(container.querySelector(".th-empty").textContent).toMatch(/no offers/i);
   });
+
+  // The auction resolves against the enriched request, so no offer, price, reason
+  // or winner may be on screen while enrichment is still running.
+  it("withholds every offer and the winner until revealed", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(capturedBidResponse)} revealed={false} />);
+    expect(qa(".th-offer")).toHaveLength(0);
+    expect(q("offers-panel-winner")).toBeNull();
+    expect(q("offers-panel-unsold")).toBeNull();
+    expect(q("offers-panel-notice")).toBeNull();
+    expect(container.textContent).not.toMatch(/6\.35/);
+    expect(container.textContent).not.toMatch(/Cedar & Co/);
+  });
+
+  it("keeps the column and states why it is empty while pending", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(capturedBidResponse)} revealed={false} />);
+    expect(q("offers-panel")).not.toBeNull();
+    expect(container.querySelector(".th-col-title").textContent).toBe("Offers");
+    expect(q("offers-panel-pending").textContent).toMatch(/enriched request/i);
+  });
+
+  it("shows the offers once revealed", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(capturedBidResponse)} revealed />);
+    expect(q("offers-panel-pending")).toBeNull();
+    expect(qa(".th-offer")).toHaveLength(5);
+  });
+});
+
+// A fixture shown because the auction FAILED must not look like a fixture shown
+// because Prebid was never deployed. Conflating them is what let a 401 read as an
+// expected absence for the life of the feature.
+describe("OffersPanel auction fault", () => {
+  const vm = () => buildOfferViewModel(capturedBidResponse);
+
+  it("says nothing when the auction was read", () => {
+    render(<OffersPanel viewModel={vm()} revealed auctionFault={null} />);
+    expect(q("offers-panel-fault")).toBeNull();
+  });
+
+  it("reports a failure as a failure, and says the offers are the fixture", () => {
+    render(
+      <OffersPanel
+        viewModel={vm()}
+        revealed
+        auctionFault={{ kind: "failed", status: 401, detail: "Authentication required" }}
+      />,
+    );
+    const fault = q("offers-panel-fault");
+    expect(fault).not.toBeNull();
+    expect(fault.dataset.faultKind).toBe("failed");
+    expect(fault.textContent).toMatch(/could not be read/i);
+    expect(fault.textContent).toMatch(/Authentication required/);
+    expect(fault.textContent).toMatch(/captured fixture/i);
+  });
+
+  it("reports an undeployed exchange distinctly from a failure", () => {
+    render(
+      <OffersPanel
+        viewModel={vm()}
+        revealed
+        auctionFault={{ kind: "not_deployed", detail: "Prebid Server is not deployed." }}
+      />,
+    );
+    const fault = q("offers-panel-fault");
+    expect(fault.dataset.faultKind).toBe("not_deployed");
+    expect(fault.textContent).toMatch(/No live auction/i);
+    expect(fault.textContent).not.toMatch(/could not be read/i);
+  });
+
+  it("keeps the fault out of the pending state, which has nothing to explain yet", () => {
+    render(
+      <OffersPanel
+        viewModel={vm()}
+        revealed={false}
+        auctionFault={{ kind: "failed", detail: "boom" }}
+      />,
+    );
+    expect(q("offers-panel-fault")).toBeNull();
+    expect(q("offers-panel-pending")).not.toBeNull();
+  });
+});
+
+
+// Three rows reading "unknown / No offer — unrecognised status 0" was the whole of
+// what the simulator's non-bids showed. The response named the seat and the
+// orchestrator can supply the price it returned, so both belong on the row.
+describe("OffersPanel seat-level non-bids", () => {
+  const LIVE_ISV = {
+    cur: "USD",
+    seatbid: [
+      {
+        seat: "artfhouse",
+        bid: [
+          {
+            id: "b1",
+            impid: "imp-1",
+            price: 7.2,
+            dealid: "deal-premium-auto",
+            adomain: ["autoline.example"],
+            ext: { prebid: { targeting: { hb_bidder: "artfhouse", hb_pb: "7.20" } } },
+          },
+        ],
+      },
+    ],
+    ext: {
+      seatnonbid: [
+        {
+          seat: "amt",
+          nonbid: [
+            {
+              impid: "imp-1",
+              statuscode: 0,
+              ext: {
+                artf: { observed: { returnedPrice: 3.25, impFloor: 4.0, currency: "USD" } },
+              },
+            },
+            { impid: "imp-2", statuscode: 0 },
+          ],
+        },
+      ],
+    },
+  };
+
+  it("names the seat instead of rendering unknown", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(LIVE_ISV)} revealed />);
+    const row = q("offer-row-amt");
+    expect(row).not.toBeNull();
+    expect(row.textContent).toMatch(/amt \(seat\)/);
+    expect(row.textContent).not.toMatch(/unknown/i);
+  });
+
+  it("labels it a returned no-bid in the auction category, not not-attempted", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(LIVE_ISV)} revealed />);
+    expect(q("offer-row-amt").dataset.category).toBe("AuctionOutcome");
+    expect(q("offer-row-outcome-amt").textContent).toMatch(/No bid returned/);
+    expect(q("offer-row-outcome-amt").textContent).toMatch(/auction/);
+    expect(container.textContent).not.toMatch(/unrecognised status/i);
+  });
+
+  it("shows the price the seat returned against the floor it faced", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(LIVE_ISV)} revealed />);
+    const reason = q("offer-row-reason-amt").textContent;
+    expect(reason).toMatch(/3\.25/);
+    expect(reason).toMatch(/4\.00/);
+  });
+
+  it("does not tell the reader the floor rejected it", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(LIVE_ISV)} revealed />);
+    const reason = q("offer-row-reason-amt").textContent;
+    expect(reason).not.toMatch(/rejected/i);
+    expect(q("offer-row-amt").dataset.category).not.toBe("ArtfDecision");
+  });
+
+  it("keeps the winner intact alongside the seat rows", () => {
+    render(<OffersPanel viewModel={buildOfferViewModel(LIVE_ISV)} revealed />);
+    expect(q("offers-panel-winner").textContent).toMatch(/deal-premium-auto/);
+    expect(q("offers-panel-winner").textContent).toMatch(/cleared at \$7\.20/);
+  });
 });
