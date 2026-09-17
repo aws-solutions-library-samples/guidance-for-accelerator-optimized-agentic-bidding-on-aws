@@ -132,6 +132,54 @@ def build(
 _MTYPE = {"banner": 1, "video": 2}
 
 
+def video_adm(creative_id: str, duration: int, width: int, height: int) -> str:
+    """A VAST document for a video bid.
+
+    WHY A VIDEO BID CANNOT OMIT THIS
+
+    Prebid's ResponseBidValidator rejects a video bid carrying neither ``adm`` nor
+    ``nurl``, and says so exactly:
+
+        Bid "bid-camp-skyline-video" with video type missing adm and nurl
+
+    Every video campaign was bid correctly by this endpoint -- right price, right
+    mtype, right duration -- and then dropped by the exchange for having no
+    creative. The auction reported one seat, and nothing in the seatbid explained
+    why the other was absent.
+
+    WHAT THIS DOCUMENT IS, PLAINLY
+
+    A structurally valid VAST wrapper around a MediaFile path that IS NOT SHIPPED.
+    No video asset exists in this repository, so there is nothing to point at that
+    would play, and inventing a path that looks like a real creative would assert a
+    file that does not exist. The AdSystem and AdTitle say what it is, so anyone who
+    inspects a winning bid reads "placeholder" rather than a brand name.
+
+    The release's own simulator has the same property -- its MediaFile paths under
+    /assets/videos/ are not shipped here either -- so neither seat's video creative
+    is playable in this deployment. What is real is the auction: the bid, its price,
+    its duration, and which seat won.
+    """
+    clock = f"00:00:{min(duration, 59):02d}"
+    return (
+        "<VAST version='3.0'>"
+        f"<Ad id='{creative_id}'>"
+        "<InLine>"
+        "<AdSystem>ARTF demand endpoint (placeholder creative)</AdSystem>"
+        f"<AdTitle>{creative_id} -- placeholder, no video asset is shipped</AdTitle>"
+        "<Creatives><Creative><Linear>"
+        f"<Duration>{clock}</Duration>"
+        "<MediaFiles>"
+        f"<MediaFile delivery='progressive' type='video/mp4' width='{width}' "
+        f"height='{height}'>"
+        f"<![CDATA[/assets/videos/not-shipped/{creative_id}.mp4]]>"
+        "</MediaFile>"
+        "</MediaFiles>"
+        "</Linear></Creative></Creatives>"
+        "</InLine></Ad></VAST>"
+    )
+
+
 def to_seatbid(bids: tuple[Bid, ...]) -> dict:
     """A single seatbid. No aliases.
 
@@ -159,6 +207,14 @@ def to_seatbid(bids: tuple[Bid, ...]) -> dict:
                 # that does not say how long its creative runs cannot be checked
                 # against them.
                 **({"dur": b.duration} if b.duration is not None else {}),
+                # Video only, and REQUIRED there: Prebid rejects a video bid with
+                # neither adm nor nurl. See video_adm for what the document is and
+                # what it does not claim.
+                **(
+                    {"adm": video_adm(b.creative_id, b.duration or 15, b.width, b.height)}
+                    if b.media_type == "video"
+                    else {}
+                ),
                 "ext": {
                     "prebid": {
                         "artf": {

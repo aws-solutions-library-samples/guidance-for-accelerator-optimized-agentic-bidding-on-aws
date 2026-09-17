@@ -208,3 +208,76 @@ def test_no_two_campaigns_claim_the_same_deal():
                 f"{deal_id} claimed by both {seen[deal_id]} and {campaign.campaign_id}"
             )
             seen[deal_id] = campaign.campaign_id
+
+
+# ---------------------------------------------------------------------------
+# VIDEO CREATIVE MARKUP.
+#
+# Prebid's ResponseBidValidator rejects a video bid carrying neither adm nor nurl,
+# and said so exactly:
+#
+#   Bid "bid-camp-skyline-video" with video type missing adm and nurl
+#
+# The endpoint had bid all three video campaigns correctly -- right price, right
+# mtype, right duration -- and the exchange dropped every one for having no
+# creative. The auction reported a single seat and nothing explained the absence.
+# ---------------------------------------------------------------------------
+
+def test_a_video_bid_carries_creative_markup():
+    video_imp = {
+        "id": "imp-1",
+        "bidfloor": 8.0,
+        "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+    }
+    response = SERVICE.decide({"id": "r", "imp": [video_imp]})
+    bids = [b for s in response.get("seatbid") or [] for b in s.get("bid") or []]
+    assert bids
+
+    for bid in bids:
+        assert bid.get("adm"), f"{bid.get('crid')} is video with no adm; Prebid drops it"
+        assert bid["adm"].startswith("<VAST")
+        assert "</VAST>" in bid["adm"]
+
+
+def test_the_video_creative_does_not_pretend_to_be_playable():
+    """The markup must not imply a video asset that is not shipped.
+
+    No video file exists in this repository, so the document says what it is. A
+    MediaFile path that looked like a real creative would assert a file that does
+    not exist.
+    """
+    video_imp = {
+        "id": "imp-1",
+        "bidfloor": 8.0,
+        "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+    }
+    response = SERVICE.decide({"id": "r", "imp": [video_imp]})
+    adm = [b for s in response["seatbid"] for b in s["bid"]][0]["adm"]
+
+    assert "placeholder" in adm.lower()
+    assert "not-shipped" in adm
+
+
+def test_a_banner_bid_carries_no_video_markup():
+    banner_imp = {
+        "id": "imp-1",
+        "bidfloor": 1.0,
+        "banner": {"w": 300, "h": 250},
+        "pmp": {"deals": [{"id": "deal-home-premium", "bidfloor": 5.0}]},
+    }
+    response = SERVICE.decide({"id": "r", "imp": [banner_imp]})
+    bids = [b for s in response.get("seatbid") or [] for b in s.get("bid") or []]
+    assert bids
+    for bid in bids:
+        assert "adm" not in bid
+
+
+def test_the_declared_duration_appears_in_the_vast_document():
+    # A VAST Duration that disagreed with bid.dur would describe a creative of a
+    # different length to the one the bid offered.
+    from demand.artfhouse.bids import video_adm
+
+    assert "<Duration>00:00:30</Duration>" in video_adm("cr-x", 30, 640, 480)
+    assert "<Duration>00:00:15</Duration>" in video_adm("cr-x", 15, 640, 480)
