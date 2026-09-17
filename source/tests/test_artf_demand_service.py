@@ -176,3 +176,90 @@ def test_deal_suppression_removes_a_candidate_before_bidding():
     }
     reasons = {e["campaignId"]: e["exclusionReason"] for e in excluded_of(suppressed)}
     assert reasons["camp-harbour"] == ExclusionReason.DEAL_SUPPRESSED.value
+
+
+# ---------------------------------------------------------------------------
+# CATEGORY TARGETING THROUGH PREBID.
+#
+# Prebid Server rewrites imp.ext per bidder and removes keys it does not
+# recognise, treating an unknown key as a bidder name. A request carrying
+# imp.ext.artf came back with
+#
+#   request.imp[0].ext.prebid.bidder.artf was dropped with a reason:
+#   request.imp[0].ext.prebid.bidder contains unknown bidder: artf
+#
+# so the category signal never reached this endpoint through an auction. It was
+# masked because an impression with NO categories matches every campaign, which
+# meant a targeted campaign bid for a reason that had nothing to do with
+# targeting. imp.ext.data is first-party data that Prebid preserves, so it is
+# read as well.
+# ---------------------------------------------------------------------------
+
+def request_with_categories(categories, location="data"):
+    """A request whose only variable is WHERE the categories are declared.
+
+    The deal is present because camp-cedar bids only on deal-home-premium: without
+    it cedar is excluded for no_deal_on_impression, and a test that then observed
+    "cedar did not bid" would be measuring the missing deal rather than targeting.
+    """
+    imp = {
+        "id": "imp-1",
+        "bidfloor": 1.0,
+        "pmp": {"deals": [{"id": "deal-home-premium", "bidfloor": 5.0}]},
+    }
+    if location == "data":
+        imp["ext"] = {"data": {"artf": {"categories": list(categories)}}}
+    elif location == "direct":
+        imp["ext"] = {"artf": {"categories": list(categories)}}
+    else:
+        raise AssertionError(f"unknown location {location!r}")
+    return {"id": "req-cat", "imp": [imp]}
+
+
+def crids_of(response):
+    return {b.get("crid") for b in bids_of(response)}
+
+
+def test_categories_under_imp_ext_data_are_read():
+    # The Prebid-safe location. Regression: before the fix this was ignored, so a
+    # non-matching category still admitted every targeted campaign.
+    response = SERVICE.decide(request_with_categories(["home"], "data"))
+    assert "cr-cedar-300x250" in crids_of(response)
+
+
+def test_categories_under_imp_ext_artf_are_still_read_for_direct_callers():
+    # Callers that reach this endpoint without Prebid in the path.
+    response = SERVICE.decide(request_with_categories(["home"], "direct"))
+    assert "cr-cedar-300x250" in crids_of(response)
+
+
+def test_a_non_matching_category_excludes_a_targeted_campaign():
+    # THE check that proves targeting is exercised at all. camp-cedar targets
+    # home and lifestyle, so a finance impression must not admit it. Without this,
+    # a passing "cedar bid" says nothing: an impression with no categories matches
+    # everything.
+    response = SERVICE.decide(request_with_categories(["finance"], "data"))
+    assert "cr-cedar-300x250" not in crids_of(response)
+
+
+def test_a_non_matching_category_still_admits_the_open_market_campaign():
+    # Exclusion has to be selective. camp-openfield declares no target categories,
+    # so it is unrestricted and must survive a category that excludes others.
+    response = SERVICE.decide(request_with_categories(["finance"], "data"))
+    assert "cr-openfield-300x250" in crids_of(response)
+
+
+def test_the_data_location_wins_when_both_are_present():
+    # Read order is not arbitrary: the Prebid-safe location is authoritative,
+    # because that is the one an auction can actually deliver.
+    imp = {
+        "id": "imp-1",
+        "bidfloor": 1.0,
+        "pmp": {"deals": [{"id": "deal-home-premium", "bidfloor": 5.0}]},
+        "ext": {
+            "data": {"artf": {"categories": ["finance"]}},
+            "artf": {"categories": ["home"]},
+        },
+    }
+    response = SERVICE.decide({"id": "req-cat", "imp": [imp]})
+    assert "cr-cedar-300x250" not in crids_of(response)

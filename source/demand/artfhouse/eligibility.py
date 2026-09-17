@@ -60,10 +60,31 @@ def _is_suppressed(deal: dict) -> bool:
 
 
 def _categories_of(imp: dict) -> tuple[str, ...]:
-    """Content categories on the impression, if any."""
+    """Content categories on the impression, if any.
+
+    TWO locations are read, and both are load-bearing:
+
+      imp.ext.data.artf.categories  -- the only one that SURVIVES Prebid Server.
+          Prebid rewrites imp.ext per bidder and removes keys it does not recognise,
+          treating an unknown key as a bidder name: a request carrying
+          imp.ext.artf came back with "request.imp[0].ext.prebid.bidder.artf was
+          dropped ... contains unknown bidder: artf". imp.ext.data is first-party
+          data, which Prebid preserves and forwards, so that is where categories
+          have to live to reach this endpoint through an auction.
+
+      imp.ext.artf.categories       -- kept for callers that reach this endpoint
+          DIRECTLY, without Prebid in the path, which is how the demand endpoint is
+          exercised in isolation.
+
+    Read in that order, so the Prebid-safe location wins when both are present.
+    """
     ext = (imp or {}).get("ext") or {}
-    artf = ext.get("artf") or {}
-    cats = artf.get("categories") or []
+
+    data_artf = ((ext.get("data") or {}).get("artf")) or {}
+    cats = data_artf.get("categories") or []
+    if not cats:
+        cats = (ext.get("artf") or {}).get("categories") or []
+
     return tuple(str(c) for c in cats)
 
 

@@ -11,9 +11,14 @@
     "                                   from catching a regression of the defect",
     "                                   that made assert_supported_currency raise",
     "                                   AttributeError and return 500.",
-    "  site.cat / imp.ext.artf.categories",
-    "                                 - 'home' is what makes camp-cedar eligible;",
-    "                                   without it artfhouse has nothing to bid.",
+    "  imp.ext.data.artf.categories   - 'home' is what makes camp-cedar's targeting",
+    "                                   MATCH. It sits under imp.ext.DATA because that",
+    "                                   is the only place Prebid preserves: an earlier",
+    "                                   imp.ext.artf was dropped with 'contains unknown",
+    "                                   bidder: artf', so the signal never reached the",
+    "                                   demand endpoint and cedar bid only because an",
+    "                                   impression with NO categories matches",
+    "                                   everything.",
     "  pmp.deals[].id                 - deal-home-premium is a REAL id from",
     "                                   source/demand/artfhouse/catalog.py. An",
     "                                   invented id returns no bid, which looks",
@@ -73,7 +78,8 @@
       },
       "ext": {
         "artfhouse": {},
-        "amt": {"placementId": "artf-verification-placement"}
+        "amt": {"placementId": "artf-verification-placement"},
+        "data": {"artf": {"categories": ["home"]}}
       }
     }
   ],
