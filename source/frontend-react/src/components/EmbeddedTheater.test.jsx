@@ -90,10 +90,10 @@ afterEach(() => {
 });
 
 const click = (el) => act(() => el.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-const openTheater = () => {
-  click(host.querySelector(".scenario"));
+// No reveal click: the dropdown selects the scenario and the card shows its
+// actions immediately.
+const openTheater = () =>
   click(host.querySelector('[data-testid="scenario-open-theater"]'));
-};
 
 describe("opening the Theater from a scenario card", () => {
   it("starts with the sidebar present and no Theater", () => {
@@ -143,7 +143,6 @@ describe("closing the Theater", () => {
 
   it("does not discard a run that happened before the Theater opened", async () => {
     // Send a scenario the ordinary way first, so there is a timeline to lose.
-    click(host.querySelector(".scenario"));
     await act(async () => {
       host
         .querySelector('[data-testid="scenario-send"]')

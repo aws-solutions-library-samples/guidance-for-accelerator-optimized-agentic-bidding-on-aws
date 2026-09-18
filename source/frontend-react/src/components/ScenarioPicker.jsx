@@ -215,6 +215,15 @@ export default function ScenarioPicker({
   // empty panel after every toggle switch, which reads as a load failure.
   const shown = options.find((s) => s.id === activeScenarioId) ?? options[0] ?? null;
 
+  // Tell the parent which scenario is on screen whenever the two disagree — on
+  // first render, and after a surface switch leaves the previous selection behind.
+  // Without this the card displays one scenario while the app's idea of "current"
+  // is null or a scenario from the other surface, and the selection ring never
+  // lights up because nothing ever claimed the default was selected.
+  useEffect(() => {
+    if (shown && shown.id !== activeScenarioId) onSelect?.(shown);
+  }, [shown, activeScenarioId, onSelect]);
+
   const handleSurfaceChange = useCallback(
     (next) => {
       if (next === surface) return;
@@ -277,7 +286,6 @@ export default function ScenarioPicker({
             isActive={activeScenarioId === shown.id}
             isLoading={runningScenarioId === shown.id}
             disabled={disabled}
-            onSelect={onSelect}
             onSend={onSend}
             onOpenTheater={onOpenTheater}
           />

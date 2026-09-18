@@ -102,6 +102,23 @@ describe("selection", () => {
     expect(host.querySelectorAll(".scenario").length).toBe(1);
   });
 
+  it("reports the default selection upward on first render", () => {
+    // Otherwise the card displays one scenario while the app's idea of "current"
+    // is still null, and the selection ring never lights up.
+    const onSelect = vi.fn();
+    render({ onSelect });
+    expect(onSelect).toHaveBeenCalled();
+    expect(onSelect.mock.calls[0][0].id).toBe(scenariosOnSurface(SURFACE_REQUEST)[0].id);
+  });
+
+  it("stops reporting once the parent agrees with what is shown", () => {
+    // Guards the sync effect against re-firing on every render.
+    const onSelect = vi.fn();
+    const first = scenariosOnSurface(SURFACE_REQUEST)[0];
+    render({ activeScenarioId: first.id, onSelect });
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("selects the first scenario of the new surface when the toggle changes", () => {
     // Leaving the previous selection would show an empty panel, which reads as a
     // load failure rather than as a switched filter.
@@ -139,7 +156,9 @@ describe("selection", () => {
 
   it("does not switch surface when the same toggle is clicked again", () => {
     const onSelect = vi.fn();
-    render({ onSelect });
+    // Pre-selected, so the mount-time sync has nothing to report and anything
+    // recorded below came from the click.
+    render({ activeScenarioId: scenariosOnSurface(SURFACE_REQUEST)[0].id, onSelect });
     click(host.querySelector(`[data-testid="scenario-surface-${SURFACE_REQUEST}"]`));
     expect(onSelect).not.toHaveBeenCalled();
   });
@@ -209,9 +228,10 @@ describe("keyboard and ARIA", () => {
   });
 
   it("moves the active row with the arrows without selecting anything", () => {
-    // Arrowing must not commit: the reader is looking, not choosing.
+    // Arrowing must not commit: the reader is looking, not choosing. Pre-selected
+    // so the mount-time sync has nothing to report and only the keys are measured.
     const onSelect = vi.fn();
-    render({ onSelect });
+    render({ activeScenarioId: scenariosOnSurface(SURFACE_REQUEST)[0].id, onSelect });
     openList();
     const ids = optionValues();
     key(list(), "ArrowDown");
@@ -244,7 +264,7 @@ describe("keyboard and ARIA", () => {
 
   it("closes on Escape without selecting", () => {
     const onSelect = vi.fn();
-    render({ onSelect });
+    render({ activeScenarioId: scenariosOnSurface(SURFACE_REQUEST)[0].id, onSelect });
     openList();
     key(list(), "ArrowDown");
     key(list(), "Escape");
@@ -289,12 +309,40 @@ describe("keyboard and ARIA", () => {
 });
 
 describe("the two card actions", () => {
-  it("offers both Send and Step through in Auction Theater", () => {
+  it("offers both Send and Step through in Auction Theater with no extra click", () => {
+    // The dropdown selects; the card is shown ready to run. There used to be a
+    // click-to-reveal step here, which existed only because the sidebar once
+    // listed every card.
     render();
-    click(host.querySelector(".scenario"));
-    render({ activeScenarioId: scenariosOnSurface(SURFACE_REQUEST)[0].id });
     expect(host.querySelector('[data-testid="scenario-send"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="scenario-open-theater"]')).not.toBeNull();
+  });
+
+  it("shows the tuner controls immediately", () => {
+    render();
+    expect(host.querySelector(".scenario-tuner")).not.toBeNull();
+    expect(host.querySelectorAll(".tuner-row").length).toBeGreaterThan(0);
+  });
+
+  it("does not submit when the card body is clicked", () => {
+    // The card carries sliders and two buttons. Making the body itself submit was
+    // an accidental submit waiting to happen.
+    const onSend = vi.fn();
+    const onOpenTheater = vi.fn();
+    render({ onSend, onOpenTheater });
+    click(host.querySelector('[data-testid="scenario-card"]'));
+    click(host.querySelector(".scenario-brief"));
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onOpenTheater).not.toHaveBeenCalled();
+  });
+
+  it("does not present the card as a control", () => {
+    // It wraps real buttons and range inputs, so role="button" on the container
+    // was never valid.
+    render();
+    const card = host.querySelector('[data-testid="scenario-card"]');
+    expect(card.getAttribute("role")).toBeNull();
+    expect(card.getAttribute("tabindex")).toBeNull();
   });
 
   it("hands the same tuner values to both actions", () => {

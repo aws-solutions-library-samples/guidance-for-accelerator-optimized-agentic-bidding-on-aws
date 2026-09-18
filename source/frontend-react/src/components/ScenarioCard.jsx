@@ -376,12 +376,26 @@ function initialTunerValue(scenario, key) {
   return override === undefined ? TUNER_DEFAULTS[key] : override;
 }
 
+/**
+ * The full detail and controls for ONE scenario — the one the picker has selected.
+ *
+ * The card is not itself a control any more. It used to be a `role="button"` div
+ * whose click meant "select me" on the first press and "submit me" on the second,
+ * with the tuner hidden until that first press. That made sense when the sidebar
+ * listed every scenario and you had to choose among cards. With a dropdown above
+ * it there is only ever one card, and it is already the selection — so the hidden
+ * state was a click that existed for no reason, and click-to-submit was an
+ * accidental submit waiting to happen on a panel full of sliders.
+ *
+ * Now: the dropdown selects, the card shows, and the only things that submit are
+ * the two buttons that say so. It also stops nesting buttons and range inputs
+ * inside a `role="button"`, which was never valid.
+ */
 export default function ScenarioCard({
   scenario,
   isActive,
   isLoading,
   disabled,
-  onSelect,
   onSend,
   onOpenTheater,
 }) {
@@ -405,17 +419,6 @@ export default function ScenarioCard({
     explore,
   });
 
-  const handleClick = (e) => {
-    if (disabled) return;
-    // Don't trigger select when clicking sliders
-    if (e.target.closest(".scenario-tuner")) return;
-    if (isActive) {
-      onSend(scenario, getParams());
-    } else {
-      onSelect(scenario);
-    }
-  };
-
   const handleSend = (e) => {
     e.stopPropagation();
     onSend(scenario, getParams());
@@ -430,22 +433,10 @@ export default function ScenarioCard({
   };
 
   return (
-    <div
+    <section
       className={`scenario ${isActive ? "active" : ""} ${isLoading ? "loading" : ""} ${disabled ? "disabled" : ""}`}
-      role="button"
-      tabIndex={disabled ? -1 : 0}
-      aria-label={`Run scenario: ${scenario.name}`}
-      aria-disabled={disabled}
-      onClick={handleClick}
-      onKeyDown={(e) => {
-        if (disabled) return;
-        if (e.target.closest(".scenario-tuner")) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          if (isActive) onSend(scenario, getParams());
-          else onSelect(scenario);
-        }
-      }}
+      aria-label={`Scenario: ${scenario.name}`}
+      data-testid="scenario-card"
     >
       <h3>{scenario.name}</h3>
       {scenario.models?.length > 0 && (
@@ -471,9 +462,10 @@ export default function ScenarioCard({
         ))}
       </div>
 
-      {/* Inline tuner — only visible when active */}
-      {isActive && (
-        <div className="scenario-tuner" onClick={(e) => e.stopPropagation()}>
+      {/* The tuner is always here. It used to be revealed by clicking the card,
+          which was a click with nothing behind it once the dropdown became the
+          thing that selects. */}
+      <div className="scenario-tuner">
           {controls.includes("bidFloor") && (
             <div className="tuner-row">
               <label>Bid Floor</label>
@@ -562,8 +554,7 @@ export default function ScenarioCard({
               Step through in Auction Theater
             </button>
           </div>
-        </div>
-      )}
-    </div>
+      </div>
+    </section>
   );
 }
