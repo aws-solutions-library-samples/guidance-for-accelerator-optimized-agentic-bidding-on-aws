@@ -175,6 +175,52 @@ def _build_and_upload_react(s3, bucket_name: str, react_dir: Path) -> None:
             ExtraArgs={"ContentType": ct, "CacheControl": _cache_control(key)},
         )
 
+    _prune_stale(s3, bucket_name, dist_dir)
+
+
+#: Prefixes pruned after upload. Only PATH-STABLE prefixes belong here.
+#
+# `assets/` is deliberately NOT pruned. Vite content-hashes those filenames, so
+# every past deploy's bundle is still present and still reachable by the
+# index.html that named it -- a client holding a cached index.html (which is
+# served no-cache but may still be in flight) would 404 on its own bundle if the
+# old asset were removed.
+#
+# `samples/` is the opposite case: the filename is the scenario's identity, so a
+# removed scenario leaves a payload behind at a stable URL, and that file goes on
+# being served as if the app still ships it. It also contradicts
+# test_scenario_card_fixture_wiring's no-orphaned-payloads assertion, which can
+# only see the working tree.
+_PRUNED_PREFIXES = ("samples/",)
+
+
+def _prune_stale(s3, bucket_name: str, dist_dir: Path) -> None:
+    """Delete objects under _PRUNED_PREFIXES that the new build does not contain."""
+    built = {
+        str(p.relative_to(dist_dir))
+        for p in dist_dir.rglob("*")
+        if p.is_file()
+    }
+
+    stale: list[dict] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for prefix in _PRUNED_PREFIXES:
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                if obj["Key"] not in built:
+                    stale.append({"Key": obj["Key"]})
+
+    if not stale:
+        return
+
+    _LOG.info("Removing %d object(s) the build no longer contains: %s",
+              len(stale), ", ".join(o["Key"] for o in stale))
+    # Batched, and scoped to the keys listed above -- never a prefix wildcard.
+    for i in range(0, len(stale), 1000):
+        s3.delete_objects(
+            Bucket=bucket_name, Delete={"Objects": stale[i:i + 1000], "Quiet": True}
+        )
+
 
 def _cache_control(key: str) -> str:
     """Cache-Control for a dist object.
