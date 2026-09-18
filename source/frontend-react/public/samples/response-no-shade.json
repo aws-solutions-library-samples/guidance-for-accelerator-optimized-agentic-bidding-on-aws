@@ -1,0 +1,55 @@
+{
+  "id": "sample-response-no-shade-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+  "originator": {"type": "TYPE_DSP", "id": "dsp-tallgrass-001"},
+  "applicable_intents": [
+    "BID_SHADE",
+    "ADD_METRICS"
+  ],
+  "bid_request": {
+    "id": "auction-response-no-shade-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 320, "h": 50, "pos": 3},
+        "bidfloor": 0.50,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-recipes-01",
+      "domain": "weeknight-kitchen.example",
+      "cat": ["IAB8"],
+      "page": "https://weeknight-kitchen.example/recipes/sheet-pan-dinners"
+    },
+    "user": {
+      "id": "user-no-shade-01",
+      "yob": 1997,
+      "gender": "F"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36",
+      "ip": "203.0.113.92",
+      "geo": {"country": "USA", "region": "OR"}
+    }
+  },
+  "bid_response": {
+    "id": "auction-response-no-shade-001",
+    "seatbid": [
+      {
+        "seat": "dsp-tallgrass-001",
+        "bid": [
+          {
+            "id": "bid-tallgrass-thin",
+            "impid": "imp-1",
+            "price": 1.20,
+            "adomain": ["tallgrass-meals.example"],
+            "crid": "cr-tallgrass-320x50",
+            "cid": "camp-tallgrass-subscription"
+          }
+        ]
+      }
+    ]
+  }
+}

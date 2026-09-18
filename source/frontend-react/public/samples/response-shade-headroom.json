@@ -1,0 +1,55 @@
+{
+  "id": "sample-response-headroom-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+  "originator": {"type": "TYPE_DSP", "id": "dsp-northwind-001"},
+  "applicable_intents": [
+    "BID_SHADE",
+    "ADD_METRICS"
+  ],
+  "bid_request": {
+    "id": "auction-response-headroom-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 728, "h": 90, "pos": 1},
+        "bidfloor": 0.10,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-brief-01",
+      "domain": "the-morning-brief.example",
+      "cat": ["IAB12"],
+      "page": "https://the-morning-brief.example/markets/pre-open-summary"
+    },
+    "user": {
+      "id": "user-headroom-01",
+      "yob": 1988,
+      "gender": "F"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      "ip": "203.0.113.90",
+      "geo": {"country": "USA", "region": "NY"}
+    }
+  },
+  "bid_response": {
+    "id": "auction-response-headroom-001",
+    "seatbid": [
+      {
+        "seat": "dsp-northwind-001",
+        "bid": [
+          {
+            "id": "bid-northwind-headroom",
+            "impid": "imp-1",
+            "price": 25.00,
+            "adomain": ["northwind-outfitters.example"],
+            "crid": "cr-northwind-728x90",
+            "cid": "camp-northwind-brand"
+          }
+        ]
+      }
+    ]
+  }
+}

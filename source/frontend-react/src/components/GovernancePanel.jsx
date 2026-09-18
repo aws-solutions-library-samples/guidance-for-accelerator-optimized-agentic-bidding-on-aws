@@ -9,6 +9,9 @@ import {
   GovernanceVerdictCard, SessionAuditTrail, RecommendationBadge,
 } from "./closedLoopUi.jsx";
 import LoadTestSweepStatus from "./LoadTestSweepStatus.jsx";
+import GovernanceStepper, { GOVERNANCE_STEPS } from "./GovernanceStepper.jsx";
+import LoadTestPanel, { LoadTestResults } from "./LoadTestPanel.jsx";
+import BidBubbleOverlay from "./BidBubbleOverlay.jsx";
 import { COMPARABLE_MODEL_TYPES, isFilModel } from "../utils/comparableModels.js";
 
 // Default pipeline stages shown (all "done"/grey) before any scenario has run,
@@ -70,6 +73,16 @@ const TRAINING_MODEL_TYPES = [
  * decision, and the rationale. Unknown/unreachable states are shown honestly.
  */
 export default function GovernancePanel() {
+  // Which step's panel is showing. Steps are freely clickable — nothing here is
+  // truly sequential, and gating them would block a user who only wants to read a
+  // past comparison.
+  const [step, setStep] = useState(GOVERNANCE_STEPS[0].key);
+
+  // Load test (Step 1). This state used to live in App.jsx and be threaded into
+  // the sidebar; it is local now that both halves of the load test are on this page.
+  const [loadTestState, setLoadTestState] = useState(null);
+  const [loadTestRunning, setLoadTestRunning] = useState(false);
+
   const [scenarios, setScenarios] = useState([]);
   const [selected, setSelected] = useState(null);
   const [modelType, setModelType] = useState("dlrm_bid_shader");
@@ -640,28 +653,53 @@ export default function GovernancePanel() {
   return (
     <div className="cl-page">
       <div className="cl-page-header">
-        <h2>Model Governance — Bid Request Mutation Outcomes</h2>
+        <h2>Model Governance</h2>
         <p className="cl-page-desc">
           Each model in the pipeline drives a specific ARTF mutation on the bidstream. Governance decisions (promote, reject, extend) directly affect how bids are priced, which deals are activated, and what metrics are attached.
         </p>
       </div>
 
-      {/* Load-test outcome pipeline and Train-from-load-test sit side by side:
-          the pipeline card shows which runs a Glue ETL sweep has moved into the
-          training bucket, and the training card trains from one of them. Both
-          are compact forms; collapses to one column under 980px. The step log,
-          session history and model registry below stay full-width. */}
-      <div className="cl-side-by-side">
-      <section className="cl-side-by-side-col">
-      <div className="cl-section-title">Load test outcome pipeline</div>
-      <LoadTestSweepStatus onRunBecameTrainable={fetchTrainableRuns} />
-      </section>
+      <GovernanceStepper activeKey={step} onSelect={setStep} />
 
-      {/* Train from load test (FR-4/FR-5, Story 3): real cost/duration
+      {/* STEP 1 — Run Load Test. Moved here from the landing page, where the
+          launcher lived in the sidebar and the results rendered in the main area:
+          two halves of one activity on one screen instead of split across two. */}
+      {step === "load-test" ? (
+        <section className="gov-step-panel" data-testid="governance-panel-load-test">
+          <div className="cl-section-title">Run load test</div>
+          <LoadTestPanel
+            onRunningChange={setLoadTestRunning}
+            onResultChange={setLoadTestState}
+          />
+          <LoadTestResults
+            progress={loadTestState?.progress}
+            result={loadTestState?.result}
+            running={loadTestState?.running || false}
+            error={loadTestState?.error}
+          />
+          <BidBubbleOverlay
+            running={loadTestState?.running}
+            progress={loadTestState?.progress}
+          />
+        </section>
+      ) : null}
+
+      {/* STEP 2 — the pipeline card shows which runs a Glue ETL sweep has moved
+          into the training bucket. It used to sit beside Step 3 in a two-column
+          row; the two are now separate steps, so the row is gone. */}
+      {step === "outcome-pipeline" ? (
+        <section className="gov-step-panel" data-testid="governance-panel-outcome-pipeline">
+          <div className="cl-section-title">Load test outcome pipeline</div>
+          <LoadTestSweepStatus onRunBecameTrainable={fetchTrainableRuns} />
+        </section>
+      ) : null}
+
+      {/* STEP 3 — Train from load test (FR-4/FR-5, Story 3): real cost/duration
           estimate + explicit confirmation + concurrency-guarded trigger. Its
           own model selector (decoupled from the general one) since
           ncf_deal_manager training is parked. */}
-      <section className="cl-side-by-side-col">
+      {step === "train" ? (
+      <section className="gov-step-panel" data-testid="governance-panel-train">
       <div className="cl-section-title">Train from load test</div>
       <div className="cl-card sg-elevated" data-testid="governance-train-card">
         <div className="cl-control-group">
@@ -827,12 +865,16 @@ export default function GovernancePanel() {
         )}
       </div>
 
-      {/* Compare load-test outcomes (FR-7/FR-8, Story 5) + Promote
-          (FR-9/FR-10, Story 6) — sits directly under "Train from load test" in
-          the right column, so both fit beside the pipeline card on the left.
-          Every result below is labeled by source — load-test-derived, distinct
-          from the automated pipeline's live-canary-CloudWatch-derived decisions. */}
-      <div className="cl-section-title">Compare load-test outcomes</div>
+      </section>
+      ) : null}
+
+      {/* STEP 4 — Test Model Versions. Compare load-test outcomes (FR-7/FR-8,
+          Story 5) + Promote (FR-9/FR-10, Story 6). Every result below is labeled
+          by source — load-test-derived, distinct from the automated pipeline's
+          live-canary-CloudWatch-derived decisions. */}
+      {step === "test-versions" ? (
+      <section className="gov-step-panel" data-testid="governance-panel-test-versions">
+      <div className="cl-section-title">Test model versions</div>
       <div className="cl-card sg-elevated" data-testid="governance-compare-card">
         {eligibleRunsError && (
           <div className="cl-honest cl-honest-block">Could not load eligible runs: {eligibleRunsError}</div>
@@ -965,7 +1007,12 @@ export default function GovernancePanel() {
       </div>
 
       </section>
-      </div>
+      ) : null}
+
+      {/* Model registry sits OUTSIDE the stepper, below every step. It is a
+          reference view rather than a stage of the journey, and it is useful
+          whichever step is open -- so it stays visible instead of being reachable
+          from only one of them. */}
 
       <div className="cl-section-title">Model registry</div>
       <div className="info-bar" style={{ margin: "0 0 12px" }}>

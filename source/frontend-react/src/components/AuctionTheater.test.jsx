@@ -19,8 +19,17 @@ vi.mock("../hooks/useOrchestratorClientWithBase.js", () => ({
   }),
 }));
 
+// The Theater fetches its scenario payload on mount. jsdom has no fetch here, so
+// it is stubbed to a never-resolving promise: these tests are about the chrome the
+// Theater renders while a run is in flight, not about the run.
+const fetchMock = vi.fn(() => new Promise(() => {}));
+vi.stubGlobal("fetch", fetchMock);
+
 import AuctionTheater, { factualCaption } from "./AuctionTheater.jsx";
 import { BEAT_RECAP } from "../utils/theaterBeats.js";
+import { SCENARIOS } from "./ScenarioCard.jsx";
+
+const SCENARIO = SCENARIOS[0];
 
 let container;
 let root;
@@ -37,26 +46,65 @@ afterEach(() => {
 });
 
 describe("AuctionTheater", () => {
-  it("mounts and offers a scenario to choose", () => {
-    act(() => root.render(<AuctionTheater onExit={() => {}} />));
-    expect(container.querySelector('[data-testid="theater-scenario-select"]')).not.toBeNull();
-    expect(container.querySelectorAll(".th-scenario").length).toBeGreaterThan(0);
+  // Block body, not a concise arrow: `mockClear()` returns the mock, and Vitest
+  // treats a function returned from a hook as a TEARDOWN callback. It would then
+  // invoke the fetch mock after every test and await its never-resolving promise,
+  // which times out the hook — with the failure reported against the hook, not
+  // against anything this file is actually asserting.
+  beforeEach(() => {
+    fetchMock.mockClear();
   });
 
-  it("does not claim a step count before a scenario has been submitted", () => {
-    act(() => root.render(<AuctionTheater onExit={() => {}} />));
+  it("names the scenario it was given", () => {
+    act(() => root.render(
+      <AuctionTheater scenario={SCENARIO} params={{}} onExit={() => {}} />
+    ));
+    expect(
+      container.querySelector('[data-testid="theater-scenario-name"]').textContent
+    ).toBe(SCENARIO.name);
+  });
+
+  it("has no scenario chooser of its own", () => {
+    // It is opened from a scenario card and always arrives with one. A second
+    // place to pick a scenario would be a second place for the two to disagree
+    // about which tuner values were used.
+    act(() => root.render(
+      <AuctionTheater scenario={SCENARIO} params={{}} onExit={() => {}} />
+    ));
+    expect(container.querySelector('[data-testid="theater-scenario-select"]')).toBeNull();
+  });
+
+  it("submits the scenario it was given on mount", () => {
+    act(() => root.render(
+      <AuctionTheater scenario={SCENARIO} params={{}} onExit={() => {}} />
+    ));
+    expect(fetchMock).toHaveBeenCalled();
+    expect(String(fetchMock.mock.calls[0][0])).toContain(SCENARIO.file);
+  });
+
+  it("does not claim a step count before the run is ready", () => {
+    act(() => root.render(
+      <AuctionTheater scenario={SCENARIO} params={{}} onExit={() => {}} />
+    ));
     const label = container.querySelector('[data-testid="theater-progress-label"]');
     expect(label.textContent).toBe("Preparing");
     expect(container.textContent).not.toMatch(/Step \d+ of \d+/);
   });
 
-  it("offers an exit", () => {
+  it("offers a close control", () => {
     const onExit = vi.fn();
-    act(() => root.render(<AuctionTheater onExit={onExit} />));
+    act(() => root.render(
+      <AuctionTheater scenario={SCENARIO} params={{}} onExit={onExit} />
+    ));
     const exit = container.querySelector('[data-testid="theater-exit"]');
     expect(exit).not.toBeNull();
     act(() => exit.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onExit).toHaveBeenCalled();
+  });
+
+  it("does not submit anything when given no scenario", () => {
+    act(() => root.render(<AuctionTheater scenario={null} params={{}} onExit={() => {}} />));
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

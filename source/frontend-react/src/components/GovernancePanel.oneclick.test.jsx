@@ -104,6 +104,13 @@ describe('one-click Compare current vs. retrained (DLRM)', () => {
     await act(async () => { root.render(<GovernancePanel />); });
     await flush();
 
+    // The compare card lives in Step 4 now, and Step 1 is the landing step, so
+    // the step has to be opened first — the same click a user makes.
+    const step4 = container.querySelector('[data-testid="governance-step-test-versions"]');
+    expect(step4).toBeTruthy();
+    await act(async () => { step4.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    await flush();
+
     const btn = container.querySelector('[data-testid="governance-compare-retrained-button"]');
     expect(btn).toBeTruthy();
     // Eligible-runs auto-selected the control run, so the button is enabled.

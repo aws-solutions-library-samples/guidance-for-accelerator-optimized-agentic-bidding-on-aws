@@ -9,8 +9,7 @@
 // exactly the state that moving forwards to the same index produces, so there is
 // no reset-and-replay step and no possibility of residue.
 
-import { useMemo } from "react";
-import { SCENARIOS } from "./ScenarioCard.jsx";
+import { useMemo, useEffect, useRef } from "react";
 import { useTheaterRun, RUN_IDLE, RUN_SUBMITTING, RUN_READY, RUN_FAILED } from "../hooks/useTheaterRun.js";
 import { useBeatStepper } from "../hooks/useBeatStepper.js";
 import { useBeatCaption } from "../hooks/useBeatCaption.js";
@@ -33,9 +32,32 @@ import { SellSideDecisionsPanel } from "./SellSideDecisionsPanel.jsx";
 // originally defined in this module and is imported from here by tests.
 export { factualCaption };
 
-export default function AuctionTheater({ onExit }) {
+/**
+ * The stepped walkthrough for ONE scenario, chosen before it mounts.
+ *
+ * It used to own a "Choose a scenario" page of its own, because it was a
+ * full-screen surface reached from the top nav with no scenario in hand. It is now
+ * embedded in the main area and opened from a scenario card, so the scenario and
+ * its tuner values arrive as props and the run starts on mount. The chooser is
+ * gone rather than hidden: a second place to pick a scenario is a second place for
+ * the two to disagree about which tuner values were used.
+ */
+export default function AuctionTheater({ scenario, params, onExit }) {
   const run = useTheaterRun();
   const stepper = useBeatStepper({ beats: run.beats });
+
+  // Starts the run for whichever scenario is mounted, and re-runs if the parent
+  // swaps it. `params` is deliberately NOT a dependency: it is a fresh object on
+  // every parent render, so depending on it would resubmit in a loop. The values
+  // are read at submit time, which is the moment the button was pressed.
+  const startRef = useRef(run.start);
+  startRef.current = run.start;
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  useEffect(() => {
+    if (!scenario) return;
+    void startRef.current(scenario, paramsRef.current ?? {});
+  }, [scenario?.id]);
 
   const { beats } = run;
   const { index, currentBeat } = stepper;
@@ -65,49 +87,30 @@ export default function AuctionTheater({ onExit }) {
     : `Step ${index + 1} of ${stepper.total}`;
 
   return (
-    <div className="th-stage">
+    <div className="th-stage th-stage-embedded">
+      <div className="th-embedded-bar">
+        <span className="th-embedded-scenario" data-testid="theater-scenario-name">
+          {scenario?.name ?? "No scenario"}
+        </span>
+        <button
+          type="button"
+          className="th-btn th-btn-ghost th-embedded-close"
+          onClick={onExit}
+          data-testid="theater-exit"
+        >
+          Close
+        </button>
+      </div>
+
       <TheaterSceneRibbon
         context={run.context}
         revealed={sawOrigin && run.status === RUN_READY}
         stepLabel={stepLabel}
       />
 
-      {run.status === RUN_IDLE ? (
-        <div className="th-chooser">
-          <h2 className="th-chooser-title">Choose a scenario</h2>
-          <p className="th-chooser-sub">
-            Each scenario is submitted to the running orchestrator. The walkthrough
-            has one step for every mutation the containers actually return, so its
-            length depends on the scenario.
-          </p>
-          <div className="th-chooser-list" data-testid="theater-scenario-select">
-            {SCENARIOS.map((s) => (
-              <button key={s.id} type="button" className="th-scenario"
-                onClick={() => run.start(s)}>
-                <span className="th-scenario-name">{s.name}</span>
-                {/* A scenario is a publisher bid request, so it is described the way
-                    the sell side reads one: the page, the audience asserted on it,
-                    and the demand eligible to compete. */}
-                <span className="th-scenario-desc">
-                  <span className="th-scenario-facet">
-                    <span className="th-scenario-facet-key">Page</span>{s.page}
-                  </span>
-                  <span className="th-scenario-facet">
-                    <span className="th-scenario-facet-key">Audience</span>{s.audience}
-                  </span>
-                  <span className="th-scenario-facet">
-                    <span className="th-scenario-facet-key">Demand</span>{s.demand}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
-          <button type="button" className="th-btn th-btn-ghost th-chooser-exit"
-            onClick={onExit} data-testid="theater-exit">Exit</button>
-        </div>
-      ) : null}
-
-      {run.status === RUN_SUBMITTING ? (
+      {/* RUN_IDLE is now only the instant between mount and the start effect
+          firing. It is not a chooser any more — there is nothing to choose. */}
+      {run.status === RUN_IDLE || run.status === RUN_SUBMITTING ? (
         <div className="th-chooser">
           <h2 className="th-chooser-title">Submitting to the orchestrator</h2>
           <p className="th-chooser-sub">
@@ -127,11 +130,19 @@ export default function AuctionTheater({ onExit }) {
             There is no walkthrough to show, because nothing was processed.
           </p>
           <div className="th-chooser-actions">
-            <button type="button" className="th-btn th-btn-primary" onClick={run.reset}>
-              Choose a scenario
+            {/* Retry re-submits THIS scenario. There is no "choose another" any
+                more; closing returns to the picker, which is where scenarios are
+                chosen. */}
+            <button
+              type="button"
+              className="th-btn th-btn-primary"
+              onClick={() => run.start(scenario, params ?? {})}
+              data-testid="theater-retry"
+            >
+              Try again
             </button>
             <button type="button" className="th-btn th-btn-ghost" onClick={onExit}>
-              Exit
+              Close
             </button>
           </div>
         </div>

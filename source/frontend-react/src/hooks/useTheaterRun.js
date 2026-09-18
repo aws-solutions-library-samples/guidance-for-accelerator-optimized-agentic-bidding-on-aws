@@ -11,6 +11,7 @@ import { useOrchestratorClientWithBase } from "./useOrchestratorClientWithBase.j
 import { authFetch } from "../authFetch.js";
 import { buildBeats, buildScenarioContext } from "../utils/theaterBeats.js";
 import { isLiveAuctionResponse } from "../utils/bidResponseFixture.js";
+import { loadScenarioPayload } from "../utils/scenarioPayload.js";
 
 export const RUN_IDLE = "idle";
 export const RUN_SUBMITTING = "submitting";
@@ -133,7 +134,16 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     }
   }, [baseUrl]);
 
-  const start = useCallback(async (scenario) => {
+  /**
+   * Submit one scenario and turn the result into a beat sequence.
+   *
+   * `params` are the scenario card's tuner values. They are applied through the
+   * SAME `loadScenarioPayload` the `▶ Send` path uses, so stepping through a
+   * scenario in the Theater submits the identical bytes that sending it would —
+   * a second copy of the patching logic here is how the two would drift, and the
+   * drift would be invisible: the Theater would narrate a run nothing else made.
+   */
+  const start = useCallback(async (scenario, params = {}) => {
     const token = ++runTokenRef.current;
     setScenarioId(scenario?.id ?? null);
     setStatus(RUN_SUBMITTING);
@@ -146,11 +156,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setAuctionFault(null);
 
     try {
-      // The scenario payload is a static asset on the same origin, not a backend
-      // call, so it takes plain fetch.
-      const resp = await fetch(`/samples/${scenario.file}?t=${Date.now()}`);
-      if (!resp.ok) throw new Error(`Could not load scenario ${scenario.file} (${resp.status})`);
-      const payload = await resp.json();
+      const payload = await loadScenarioPayload(scenario, params);
       if (token !== runTokenRef.current) return null;
 
       setContext(buildScenarioContext(payload));

@@ -1,7 +1,7 @@
 import { isAuthConfigured, signOut, getCurrentUserEmail } from "../auth";
 import { useState, useEffect } from "react";
 
-export default function Header({ loading, error, onContainersClick, view, onViewChange, onOpenTheater }) {
+export default function Header({ loading, error, onContainersClick, view, onViewChange }) {
   const statusClass = error ? "err" : loading ? "warn" : "ok";
   const statusLabel = error ? "Error" : loading ? "Processing…" : "Connected";
   const [userEmail, setUserEmail] = useState(null);
@@ -47,15 +47,9 @@ export default function Header({ loading, error, onContainersClick, view, onView
           >
             Governance
           </button>
-          {/* Navigates to a hash route rather than switching `view`, because the
-              theater is a full-screen surface rendered outside this layout. */}
-          <button
-            className="header-nav-link"
-            onClick={onOpenTheater}
-            data-testid="header-nav-theater"
-          >
-            Auction Theater
-          </button>
+          {/* No Auction Theater entry here any more. The Theater is opened from a
+              scenario card, so it always arrives with a scenario and that card's
+              tuner values in hand — a nav button could only ever open it empty. */}
         </nav>
         {userEmail && (
           <div className="header-auth">

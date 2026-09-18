@@ -4425,3 +4425,173 @@ h1, h2, h3, .sg-display {
   /* Width and opacity transitions convey state rather than decorate it, so
      they are kept; removing them would remove information. */
 }
+
+/* ===================================================================
+   Scenario picker — surface toggle, dropdown, selected card
+   =================================================================== */
+
+.scenario-picker { display: flex; flex-direction: column; gap: 10px; }
+
+/* Two mutually exclusive surfaces, so a radiogroup rather than tabs: the choice
+   filters a list, it does not navigate anywhere. */
+.scenario-surface-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-low, rgba(148, 163, 184, 0.12));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.scenario-surface-option {
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: clamp(10px, 0.85vw, 11px);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1), color 0.2s ease;
+}
+.scenario-surface-option:hover:not(:disabled):not(.is-on) {
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-surface-option.is-on {
+  background: #fff;
+  color: var(--text-primary, #0f172a);
+  border-color: rgba(99, 102, 241, 0.2);
+  box-shadow: 0px 1px 2px rgba(0, 0, 0, 0.02), 0px 4px 16px rgba(148, 163, 184, 0.06);
+}
+.scenario-surface-option:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+.scenario-surface-option:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.scenario-select {
+  width: 100%;
+  padding: 7px 9px;
+  font-size: clamp(11px, 0.95vw, 12px);
+  color: var(--text-primary, #0f172a);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  transition: box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.scenario-select:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+
+/* The dropdown can only carry text in its options, so the intents are repeated
+   here as the same chips the card uses — one colour vocabulary in both places. */
+.scenario-picker-intents { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* Two actions now: Send, and open the walkthrough. */
+.tuner-actions { display: flex; flex-direction: column; gap: 6px; }
+.tuner-send-theater {
+  background: transparent;
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  color: var(--accent, #6366f1);
+  font-weight: 700;
+}
+.tuner-send-theater:hover:not(:disabled) {
+  background: #fff;
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+
+/* ===================================================================
+   Embedded Auction Theater
+   =================================================================== */
+
+/* The sidebar is removed from the DOM while the Theater is open, so the layout
+   only needs to stop reserving a column for it. */
+.app-layout--theater { grid-template-columns: 1fr; }
+
+.th-stage-embedded { min-height: 0; }
+
+.th-embedded-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 0 8px;
+}
+.th-embedded-scenario {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--th-ink-2);
+}
+
+/* ===================================================================
+   Governance stepper
+   =================================================================== */
+
+.gov-stepper { margin: 0 0 16px; }
+.gov-stepper-list {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (max-width: 1100px) {
+  .gov-stepper-list { grid-template-columns: repeat(2, 1fr); }
+}
+.gov-stepper-item { display: flex; }
+.gov-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  background: var(--surface-raised, #fff);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.gov-step:hover:not(.is-on) {
+  background: #fff;
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.gov-step.is-on {
+  border-color: rgba(99, 102, 241, 0.25);
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(99, 102, 241, 0.12),
+    0px 8px 32px rgba(148, 163, 184, 0.04);
+}
+.gov-step:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+.gov-step-number {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--surface-low, rgba(148, 163, 184, 0.15));
+  border: 1px solid var(--border);
+}
+.gov-step.is-on .gov-step-number {
+  color: #fff;
+  background: var(--accent, #6366f1);
+  border-color: transparent;
+}
+.gov-step-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.gov-step-title { font-size: 12px; font-weight: 700; color: var(--text-primary, #0f172a); }
+.gov-step-blurb { font-size: 10px; line-height: 1.4; color: var(--text-secondary); }
+
+.gov-step-panel { display: block; }

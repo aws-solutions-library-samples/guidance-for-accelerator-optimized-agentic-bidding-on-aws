@@ -1,7 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import Header from "./components/Header";
 import AuctionTheater from "./components/AuctionTheater";
-import { useHashRoute, THEATER_ROUTE } from "./hooks/useHashRoute";
 import Sidebar from "./components/Sidebar";
 import RawPanel from "./components/RawPanel";
 import ContainersPanel from "./components/ContainersPanel";
@@ -20,11 +19,13 @@ import {
   ComparisonLayout,
 } from "./components/comparison";
 
-function AppContent({ onOpenTheater }) {
+function AppContent() {
   const [showContainers, setShowContainers] = useState(false);
   const [view, setView] = useState("scenarios");
   const [lastPayload, setLastPayload] = useState(null);
-  const [loadTestState, setLoadTestState] = useState(null);
+  // The scenario currently open in the embedded Theater, with the tuner values it
+  // was opened with. Null means the main area shows the mutation timeline instead.
+  const [theaterRun, setTheaterRun] = useState(null);
   const [demoActive, setDemoActive] = useState(false);
   const [annotationText, setAnnotationText] = useState(null);
   const [annotationVisible, setAnnotationVisible] = useState(false);
@@ -54,7 +55,6 @@ function AppContent({ onOpenTheater }) {
     if (!resp.ok) throw new Error(`Failed to load sample: ${scenario.file}`);
     const payload = await resp.json();
     setLastPayload(payload);
-    setLoadTestState(null);
     const result = await submitScenario(payload, "REST");
     return result;
   }, [submitScenario]);
@@ -92,20 +92,30 @@ function AppContent({ onOpenTheater }) {
 
   const handleSubmit = async (payload) => {
     setLastPayload(payload);
-    setLoadTestState(null); // Clear load test when running a scenario
+    // Sending a scenario the ordinary way returns the main area to the timeline.
+    setTheaterRun(null);
     return submitScenario(payload, "REST");
   };
+
+  // Opening the Theater collapses the sidebar, so the walkthrough's three columns
+  // get the full width. Closing restores both, and the timeline for whatever ran
+  // last is still there — the run is not discarded.
+  const handleOpenTheater = useCallback((scenario, params) => {
+    setTheaterRun({ scenario, params });
+  }, []);
+  const handleCloseTheater = useCallback(() => setTheaterRun(null), []);
+
+  const theaterOpen = !!theaterRun;
 
   // For the raw panel, show the active result based on mode
   const activeResult = mode === "fabric" ? fabric.result : standalone.result;
   const activeLoading = mode === "fabric" ? fabric.loading : standalone.loading;
   const activeError = mode === "fabric" ? fabric.error : standalone.error;
 
-  // Is load test active (running or has results)?
-  const loadTestActive = loadTestState && (loadTestState.running || loadTestState.result);
-
   // Show scenario view only when a scenario has been submitted (not the default)
   const showScenarioView = !!(activeResult || lastPayload);
+
+  const showSidebar = view !== "adaptive" && view !== "governance" && !theaterOpen;
 
   return (
     <div className="app">
@@ -115,14 +125,12 @@ function AppContent({ onOpenTheater }) {
         onContainersClick={() => setShowContainers(true)}
         view={view}
         onViewChange={setView}
-        onOpenTheater={onOpenTheater}
       />
-      <div className="app-layout">
-        {view !== "adaptive" && view !== "governance" && (
+      <div className={`app-layout${theaterOpen ? " app-layout--theater" : ""}`}>
+        {showSidebar && (
           <Sidebar
-            onResult={(r) => { }}
             submit={handleSubmit}
-            onLoadTestChange={setLoadTestState}
+            onOpenTheater={handleOpenTheater}
             demoActive={demoActive}
           />
         )}
@@ -131,6 +139,12 @@ function AppContent({ onOpenTheater }) {
             <AdaptiveBiddingPanel />
           ) : view === "governance" ? (
             <GovernancePanel />
+          ) : theaterOpen ? (
+            <AuctionTheater
+              scenario={theaterRun.scenario}
+              params={theaterRun.params}
+              onExit={handleCloseTheater}
+            />
           ) : (
             <>
               {/* Mode selector bar */}
@@ -138,7 +152,7 @@ function AppContent({ onOpenTheater }) {
                 <ModeSelector />
               </div>
               {/* Scenario timeline + Request JSON (shown only after a scenario is submitted) */}
-              {showScenarioView && !loadTestActive && (
+              {showScenarioView && (
                 <div className="main-top">
                   <div className="main-top-left">
                     <ComparisonLayout />
@@ -159,19 +173,6 @@ function AppContent({ onOpenTheater }) {
                   </div>
                 </div>
               )}
-              {/* Load test results — always visible as the default view */}
-              <LoadTestResults
-                progress={loadTestState?.progress}
-                result={loadTestState?.result}
-                running={loadTestState?.running || false}
-                error={loadTestState?.error}
-              />
-
-              {/* Bid bubble overlay — scoped to main area width */}
-              <BidBubbleOverlay
-                running={loadTestState?.running}
-                progress={loadTestState?.progress}
-              />
             </>
           )}
         </main>
@@ -185,21 +186,14 @@ function AppContent({ onOpenTheater }) {
 }
 
 export default function App() {
-  // Hash routing rather than a router: CloudFront serves this bundle from S3
-  // with no 403/404 rewrite to index.html, so a real path like /theater would
-  // 404 at the origin. See hooks/useHashRoute.js.
-  const { route, navigate } = useHashRoute();
-
-  // The theater is a full-screen surface with no app chrome, so it renders
-  // outside ComparisonProvider and the app layout entirely. It submits once to
-  // one endpoint and has no use for comparison-mode state.
-  if (route === THEATER_ROUTE) {
-    return <AuctionTheater onExit={() => navigate("/")} />;
-  }
-
+  // The Theater used to be a full-screen surface at the hash route `#/theater`,
+  // rendered outside ComparisonProvider and the app layout, reached from a top-nav
+  // button. It is now embedded in the main area and opened from a scenario card,
+  // so the route, the button and the hash-routing hook are all gone. One entry
+  // point, and the Theater always has a scenario in hand.
   return (
     <ComparisonProvider>
-      <AppContent onOpenTheater={() => navigate(THEATER_ROUTE)} />
+      <AppContent />
     </ComparisonProvider>
   );
 }
