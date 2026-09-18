@@ -280,19 +280,13 @@ body {
   
 }
 .scenario:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); transform: translateY(-1px); }
+/* `active` means "this is the scenario currently selected in the picker", so the
+   ring is all it should say. It used to also paint a green "✓ Sent" badge, which
+   was already loose when the sidebar listed every card and became plainly wrong
+   with the picker: selecting a scenario sets `active`, so the badge claimed the
+   scenario had been submitted the moment it was merely chosen. The loading spinner
+   below is the honest progress signal, and it fires on a real submission. */
 .scenario.active { border-color: var(--accent); box-shadow: 0 4px 20px var(--accent-glow); }
-.scenario.active::after {
-  content: '✓ Sent';
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  background: var(--green);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  padding: 3px 8px;
-  border-radius: 20px;
-}
 .scenario.loading::after {
   content: '';
   position: absolute;
@@ -4471,24 +4465,108 @@ h1, h2, h3, .sg-display {
 }
 .scenario-surface-option:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.scenario-select {
+/* Scenario chooser — a listbox, not a <select>, so each row can carry the name
+   with its intent chips underneath instead of a comma-separated string that
+   overflowed the control and lost the colour coding. */
+.scenario-combo { position: relative; }
+
+.scenario-combo-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  padding: 7px 9px;
-  font-size: clamp(11px, 0.95vw, 12px);
-  color: var(--text-primary, #0f172a);
-  background: #fff;
+  padding: 8px 10px;
+  text-align: left;
+  background: var(--surface-raised, #fff);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  transition: box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.scenario-select:focus-visible {
+.scenario-combo-trigger:hover:not(:disabled) {
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-trigger:focus-visible {
   outline: none;
   box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
 }
+.scenario-combo-trigger.is-open {
+  border-color: rgba(99, 102, 241, 0.25);
+  box-shadow: 0px 1px 2px rgba(0, 0, 0, 0.02), 0px 4px 16px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* The dropdown can only carry text in its options, so the intents are repeated
-   here as the same chips the card uses — one colour vocabulary in both places. */
-.scenario-picker-intents { display: flex; flex-wrap: wrap; gap: 4px; }
+/* min-width:0 so a long scenario name wraps inside the flex row instead of
+   forcing the control wider than the sidebar. */
+.scenario-combo-value {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.scenario-combo-name {
+  font-size: clamp(11px, 0.95vw, 12px);
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--text-primary, #0f172a);
+  /* Wraps rather than truncating: the name is the only thing identifying the
+     scenario, so hiding half of it is worse than two lines. */
+  overflow-wrap: anywhere;
+}
+.scenario-combo-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+
+.scenario-combo-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-secondary);
+  opacity: 0.6;
+  transition: transform 0.2s ease;
+}
+.scenario-combo-trigger.is-open .scenario-combo-caret { transform: rotate(180deg); }
+
+.scenario-combo-list {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--surface-raised, #fff);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 10px;
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(148, 163, 184, 0.06),
+    0px 8px 24px rgba(148, 163, 184, 0.04);
+}
+.scenario-combo-list:focus-visible { outline: none; }
+
+.scenario-combo-option {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* The keyboard cursor and the current selection are DIFFERENT states: arrowing
+   through the list moves the cursor without committing anything, so they must not
+   look the same. The cursor gets the wash, the selection gets the rim. */
+.scenario-combo-option.is-cursor {
+  background: rgba(99, 102, 241, 0.06);
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-option.is-selected { border-color: rgba(99, 102, 241, 0.3); }
 
 /* Two actions now: Send, and open the walkthrough. */
 .tuner-actions { display: flex; flex-direction: column; gap: 6px; }

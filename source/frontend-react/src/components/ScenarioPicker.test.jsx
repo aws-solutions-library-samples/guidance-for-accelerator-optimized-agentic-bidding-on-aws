@@ -48,8 +48,19 @@ function render(props = {}) {
 }
 
 const click = (el) => act(() => el.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-const optionValues = () =>
-  Array.from(host.querySelectorAll('[data-testid="scenario-select"] option')).map((o) => o.value);
+const mouseDown = (el) => act(() => el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
+const key = (el, k) =>
+  act(() => el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true })));
+
+const trigger = () => host.querySelector('[data-testid="scenario-select"]');
+const list = () => host.querySelector('[data-testid="scenario-select-list"]');
+const openList = () => click(trigger());
+const rows = () => Array.from(host.querySelectorAll('[role="option"]'));
+/** Scenario ids in the popup, in order. Opens it if it is closed. */
+const optionValues = () => {
+  if (!list()) openList();
+  return rows().map((r) => r.id.replace("scenario-option-", ""));
+};
 
 describe("surface filtering", () => {
   it("lists only request-surface scenarios by default", () => {
@@ -112,11 +123,18 @@ describe("selection", () => {
   it("reports the scenario the dropdown picked", () => {
     const onSelect = vi.fn();
     render({ onSelect });
-    const select = host.querySelector('[data-testid="scenario-select"]');
     const target = scenariosOnSurface(SURFACE_REQUEST)[2];
-    select.value = target.id;
-    act(() => select.dispatchEvent(new Event("change", { bubbles: true })));
+    openList();
+    mouseDown(host.querySelector(`[data-testid="scenario-option-${target.id}"]`));
     expect(onSelect.mock.calls.at(-1)[0].id).toBe(target.id);
+  });
+
+  it("closes the list once a scenario is picked", () => {
+    render();
+    openList();
+    expect(list()).not.toBeNull();
+    mouseDown(rows()[1]);
+    expect(list()).toBeNull();
   });
 
   it("does not switch surface when the same toggle is clicked again", () => {
@@ -127,24 +145,146 @@ describe("selection", () => {
   });
 });
 
-describe("what the option and the chips show", () => {
-  it("names the scenario and its intents in each option", () => {
+describe("what a row shows", () => {
+  it("gives every row the scenario's name and its intents as real chips", () => {
+    // Chips, not a comma-separated string: a native <option> can only hold text,
+    // which is what forced the intents into the name and lost their colours.
     render();
+    openList();
     const first = scenariosOnSurface(SURFACE_REQUEST)[0];
-    const option = host.querySelector('[data-testid="scenario-select"] option');
-    expect(option.textContent).toContain(first.name);
-    for (const tag of first.tags) {
-      expect(option.textContent).toContain(tag.label);
-    }
+    const row = host.querySelector(`[data-testid="scenario-option-${first.id}"]`);
+    expect(row.querySelector(".scenario-combo-name").textContent).toBe(first.name);
+    const chips = Array.from(row.querySelectorAll(".tag")).map((el) => el.textContent);
+    expect(chips).toEqual(first.tags.map((t) => t.label));
   });
 
-  it("shows the selected scenario's intents as the same chips the card uses", () => {
+  it("colour-codes each chip with the class the card uses for that intent", () => {
+    render();
+    openList();
+    const first = scenariosOnSurface(SURFACE_REQUEST)[0];
+    const row = host.querySelector(`[data-testid="scenario-option-${first.id}"]`);
+    const classes = Array.from(row.querySelectorAll(".tag")).map((el) => el.className);
+    expect(classes).toEqual(first.tags.map((t) => `tag ${t.cls}`));
+  });
+
+  it("shows the selected scenario's name and chips on the closed trigger", () => {
     render();
     const first = scenariosOnSurface(SURFACE_REQUEST)[0];
-    const chips = Array.from(
-      host.querySelectorAll('[data-testid="scenario-picker-intents"] .tag')
-    ).map((el) => el.textContent);
+    expect(trigger().querySelector(".scenario-combo-name").textContent).toBe(first.name);
+    const chips = Array.from(trigger().querySelectorAll(".tag")).map((el) => el.textContent);
     expect(chips).toEqual(first.tags.map((t) => t.label));
+  });
+
+  it("marks the selected row, and only that one", () => {
+    render({ activeScenarioId: scenariosOnSurface(SURFACE_REQUEST)[3].id });
+    openList();
+    const selected = rows().filter((r) => r.getAttribute("aria-selected") === "true");
+    expect(selected).toHaveLength(1);
+    expect(selected[0].id).toBe(
+      `scenario-option-${scenariosOnSurface(SURFACE_REQUEST)[3].id}`
+    );
+  });
+});
+
+describe("keyboard and ARIA", () => {
+  it("reports the popup state on the trigger", () => {
+    render();
+    expect(trigger().getAttribute("aria-expanded")).toBe("false");
+    expect(trigger().getAttribute("aria-haspopup")).toBe("listbox");
+    openList();
+    expect(trigger().getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("is a real listbox of options", () => {
+    render();
+    openList();
+    expect(list().getAttribute("role")).toBe("listbox");
+    expect(rows().length).toBe(scenariosOnSurface(SURFACE_REQUEST).length);
+  });
+
+  it("opens on ArrowDown from the trigger", () => {
+    render();
+    key(trigger(), "ArrowDown");
+    expect(list()).not.toBeNull();
+  });
+
+  it("moves the active row with the arrows without selecting anything", () => {
+    // Arrowing must not commit: the reader is looking, not choosing.
+    const onSelect = vi.fn();
+    render({ onSelect });
+    openList();
+    const ids = optionValues();
+    key(list(), "ArrowDown");
+    expect(list().getAttribute("aria-activedescendant")).toBe(`scenario-option-${ids[1]}`);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("commits the active row on Enter", () => {
+    const onSelect = vi.fn();
+    render({ onSelect });
+    openList();
+    const ids = optionValues();
+    key(list(), "ArrowDown");
+    key(list(), "Enter");
+    expect(onSelect.mock.calls.at(-1)[0].id).toBe(ids[1]);
+    expect(list()).toBeNull();
+  });
+
+  it("jumps to the ends with Home and End", () => {
+    render();
+    openList();
+    const ids = optionValues();
+    key(list(), "End");
+    expect(list().getAttribute("aria-activedescendant")).toBe(
+      `scenario-option-${ids.at(-1)}`
+    );
+    key(list(), "Home");
+    expect(list().getAttribute("aria-activedescendant")).toBe(`scenario-option-${ids[0]}`);
+  });
+
+  it("closes on Escape without selecting", () => {
+    const onSelect = vi.fn();
+    render({ onSelect });
+    openList();
+    key(list(), "ArrowDown");
+    key(list(), "Escape");
+    expect(list()).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("does not run off either end of the list", () => {
+    render();
+    openList();
+    const ids = optionValues();
+    for (let i = 0; i < ids.length + 3; i += 1) key(list(), "ArrowDown");
+    expect(list().getAttribute("aria-activedescendant")).toBe(
+      `scenario-option-${ids.at(-1)}`
+    );
+    for (let i = 0; i < ids.length + 3; i += 1) key(list(), "ArrowUp");
+    expect(list().getAttribute("aria-activedescendant")).toBe(`scenario-option-${ids[0]}`);
+  });
+
+  it("opens with the cursor on the current selection, not at the top", () => {
+    const target = scenariosOnSurface(SURFACE_REQUEST)[4];
+    render({ activeScenarioId: target.id });
+    openList();
+    expect(list().getAttribute("aria-activedescendant")).toBe(
+      `scenario-option-${target.id}`
+    );
+  });
+
+  it("closes when the reader clicks away", () => {
+    render();
+    openList();
+    act(() => document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
+    expect(list()).toBeNull();
+  });
+
+  it("is not operable while disabled", () => {
+    render({ disabled: true });
+    expect(trigger().disabled).toBe(true);
+    openList();
+    expect(list()).toBeNull();
   });
 });
 
