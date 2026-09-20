@@ -230,6 +230,42 @@ else
   log "amt bidder: not injected - single-seat auction (artfhouse only)"
 fi
 
+# ------------------------------------------------------ third-party injectors
+# An extension point for seats this repository does not own.
+#
+# THE CONTRACT. Any immediate subdirectory of this slot that contains an executable
+# inject.sh is sourced here, with its own absolute directory as $1. That script must:
+#
+#   - ADD files to the checkout, never modify or remove an upstream file (U1-NFR-16);
+#   - assert its own destinations and return non-zero if it could not place them;
+#   - confine itself to its own Java packages and resource filenames.
+#
+# Nothing here knows, or needs to know, what any injector places. There is no list of
+# known plugins and no plugin is named anywhere in this repository: a seat is attached by
+# putting a directory in the slot, which deploy_prebid.sh --inject-plugin does.
+#
+# The `[[ -f ]]` guard is load-bearing, not defensive. With no nullglob and no matches,
+# bash leaves the pattern itself as the single loop word, so the guard is what turns "no
+# plugins" into a no-op instead of an attempt to source a file called '*/inject.sh'.
+#
+# SOURCED rather than executed, for two reasons. The injector needs the working directory
+# and the log helpers of this script, and `set -e` then propagates its failure into this
+# script: an injector that cannot place its files FAILS THE BUILD. The alternative is an
+# image that builds, starts, serves auctions and is quietly missing a seat, which is
+# indistinguishable from success until an auction returns one fewer bid than expected.
+for _injector in "${SCRIPT_DIR}"/*/inject.sh; do
+  [[ -f "${_injector}" ]] || continue
+  _plugin_dir="$(cd "$(dirname "${_injector}")" && pwd)"
+  log "third-party injector: $(basename "${_plugin_dir}")/inject.sh"
+  # shellcheck disable=SC1090  # path is discovered at build time, by design
+  source "${_injector}" "${_plugin_dir}" \
+    || fail "$(basename "${_plugin_dir}")/inject.sh failed - its seat is NOT in this image"
+done
+unset _injector _plugin_dir
+
 # ---------------------------------------------------------------- final report
-log "injection complete. Maven will now compile:"
+# Scoped to ARTF's own package deliberately. A third-party injector reports its own
+# placements in its own log lines; enumerating them here would mean this repository
+# describing files it does not own, and a list that silently goes stale.
+log "injection complete. Maven will now compile, from ${ARTF_PACKAGE}:"
 find "src/main/java/${ARTF_PACKAGE}" -name '*.java' -type f | sort | sed 's/^/  /'

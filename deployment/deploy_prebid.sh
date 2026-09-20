@@ -56,6 +56,10 @@ fi
 #   --tag TAG            Image tag (default: pinned version + source hash)
 #   --start-at N         Resume from step N
 #   --skip-build         Reuse the image already in ECR
+#   --inject-plugin DIR  Add a third-party bidder to this image. DIR must contain an
+#                        inject.sh; it is copied into the build context's injection slot
+#                        and sourced by copy-bidder-files.sh before Maven runs. Repeatable.
+#                        Nothing in this repository knows what a plugin injects.
 #   --yes                Accept the cost disclosure without prompting
 #   --destroy            Tear down (Kubernetes first, then the CFN stack)
 #
@@ -96,6 +100,13 @@ DESTROY=0
 # bidder with no endpoint is a pod that will not start.
 WITH_SIMULATOR=1
 
+# Third-party bidder directories to add to this image, from --inject-plugin. Each is
+# copied into the build context's injection slot, where copy-bidder-files.sh discovers it
+# by the presence of an inject.sh and sources it. This array is the ONLY place a plugin is
+# named, and it is named by the operator at the command line -- there is no list of known
+# plugins in this repository, and no plugin's contents are interpreted here.
+INJECT_PLUGINS=()
+
 # The cost of any node capacity the Prebid pods force. Passed to the disclosure
 # helper, which REQUIRES it: on a cluster without headroom it is the dominant term.
 # Left empty means "not yet known", and the disclosure then says so rather than
@@ -118,6 +129,8 @@ for arg in "$@"; do
     --tag)             ;;
     --start-at=*)      START_AT="${arg#--start-at=}" ;;
     --start-at)        ;;
+    --inject-plugin=*) INJECT_PLUGINS+=("${arg#--inject-plugin=}") ;;
+    --inject-plugin)   ;;
     --skip-build)      SKIP_BUILD=1 ;;
     --no-simulator)    WITH_SIMULATOR=0 ;;
     --yes|--non-interactive) ASSUME_YES=1 ;;
@@ -131,6 +144,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--region" ]];       then AWS_REGION="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--tag" ]];          then IMAGE_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]];     then START_AT="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--inject-plugin" ]]; then INJECT_PLUGINS+=("${arg}")
       fi
       ;;
   esac
@@ -955,6 +969,41 @@ if [[ "${START_AT}" -le 4 ]]; then
   else
     warn "No ${PREBID_SRC} directory - nothing to inject."
   fi
+
+  # ------------------------------------------------ third-party bidder plugins
+  # Each --inject-plugin directory is placed in the slot under its own basename, where
+  # copy-bidder-files.sh finds it by the presence of inject.sh and sources it before Maven.
+  #
+  # Copied into the THROWAWAY build context, never into source/prebid/: that directory is
+  # this repository's and is committed, and a plugin belongs to whoever wrote it. Nothing
+  # of a plugin's ever enters this repository's tree, which is what keeps the dependency
+  # pointing one way -- a plugin depends on this build, this build depends on nothing of
+  # the plugin's beyond the inject.sh contract.
+  #
+  # Validated here rather than at build time. A directory with no inject.sh would simply
+  # be ignored by the loop in copy-bidder-files.sh, and the operator would get an image
+  # silently missing the seat they asked for.
+  # The count guard is required, not stylistic: bash 3.2 ships on macOS, and there
+  # "${INJECT_PLUGINS[@]}" on an EMPTY array is an unbound variable under `set -u`. So the
+  # no-plugin case -- every deployment this repository makes on its own -- would abort here.
+  if [[ ${#INJECT_PLUGINS[@]} -gt 0 ]]; then
+  for _plugin in "${INJECT_PLUGINS[@]}"; do
+    [[ -d "${_plugin}" ]] \
+      || fail "--inject-plugin ${_plugin} is not a directory."
+    [[ -f "${_plugin}/inject.sh" ]] \
+      || fail "--inject-plugin ${_plugin} has no inject.sh, so nothing would inject it. A plugin directory must contain an inject.sh that this build sources with the plugin's own directory as \$1."
+    _plugin_name="$(basename "${_plugin}")"
+    [[ "${_plugin_name}" != "upstream-amt-bidder" ]] \
+      || fail "--inject-plugin may not be named upstream-amt-bidder: that name is used by the release's own AMT seat in this slot."
+    [[ ! -e "${INJECT_DIR}/${_plugin_name}" ]] \
+      || fail "--inject-plugin ${_plugin} collides with ${INJECT_DIR}/${_plugin_name}, which already exists in the slot. Rename the plugin directory."
+    cp -R "${_plugin}" "${INJECT_DIR}/${_plugin_name}" \
+      || fail "could not copy ${_plugin} into the injection slot."
+    chmod +x "${INJECT_DIR}/${_plugin_name}/inject.sh"
+    log "  Placed third-party plugin ${_plugin_name} into the injection slot"
+  done
+  fi
+  unset _plugin _plugin_name
 
   # --------------------------------------------------- the release's AMT bidder
   # The second seat. Its sources come from the release we already fetched, and are
