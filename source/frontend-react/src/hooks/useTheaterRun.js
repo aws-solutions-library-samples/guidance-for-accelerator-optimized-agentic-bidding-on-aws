@@ -45,6 +45,12 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
   // offers panel then falls back to the captured fixture and says so (FR-31).
   // Never set from anything but a real auction response.
   const [bidResponse, setBidResponse] = useState(null);
+  // The exact bytes submitted, and the orchestrator's normalized answer. Exposed
+  // so the Theater's code view can render the SAME merged JSON the default
+  // scenario view renders, through the same RawPanel, rather than a second
+  // serializer that could disagree about what was sent.
+  const [payload, setPayload] = useState(null);
+  const [result, setResult] = useState(null);
   // Why no live auction was read, when none was. `{ kind, detail }` or null.
   const [auctionFault, setAuctionFault] = useState(null);
   // Guards against a slow earlier submission overwriting a later one.
@@ -59,6 +65,8 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setError(null);
     setBidResponse(null);
     setAuctionFault(null);
+    setPayload(null);
+    setResult(null);
   }, []);
 
   // Runs the scenario's OpenRTB request as a real auction, if one is available.
@@ -154,32 +162,36 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setContext(null);
     setBidResponse(null);
     setAuctionFault(null);
+    setPayload(null);
+    setResult(null);
 
     try {
-      const payload = await loadScenarioPayload(scenario, params);
+      const submitted = await loadScenarioPayload(scenario, params);
       if (token !== runTokenRef.current) return null;
 
-      setContext(buildScenarioContext(payload));
+      setContext(buildScenarioContext(submitted));
+      setPayload(submitted);
 
-      const result = await submit(payload, "REST");
+      const answered = await submit(submitted, "REST");
       if (token !== runTokenRef.current) return null;
 
       // The orchestrator answered, but the response itself may report a
       // pipeline error. That is a real failure, not a walkthrough.
-      if (result?.error) {
-        setError(new Error(result.error.message || "The orchestrator reported an error"));
+      if (answered?.error) {
+        setError(new Error(answered.error.message || "The orchestrator reported an error"));
         setStatus(RUN_FAILED);
         return null;
       }
 
-      setBeats(buildBeats(payload, result));
+      setResult(answered);
+      setBeats(buildBeats(submitted, answered));
       setStatus(RUN_READY);
 
       // The auction runs AFTER the walkthrough is ready. An unavailable auction
       // leaves bidResponse null, and the offers panel then shows the captured
       // fixture with its own notice rather than presenting a fixture as live.
-      void runAuction(payload, token);
-      return result;
+      void runAuction(submitted, token);
+      return answered;
     } catch (err) {
       if (token !== runTokenRef.current) return null;
       setError(err instanceof Error ? err : new Error(String(err)));
@@ -188,5 +200,8 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     }
   }, [submit, runAuction]);
 
-  return { status, scenarioId, context, beats, error, bidResponse, auctionFault, start, reset };
+  return {
+    status, scenarioId, context, beats, error, bidResponse, auctionFault,
+    payload, result, start, reset,
+  };
 }

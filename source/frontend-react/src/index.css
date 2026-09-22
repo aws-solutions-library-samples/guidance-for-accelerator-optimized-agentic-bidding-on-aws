@@ -4139,12 +4139,10 @@ h1, h2, h3, .sg-display {
   border-right: none;
   flex: none;
 }
-.th-consequences {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 0 18px 16px;
-}
+/* `.th-consequences` is gone with the `consequences` prop it styled. That prop
+   was read from `run.sellSideConsequences`, which useTheaterRun never returned,
+   so the block never rendered once. Replaced by `.th-kpis` below, fed by
+   deriveSellSideKpis. */
 
 /* ------------------------------------------------------------- visualisers */
 
@@ -4284,46 +4282,9 @@ h1, h2, h3, .sg-display {
 
 /* ---------------------------------------------------------------- caption */
 
-.th-caption-wrap {
-  position: absolute;
-  left: 50%;
-  bottom: 84px;
-  transform: translateX(-50%);
-  width: min(660px, 84vw);
-  z-index: 45;
-  pointer-events: none;
-}
-.th-caption {
-  background: rgba(255, 255, 255, 0.62);
-  backdrop-filter: blur(14px) saturate(1.4);
-  -webkit-backdrop-filter: blur(14px) saturate(1.4);
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  box-shadow: 0 10px 40px rgba(30, 40, 70, 0.16);
-  border-radius: 16px;
-  padding: 15px 22px;
-  font-size: 15px;
-  line-height: 1.5;
-  text-align: center;
-}
-.th-caption-step {
-  display: block;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--th-ink-3);
-  margin-bottom: 6px;
-}
-.th-recap {
-  list-style: none;
-  margin: 12px 0 0;
-  padding: 0;
-  text-align: left;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--th-ink-2);
-}
+/* The `.th-caption*` and `.th-recap` rules that were here are gone with
+   TheaterCaption. The narration moved to `.th-mstage`, over the centre of the
+   stage; see the embedded-Theater section below. */
 
 /* --------------------------------------------------------------- controls */
 
@@ -4585,24 +4546,451 @@ h1, h2, h3, .sg-display {
    Embedded Auction Theater
    =================================================================== */
 
-/* The sidebar is removed from the DOM while the Theater is open, so the layout
-   only needs to stop reserving a column for it. */
-.app-layout--theater { grid-template-columns: 1fr; }
+/* ===================================================================
+   Embedded Auction Theater
 
-.th-stage-embedded { min-height: 0; }
+   The Theater is a view INSIDE this application, not a page over it. That
+   required undoing `.th-stage`'s `position: fixed; inset: 0; z-index: 100`,
+   which pinned it to the viewport and painted over the header and the
+   scenario panel. The class was already named "embedded" and already
+   applied; it only set `min-height: 0`, so the name described an intention
+   the CSS never carried out.
+
+   The previous rule here was `.app-layout--theater { grid-template-columns:
+   1fr }` — a grid property on a flex container, so inert. The sidebar
+   vanished because App unmounted it. It is now collapsed instead, and these
+   rules do the work the old one only claimed to.
+   =================================================================== */
+
+/* Header (sticky, ~72px) plus the layout's 20px padding top and bottom. */
+.app-layout { --th-chrome: 116px; }
+
+.app-layout--theater {
+  /* Expanding the panel pushes the Theater right and scrolls, rather than
+     squeezing the walkthrough's three columns into whatever is left. */
+  overflow-x: auto;
+  align-items: stretch;
+}
+.app-layout--theater > .app-main {
+  /* `flex: 1 1 0` — basis ZERO, not auto. With `auto` the base size is the
+     content size, and the Theater's max-content width is large (nowrap chips, the
+     JSON panel, the offers rows), so the main column sized itself to its content
+     and `flex-shrink: 0` then forbade it from coming back down: it ran past the
+     viewport with no way to recover.
+
+     Basis 0 plus grow 1 makes the width purely "the free space that is left",
+     which the browser computes from the real box model — the rail's actual width,
+     the actual gap and the actual padding — rather than from arithmetic hardcoded
+     here that would drift the moment any of the three changed.
+
+     `min-width: 0` is load-bearing: a flex item's default `min-width: auto`
+     floors it at its content's min-content width, which is the other half of why
+     it would not shrink. */
+  flex: 1 1 0;
+  min-width: 0;
+  height: calc(100vh - var(--th-chrome));
+  min-height: 560px;
+  display: flex;
+}
+/* Only an EXPANDED panel makes the Theater refuse to compress, which is what
+   turns expansion into a horizontal scroll. While the panel is a rail there is
+   nothing to scroll and the Theater must fit exactly, so the floor is applied
+   here rather than unconditionally above. */
+.app-layout--theater.app-layout--panel-open > .app-main { min-width: 860px; }
+
+.th-stage-embedded {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  min-height: 0;
+  /* As a flex item of `.app-main`, an `auto` minimum would floor this at its
+     content's min-content width and let it push out of the column. */
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  /* The outer margin the fixed overlay could not have: labels and buttons in
+     the ribbon were touching the viewport edge. */
+  padding: 14px 16px 12px;
+  border: 1px solid var(--th-hair);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.02),
+    0 4px 16px rgba(148, 163, 184, 0.06),
+    0 8px 32px rgba(148, 163, 184, 0.04);
+}
+
+/* Everything between the ribbon and the controls. Establishes the containing
+   block for the centre-stage and summary surfaces, which were previously
+   positioned against the viewport. */
+.th-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.th-stage-embedded .th-columns {
+  border: 1px solid var(--th-hair);
+  border-radius: 14px;
+  overflow: hidden;
+}
+/* `1fr` is `minmax(auto, 1fr)`, and that `auto` minimum is the item's content
+   min-content width — so a nowrap chip or a long deal id in any one column could
+   force its track wider than its share and push the grid past its container.
+   `min-width: 0` lets the tracks actually honour the 1 : 1.15 : 1 split. */
+.th-stage-embedded .th-columns > * { min-width: 0; }
+/* Each region scrolls on its own when it overflows (FR-5). The columns already
+   carried `overflow-y: auto`; it did nothing until the stage had a bounded
+   height, which it now has. */
+.th-stage-embedded .th-col,
+.th-stage-embedded .th-col-sell-wrap,
+.th-stage-embedded .th-col-offers {
+  overflow-y: auto;
+  min-height: 0;
+}
 
 .th-embedded-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 0 8px;
+  padding: 0 4px 8px;
+  flex: none;
 }
 .th-embedded-scenario {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.01em;
   color: var(--th-ink-2);
+}
+.th-stage-embedded .th-ribbon {
+  border: 1px solid var(--th-hair);
+  border-radius: 14px;
+  margin-bottom: 10px;
+}
+
+/* ---- controls, in flow ----
+   They were `position: absolute; bottom: 14px`, floating over the columns
+   together with the caption strip above them. Both covered the data they were
+   describing. */
+.th-stage-embedded .th-controls {
+  position: static;
+  transform: none;
+  bottom: auto;
+  left: auto;
+  margin: 10px auto 0;
+  flex: none;
+}
+
+/* ---- collapsible scenario panel ---- */
+.app-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: width 0.2s ease;
+}
+.app-sidebar--collapsed {
+  width: 44px;
+  min-width: 44px;
+}
+.app-sidebar-body { min-width: 0; }
+.app-sidebar-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.app-sidebar-toggle:hover {
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.15), 0 4px 20px rgba(99, 102, 241, 0.12);
+}
+.app-sidebar-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg, #0b0f19), 0 0 0 5px rgba(99, 102, 241, 0.4);
+}
+.app-sidebar-toggle-chevron { font-size: 15px; line-height: 1; }
+.app-sidebar--collapsed .app-sidebar-toggle {
+  flex-direction: column;
+  justify-content: flex-start;
+  padding: 10px 6px;
+  height: 100%;
+  align-items: center;
+}
+.app-sidebar--collapsed .app-sidebar-toggle-label {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+/* ===================================================================
+   Centre-stage mutation card
+   =================================================================== */
+
+.th-mstage-wrap {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(620px, 78%);
+  z-index: 46;
+  pointer-events: none;
+}
+.th-mstage {
+  /* Opaque enough to read as a surface ABOVE the columns rather than a tint over
+     them. The old caption strip was 0.62 alpha and the data behind it competed
+     with the text. */
+  background: rgba(255, 255, 255, 0.97);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 12px 44px rgba(30, 40, 70, 0.18);
+  border-radius: 18px;
+  padding: 16px 20px 14px;
+}
+.th-mstage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.th-mstage-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--th-ink-3);
+}
+.th-mstage-attr { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.th-mstage-container {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--th-enrich);
+  white-space: nowrap;
+}
+.th-mstage-intent {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #4c2a86;
+  background: var(--th-enrich-soft);
+  border: 1px solid #ddd0f3;
+  border-radius: 20px;
+  padding: 3px 9px;
+  white-space: nowrap;
+}
+.th-mstage-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+  /* 4.5:1 against the card (NFR-5). */
+  color: var(--th-ink);
+}
+/* The full sentence is in the DOM; only the untyped remainder is invisible, so
+   the card does not reflow as characters arrive. */
+.th-mstage-pending { visibility: hidden; }
+.th-mstage-foot {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--th-ink-3);
+}
+.th-mstage-explore { color: var(--th-gold); font-weight: 700; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .th-mstage { animation: thMStageIn 0.22s ease-out; }
+  @keyframes thMStageIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/* ===================================================================
+   Run summary
+   =================================================================== */
+
+.th-summary-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(26, 31, 43, 0.28);
+}
+.th-summary {
+  width: min(560px, 100%);
+  background: var(--th-canvas);
+  border: 1px solid var(--th-hair-2);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 16px 48px rgba(30, 40, 70, 0.22);
+  padding: 18px 20px 16px;
+  pointer-events: auto;
+}
+.th-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.th-summary-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--th-enrich);
+}
+.th-summary-close {
+  border: none;
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.th-summary-close:hover { background: var(--th-hair); }
+.th-summary-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(107, 63, 181, 0.4);
+}
+.th-summary-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--th-ink);
+}
+.th-summary-sub {
+  margin: 12px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--th-hair);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--th-ink-3);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .th-summary { animation: thSummaryIn 0.24s ease-out; }
+  @keyframes thSummaryIn {
+    from { opacity: 0; transform: scale(0.98); }
+    to { opacity: 1; transform: scale(1); }
+  }
+}
+
+/* ===================================================================
+   Request card: three-view toggle
+   =================================================================== */
+
+.th-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.th-card-views { display: flex; gap: 2px; }
+.th-card-view {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--th-ink-3);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.th-card-view:hover {
+  color: var(--th-ink-2);
+  background: var(--th-panel-2);
+}
+.th-card-view.is-on {
+  color: var(--th-enrich);
+  background: var(--th-enrich-soft);
+  border-color: #ddd0f3;
+}
+.th-card-view:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(107, 63, 181, 0.4);
+}
+
+.th-card--wide { max-width: 100%; }
+
+/* The code view hosts RawPanel, which carries the application's dark JSON
+   palette. Kept dark on purpose: it is the same view as the default scenario
+   screen, and recolouring it would make two presentations of one thing. */
+.th-card-body-code {
+  padding: 0;
+  background: var(--th-ink);
+}
+.th-card-body-code .raw-section-standalone {
+  border: none;
+  border-radius: 0;
+  background: none;
+}
+.th-card-body-info { padding: 14px; }
+.th-card-info { display: flex; flex-direction: column; gap: 12px; }
+.th-card-info-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--th-ink);
+}
+.th-card-info-reopen { align-self: flex-start; }
+
+/* ===================================================================
+   Sell-side deal package result
+   =================================================================== */
+
+.th-kpis {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 18px 16px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--th-hair-2);
+}
+.th-kpis-head { margin-bottom: 2px; }
+.th-kpis-notice {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #7a4b00;
+  background: #fff8e6;
+  border: 1px solid #f0d9a3;
+  border-radius: var(--th-radius-sm);
+  padding: 7px 9px;
+}
+.th-kpis .th-row-key {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.th-kpi-detail {
+  font-size: 10px;
+  color: var(--th-ink-3);
 }
 
 /* ===================================================================
@@ -4673,3 +5061,45 @@ h1, h2, h3, .sg-display {
 .gov-step-blurb { font-size: 10px; line-height: 1.4; color: var(--text-secondary); }
 
 .gov-step-panel { display: block; }
+
+/* ---------------------------------------------------------------------------
+   Mutation precedence
+   ---------------------------------------------------------------------------
+   Two containers may claim the same intent. Both are called, but for a given
+   (path, intent) only the highest-priority one's mutation is returned. The
+   losing container ran and computed a value that was then discarded, which is
+   neither a success nor a failure and needs its own treatment: amber, the same
+   language the shared-intent chip already uses, rather than the red reserved
+   for something that actually went wrong.
+   --------------------------------------------------------------------------- */
+
+.container-precedence {
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--surface-low, rgba(241, 245, 249, 0.6));
+  border: 1px solid rgba(245, 158, 11, 0.18);
+  line-height: 1.5;
+}
+
+.agent-superseded-tag {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #d97706;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+
+/* Sits alongside .agent-row--active rather than replacing it: the container did
+   run, so it keeps the active treatment and gains a marker. */
+.agent-row--superseded {
+  box-shadow: inset 2px 0 0 rgba(245, 158, 11, 0.45);
+}

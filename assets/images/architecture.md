@@ -8,7 +8,7 @@ the same picture in a maintainable, text-authored form.
 
 ## Solution overview
 
-The solution implements **six** ARTF-compliant (IAB Tech Lab Agentic RTB Framework)
+The solution implements **six** ARTF-compliant (IAB Tech Lab Agentic Real Time Framework)
 containers, each doing one job in the bidstream. Four run GPU-accelerated inference
 on **NVIDIA Triton Inference Server**; two are deterministic and rule-based on CPU:
 

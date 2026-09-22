@@ -243,6 +243,17 @@ export function buildBeats(submittedPayload, normalizedResult) {
         path: typeof mutation?.path === "string" ? mutation.path : null,
         values: mutationToValues(mutation, submittedPayload),
       }));
+      // Attribution travels WITH the value. visibleValues flattens the beat
+      // away, so a floor change reaching the sell-side column could otherwise
+      // only render as "Floor · deal-x" — the container that decided it was lost
+      // at the flatten. Stamped here rather than passed alongside because every
+      // consumer that reads a value already has the value and nothing else.
+      const beat = beats[beats.length - 1];
+      for (const value of beat.values) {
+        value.containerName = beat.containerName;
+        value.displayLabel = beat.displayLabel;
+        value.intent = beat.intent;
+      }
     }
   }
 

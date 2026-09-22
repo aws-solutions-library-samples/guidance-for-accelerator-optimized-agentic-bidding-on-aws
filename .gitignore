@@ -75,6 +75,15 @@ source/frontend-react/public/fonts/*.woff2
 .image-outputs.json
 .nemo-outputs.json
 deployment/.bootstrap-status.json
+# Per-prefix record of the flags a run was GIVEN, and the values it resolved, so a
+# re-run need not be told them again. Deliberately holds no progress -- that comes
+# from AWS via `./deploy.sh --status`. Local state, not source.
+deployment/.deploy-state.json
+# Captured output from the noisy deploy steps (AgentCore runtimes, agent image
+# builds, the closed-loop stack), so a failure there is readable after the fact
+# instead of living only in a terminal's scrollback. One glob covers the lot,
+# including the per-prefix variants (.deploy-bt1-closed-loop.log).
+deployment/.deploy-*.log
 
 # --- Kiro ---
 .kiro/

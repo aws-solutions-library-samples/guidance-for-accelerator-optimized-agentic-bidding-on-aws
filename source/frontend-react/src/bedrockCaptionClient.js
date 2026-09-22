@@ -29,6 +29,8 @@ import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-id
 import { getIdToken } from "./auth";
 import { buildCaptionPrompt } from "./utils/captionPrompt.js";
 import { validateCaption } from "./utils/captionValidation.js";
+import { buildRunSummaryPrompt } from "./utils/runSummaryPrompt.js";
+import { validateRunSummary } from "./utils/runSummaryValidation.js";
 import { resolveSegmentLabel } from "./utils/segmentLabels.js";
 
 const COGNITO_REGION = import.meta.env.VITE_COGNITO_REGION || "us-east-1";
@@ -203,6 +205,95 @@ export async function generateCaption({ beat, context, signal, deps = {} }) {
 
   const outcome = { ok: true, text: verdict.text };
   emit({ beat, prompt, elapsedMs: elapsed(), outcome, raw });
+  return outcome;
+}
+
+/**
+ * Generate ONE summary for a completed run.
+ *
+ * Shares this module's client, credential cache, error mapping and trace with
+ * `generateCaption`, and differs only in which prompt and which validator it
+ * uses. The per-beat path is left exactly as it was: `captionPrompt.js` still
+ * never receives the sequence, so BR3-7 is still enforced by construction for
+ * captions — this function is the one place that is *supposed* to see the whole
+ * run, and it says so in its signature.
+ *
+ * Fires once per run rather than once per beat, so it is strictly fewer model
+ * invocations than the per-beat captions it replaces.
+ *
+ * @param {object}       args
+ * @param {object[]}     args.beats
+ * @param {object}       args.context
+ * @param {object}       args.viewModel  offers view model, for the outcome
+ * @param {AbortSignal} [args.signal]
+ * @param {object}      [args.deps]      injection seam for tests
+ * @returns {Promise<{ok: true, text: string} | {ok: false, kind: string, detail: string, violations?: object[]}>}
+ */
+export async function generateRunSummary({ beats, context, viewModel, signal, deps = {} }) {
+  const started = (globalThis.performance ?? Date).now();
+  const buildPrompt = deps.buildRunSummaryPrompt ?? buildRunSummaryPrompt;
+  const validate = deps.validateRunSummary ?? validateRunSummary;
+  const clientFactory = deps.getClient ?? getClient;
+  const profileId = deps.profileId ?? PROFILE_ID;
+  const emit = deps.trace ?? trace;
+
+  const elapsed = () => (globalThis.performance ?? Date).now() - started;
+  // The trace is keyed on beats, not on one beat. A synthetic marker keeps the
+  // log line's shape identical so the console output stays scannable.
+  const traceBeat = { index: "run", intent: null, kind: "run-summary" };
+
+  if (!profileId) {
+    const outcome = { ok: false, kind: "not_configured", detail: "No inference profile id configured." };
+    emit({ beat: traceBeat, prompt: null, elapsedMs: elapsed(), outcome });
+    return outcome;
+  }
+
+  const prompt = buildPrompt(beats, context, viewModel, {
+    resolveSegmentLabel: deps.resolveSegmentLabel ?? resolveSegmentLabel,
+  });
+
+  const { client, error } = await clientFactory();
+  if (error) {
+    const outcome = { ok: false, ...error };
+    emit({ beat: traceBeat, prompt, elapsedMs: elapsed(), outcome });
+    return outcome;
+  }
+
+  let raw;
+  try {
+    // Converse, not ConverseStream, for the same reason as the per-beat path: a
+    // partially streamed summary cannot be validated, because a fabricated number
+    // may still be arriving.
+    const response = await client.send(
+      new ConverseCommand({
+        modelId: profileId,
+        system: [{ text: prompt.system }],
+        messages: [{ role: "user", content: [{ text: prompt.message }] }],
+        inferenceConfig: { maxTokens: prompt.maxTokens, temperature: prompt.temperature },
+      }),
+      signal ? { abortSignal: signal } : undefined,
+    );
+    raw = response?.output?.message?.content?.[0]?.text ?? "";
+  } catch (err) {
+    const outcome = { ok: false, ...mapError(err) };
+    emit({ beat: traceBeat, prompt, elapsedMs: elapsed(), outcome });
+    return outcome;
+  }
+
+  const verdict = validate(raw, beats, context, viewModel);
+  if (!verdict.ok) {
+    const outcome = {
+      ok: false,
+      kind: "invalid",
+      detail: verdict.violations.map((v) => v.rule).join(","),
+      violations: verdict.violations,
+    };
+    emit({ beat: traceBeat, prompt, elapsedMs: elapsed(), outcome, raw });
+    return outcome;
+  }
+
+  const outcome = { ok: true, text: verdict.text };
+  emit({ beat: traceBeat, prompt, elapsedMs: elapsed(), outcome, raw });
   return outcome;
 }
 

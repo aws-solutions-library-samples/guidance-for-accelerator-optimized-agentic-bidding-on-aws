@@ -69,12 +69,97 @@ export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
 
 /* ------------------------------------------------------------- request card */
 
+/** The three ways to read the middle column. */
+export const CARD_VIEW = Object.freeze({
+  VISUAL: "visual",
+  CODE: "code",
+  INFO: "info",
+});
+
+/**
+ * Eye, code, info. Inline SVG rather than an icon dependency: three glyphs is
+ * not worth a package, and `currentColor` makes them inherit the active state
+ * without a second set of rules.
+ */
+function ViewIcon({ view }) {
+  const common = {
+    viewBox: "0 0 16 16",
+    width: 14,
+    height: 14,
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.6,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": true,
+    focusable: "false",
+  };
+  if (view === CARD_VIEW.VISUAL) {
+    return (
+      <svg {...common}>
+        <path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z" />
+        <circle cx="8" cy="8" r="1.9" />
+      </svg>
+    );
+  }
+  if (view === CARD_VIEW.CODE) {
+    return (
+      <svg {...common}>
+        <path d="m5.5 5.5-3 2.5 3 2.5" />
+        <path d="m10.5 5.5 3 2.5-3 2.5" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common}>
+      <circle cx="8" cy="8" r="6.3" />
+      <path d="M8 7.2v4" />
+      <path d="M8 4.9h.01" />
+    </svg>
+  );
+}
+
+const VIEW_LABEL = Object.freeze({
+  [CARD_VIEW.VISUAL]: "Visual view",
+  [CARD_VIEW.CODE]: "Request JSON",
+  [CARD_VIEW.INFO]: "What happened",
+});
+
+export function TheaterCardViewToggle({ view, onChange }) {
+  return (
+    <div className="th-card-views" role="group" aria-label="Bid request view">
+      {[CARD_VIEW.VISUAL, CARD_VIEW.CODE, CARD_VIEW.INFO].map((v) => (
+        <button
+          key={v}
+          type="button"
+          className={`th-card-view${view === v ? " is-on" : ""}`}
+          // aria-pressed, not aria-selected: these are toggle buttons in a group,
+          // not tabs, because `info` opens a surface rather than swapping a panel.
+          aria-pressed={view === v}
+          aria-label={VIEW_LABEL[v]}
+          title={VIEW_LABEL[v]}
+          onClick={() => onChange(v)}
+          data-testid={`card-view-${v}`}
+        >
+          <ViewIcon view={v} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /**
  * The centre column. Base fields come only from the submitted request; user
  * data from the request is shown in the base group labelled as already present,
  * never in the contributed group (BR-22, BR-23).
+ *
+ * `view` selects which body is rendered. The header and its toggle are constant
+ * across all three, so the control never moves under the pointer.
  */
-export function TheaterRequestCard({ context, visible, landingValues, cardState, contributors, taxonomyNames }) {
+export function TheaterRequestCard({
+  context, visible, landingValues, cardState, contributors, taxonomyNames,
+  view = CARD_VIEW.VISUAL, onViewChange, codeSlot, infoSlot,
+}) {
   const baseFields = [
     ["request", context?.requestId],
     ["format", context?.impressionFormat],
@@ -83,10 +168,40 @@ export function TheaterRequestCard({ context, visible, landingValues, cardState,
     ["taxonomy", context?.categoryTaxonomy != null ? `cattax ${context.categoryTaxonomy}` : null],
   ].filter(([, v]) => v !== null && v !== undefined);
 
+  if (view === CARD_VIEW.CODE || view === CARD_VIEW.INFO) {
+    return (
+      <div
+        // The card is capped at 380px for the visual view, which is right for
+        // chips and gauges and far too narrow for JSON. The code view widens it
+        // rather than wrapping every line.
+        className={`th-card th-card-${cardState}${view === CARD_VIEW.CODE ? " th-card--wide" : ""}`}
+        data-testid="theater-request-card"
+      >
+        <div className="th-card-head">
+          <span>Bid Request</span>
+          {onViewChange ? (
+            <TheaterCardViewToggle view={view} onChange={onViewChange} />
+          ) : null}
+        </div>
+        <div
+          className={`th-card-body th-card-body-${view}`}
+          data-testid={`theater-card-body-${view}`}
+        >
+          {view === CARD_VIEW.CODE ? codeSlot : infoSlot}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`th-card th-card-${cardState}`} data-testid="theater-request-card">
-      <div className="th-card-head">Bid Request</div>
-      <div className="th-card-body">
+      <div className="th-card-head">
+        <span>Bid Request</span>
+        {onViewChange ? (
+          <TheaterCardViewToggle view={view} onChange={onViewChange} />
+        ) : null}
+      </div>
+      <div className="th-card-body" data-testid="theater-card-body-visual">
         <div className="th-group">
           <div className="th-group-label">As sent by the exchange</div>
           <div className="th-chips">
@@ -219,30 +334,13 @@ export function TheaterSellSidePanel({ values, revealed }) {
 
 /* -------------------------------------------------------------- caption */
 
-/**
- * Polite live region: a change is announced without interrupting a viewer
- * mid-sentence (BR-38).
- */
-export function TheaterCaption({ text, stepLabel, recap }) {
-  return (
-    <div className="th-caption-wrap">
-      <div className="th-caption" data-testid="theater-caption" aria-live="polite">
-        <span className="th-caption-step">{stepLabel}</span>
-        <span className="th-caption-text">{text}</span>
-        {recap?.length ? (
-          <ul className="th-recap">
-            {recap.map((r) => (
-              <li key={r.containerName}>
-                <strong>{r.displayLabel}</strong>
-                {` — ${r.beatIndexes.length} ${r.beatIndexes.length === 1 ? "mutation" : "mutations"}`}
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </div>
-    </div>
-  );
-}
+// TheaterCaption is gone. It was a translucent strip pinned above the controls,
+// and both floated over the three columns — so the two things a reader needs at
+// once, the narration and the data it describes, were stacked on the same pixels.
+// The narration moved to TheaterMutationStage, over the centre of the stage; the
+// controls moved into a footer in flow. Nothing was lost: the step label is on
+// the mutation card and in the ribbon, and the recap list is the contributors
+// block already on the request card.
 
 /* ------------------------------------------------------------- seam arrow */
 

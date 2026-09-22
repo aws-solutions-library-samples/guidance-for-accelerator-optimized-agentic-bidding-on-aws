@@ -63,8 +63,72 @@ phases:
           echo "No NGC_API_KEY_SECRET set — skipping NGC login (only needed for NeMo/TensorRT base images)"
         fi
 
-      # Set up QEMU for ARM64 cross-compilation and configure buildx
-      - docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+      # QEMU/binfmt for ARM64 cross-compilation.
+      #
+      # ONLY when an arm64 image is actually being built. This used to run
+      # unconditionally and pulled multiarch/qemu-user-static from Docker Hub
+      # anonymously on every build, so an amd64-only build could fail in
+      # PRE_BUILD on a Docker Hub rate limit it never needed to touch:
+      #
+      #   docker: Error response from daemon: toomanyrequests: You have reached
+      #   your unauthenticated pull rate limit.
+      #   ... exit status 125
+      #
+      # CodeBuild egresses from shared addresses, so that limit is reached by
+      # other tenants, not by this account's build frequency.
+      #
+      # The condition below must stay in step with the agentcore block in the
+      # build phase -- that is the only arm64 image here.
+      - |
+        NEEDS_ARM=0
+        if [ -n "${BUILD_ONLY}" ]; then
+          case " ${BUILD_ONLY} " in *" agentcore "*) NEEDS_ARM=1 ;; esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then
+          NEEDS_ARM=1
+        fi
+        export NEEDS_ARM
+        if [ "${NEEDS_ARM}" = "0" ]; then
+          echo "No arm64 image in this build (target=${BUILD_TARGET} only=${BUILD_ONLY:-none})."
+          echo "Skipping QEMU/binfmt setup, so nothing is pulled from Docker Hub."
+        else
+          # A rate limit is a time window, not a permanent state, so a bounded
+          # retry is worth the seconds it costs.
+          ok=0
+          for attempt in 1 2 3; do
+            if docker run --rm --privileged multiarch/qemu-user-static --reset -p yes; then
+              ok=1; break
+            fi
+            echo "binfmt setup attempt ${attempt} failed; waiting before retry..."
+            sleep $((attempt * 20))
+          done
+          if [ "${ok}" = "0" ]; then
+            echo ""
+            echo "ERROR: could not register QEMU binfmt handlers, so the arm64"
+            echo "       AgentCore image cannot be cross-compiled here."
+            echo ""
+            echo "The usual cause is Docker Hub's anonymous pull rate limit, which"
+            echo "CodeBuild hits because it egresses from shared addresses. Three ways out:"
+            echo ""
+            echo "  1. Build the arm64 image natively instead of cross-compiling it:"
+            echo "       ./deployment/codebuild/remote_build.sh --target agents"
+            echo "     That uses the ${STACK_NAME}-arm-image-builder project, which runs on"
+            echo "     Graviton and needs no QEMU at all."
+            echo ""
+            echo "  2. Build everything except the arm64 image:"
+            echo "       remote_build.sh --target nemo      # or --only <image>"
+            echo ""
+            echo "  3. Wait for the rate-limit window to reset and re-run."
+            echo ""
+            echo "A durable fix is to pull the binfmt image from a registry with no"
+            echo "anonymous limit -- public.ecr.aws/eks-distro-build-tooling/binfmt-misc"
+            echo "carries qemu tags. Its entrypoint arguments differ from"
+            echo "multiarch/qemu-user-static and were not verified here, so it is named"
+            echo "rather than wired in."
+            exit 1
+          fi
+        fi
+      # buildx is configured regardless: the amd64 builds below invoke
+      # `docker buildx build`, so the builder has to exist even with no ARM work.
       - docker buildx create --name multiarch --driver docker-container --use 2>/dev/null || docker buildx use multiarch
       - docker buildx inspect --bootstrap
 

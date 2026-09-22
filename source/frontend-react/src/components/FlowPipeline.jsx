@@ -231,12 +231,18 @@ export default function FlowPipeline({ result, loading, error }) {
               // rendered active alongside "ok" — treating it as inactive would
               // read as "did not run", which is a different thing.
               const ran = status === "ok" || status === "no_mutations";
+              // Mutations this container produced that another container's
+              // higher-priority claim replaced. It ran and computed a value that
+              // the bid path did not use, which is neither "contributed" nor
+              // "did not run" and has to be visible as its own thing.
+              const superseded = stop?.superseded ?? 0;
 
               return (
                 <div
                   key={node.id}
-                  className={`agent-row ${ran ? "agent-row--active" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
+                  className={`agent-row ${ran ? "agent-row--active" : ""} ${superseded > 0 ? "agent-row--superseded" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
                   data-node={node.id}
+                  data-superseded={superseded > 0 ? superseded : undefined}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                 >
@@ -289,6 +295,19 @@ export default function FlowPipeline({ result, loading, error }) {
                               />
                             ))}
                           </div>
+                        )}
+                        {superseded > 0 && (
+                          <span
+                            className="agent-superseded-tag"
+                            data-testid={`flow-superseded-${node.id}`}
+                            title={
+                              superseded === 1
+                                ? "1 mutation was computed but overridden by a higher-priority container"
+                                : `${superseded} mutations were computed but overridden by a higher-priority container`
+                            }
+                          >
+                            {superseded} overridden
+                          </span>
                         )}
                       </>
                     )}

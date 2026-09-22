@@ -62,10 +62,15 @@ CLUSTER_NAME="${CLUSTER_NAME:-}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
 START_AT=1
+# --verbose: print the full detailed log stream. Default (0) shows only the
+# always-visible say()/ok()/warn()/fail() lines. deploy.sh passes this through so
+# one --verbose on the parent turns on the child too.
+VERBOSE="${VERBOSE:-0}"
 
 for arg in "$@"; do
   case "${arg}" in
     --skip-agentcore)  SKIP_AGENTCORE=1 ;;
+    --verbose)         VERBOSE=1 ;;
     --stack-only)      STACK_ONLY=1; SKIP_AGENTCORE=1 ;;
     --local-build)     LOCAL_BUILD=1 ;;
     --remote-build)    LOCAL_BUILD=0 ;;
@@ -94,9 +99,34 @@ for arg in "$@"; do
 done
 unset _PREV_ARG
 
-log()  { printf '\033[0;32m[closed-loop]\033[0m %s\n' "$*"; }
+# Output helpers, matching deploy.sh's (see its say/log/warn/ok definitions).
+#
+# This script previously had NO verbosity gating at all: ~100 unconditional log
+# lines plus full CloudFormation CLI output tee'd to stdout for all six stacks,
+# which is what made a deploy look noisy even though deploy.sh's own default
+# output is five phase headers and a summary. log() is now verbose-gated and
+# --verbose is passed down from deploy.sh.
+#
+# warn() and fail() stay unconditional. A warning or a hard failure is never
+# hidden by a verbosity setting.
+log()  { [[ "${VERBOSE}" -eq 1 ]] && printf '\033[0;32m[closed-loop]\033[0m %s\n' "$*"; return 0; }
+# say(): always visible. For the handful of lines a user needs without --verbose.
+say()  { printf '\033[0;32m[closed-loop]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[closed-loop][warn]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[closed-loop][fail]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# step()/done_ok()/run_logged() and the status marks. run_logged is what keeps the
+# arm64 agent image builds and the AgentCore SDK's INFO logging out of the terminal.
+# shellcheck source=lib/deploy_progress.sh
+source "${SCRIPT_DIR}/lib/deploy_progress.sh"
+
+# ok() predates the shared marks; point it at MARK_OK so a completed step looks the
+# same here as it does in deploy.sh and in `--status`.
+ok() { done_ok "$*"; }
+
+# Where the noisy commands' output goes. deploy.sh passes its Phase 5 log so there
+# is ONE file to read after a failure; standalone runs get their own.
+CL_DETAIL_LOG="${CL_DETAIL_LOG:-${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-closed-loop-detail.log}"
 
 # AgentCore VPC-supported Availability Zone IDs per region. Subnets outside these
 # AZs fail AgentCore runtime creation. Extend as AgentCore adds regions.
@@ -218,17 +248,33 @@ deploy_cfn_stack() {
     cmd+=(--parameters "${params[@]}")
   fi
 
-  if "${cmd[@]}" 2>&1 | tee /tmp/cfn-deploy-output.txt | grep -q "StackId"; then
+  # CloudFormation's own output goes to a per-stack log file, not to stdout.
+  #
+  # This was `"${cmd[@]}" 2>&1 | tee /tmp/cfn-deploy-output.txt | grep -q "StackId"`
+  # -- the single largest source of deploy noise, printing full CFN CLI output for
+  # all six stacks. Two consequences of the rewrite worth knowing:
+  #
+  #   1. The pipeline's exit status was `grep`'s, not the command's, because a
+  #      pipeline reports its LAST element. A CFN call that failed while still
+  #      printing a StackId took the success path. The command's own status is now
+  #      the primary condition, with the grep as a second &&. The else branch
+  #      already re-queries the real stack status, so a false negative still
+  #      resolves correctly.
+  #   2. The log file is per-stack and is NOT deleted, so a failure can be read
+  #      after the fact. The shared /tmp/cfn-deploy-output.txt was overwritten by
+  #      whichever stack ran last.
+  local cfn_log="/tmp/cfn-deploy-${stack_name}-$(date +%s).log"
+  if "${cmd[@]}" >"${cfn_log}" 2>&1 && grep -q "StackId" "${cfn_log}"; then
     local wait_action="stack-create-complete"
     [[ "${action}" == "update-stack" ]] && wait_action="stack-update-complete"
     log "  Waiting for ${stack_name} (${wait_action})..."
     aws cloudformation wait "${wait_action}" \
       --stack-name "${stack_name}" \
       --region "${AWS_REGION}"
-    log "  Stack ${stack_name}: COMPLETE"
+    ok "Stack ${stack_name}: COMPLETE"
   else
     local cfn_error
-    cfn_error="$(cat /tmp/cfn-deploy-output.txt 2>/dev/null || echo '')"
+    cfn_error="$(cat "${cfn_log}" 2>/dev/null || echo '')"
     # Check if it's a "no updates" situation
     if echo "${cfn_error}" | grep -q "No updates are to be performed"; then
       log "  Stack ${stack_name}: no updates needed"
@@ -241,6 +287,7 @@ deploy_cfn_stack() {
       log "  Stack ${stack_name}: no updates needed (${status})"
     else
       warn "CFN error: ${cfn_error}"
+      warn "Full CloudFormation output: ${cfn_log}"
       fail "Stack ${stack_name} deploy failed (status: ${status})"
     fi
   fi
@@ -275,7 +322,7 @@ fi
 # Step 1: Feedback Pipeline (Kinesis/Firehose/S3/KMS)
 # =========================================================================
 if [[ "${START_AT}" -le 1 ]]; then
-log "Step 1: Deploying Feedback Pipeline"
+step "Step 1: Deploying Feedback Pipeline"
 deploy_cfn_stack "${FEEDBACK_STACK}" "${SCRIPT_DIR}/feedback_pipeline_cfn.yaml" \
   "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
   "ParameterKey=EKSNodeRoleArn,ParameterValue=${EKS_NODE_ROLE}"
@@ -347,7 +394,7 @@ fi
 fi # step 1
 
 if [[ "${START_AT}" -le 2 ]]; then
-log "Step 2: Deploying Glue ETL"
+step "Step 2: Deploying Glue ETL"
 
 # Glue script bucket. GLUE_SCRIPT_S3_PATH can still be overridden to point at
 # an already-existing script elsewhere, but the default path below is now
@@ -424,7 +471,7 @@ deploy_cfn_stack "${GLUE_STACK}" "${SCRIPT_DIR}/glue_etl_cfn.yaml" \
 fi # step 2
 
 if [[ "${START_AT}" -le 3 ]]; then
-log "Step 3: Deploying Closed-Loop Core"
+step "Step 3: Deploying Closed-Loop Core"
 # TRAINING_DATA_BUCKET was resolved in Step 2. MODEL_BUCKET is passed in from
 # deploy.sh Step 11 (the Triton model-repository bucket, already holding the
 # genesis ONNX artifacts uploaded at deploy.sh Step 3a). Both are needed to
@@ -480,7 +527,7 @@ log "  SNS Topic: ${SNS_TOPIC_ARN}"
 fi # step 3
 
 if [[ "${START_AT}" -le 4 ]]; then
-log "Step 4: Deploying AgentCore execution roles (roles-only; deployed BEFORE the runtimes)"
+step "Step 4: Deploying AgentCore execution roles (roles-only; deployed BEFORE the runtimes)"
 
 # These roles use runtime-name-prefixed trust (ArnLike), so they do NOT depend on a
 # runtime ARN and can be created before the runtimes. No placeholder ARNs.
@@ -533,7 +580,7 @@ log "  Governance execution role: ${GOVERNANCE_ROLE_ARN}"
 TRAINING_REPO="artf-nemo-rl-training"
 fi # step 4
 
-log "Step 4b: Building NeMo-RL training container"
+step "Step 4b: Building NeMo-RL training container"
 
 # Create ECR repo if needed
 aws ecr describe-repositories --repository-names "${TRAINING_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
@@ -627,6 +674,9 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
 
   if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
     # Local build (synchronous — requires ~25 GB free disk)
+    # shellcheck source=lib/deploy_docker.sh
+    source "${SCRIPT_DIR}/lib/deploy_docker.sh"
+    docker_ensure_running "build the NeMo-RL training image locally"
     aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${TRAINING_REGISTRY}" 2>/dev/null
     docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SCRIPT_DIR}/../source/training/container/"
     # src-<hash> is pushed alongside dlrm/ncf so the next run can tell this
@@ -685,7 +735,7 @@ fi
 # touched here.
 # =========================================================================
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
-  log "Step 5: Deploying AgentCore Runtimes"
+  step "Step 5: Deploying AgentCore Runtimes"
 
   # Resolve the dedicated per-agent execution roles created in Step 4 (fallback to the
   # security stack outputs so --start-at=5 works). The runtimes use these least-privilege
@@ -711,6 +761,20 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   IMAGE_TAG="$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo latest)"
 
+  # The two agent images below are built locally and on purpose -- AgentCore needs
+  # arm64 and the builds are small. So make sure Docker is actually running FIRST,
+  # and start it if not.
+  #
+  # This is where Phase 5 used to die. With the daemon down, `docker buildx build`
+  # failed with a raw connect error after the ECR repository had already been
+  # created, aborting the rest of Phase 5: no agent runtimes, no
+  # governance-eventbridge stack. The only evidence left behind was an ECR
+  # repository holding zero images, which reads like nothing in particular.
+  # shellcheck source=lib/deploy_docker.sh
+  source "${SCRIPT_DIR}/lib/deploy_docker.sh"
+  docker_ensure_running "build the AgentCore agent images"
+  docker_ensure_buildx
+
   # Authenticate to ECR once for all agent image pushes
   aws ecr get-login-password --region "${AWS_REGION}" | \
     docker login --username AWS --password-stdin "${REGISTRY}" 2>/dev/null
@@ -725,28 +789,37 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     aws ecr create-repository --repository-name "${ADAPTIVE_BIDDING_REPO}" --region "${AWS_REGION}" \
       --image-scanning-configuration scanOnPush=true >/dev/null
 
-  log "  Building Adaptive Bidding agent image (arm64)..."
-  docker buildx build \
-    --platform linux/arm64 \
-    -f "${SCRIPT_DIR}/../source/Dockerfile.adaptive-bidding-agent" \
-    -t "${ADAPTIVE_BIDDING_IMAGE}" --load "${SCRIPT_DIR}/../source"
-  docker push "${ADAPTIVE_BIDDING_IMAGE}"
-  log "  Pushed: ${ADAPTIVE_BIDDING_IMAGE}"
+  # An arm64 buildx build emits hundreds of layer lines. They go to CL_DETAIL_LOG;
+  # the screen gets one line per step. run_logged tails the log if a build fails, so
+  # the quiet path never costs a diagnosis.
+  run_logged "${CL_DETAIL_LOG}" "Building Adaptive Bidding agent image (arm64)" \
+    docker buildx build \
+      --platform linux/arm64 \
+      -f "${SCRIPT_DIR}/../source/Dockerfile.adaptive-bidding-agent" \
+      -t "${ADAPTIVE_BIDDING_IMAGE}" --load "${SCRIPT_DIR}/../source" \
+    || fail "Adaptive Bidding agent image build failed (detail in ${CL_DETAIL_LOG})"
+  run_logged "${CL_DETAIL_LOG}" "Pushing ${ADAPTIVE_BIDDING_REPO}:${IMAGE_TAG}" \
+    docker push "${ADAPTIVE_BIDDING_IMAGE}" \
+    || fail "docker push failed for ${ADAPTIVE_BIDDING_IMAGE} (detail in ${CL_DETAIL_LOG})"
 
-  log "  Deploying ${ADAPTIVE_BIDDING_RUNTIME_NAME} (HTTP)..."
-  ADAPTIVE_BIDDING_RUNTIME_ARN="$(python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
-    --action deploy \
-    --runtime-name "${ADAPTIVE_BIDDING_RUNTIME_NAME}" \
-    --role-arn "${ADAPTIVE_BIDDING_ROLE_ARN}" \
-    --container-uri "${ADAPTIVE_BIDDING_IMAGE}" \
-    --protocol HTTP \
-    --environment "PARAMETER_STORE_TABLE=${PARAM_TABLE_NAME}" \
-    --environment "AUDIT_TRAIL_TABLE=${AUDIT_TABLE_NAME}" \
-    --environment "AWS_REGION=${AWS_REGION}" \
-    --environment "ADAPTIVE_BIDDING_MODEL_ID=${ADAPTIVE_BIDDING_MODEL_ID}" \
-    --description "Adaptive Bidding Strategy Agent — Bedrock reasoning agent for bid parameter tuning" \
-    --region "${AWS_REGION}" \
-    --print-arn)"
+  # deploy_to_agentcore.py logs to STDERR and prints only the ARN on stdout, so the
+  # ARN is still capturable with the INFO chatter diverted to the log.
+  run_logged_capture ADAPTIVE_BIDDING_RUNTIME_ARN "${CL_DETAIL_LOG}" \
+    "Registering ${ADAPTIVE_BIDDING_RUNTIME_NAME} (HTTP)" \
+    python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
+      --action deploy \
+      --runtime-name "${ADAPTIVE_BIDDING_RUNTIME_NAME}" \
+      --role-arn "${ADAPTIVE_BIDDING_ROLE_ARN}" \
+      --container-uri "${ADAPTIVE_BIDDING_IMAGE}" \
+      --protocol HTTP \
+      --environment "PARAMETER_STORE_TABLE=${PARAM_TABLE_NAME}" \
+      --environment "AUDIT_TRAIL_TABLE=${AUDIT_TABLE_NAME}" \
+      --environment "AWS_REGION=${AWS_REGION}" \
+      --environment "ADAPTIVE_BIDDING_MODEL_ID=${ADAPTIVE_BIDDING_MODEL_ID}" \
+      --description "Adaptive Bidding Strategy Agent — Bedrock reasoning agent for bid parameter tuning" \
+      --region "${AWS_REGION}" \
+      --print-arn \
+    || fail "${ADAPTIVE_BIDDING_RUNTIME_NAME} deploy failed (detail in ${CL_DETAIL_LOG})"
   [[ -n "${ADAPTIVE_BIDDING_RUNTIME_ARN}" ]] || fail "${ADAPTIVE_BIDDING_RUNTIME_NAME} deploy did not return a runtime ARN"
   export ADAPTIVE_BIDDING_RUNTIME_ARN
   log "  ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}"
@@ -761,13 +834,15 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     aws ecr create-repository --repository-name "${GOVERNANCE_REPO}" --region "${AWS_REGION}" \
       --image-scanning-configuration scanOnPush=true >/dev/null
 
-  log "  Building Model Promotion Governance agent image (arm64)..."
-  docker buildx build \
-    --platform linux/arm64 \
-    -f "${SCRIPT_DIR}/../source/Dockerfile.governance" \
-    -t "${GOVERNANCE_IMAGE}" --load "${SCRIPT_DIR}/../source"
-  docker push "${GOVERNANCE_IMAGE}"
-  log "  Pushed: ${GOVERNANCE_IMAGE}"
+  run_logged "${CL_DETAIL_LOG}" "Building Model Promotion Governance agent image (arm64)" \
+    docker buildx build \
+      --platform linux/arm64 \
+      -f "${SCRIPT_DIR}/../source/Dockerfile.governance" \
+      -t "${GOVERNANCE_IMAGE}" --load "${SCRIPT_DIR}/../source" \
+    || fail "Governance agent image build failed (detail in ${CL_DETAIL_LOG})"
+  run_logged "${CL_DETAIL_LOG}" "Pushing ${GOVERNANCE_REPO}:${IMAGE_TAG}" \
+    docker push "${GOVERNANCE_IMAGE}" \
+    || fail "docker push failed for ${GOVERNANCE_IMAGE} (detail in ${CL_DETAIL_LOG})"
 
   # ---- Resolve VPC networking + in-cluster endpoints for the governance runtime ----
   # The governance agent reaches the Model Optimizer + Triton over their INTERNAL
@@ -878,24 +953,26 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     warn "  fail honestly until a cluster VPC is available (deploy via deploy.sh --with-retraining)."
   fi
 
-  log "  Deploying ${GOVERNANCE_RUNTIME_NAME} (HTTP)..."
-  GOVERNANCE_RUNTIME_ARN="$(python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
-    --action deploy \
-    --runtime-name "${GOVERNANCE_RUNTIME_NAME}" \
-    --role-arn "${GOVERNANCE_ROLE_ARN}" \
-    --container-uri "${GOVERNANCE_IMAGE}" \
-    --protocol HTTP \
-    --environment "AUDIT_TABLE=${AUDIT_TABLE_NAME}" \
-    --environment "AWS_REGION=${AWS_REGION}" \
-    --environment "GOVERNANCE_MODEL_ID=${GOVERNANCE_MODEL_ID}" \
-    --environment "MODEL_BUCKET=${MODEL_BUCKET:-}" \
-    --environment "OPTIMIZER_ENDPOINT=${OPTIMIZER_ENDPOINT:-}" \
-    --environment "TRITON_URL=${GOV_TRITON_URL:-}" \
-    --environment "VPC_PROXY_LAMBDA_ARN=${VPC_PROXY_LAMBDA_ARN:-}" \
-    --environment "VPC_PROXY_TIMEOUT_SECONDS=${VPC_PROXY_TIMEOUT_SECONDS}" \
-    --description "Model Promotion Governance Agent — deterministic A/B gate + Bedrock reasoning" \
-    --region "${AWS_REGION}" \
-    --print-arn)"
+  run_logged_capture GOVERNANCE_RUNTIME_ARN "${CL_DETAIL_LOG}" \
+    "Registering ${GOVERNANCE_RUNTIME_NAME} (HTTP)" \
+    python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
+      --action deploy \
+      --runtime-name "${GOVERNANCE_RUNTIME_NAME}" \
+      --role-arn "${GOVERNANCE_ROLE_ARN}" \
+      --container-uri "${GOVERNANCE_IMAGE}" \
+      --protocol HTTP \
+      --environment "AUDIT_TABLE=${AUDIT_TABLE_NAME}" \
+      --environment "AWS_REGION=${AWS_REGION}" \
+      --environment "GOVERNANCE_MODEL_ID=${GOVERNANCE_MODEL_ID}" \
+      --environment "MODEL_BUCKET=${MODEL_BUCKET:-}" \
+      --environment "OPTIMIZER_ENDPOINT=${OPTIMIZER_ENDPOINT:-}" \
+      --environment "TRITON_URL=${GOV_TRITON_URL:-}" \
+      --environment "VPC_PROXY_LAMBDA_ARN=${VPC_PROXY_LAMBDA_ARN:-}" \
+      --environment "VPC_PROXY_TIMEOUT_SECONDS=${VPC_PROXY_TIMEOUT_SECONDS}" \
+      --description "Model Promotion Governance Agent — deterministic A/B gate + Bedrock reasoning" \
+      --region "${AWS_REGION}" \
+      --print-arn \
+    || fail "${GOVERNANCE_RUNTIME_NAME} deploy failed (detail in ${CL_DETAIL_LOG})"
   [[ -n "${GOVERNANCE_RUNTIME_ARN}" ]] || fail "${GOVERNANCE_RUNTIME_NAME} deploy did not return a runtime ARN"
   export GOVERNANCE_RUNTIME_ARN
   log "  GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}"
@@ -913,7 +990,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # Package Group names (also from Step 3). Falls back to stack-output lookups so
   # --start-at=5/6 works standalone.
   # -----------------------------------------------------------------------
-  log "Step 6: Deploying invocation stack (${GOVERNANCE_EVENTBRIDGE_STACK})"
+  step "Step 6: Deploying invocation stack (${GOVERNANCE_EVENTBRIDGE_STACK})"
   SAGEMAKER_TRAINING_ROLE_ARN="${SAGEMAKER_TRAINING_ROLE_ARN:-$(get_stack_output "${CLOSED_LOOP_STACK}" "SageMakerTrainingExecutionRoleArn")}"
   DLRM_PACKAGE_GROUP="${DLRM_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "DLRMModelPackageGroupName")}"
   NCF_PACKAGE_GROUP="${NCF_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "NCFModelPackageGroupName")}"
@@ -1004,7 +1081,7 @@ except Exception:
   # ship a broken distribution.
   # -----------------------------------------------------------------------
   if [[ -n "${ADAPTIVE_BIDDING_RUNTIME_ARN}" || -n "${GOVERNANCE_RUNTIME_ARN}" ]]; then
-    log "Step 7: Rewiring the UI with the closed-loop agent runtime ARNs"
+    step "Step 7: Rewiring the UI with the closed-loop agent runtime ARNs"
 
     # Grant the Identity Pool authenticated role least-privilege InvokeAgentRuntime,
     # scoped to exactly these two runtimes (+ their DEFAULT endpoint sub-resources).

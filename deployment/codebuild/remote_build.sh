@@ -111,6 +111,25 @@ log()  { printf '\033[0;32m[remote-build]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[0;33m[warn]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# _can_prompt(): true only when this process can ACTUALLY read the terminal.
+#
+# `[[ -t 0 ]]` is not that test. For `nohup … &` stdin is still the terminal, so
+# `-t 0` passes — but a BACKGROUND process that reads the terminal is sent SIGTTIN
+# and stops. `-t 0` therefore turns a clean failure into a silently stopped
+# deployment, which is worse than the `</dev/tty` bug it replaced.
+#
+# The real question is whether our process group is the terminal's FOREGROUND
+# process group; `ps -o tpgid=` reports that group for the controlling terminal.
+# If ps cannot answer, assume we cannot prompt — a wrong default costs one
+# decision, a block costs the whole run. Kept in step with deploy.sh's copy.
+_can_prompt() {
+  [[ -t 0 ]] || return 1
+  local _pgid _tpgid
+  _pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')"
+  _tpgid="$(ps -o tpgid= -p $$ 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "${_pgid}" && -n "${_tpgid}" && "${_pgid}" == "${_tpgid}" ]]
+}
+
 # Validate inputs
 [[ -n "${STACK_NAME}" ]] || fail "--stack-name is required"
 [[ "${BUILD_TARGET}" =~ ^(all|part1|nemo|agents|optimizer)$ ]] || fail "--target must be one of: all, part1, nemo, agents, optimizer"
@@ -172,8 +191,26 @@ if [[ -z "${NGC_SECRET}" && "${_BUILDS_NEMO}" -eq 1 ]]; then
   warn "  Pass --ngc-key YOUR_API_KEY  (creates secret automatically)"
   warn "  Or   --ngc-secret SECRET_NAME (if you already stored it in Secrets Manager)"
   warn ""
+  # Gated on stdin being a TERMINAL, not on /dev/tty existing.
+  #
+  # This prompt previously read `</dev/tty` unconditionally. With no controlling
+  # terminal -- a detached run, nohup, setsid, CI -- the REDIRECT ITSELF fails, so
+  # `read` returns non-zero and `set -euo pipefail` (top of this file) exits the
+  # script. deploy_closed_loop.sh calls this in a command substitution under its own
+  # `set -e`, so it died here at its Step 4b: after the feedback-pipeline, glue-etl,
+  # closed-loop-core and agentcore-security stacks were created, and BEFORE the
+  # vpc-proxy and governance-eventbridge stacks. deploy.sh then turned that into two
+  # warnings and printed its success banner. Reported from a real walkthrough.
+  #
+  # Non-interactively we fail with the remedy instead. The interactive default here
+  # is already N -> fail, so this matches the overwhelmingly likely interactive
+  # outcome rather than inventing a new behaviour -- and it fails BEFORE any build
+  # starts, rather than 20 minutes later at the nvcr.io pull.
+  if ! _can_prompt; then
+    fail "NGC credentials are required for the NeMo build and none were found for this stack. Pass --ngc-key YOUR_API_KEY (stored in Secrets Manager automatically and reused on later runs) or --ngc-secret SECRET_NAME. Get a key from https://ngc.nvidia.com/ (Profile > Generate API Key). This is not interactive, so there is nothing to confirm."
+  fi
   printf '\033[0;33m[warn]\033[0m Continue without NGC credentials? The build will fail if nvcr.io requires auth. [y/N]: ' >&2
-  read -r CONTINUE </dev/tty
+  read -r CONTINUE || CONTINUE=""
   if [[ "${CONTINUE}" != "y" && "${CONTINUE}" != "Y" ]]; then
     fail "Aborted. Get your NGC API key from https://ngc.nvidia.com/ (Profile > Generate API Key)"
   fi
@@ -331,8 +368,22 @@ if [[ "${EXISTING_BUILD}" != "None" && -n "${EXISTING_BUILD}" ]]; then
     warn "  Started:  ${EXISTING_START}"
     warn "  Console:  https://${AWS_REGION}.console.aws.amazon.com/codesuite/codebuild/projects/${CB_PROJECT}/build/${EXISTING_BUILD}?region=${AWS_REGION}"
     warn ""
-    printf '\033[0;33m[warn]\033[0m Do you want to (w)ait for the existing build, (n)ew build, or (q)uit? [w/n/q]: ' >&2
-    read -r CHOICE </dev/tty
+    # Same tty guard as the NGC prompt above, and the same reason: `</dev/tty`
+    # fails outright with no controlling terminal, taking the script down under
+    # `set -e`. This prompt is reachable on any re-run while a prior NeMo build is
+    # still IN_PROGRESS, which makes it the second way a detached deploy died.
+    #
+    # Non-interactively we WAIT. Waiting joins the existing build; starting a new
+    # one would duplicate a 15-50 minute GPU-adjacent build, double the spend, and
+    # race the first build on the same ECR tags. Quitting would abandon a build the
+    # caller is about to depend on.
+    if ! _can_prompt; then
+      log "Not running in the foreground — waiting for the in-progress build instead of starting a second one."
+      CHOICE="w"
+    else
+      printf '\033[0;33m[warn]\033[0m Do you want to (w)ait for the existing build, (n)ew build, or (q)uit? [w/n/q]: ' >&2
+      read -r CHOICE || CHOICE="w"
+    fi
     case "${CHOICE}" in
       w|W)
         log "Waiting for existing build: ${EXISTING_BUILD}"
@@ -386,6 +437,39 @@ log "Waiting for build to complete (Ctrl+C to detach; build continues remotely).
 
 POLL_INTERVAL=15
 POLL_START=$(date +%s)
+
+# Progress line. The previous form was `printf '\r...%s\n'` -- a carriage return
+# AND a newline -- so every 15-second poll left its line behind: 60-80 lines for a
+# 20-minute build, and the single largest contributor to this script's output.
+#
+# On a terminal the line now rewrites in place. Off a terminal (redirected to a
+# log, or CI) in-place rewriting produces one unreadable line, so there we print
+# only when the build's PHASE actually changes -- a handful of lines that are worth
+# having in a log file, instead of one per poll.
+_LAST_REPORTED_PHASE=""
+_PROGRESS_LINE_OPEN=0
+report_progress() {
+  local status="$1" phase="$2" elapsed="$3"
+  local text
+  text="$(printf '\033[0;32m[remote-build]\033[0m Status: %-12s Phase: %-20s Elapsed: %dm%02ds' \
+    "${status}" "${phase}" "$(( elapsed / 60 ))" "$(( elapsed % 60 ))")"
+  if [[ -t 2 ]]; then
+    printf '\r%s\033[K' "${text}" >&2
+    _PROGRESS_LINE_OPEN=1
+  elif [[ "${phase}" != "${_LAST_REPORTED_PHASE}" ]]; then
+    printf '%s\n' "${text}" >&2
+  fi
+  _LAST_REPORTED_PHASE="${phase}"
+}
+
+# Close the in-place line so whatever prints next starts on its own row.
+end_progress() {
+  if [[ "${_PROGRESS_LINE_OPEN}" -eq 1 ]]; then
+    printf '\n' >&2
+    _PROGRESS_LINE_OPEN=0
+  fi
+}
+
 while true; do
   BUILD_STATUS=$(aws codebuild batch-get-builds \
     --ids "${BUILD_ID}" \
@@ -401,18 +485,16 @@ while true; do
 
   case "${BUILD_STATUS}" in
     SUCCEEDED)
+      end_progress
       log "Build SUCCEEDED"
       break
       ;;
     FAILED|FAULT|TIMED_OUT|STOPPED)
+      end_progress
       fail "Build ${BUILD_STATUS}. Check logs: https://${AWS_REGION}.console.aws.amazon.com/codesuite/codebuild/projects/${CB_PROJECT}/build/${BUILD_ID}?region=${AWS_REGION}"
       ;;
-    IN_PROGRESS)
-      printf '\r\033[0;32m[remote-build]\033[0m Status: IN_PROGRESS  Phase: %-20s  Elapsed: %dm%02ds\n' "${PHASE}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
-      sleep "${POLL_INTERVAL}"
-      ;;
-    *)
-      printf '\r\033[0;32m[remote-build]\033[0m Status: %-15s Phase: %-20s  Elapsed: %dm%02ds\n' "${BUILD_STATUS}" "${PHASE}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
+    IN_PROGRESS|*)
+      report_progress "${BUILD_STATUS}" "${PHASE}" "${ELAPSED}"
       sleep "${POLL_INTERVAL}"
       ;;
   esac

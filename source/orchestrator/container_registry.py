@@ -133,6 +133,7 @@ class RegistryEntry:
     active: bool
     source: str
     configurable: bool
+    priority: int = 0
 
     def as_container_dict(self) -> dict:
         """The legacy container-dict shape the transport helpers expect.
@@ -180,6 +181,23 @@ def _normalise_intents(raw) -> frozenset[str]:
     return frozenset(out)
 
 
+def _coerce_priority(raw) -> int:
+    """Coerce a stored priority to an int, defaulting to 0.
+
+    DynamoDB numbers arrive as ``Decimal``, and a hand-written record can carry a
+    string or nothing at all. An unparseable value becomes 0 rather than raising:
+    this runs on the bid path, and a typo in one registry record must not stop
+    every container being called.
+    """
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Registry record has an unparseable priority %r; treating it as 0.", raw)
+        return 0
+
+
 def _entry_from_code(container: dict) -> RegistryEntry:
     name = container["name"]
     return RegistryEntry(
@@ -194,6 +212,11 @@ def _entry_from_code(container: dict) -> RegistryEntry:
         active=True,
         source=SOURCE_CODE,
         configurable=False,
+        # Pinned, with no code path to change it — same reasoning as `active`
+        # and `configurable`. A store record cannot promote or demote a built-in;
+        # to outrank one, an attached container must be given a priority above 0
+        # deliberately.
+        priority=0,
     )
 
 
@@ -218,6 +241,7 @@ def _entry_from_record(record: dict) -> RegistryEntry:
         active=bool(record.get("active", False)),
         source=SOURCE_STORE,
         configurable=True,
+        priority=_coerce_priority(record.get("priority")),
     )
 
 
@@ -343,6 +367,137 @@ def select_active(
 # ---------------------------------------------------------------------------
 # Pure function: status
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MutationClaim:
+    """One mutation, plus who produced it and where they sit in the registry.
+
+    ``order`` is the producing container's index in registry order and ``index``
+    is the mutation's position in the flattened list. Both are needed because the
+    tie-break has to reproduce the existing behaviour exactly — see
+    ``resolve_conflicts``.
+    """
+
+    container: str
+    priority: int
+    order: int
+    index: int
+    mutation: Mutation
+
+
+@dataclass(frozen=True)
+class ConflictRecord:
+    """One ``(path, intent)`` contested by more than one container."""
+
+    path: str
+    intent: int
+    winner: str
+    losers: tuple[str, ...]
+
+
+def build_claims(
+    invocations,
+    priority_by_name: dict[str, int] | None = None,
+) -> list[MutationClaim]:
+    """Flatten per-container mutations into claims, preserving registry order.
+
+    *invocations* is the list ``_fan_out`` returns, which is **already in registry
+    order** — so a container's index in it is its registry position and no second
+    registry lookup is needed to establish ordering. Only the priority has to be
+    supplied, and that comes from the TTL-cached registry, so this adds no I/O to
+    the bid path.
+    """
+    priorities = priority_by_name or {}
+    claims: list[MutationClaim] = []
+    index = 0
+    for order, inv in enumerate(invocations):
+        for mutation in getattr(inv, "mutations", None) or []:
+            claims.append(
+                MutationClaim(
+                    container=inv.name,
+                    priority=priorities.get(inv.name, 0),
+                    order=order,
+                    index=index,
+                    mutation=mutation,
+                )
+            )
+            index += 1
+    return claims
+
+
+def resolve_conflicts(
+    claims: list[MutationClaim],
+) -> tuple[list[Mutation], list[ConflictRecord], dict[str, int]]:
+    """Pick one mutation per ``(path, intent)``.
+
+    Returns ``(survivors, conflicts, superseded_by_container)``. Survivors are in
+    **input order**, so the response's mutation ordering stays stable and still
+    reflects registry order rather than the order winners happened to be decided.
+
+    Why this exists
+    ---------------
+    Two containers may claim the same intent, which the fan-out allows on purpose.
+    But a consumer applies the mutation list in order, and for a deal floor the
+    applier does ``updatedDeals.set(dealIndex, …)`` — so only the **last** mutation
+    applied to a given path has any effect. Before this function, the earlier one
+    was still returned, still reported ``ok``, and silently did nothing.
+
+    The tie-break direction
+    -----------------------
+    The winner is ``max`` by ``(priority, order, index)``. The ``max`` matters:
+    with every priority equal it reduces to "highest order, then highest index",
+    which is the **last** mutation in the flattened list — exactly the
+    last-write-wins outcome a consumer produces today. Using ``min`` would look
+    like it was "preserving registry order" while inverting which container's
+    value is honoured on every existing deployment.
+
+    That is the whole backward-compatibility guarantee: set no priorities and the
+    surviving set is byte-identical to what was returned before this function
+    existed. Attaching a container therefore changes nothing until someone gives
+    it a priority deliberately.
+    """
+    if not claims:
+        return [], [], {}
+
+    grouped: dict[tuple[str, int], list[MutationClaim]] = {}
+    for claim in claims:
+        grouped.setdefault((claim.mutation.path, claim.mutation.intent), []).append(claim)
+
+    winners: set[int] = set()
+    conflicts: list[ConflictRecord] = []
+    superseded: dict[str, int] = {}
+
+    for (path, intent), group in grouped.items():
+        winner = max(group, key=lambda c: (c.priority, c.order, c.index))
+        winners.add(winner.index)
+
+        if len(group) == 1:
+            # Uncontested. A conflict record here would be noise.
+            continue
+
+        losers = [c for c in group if c.index != winner.index]
+        for loser in losers:
+            superseded[loser.container] = superseded.get(loser.container, 0) + 1
+
+        # Losing container names, de-duplicated but order-preserving: one
+        # container can lose twice on the same key and should be named once.
+        loser_names: list[str] = []
+        for loser in losers:
+            if loser.container not in loser_names:
+                loser_names.append(loser.container)
+
+        conflicts.append(
+            ConflictRecord(
+                path=path,
+                intent=intent,
+                winner=winner.container,
+                losers=tuple(loser_names),
+            )
+        )
+
+    survivors = [c.mutation for c in claims if c.index in winners]
+    return survivors, conflicts, superseded
+
 
 def derive_status(outcome: ContainerCallOutcome) -> str:
     """Map a real call observation to a status.

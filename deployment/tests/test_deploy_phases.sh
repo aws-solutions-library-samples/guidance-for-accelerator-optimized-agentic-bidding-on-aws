@@ -19,6 +19,14 @@
 
 set -uo pipefail
 
+# NOTE ON ERREXIT: this suite deliberately runs WITHOUT `set -e` (above), because
+# tests routinely run commands expected to fail and then assert on the status.
+# Several tests wrap such a command in `set +e` ... `set -e` -- and that trailing
+# `set -e` used to ENABLE errexit rather than restore it, since it was never on.
+# The effect was invisible until a test had a top-level command legitimately
+# return non-zero (`wait` on a killed process, status 143): the whole suite then
+# exited silently at that line, reporting no results at all. Restores are `set +e`
+# for that reason. If you add one, restore with `set +e`.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_SH="${SCRIPT_DIR}/../deploy.sh"
 
@@ -55,6 +63,32 @@ assert_eq() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
     printf 'FAIL: %s — expected %q, got %q\n' "${label}" "${expected}" "${actual}" >&2
   fi
+}
+
+# run_limited SECONDS OUTFILE COMMAND... — run a command under a wall-clock limit
+# and return its exit code, or 124 if it had to be killed.
+#
+# Hand-rolled rather than using timeout(1): that is GNU coreutils and is NOT
+# present on a stock macOS, which is a supported platform for these scripts (the
+# same reason this codebase avoids bash-4 features). Without a limit, a test that
+# is meant to prove "this does not hang" would itself hang forever when it fails,
+# which is the least useful possible outcome.
+run_limited() {
+  local secs="$1" outfile="$2"; shift 2
+  local pid elapsed=0
+  "$@" >"${outfile}" 2>&1 &
+  pid=$!
+  while kill -0 "${pid}" 2>/dev/null; do
+    if [[ "${elapsed}" -ge "${secs}" ]]; then
+      kill -9 "${pid}" 2>/dev/null
+      wait "${pid}" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "${pid}"
+  return $?
 }
 
 # =========================================================================
@@ -100,6 +134,17 @@ test_display_name() {
 # =========================================================================
 test_output_gating() {
   local fn_src out
+
+  # The emitters now route through _journal()/_emit() (so a follower can tail their
+  # output), so those have to come along too — extracted from deploy.sh rather than
+  # reimplemented here, which is the point of this test: it asserts on the real
+  # definitions, not on a copy that could drift.
+  fn_src="$(sed -n '/^_journal() {/,/^}/p' "${DEPLOY_SH}")"
+  eval "${fn_src}"
+  fn_src="$(sed -n '/^_emit() {/,/^}/p' "${DEPLOY_SH}")"
+  eval "${fn_src}"
+  # Journaling off for this test: it asserts on what reaches the console.
+  DEPLOY_JOURNAL_FILE=""
 
   fn_src="$(sed -n '/^say() {/,/^}/p' "${DEPLOY_SH}")"
   eval "${fn_src}"
@@ -229,14 +274,538 @@ test_bootstrap_watcher() {
 }
 
 # =========================================================================
+# Test 7: the NON-INTERACTIVE remote_build.sh paths.
+#
+# This is the regression test for the defect the deploy-state feature exists to
+# fix. remote_build.sh read `</dev/tty` at two prompts; with no controlling
+# terminal the REDIRECT itself fails, `read` returns non-zero, and `set -euo
+# pipefail` exits the script. deploy_closed_loop.sh calls it in a command
+# substitution under its own `set -e`, so it died at Step 4b -- leaving the
+# vpc-proxy and governance-eventbridge stacks uncreated while deploy.sh printed
+# its success banner.
+#
+# Runs the REAL script with a mocked `aws` and stdin closed. Two things are
+# asserted that a code read cannot establish: that it does not HANG, and that it
+# exits non-zero with a message naming the remedy.
+# =========================================================================
+test_remote_build_non_interactive() {
+  local tmpdir out rc
+  tmpdir="$(mktemp -d)"
+
+  # Mock `aws`: resolve an account, and report NO existing NGC secret (which is
+  # what makes the NGC prompt reachable).
+  cat > "${tmpdir}/aws" <<'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+  *"sts get-caller-identity"*) echo "123456789012" ;;
+  *"secretsmanager describe-secret"*) exit 1 ;;
+  *"codebuild list-builds-for-project"*) echo "None" ;;
+  *) echo "None" ;;
+esac
+exit 0
+MOCK
+  chmod +x "${tmpdir}/aws"
+
+  # --target nemo is what sets _BUILDS_NEMO=1 and so makes the prompt reachable.
+  # stdin from /dev/null: not a terminal, which is exactly the detached case.
+  set +e
+  PATH="${tmpdir}:${PATH}" run_limited 60 "${tmpdir}/run1.txt" \
+    bash "${SCRIPT_DIR}/../codebuild/remote_build.sh" \
+    --stack-name teststack --target nemo --tag latest --region us-east-1 --no-wait \
+    </dev/null
+  rc=$?
+  set +e
+  out="$(cat "${tmpdir}/run1.txt" 2>/dev/null || echo '')"
+
+  # 124 means run_limited had to kill it -- i.e. it hung, which is precisely the
+  # failure mode this test exists to catch.
+  if [[ "${rc}" -eq 124 ]]; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL: remote_build.sh HUNG with no terminal attached\n' >&2
+  else
+    PASS_COUNT=$((PASS_COUNT + 1))
+  fi
+  if [[ "${rc}" -eq 0 || "${rc}" -eq 124 ]]; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL: remote_build.sh should exit non-zero when NGC credentials are missing non-interactively (got %s)\n' "${rc}" >&2
+  else
+    PASS_COUNT=$((PASS_COUNT + 1))
+  fi
+  assert_contains "${out}" "NGC credentials are required" \
+    "remote_build.sh fails with an actionable NGC message instead of a failed tty read"
+  assert_contains "${out}" "--ngc-key" \
+    "the non-interactive NGC failure names the flag that fixes it"
+  assert_not_contains "${out}" "Continue without NGC credentials?" \
+    "the interactive prompt is not emitted when there is no terminal"
+
+  # With a secret already stored for this stack, the prompt is never reached at
+  # all -- the reuse path at remote_build.sh:155-165 resolves it silently. This is
+  # what makes a re-run that omits --ngc-key work.
+  cat > "${tmpdir}/aws" <<'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+  *"sts get-caller-identity"*) echo "123456789012" ;;
+  *"secretsmanager describe-secret"*) echo '{"Name":"teststack-ngc-api-key"}' ;;
+  *) echo "None" ;;
+esac
+exit 0
+MOCK
+  chmod +x "${tmpdir}/aws"
+  # --no-wait so it exits after starting the (mocked) build rather than entering
+  # the 15-second poll loop, which a mock can never satisfy.
+  set +e
+  PATH="${tmpdir}:${PATH}" run_limited 90 "${tmpdir}/run2.txt" \
+    bash "${SCRIPT_DIR}/../codebuild/remote_build.sh" \
+    --stack-name teststack --target nemo --tag latest --region us-east-1 --no-wait \
+    </dev/null
+  rc=$?
+  set +e
+  out="$(cat "${tmpdir}/run2.txt" 2>/dev/null || echo '')"
+  assert_not_contains "${out}" "NGC credentials are required" \
+    "an existing NGC secret is reused with no prompt and no failure"
+  assert_contains "${out}" "reusing, no prompt" \
+    "the reuse path is taken, which is what makes a re-run without --ngc-key work"
+  if [[ "${rc}" -eq 124 ]]; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL: remote_build.sh HUNG on the NGC-secret-present path\n' >&2
+  else
+    PASS_COUNT=$((PASS_COUNT + 1))
+  fi
+
+  rm -rf "${tmpdir}"
+}
+
+# =========================================================================
+# Test 10: a degraded run must not print the success banner, and must exit
+# non-zero. This is the reporting half of the detach defect: the closed-loop
+# failure was swallowed into two warnings and the deploy claimed success.
+# =========================================================================
+test_degraded_summary_suppresses_success() {
+  local out rc
+
+  # Mirrors deploy.sh's summary branch.
+  _summary() {
+    local degraded="$1"
+    if [[ "${degraded}" -ne 0 ]]; then
+      echo "  Accelerator-optimized Agentic Bidding — PARTIALLY DEPLOYED"
+      echo "  To finish it:"
+      echo "    ./deploy.sh --resume"
+      return 1
+    fi
+    echo "  Accelerator-optimized Agentic Bidding — Deployed (EKS + Triton)"
+    return 0
+  }
+
+  set +e
+  out="$(_summary 1)"; rc=$?
+  set +e
+  assert_contains "${out}" "PARTIALLY DEPLOYED" "a degraded run reports partial completion"
+  assert_not_contains "${out}" "— Deployed (EKS + Triton)" "a degraded run does NOT print the success banner"
+  assert_contains "${out}" "--resume" "the partial summary names the command that finishes the deploy"
+  assert_eq "${rc}" "1" "a degraded run exits non-zero"
+
+  set +e
+  out="$(_summary 0)"; rc=$?
+  set +e
+  assert_contains "${out}" "— Deployed (EKS + Triton)" "a clean run still prints the success banner"
+  assert_eq "${rc}" "0" "a clean run exits zero"
+}
+
+# =========================================================================
+# Test 11: the credential block prints a fully-resolved reset command, and never
+# a command with an empty --user-pool-id (which would fail on paste).
+# =========================================================================
+test_demo_credentials_block() {
+  local out
+
+  _creds() {
+    local status="$1" pool="$2" region="us-east-1" email="admin@example.com"
+    case "${status}" in
+      created)  echo "    Username:  ${email}"; echo "    Password:  TEMPPASS123x" ;;
+      existing) echo "    Username:  ${email}"; echo "    Password:  (existing user — Cognito does not disclose it; reset it below)" ;;
+      *)        echo "    (Cognito auth not configured — orchestrator auth is disabled)" ;;
+    esac
+    if [[ -n "${pool}" ]]; then
+      echo "    Lost it?   aws cognito-idp admin-set-user-password \\"
+      echo "                 --user-pool-id ${pool} \\"
+    elif [[ "${status}" != "no-auth" ]]; then
+      echo "    Reset:     the user pool ID could not be resolved"
+      echo "                 aws cognito-idp list-user-pools --max-results 60 --region ${region}"
+    fi
+  }
+
+  out="$(_creds created us-east-1_AbC123)"
+  assert_contains "${out}" "admin-set-user-password" "the reset command prints for a newly created user"
+  assert_contains "${out}" "us-east-1_AbC123" "the reset command carries the real pool ID"
+
+  out="$(_creds existing us-east-1_AbC123)"
+  assert_contains "${out}" "admin-set-user-password" "the reset command prints for an existing user too"
+  assert_contains "${out}" "does not disclose" "an existing user's password is stated as unrecoverable, not omitted"
+
+  out="$(_creds existing "")"
+  assert_not_contains "${out}" "--user-pool-id " "no reset command is printed with an empty pool ID"
+  assert_contains "${out}" "list-user-pools" "an unresolved pool ID points at how to find it"
+}
+
+# =========================================================================
+# Test 10: the AWS gate decides which phases run
+# =========================================================================
+# Replaces the old resume/state-progress tests. Those asserted on a local file's
+# idea of progress, which is the thing that turned out to be untrustworthy -- it
+# reported a phase complete for a deployment whose pod had never started.
+#
+# No AWS calls here: the probe is stubbed so the DECISION logic is what gets
+# tested. Whether the probe reads AWS correctly is a separate concern, verified
+# against a real account.
+test_gate_decisions() {
+  local tmp out
+  tmp="$(mktemp -d)"
+
+  # A stub standing in for scripts/deploy_status.py, emitting the same --shell
+  # contract: DEPLOY_PHASE_n=<status> plus DEPLOY_OVERALL.
+  mkdir -p "${tmp}/scripts" "${tmp}/lib"
+  cp "${SCRIPT_DIR}/../lib/deploy_gate.sh" "${tmp}/lib/"
+  cat > "${tmp}/scripts/deploy_status.py" <<'STUB'
+import os, sys
+statuses = os.environ.get("STUB_STATUSES", "ok,ok,ok,ok,ok").split(",")
+for i, s in enumerate(statuses, 1):
+    print("DEPLOY_PHASE_%d=%s" % (i, s))
+    print("DEPLOY_BLOCKER_%d='because %s'" % (i, s))
+print("DEPLOY_OVERALL=%s" % ("ok" if set(statuses) == {"ok"} else "missing"))
+print("DEPLOY_KUBE_CONTEXT='stub'")
+sys.exit(0 if set(statuses) == {"ok"} else 1)
+STUB
+
+  _gate_env() {
+    AWS_REGION=us-east-1; WITH_RETRAINING=1; WITH_PREBID=0; SKIP_AGENTCORE=0
+    STACK_PREFIX=t; START_AT=1
+    say()  { printf '%s\n' "$*"; }
+    warn() { printf '[warn] %s\n' "$*"; }
+    ok()   { printf '  [OK] %s\n' "$*"; }
+    STATE_PYTHON=python3
+    GATE_POLL=1
+    # shellcheck source=/dev/null
+    source "${tmp}/lib/deploy_gate.sh"
+    # _run_phase, lifted from deploy.sh so the real precedence is what is tested.
+    _run_phase() {
+      local n="$1" st
+      [[ "${START_AT}" -le "${n}" ]] || return 1
+      gate_wait "${n}" "${STACK_PREFIX}" || true
+      if gate_should_run "${n}"; then return 0; fi
+      st="$(gate_status "${n}")"
+      ok "Phase ${n}/5 already complete in AWS (${st}) — skipping"
+      return 1
+    }
+  }
+  _gate_env
+
+  # --- everything already deployed -> every phase skips -------------------
+  STUB_STATUSES="ok,ok,ok,ok,ok" gate_refresh t
+  assert_eq "${GATE_AVAILABLE}" "1" "gate reads the probe output"
+  assert_eq "${DEPLOY_OVERALL}" "ok" "a fully deployed stack reports overall ok"
+  local ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "" "no phase runs when AWS says everything exists"
+
+  # --- partially deployed -> only the incomplete phases run ---------------
+  STUB_STATUSES="ok,missing,ok,failed,missing" gate_refresh t
+  ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "245" "only phases AWS reports incomplete are run"
+
+  # --- unknown must RUN, never skip ---------------------------------------
+  # Skipping something unverifiable ships a deployment that claims to be complete
+  # and is not. Re-running an idempotent phase only costs time.
+  STUB_STATUSES="unknown,unknown,unknown,unknown,unknown" gate_refresh t
+  ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "12345" "an unknown phase is run, not skipped"
+
+  # --- --start-at still overrides a completed phase -----------------------
+  STUB_STATUSES="ok,ok,ok,ok,ok" gate_refresh t
+  START_AT=3
+  ran=""
+  for n in 1 2 3 4 5; do if _run_phase "$n" >/dev/null 2>&1; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "" "--start-at does not force a phase AWS says is complete"
+  START_AT=1
+
+  # --- a probe that cannot run -> everything runs -------------------------
+  rm -f "${tmp}/scripts/deploy_status.py"
+  gate_refresh t
+  assert_eq "${GATE_AVAILABLE}" "0" "a missing probe is detected"
+  ran=""
+  for n in 1 2 3 4 5; do if gate_should_run "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "12345" "an unavailable probe degrades to running every phase"
+
+  # --- in_progress is waited on, not raced --------------------------------
+  # gate_wait must poll until the status changes. The stub flips after 2 polls.
+  cat > "${tmp}/scripts/deploy_status.py" <<'STUB2'
+import os, sys
+c = "/tmp/gate_poll_count"
+try:
+    n = int(open(c).read().strip())
+except Exception:
+    n = 0
+n += 1
+open(c, "w").write(str(n))
+st = "in_progress" if n <= 2 else "ok"
+for i in range(1, 6):
+    print("DEPLOY_PHASE_%d=%s" % (i, st if i == 2 else "ok"))
+    print("DEPLOY_BLOCKER_%d=''" % i)
+print("DEPLOY_OVERALL=missing")
+print("DEPLOY_KUBE_CONTEXT='stub'")
+sys.exit(1)
+STUB2
+  rm -f /tmp/gate_poll_count
+  gate_refresh t
+  assert_eq "$(gate_status 2)" "in_progress" "an AWS operation in flight reads as in_progress"
+  # Output to a FILE, not `$(...)`: gate_wait updates globals via gate_refresh, and a
+  # command substitution runs in a subshell where those updates are discarded. The
+  # first version of this test did exactly that and reported a polling failure that
+  # was purely its own. deploy.sh calls it bare inside `if _run_phase`, which is the
+  # current shell, so the real path is unaffected.
+  gate_wait 2 t > "${tmp}/wait.out" 2>&1
+  out="$(cat "${tmp}/wait.out")"
+  assert_eq "$(gate_status 2)" "ok" "gate_wait polls until the AWS operation finishes"
+  assert_contains "${out}" "already running in AWS" "waiting says why it is waiting"
+  assert_contains "${out}" "rather than starting another" "waiting explains it is not racing"
+  rm -f /tmp/gate_poll_count
+
+  rm -rf "${tmp}"
+}
+
+# Helper: _run_phase with its output suppressed, for the loops above.
+_gate_run_quiet() { _run_phase "$1" >/dev/null 2>&1; }
+
+
+# =========================================================================
+# Test 11: Docker is started when a local build needs it
+# =========================================================================
+# Phase 5 builds the two AgentCore agent images locally by design. It used to die
+# with a raw connect error when the daemon was down, after having already created
+# the ECR repository -- leaving a repo with zero images and no agent runtimes, which
+# is not a legible symptom. It now starts Docker instead.
+#
+# `docker` and the launchers are stubbed, so nothing here touches the real daemon.
+test_docker_autostart() {
+  local tmp out rc
+  tmp="$(mktemp -d)"
+  local D="${SCRIPT_DIR}/.."
+
+  _dk_run() {   # _dk_run <stubdir> <timeout> ; echoes rc then output
+    local stub="$1" limit="$2" o r
+    o="$(MARK="${stub}/up" PATH="${stub}:/usr/bin:/bin" D="${D}" DKT="${limit}" bash -c '
+      set -uo pipefail
+      SCRIPT_DIR="$D"; DOCKER_START_TIMEOUT="$DKT"; DOCKER_POLL=1; VERBOSE=0
+      log(){ return 0; }; say(){ printf "%s\n" "$*"; }; ok(){ printf "[OK] %s\n" "$*"; }
+      warn(){ :; }; fail(){ printf "[fail] %s\n" "$*" >&2; exit 1; }
+      source "$D/lib/deploy_docker.sh"
+      docker_ensure_running "build the AgentCore agent images"
+      echo REACHED_BUILD
+    ' 2>&1)"; r=$?
+    printf '%s\n%s' "${r}" "${o}"
+  }
+
+  # --- daemon already up: silent, no start attempted ----------------------
+  mkdir -p "${tmp}/up"
+  printf '#!/bin/sh\nexit 0\n' > "${tmp}/up/docker"; chmod +x "${tmp}/up/docker"
+  out="$(_dk_run "${tmp}/up" 6)"; rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  assert_eq "${rc}" "0" "a running daemon needs no intervention"
+  assert_contains "${out}" "REACHED_BUILD" "a running daemon proceeds straight to the build"
+  assert_not_contains "${out}" "Starting it" "a running daemon is not restarted"
+
+  # --- daemon down but startable: waits, then proceeds --------------------
+  mkdir -p "${tmp}/start"
+  cat > "${tmp}/start/docker" <<'DKS'
+#!/bin/sh
+if [ "$1" = "info" ]; then
+  [ -f "$MARK" ] && exit 0
+  n=0; [ -f "$MARK.n" ] && n=$(cat "$MARK.n")
+  n=$((n+1)); echo $n > "$MARK.n"
+  [ "$n" -ge 3 ] && touch "$MARK"
+  exit 1
+fi
+exit 0
+DKS
+  chmod +x "${tmp}/start/docker"
+  printf '#!/bin/sh\nexit 0\n' > "${tmp}/start/open"; chmod +x "${tmp}/start/open"
+  out="$(_dk_run "${tmp}/start" 20)"; rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  assert_eq "${rc}" "0" "a startable daemon results in success"
+  assert_contains "${out}" "Starting it" "the user is told Docker is being started"
+  assert_contains "${out}" "build the AgentCore agent images" "the reason Docker is needed is named"
+  assert_contains "${out}" "start requested via" "a request is claimed, not a success"
+  assert_contains "${out}" "Docker daemon ready" "readiness is reported only once confirmed"
+  assert_contains "${out}" "REACHED_BUILD" "the build proceeds after the daemon comes up"
+
+  # --- daemon down and unstartable: honest failure, no build --------------
+  mkdir -p "${tmp}/dead"
+  printf '#!/bin/sh\n[ "$1" = "info" ] && exit 1\nexit 0\n' > "${tmp}/dead/docker"
+  chmod +x "${tmp}/dead/docker"
+  for m in open colima rdctl systemctl service sudo; do
+    printf '#!/bin/sh\nexit 1\n' > "${tmp}/dead/${m}"; chmod +x "${tmp}/dead/${m}"
+  done
+  out="$(_dk_run "${tmp}/dead" 4)"; rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  if [[ "${rc}" -ne 0 ]]; then PASS_COUNT=$((PASS_COUNT + 1)); else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL: an unstartable daemon was expected to fail the deploy\n' >&2
+  fi
+  assert_not_contains "${out}" "REACHED_BUILD" "an unstartable daemon does not proceed to the build"
+  assert_contains "${out}" "docker info" "the failure says how to check Docker"
+  assert_contains "${out}" "skip everything already deployed" "the failure says re-running is safe"
+
+  # --- no docker CLI at all: install guidance -----------------------------
+  mkdir -p "${tmp}/nocli"
+  out="$(_dk_run "${tmp}/nocli" 4)"; rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  if [[ "${rc}" -ne 0 ]]; then PASS_COUNT=$((PASS_COUNT + 1)); else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL: a missing docker CLI was expected to fail the deploy\n' >&2
+  fi
+  assert_contains "${out}" "Docker Desktop" "a missing CLI points at how to install one"
+
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
+# Test: --help prints the WHOLE documentation block
+# =========================================================================
+# This used to be `sed -n '2,96p'`, so adding a paragraph above line 96 silently
+# truncated --help mid-sentence. Rather than pin a length, assert that the first
+# and last lines of the in-file doc block both survive to the output.
+test_help_is_complete() {
+  local out first last
+  out="$(bash "${DEPLOY_SH}" --help 2>&1)"
+
+  # The doc block is whatever sits between the first and second `# =====` banner.
+  first="$(awk '/^# ={10,}/{n++; next} n==1' "${DEPLOY_SH}" | head -1)"
+  last="$(awk '/^# ={10,}/{n++; next} n==1' "${DEPLOY_SH}" | tail -1)"
+
+  assert_contains "${out}" "${first}" "--help includes the first line of the doc block"
+  assert_contains "${out}" "${last}" "--help includes the LAST line of the doc block"
+  assert_not_contains "${out}" "set -euo pipefail" "--help stops before the code"
+}
+
+# =========================================================================
+# Test: lib/deploy_progress.sh — quiet output that still explains failures
+# =========================================================================
+# The AgentCore deploy used to print dozens of INFO lines into the middle of the
+# terminal. run_logged moves that into a file. The risk in doing so is obvious:
+# quiet output must not become unexplained output, and a wrapper that swallows an
+# exit code turns a failed deploy into a successful-looking one. Both are asserted.
+test_progress_output() {
+  local tmp out rc log
+  tmp="$(mktemp -d)"
+  log="${tmp}/detail.log"
+  local D="${SCRIPT_DIR}/.."
+
+  _pg_run() {   # _pg_run <script-body> ; echoes rc then output
+    local body="$1" o r
+    o="$(D="${D}" L="${log}" bash -c "
+      set -uo pipefail
+      source \"\$D/lib/deploy_progress.sh\"
+      ${body}
+    " 2>&1)"; r=$?
+    printf '%s\n%s' "${r}" "${o}"
+  }
+
+  # --- success: the command's output is in the FILE, not on screen ---------
+  out="$(_pg_run 'run_logged "$L" "Registering MCP runtime" bash -c "for i in 1 2 3; do echo INFO_NOISE_\$i; done"')"
+  rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  assert_eq "${rc}" "0" "run_logged returns 0 when the command succeeds"
+  assert_not_contains "${out}" "INFO_NOISE_2" "a succeeding command's chatter stays off the screen"
+  assert_contains "${out}" "Registering MCP runtime" "the step is still named on screen"
+  assert_contains "$(cat "${log}")" "INFO_NOISE_2" "the chatter is in the log file"
+
+  # --- failure: the real exit code survives, and the log is shown inline ---
+  # A wrapper that returned 0 here would let the deploy march on to its success
+  # banner, which is the exact failure mode the degraded-summary work fixed.
+  out="$(_pg_run 'run_logged "$L" "A step that fails" bash -c "echo THE_REAL_REASON; exit 7"')"
+  rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  assert_eq "${rc}" "7" "run_logged propagates the command's exit code, not tail's"
+  assert_contains "${out}" "THE_REAL_REASON" "a failure tails its log inline"
+  assert_contains "${out}" "${log}" "a failure names the log file"
+
+  # --- run_logged_capture: stdout is a value, stderr is noise -------------
+  out="$(_pg_run 'run_logged_capture V "$L" "Creating runtime" bash -c "echo CHATTER >&2; echo arn:aws:x:1:runtime/abc"; printf "GOT[%s]\n" "$V"')"
+  rc="${out%%$'\n'*}"; out="${out#*$'\n'}"
+  assert_eq "${rc}" "0" "run_logged_capture returns the command's status"
+  assert_contains "${out}" "GOT[arn:aws:x:1:runtime/abc]" "stdout is captured into the named variable"
+  assert_contains "$(cat "${log}")" "CHATTER" "stderr chatter goes to the log"
+
+  # --- no spinner frames when stdout is not a terminal --------------------
+  # Under nohup or a tee'd pipeline a spinner would write thousands of \r frames
+  # into a file. The test's own stdout is a pipe, so this is the real condition.
+  out="$(_pg_run 'run_logged "$L" "Quiet when redirected" true')"
+  out="${out#*$'\n'}"
+  assert_not_contains "${out}" $'\r' "no carriage returns leak into non-terminal output"
+  # `tput civis`/`cnorm` write escape sequences to stdout. A log that is meant to be
+  # plain text must not collect cursor-visibility codes either.
+  assert_not_contains "${out}" $'\033' "no terminal escape sequences leak into non-terminal output"
+
+  # --- errexit is left exactly as the caller had it -----------------------
+  # A `set +e ... set -e` pair that restores unconditionally switches errexit ON
+  # for callers that never had it; the next failing top-level command then aborts
+  # the script with no output. That bug cost a debugging session in the shell
+  # harness, so it is pinned here in both directions.
+  out="$(_pg_run 'run_logged "$L" "s" true >/dev/null; case "$-" in *e*) echo EE_ON;; *) echo EE_OFF;; esac')"
+  out="${out#*$'\n'}"
+  assert_contains "${out}" "EE_OFF" "errexit stays off for a caller that had it off"
+
+  out="$(_pg_run 'set -e; run_logged "$L" "s" true >/dev/null; case "$-" in *e*) echo EE_ON;; *) echo EE_OFF;; esac')"
+  out="${out#*$'\n'}"
+  assert_contains "${out}" "EE_ON" "errexit stays on for a caller that had it on"
+
+  # --- a pre-existing EXIT trap survives the spinner ----------------------
+  # spin_stop used to `trap - EXIT`, which would silently delete a cleanup handler
+  # added to deploy.sh later. It now restores what it found.
+  out="$(_pg_run 'trap "echo CALLER_CLEANUP" EXIT; run_logged "$L" "s" true >/dev/null')"
+  out="${out#*$'\n'}"
+  assert_contains "${out}" "CALLER_CLEANUP" "a caller's EXIT trap is restored, not discarded"
+
+  # --- stop_bg kills a background job WITHOUT a job-control notice --------
+  # The EKS-cluster heartbeat was killed but never reaped, so bash printed
+  # "<pid> Terminated: 15" plus the whole subshell body at its next job check --
+  # which landed in the middle of Step 5.5, reading like a crash in a step that had
+  # nothing to do with it. Assert both that the job dies and that nothing is said.
+  out="$(_pg_run '( while :; do sleep 30; done ) & p=$!; sleep 0.3; stop_bg "$p"; sleep 0.4; kill -0 "$p" 2>/dev/null && echo STILL_ALIVE || echo REAPED')"
+  out="${out#*$'\n'}"
+  assert_contains "${out}" "REAPED" "stop_bg actually stops the job"
+  assert_not_contains "${out}" "Terminated" "stop_bg reaps the job, so bash prints no job-control notice"
+  assert_not_contains "${out}" "while :" "the subshell body is not dumped to the terminal"
+
+  # --- the spinner leaves no orphan process ------------------------------
+  out="$(_pg_run 'run_logged "$L" "s" sleep 0.2 >/dev/null; jobs -r | wc -l | tr -d " "')"
+  out="${out#*$'\n'}"
+  assert_contains "${out}" "0" "no background spinner is left running"
+
+  # --- marks are one glyph, and OK/BAD differ ----------------------------
+  out="$(_pg_run 'printf "[%s][%s]\n" "$MARK_OK" "$MARK_BAD"')"
+  out="${out#*$'\n'}"
+  assert_not_contains "${out}" "[][]" "the marks are not empty"
+  case "${out}" in
+    *'[✓][✗]'*|*'[+][x]'*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    *) FAIL_COUNT=$((FAIL_COUNT + 1))
+       printf 'FAIL: marks are neither the UTF-8 nor the ASCII pair — got %q\n' "${out}" >&2 ;;
+  esac
+
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
 # Run all tests
 # =========================================================================
+test_gate_decisions
+test_docker_autostart
+test_progress_output
+test_help_is_complete
 test_start_at_validation
 test_display_name
 test_output_gating
 test_fail_with_hint
 test_concurrency_exit_code_propagation
 test_bootstrap_watcher
+test_remote_build_non_interactive
+test_degraded_summary_suppresses_success
+test_demo_credentials_block
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

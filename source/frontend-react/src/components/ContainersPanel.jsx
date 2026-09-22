@@ -47,6 +47,54 @@ const STATUS_PRESENTATION = {
   unreachable:  { cls: "unreachable", label: "unreachable" },
 };
 
+// Whether any of this container's intents is claimed by another container too.
+// Precedence only matters when something is contested, so the panel uses this to
+// decide whether to show it at all.
+export function hasSharedIntent(container, sharedIntents) {
+  const intents = Array.isArray(container?.intents) ? container.intents : [];
+  return intents.some((intent) => (sharedIntents?.[intent] || []).length > 1);
+}
+
+// Which container's mutation actually reaches the bid request for the contested
+// intents, using the same rule the orchestrator applies: higher priority wins,
+// and equal priorities fall back to registry order, where store-defined
+// containers follow built-in ones.
+export function precedenceNote(container, sharedIntents, allContainers) {
+  const intents = Array.isArray(container?.intents) ? container.intents : [];
+  const order = new Map((allContainers || []).map((c, i) => [c.name, i]));
+  const priorityOf = (name) => {
+    const found = (allContainers || []).find((c) => c.name === name);
+    return Number.isFinite(found?.priority) ? found.priority : 0;
+  };
+
+  const losingTo = new Set();
+  let winsSomething = false;
+
+  for (const intent of intents) {
+    const claimants = sharedIntents?.[intent] || [];
+    if (claimants.length < 2) continue;
+    const ranked = [...claimants].sort((a, b) => {
+      const byPriority = priorityOf(b) - priorityOf(a);
+      if (byPriority !== 0) return byPriority;
+      return (order.get(b) ?? 0) - (order.get(a) ?? 0);
+    });
+    if (ranked[0] === container.name) {
+      winsSomething = true;
+    } else {
+      losingTo.add(ranked[0]);
+    }
+  }
+
+  if (losingTo.size === 0) {
+    return winsSomething
+      ? "its mutations are the ones applied for the contested intents."
+      : "nothing contested.";
+  }
+  const names = [...losingTo].join(", ");
+  const partial = winsSomething ? "for some contested intents " : "";
+  return `${partial}${names} outranks it, so its mutation for those is computed and then discarded. Raise this container's priority on its registry record to change that.`;
+}
+
 function presentStatus(c) {
   // gpu_offline is a degraded sub-state worth naming: the container is fine, the
   // GPU node is stopped. Kept ahead of the table lookup because it depends on
@@ -340,6 +388,23 @@ export default function ContainersPanel({ onClose }) {
                           </span>
                         );
                       })}
+                    </div>
+                  )}
+
+                  {/* Precedence. Only meaningful when something is actually
+                      contested, so it is shown then rather than as a permanent
+                      row of zeroes on six containers that never compete. */}
+                  {hasSharedIntent(c, sharedFor) && (
+                    <div
+                      className="container-precedence"
+                      data-testid={`container-${c.name}-priority`}
+                      style={{ marginTop: "6px" }}
+                    >
+                      <span style={SUBTLE}>
+                        Priority <strong>{Number.isFinite(c.priority) ? c.priority : 0}</strong>
+                        {" — "}
+                        {precedenceNote(c, sharedFor, containers)}
+                      </span>
                     </div>
                   )}
 

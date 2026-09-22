@@ -14,9 +14,22 @@ Parameters:
       (Optional) Secrets Manager secret name or ARN containing the NVIDIA NGC
       API key. Required for building the NeMo-RL training container. Create with:
       aws secretsmanager create-secret --name artf-ngc-api-key --secret-string "YOUR_NGC_KEY"
+  ExternalArtfSourceRepositoryArn:
+    Type: String
+    Default: ''
+    Description: >-
+      (Optional) Full ARN of a foreign-account ECR repository holding an
+      externally prepared ARTF container image, so attach_artf_container.sh can
+      copy it into this account. Example:
+      arn:aws:ecr:us-east-1:123456789012:repository/semantic-context-engine-artf
+      Cross-account pull needs BOTH sides: a repository policy in the owner's
+      account granting this account, AND this identity grant. Named explicitly
+      rather than wildcarded, so attaching one container does not grant read on
+      every repository in every account.
 
 Conditions:
   HasNgcSecret: !Not [!Equals [!Ref NgcApiKeySecret, '']]
+  HasExternalArtfSource: !Not [!Equals [!Ref ExternalArtfSourceRepositoryArn, '']]
 
 Resources:
   # =========================================================================
@@ -79,6 +92,10 @@ Resources:
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
                   - ecr:DescribeRepositories
+                  # Needed to read back a pushed image's digest and compare it
+                  # with the one the producer published. Without it a copied
+                  # image cannot be verified, only assumed.
+                  - ecr:DescribeImages
                   - ecr:CreateRepository
                   - ecr:TagResource
                   - ecr:SetRepositoryPolicy
@@ -86,6 +103,19 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}-*'
                   - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/artf-nemo-rl-training'
+              # Read-only pull on ONE named foreign repository, for copying an
+              # externally prepared ARTF container image into this account. Only
+              # present when the ARN is supplied, and scoped to that ARN alone.
+              - !If
+                - HasExternalArtfSource
+                - Effect: Allow
+                  Action:
+                    - ecr:BatchCheckLayerAvailability
+                    - ecr:BatchGetImage
+                    - ecr:GetDownloadUrlForLayer
+                    - ecr:DescribeImages
+                  Resource: !Ref ExternalArtfSourceRepositoryArn
+                - !Ref 'AWS::NoValue'
 
         # -----------------------------------------------------------------
         # S3 — read source zip uploaded by remote_build.sh

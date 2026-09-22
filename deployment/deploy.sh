@@ -26,7 +26,15 @@ fi
 #   Phase 5/5 — Registering agents:    Bedrock AgentCore MCP runtime, and
 #                                       (default) the Part 2 closed-loop stack
 #
-# Default output shows only phase headers + one-line checkmarked summaries.
+# Default output shows phase headers, the step being entered, and one line per
+# finished step marked with a check or a cross. A running step animates in place so
+# a long wait reads as a wait, not a hang; set DEPLOY_NO_SPINNER=1 to hold it still
+# (it is skipped automatically when output is redirected).
+#
+# Noisy commands -- arm64 image builds, the AgentCore SDK's INFO logging -- write to
+# deployment/.deploy-*.log rather than the terminal. A FAILURE is never quiet: the
+# last 15 lines of the log are printed inline and the file is named.
+#
 # Pass --verbose for the full detailed log stream. On failure, the phase and
 # step that failed are reported with the real error plus a remediation hint.
 #
@@ -54,17 +62,46 @@ fi
 #   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
 #   ./deploy.sh --artf-node-role inference      # co-locate ARTF model containers on the GPU node
 #                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
-#   ./deploy.sh --start-at 3                   # resume from Phase 3 (skip model prep + images/cluster)
+#   ./deploy.sh --status                       # what IS deployed, read live from AWS; deploys nothing
+#   ./deploy.sh --start-at 3                   # force a starting phase, overriding the AWS check
 #   ./deploy.sh --verbose                      # print full detailed logs alongside phase output
 #   ./deploy.sh --destroy                      # tear down the entire stack
 #   AWS_REGION=us-west-2 ./deploy.sh           # different region
+#
+# WHERE DID I GET TO? Ask AWS, not this script:
+#
+#     ./deploy.sh --prefix v1 --status
+#
+# Progress is derived from the account -- CloudFormation stack statuses, CodeBuild
+# build states, EKS nodegroups AND the nodes actually registered in the cluster,
+# ECR images, Kubernetes readiness, CloudFront, Cognito, AgentCore runtimes. That
+# works from any machine, after a reboot, for a colleague, and while a deploy is
+# running, because it only reads.
+#
+# Consequences worth knowing:
+#   - Re-running skips whatever already exists. No flags, no prompts, no resume.
+#   - If AWS is mid-operation (a stack creating, a build running), this WAITS for it
+#     rather than starting a competing one. Two terminals are safe.
+#   - A phase whose state cannot be verified is RUN, not skipped. Every phase is
+#     idempotent, so re-running one costs time; skipping one ships a deployment that
+#     claims to be complete and is not.
+#   - --start-at N still forces a starting phase, for when you know something the
+#     probe cannot (e.g. rebuild my container even though an image exists).
+#
+# deployment/.deploy-state.json holds only the flags a previous run was GIVEN -- the
+# NGC secret name above all -- so you need not repeat them. It records no progress;
+# that was tried, and a file describing what the script did disagreed with what the
+# account actually contained. Gitignored, safe to delete, removed by --destroy.
 #
 # Prerequisites:
 #   - AWS CLI v2 with credentials
 #   - Python 3.11+ with boto3, torch, onnx, onnxscript (and sagemaker for the
 #     default Part 2 closed-loop stack — deploy.sh installs it automatically)
 #   - jq, eksctl, kubectl
-#   - Docker with buildx (only if using --local-build)
+#   - Docker with buildx. Needed by Phase 5 for the two arm64 AgentCore agent
+#     images (built locally by design), and by everything if --local-build. It does
+#     NOT need to be running first: if the daemon is down when it is needed, this
+#     starts it and waits.
 # =============================================================================
 
 set -euo pipefail
@@ -96,6 +133,37 @@ display_name() {
     *)                           echo "$1" ;;
   esac
 }
+
+# =========================================================================
+# "Was this explicitly given?" markers, for remembered inputs
+# =========================================================================
+# A previous run's values are reused for flags this run omitted (see the state
+# block after ACCOUNT_ID resolution below). That requires distinguishing "omitted"
+# from "given the default value", and the `"${VAR:-default}"` expressions in this
+# section destroy that distinction -- after they run, an unset AWS_REGION and an
+# explicit AWS_REGION=us-east-1 look identical.
+#
+# So the env-var-supplied cases are captured HERE, before the defaults are
+# applied. The flag-supplied cases are captured in the arg loop below.
+#
+# `if` blocks rather than `[[ ... ]] && x=1`: under `set -e` a failing `[[ ]]` as
+# the last command on a line exits the script.
+_GIVEN_REGION=0
+_GIVEN_MAXGPUS=0
+_GIVEN_ARTF_NODE_ROLE=0
+_GIVEN_MODEL_ID=0
+if [[ -n "${AWS_REGION:-}" ]];      then _GIVEN_REGION=1; fi
+if [[ -n "${MAX_GPUS:-}" ]];        then _GIVEN_MAXGPUS=1; fi
+if [[ -n "${ARTF_NODE_ROLE:-}" ]];  then _GIVEN_ARTF_NODE_ROLE=1; fi
+if [[ -n "${BEDROCK_MODEL_ID:-}" ]];then _GIVEN_MODEL_ID=1; fi
+# Flag-only markers; set in the arg loop.
+_GIVEN_LOCAL_BUILD=0
+_GIVEN_RETRAINING=0
+_GIVEN_PREBID=0
+_GIVEN_SKIP_AGENTCORE=0
+_GIVEN_START_AT=0
+# Recorded (redacted) in the state file for diagnostics.
+_DEPLOY_ARGV=("$@")
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
 # Auction Theater caption model. The `global.` inference profile is available in
@@ -146,48 +214,60 @@ MAX_GPUS="${MAX_GPUS:-3}"
 # --artf-node-role=inference (or --artf-on-gpu) to co-locate them on the GPU node.
 ARTF_NODE_ROLE="${ARTF_NODE_ROLE:-services}"
 STACK_PREFIX="${STACK_PREFIX:-}"
+# --resume: start from the phase the last recorded run did not finish. Resolved
+# against the state file after identity is known.
+RESUME=0
+# --status: print what AWS says is deployed, then exit. Read-only, needs no
+# terminal, safe to run from any number of shells while a deploy is running.
+STATUS_ONLY=0
 for arg in "$@"; do
   case "${arg}" in
     --destroy)          DESTROY=1 ;;
-    --skip-agentcore)   SKIP_AGENTCORE=1 ;;
+    --skip-agentcore)   SKIP_AGENTCORE=1; _GIVEN_SKIP_AGENTCORE=1 ;;
     --skip-images)      SKIP_IMAGES=1 ;;
     --verbose)          VERBOSE=1 ;;
-    --start-at=*)       START_AT="${arg#--start-at=}" ;;
+    --resume)           RESUME=1 ;;
+    --status)           STATUS_ONLY=1 ;;
+    --start-at=*)       START_AT="${arg#--start-at=}"; _GIVEN_START_AT=1 ;;
     --ui-only)          UI_ONLY=1 ;;
     --skip-cluster)     SKIP_CLUSTER=1 ;;
     --export-only)      EXPORT_ONLY=1 ;;
-    --with-retraining)  WITH_RETRAINING=1 ;;   # default; kept for back-compat
-    --no-retraining|--skip-retraining) WITH_RETRAINING=0 ;;
-    --with-prebid)      WITH_PREBID=1 ;;       # opt-in; see Step 12
-    --no-prebid)        WITH_PREBID=0 ;;       # default; explicit for symmetry
-    --remote-build)     LOCAL_BUILD=0 ;;
-    --local-build)      LOCAL_BUILD=1 ;;
+    --with-retraining)  WITH_RETRAINING=1; _GIVEN_RETRAINING=1 ;;   # default; kept for back-compat
+    --no-retraining|--skip-retraining) WITH_RETRAINING=0; _GIVEN_RETRAINING=1 ;;
+    --with-prebid)      WITH_PREBID=1; _GIVEN_PREBID=1 ;;       # opt-in; see Step 12
+    --no-prebid)        WITH_PREBID=0; _GIVEN_PREBID=1 ;;       # default; explicit for symmetry
+    --remote-build)     LOCAL_BUILD=0; _GIVEN_LOCAL_BUILD=1 ;;
+    --local-build)      LOCAL_BUILD=1; _GIVEN_LOCAL_BUILD=1 ;;
     --ngc-secret=*)     NGC_SECRET="${arg#--ngc-secret=}" ;;
     --ngc-secret)       ;; # value comes in next arg, handled below
     --ngc-key=*)        NGC_KEY="${arg#--ngc-key=}" ;;
     --ngc-key)          ;; # value comes in next arg, handled below
     --prefix=*)         STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)           ;; # value comes in next arg, handled below
-    --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}" ;;
+    --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}"; _GIVEN_MAXGPUS=1 ;;
     --maxGPUs)          ;; # value comes in next arg, handled below
-    --model-id=*)       BEDROCK_MODEL_ID="${arg#--model-id=}" ;;
+    --model-id=*)       BEDROCK_MODEL_ID="${arg#--model-id=}"; _GIVEN_MODEL_ID=1 ;;
     --model-id)         ;; # value comes in next arg, handled below
-    --artf-node-role=*) ARTF_NODE_ROLE="${arg#--artf-node-role=}" ;;
+    --artf-node-role=*) ARTF_NODE_ROLE="${arg#--artf-node-role=}"; _GIVEN_ARTF_NODE_ROLE=1 ;;
     --artf-node-role)   ;; # value comes in next arg, handled below
-    --artf-on-gpu)      ARTF_NODE_ROLE="inference" ;;
-    --start-at)         ;; # value comes in next arg, handled below
-    -h|--help)          sed -n '2,57p' "$0"; exit 0 ;;
+    --artf-on-gpu)      ARTF_NODE_ROLE="inference"; _GIVEN_ARTF_NODE_ROLE=1 ;;
+    --start-at)         _GIVEN_START_AT=1 ;; # value comes in next arg, handled below
+    # Print the documentation block -- everything between the first and second
+    # `# =====` banner. Derived, not a hardcoded line range: the previous
+    # `sed -n '2,96p'` silently truncated --help mid-sentence the moment anyone
+    # added a paragraph above line 96, which is exactly what happened.
+    -h|--help)          awk '/^# ={10,}/{n++; next} n==1' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
         STACK_PREFIX="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--maxGPUs" ]]; then
-        MAX_GPUS="${arg}"
+        MAX_GPUS="${arg}"; _GIVEN_MAXGPUS=1
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]]; then
-        START_AT="${arg}"
+        START_AT="${arg}"; _GIVEN_START_AT=1
       elif [[ "${_PREV_ARG:-}" == "--model-id" ]]; then
-        BEDROCK_MODEL_ID="${arg}"
+        BEDROCK_MODEL_ID="${arg}"; _GIVEN_MODEL_ID=1
       elif [[ "${_PREV_ARG:-}" == "--artf-node-role" ]]; then
-        ARTF_NODE_ROLE="${arg}"
+        ARTF_NODE_ROLE="${arg}"; _GIVEN_ARTF_NODE_ROLE=1
       elif [[ "${_PREV_ARG:-}" == "--ngc-secret" ]]; then
         NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then
@@ -256,26 +336,36 @@ fi
 ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID:-${BEDROCK_MODEL_ID}}"
 GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID:-${BEDROCK_MODEL_ID}}"
 
+# _emit(): one place that formats a line of output. Kept when the journalling it
+# used to feed was removed -- a single formatter is still worth having, and the
+# five emitters below are one line each because of it.
+_emit() {
+  local _fmt="$1"; shift
+  # shellcheck disable=SC2059  # _fmt is a literal from the call sites below
+  printf "${_fmt}\n" "$@"
+  return 0
+}
+
 # say(): always-visible output, regardless of --verbose. Used for the
 # --destroy narration (FR-12: its UX stays exactly as before) and the final
 # deployment summary (FR-6: "print ONLY what the user needs to get started").
-say() { printf '%s\n' "$*"; }
+say() { _emit '%s' "$*"; }
 
 # log(): detailed step-by-step narration. Printed only under --verbose so the
 # default output stays to the 5 phase headers + checkmarked summaries below
 # (FR-10). warn()/fail() always print — a warning or a hard failure is never
 # hidden regardless of verbosity.
-log()  { [[ "${VERBOSE}" -eq 1 ]] && printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; return 0; }
-warn() { printf '\033[0;33m[warn]\033[0m %s\n' "$*"; }
+log()  { [[ "${VERBOSE}" -eq 1 ]] && _emit '\033[0;32m[deploy]\033[0m %s' "$*"; return 0; }
+warn() { _emit '\033[0;33m[warn]\033[0m %s' "$*"; }
 
 # phase(): always-visible section header. N is 1-5 (see the phase table in
 # design.md section 2 / RENAME_MAP.md's breaking-change note).
-phase() { printf '\n\033[1;36mPhase %s/5: %s\033[0m\n' "$1" "$2"; }
+phase() { _emit '\n\033[1;36mPhase %s/5: %s\033[0m' "$1" "$2"; }
 
 # ok(): always-visible one-line checkmarked completion summary, printed after
 # the real underlying command has actually succeeded (never before — no
 # fabricated "done" markers).
-ok() { printf '  \033[0;32m[OK]\033[0m %s\n' "$*"; }
+ok() { _emit '  \033[0;32m[OK]\033[0m %s' "$*"; }
 
 # phase_hint(): a short remediation hint per phase, printed by fail() as
 # additional context above the real captured error — never a replacement
@@ -293,6 +383,29 @@ phase_hint() {
   esac
 }
 
+# _can_prompt(): true only when this process can ACTUALLY read the terminal.
+#
+# `[[ -t 0 ]]` alone is not that test, and the difference is a hang. For
+# `nohup ./deploy.sh … &` stdin is STILL the terminal, so `-t 0` passes — but a
+# background process that reads the terminal is sent SIGTTIN and STOPS. Observed
+# live: a backgrounded deploy sat in state T ("stopped") at the resume prompt with
+# the EKS cluster already built and nothing progressing, which is precisely the
+# failure mode this feature exists to remove.
+#
+# The real question is whether our process group is the terminal's FOREGROUND
+# process group. `ps -o tpgid=` reports the foreground group of the controlling
+# terminal; comparing it with our own pgid answers it.
+#
+# If ps cannot answer, the safe assumption is "cannot prompt". Skipping a question
+# costs a default; blocking on one costs the deployment.
+_can_prompt() {
+  [[ -t 0 ]] || return 1
+  local _pgid _tpgid
+  _pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')"
+  _tpgid="$(ps -o tpgid= -p $$ 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "${_pgid}" && -n "${_tpgid}" && "${_pgid}" == "${_tpgid}" ]]
+}
+
 # fail(): always prints the real error, then exits non-zero. When called with
 # a phase number as the first argument (fail "<phase>" "<message>"), also
 # prints that phase's remediation hint as additional context above it.
@@ -305,10 +418,42 @@ fail() {
     if [[ -n "${_hint}" ]]; then
       printf '\033[0;33m[hint]\033[0m %s\n' "${_hint}" >&2
     fi
+    printf '\033[0;33m[hint]\033[0m Where this got to, live from AWS: ./deploy.sh --prefix %s --status\n' \
+      "${STACK_PREFIX:-}" >&2
   else
     printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2
   fi
   exit 1
+}
+
+# report_closed_loop_stacks(): name which of the closed-loop stacks actually
+# exist, and which do not.
+#
+# Replaces a generic "retraining infra may need manual intervention" with the real
+# list. The failure this exists for lands mid-sequence -- the first four stacks get
+# created and the last two do not -- so "it failed" is much less useful than "these
+# four are there, these two are not". Names mirror deploy_closed_loop.sh's own
+# conventions (see its stack-naming block).
+report_closed_loop_stacks() {
+  local stack status
+  warn "Closed-loop stack status:"
+  for stack in \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}feedback-pipeline" \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}glue-etl" \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}closed-loop-core" \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}agentcore-security" \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}vpc-proxy" \
+    "${STACK_PREFIX:+${STACK_PREFIX}-}governance-eventbridge"
+  do
+    status="$(aws cloudformation describe-stacks --stack-name "${stack}" --region "${AWS_REGION}" \
+      --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
+    if [[ -n "${status}" && "${status}" != "None" ]]; then
+      printf '    %-28s present (%s)\n' "${stack}" "${status}" >&2
+    else
+      printf '    %-28s ABSENT\n' "${stack}" >&2
+    fi
+  done
+  return 0
 }
 
 # =========================================================================
@@ -399,8 +544,191 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! ${PYTHON} -c "from sagemaker import ima
   ${PYTHON} -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
 fi
 
+# step()/done_ok()/run_logged() and the status marks. Sourced before the gate so
+# `--status` output uses the same glyphs as the deploy itself.
+# shellcheck source=lib/deploy_progress.sh
+source "${SCRIPT_DIR}/lib/deploy_progress.sh"
+
+STATE_PYTHON="${PYTHON}"
+# shellcheck source=lib/deploy_state.sh
+source "${SCRIPT_DIR}/lib/deploy_state.sh"
+# shellcheck source=lib/deploy_gate.sh
+source "${SCRIPT_DIR}/lib/deploy_gate.sh"
+
+# --status: answer from AWS and stop. Deliberately before every other check --
+# it needs no credentials beyond read access, no kubeconfig, no Docker, and no
+# knowledge of whether anything is running.
+if [[ "${STATUS_ONLY}" -eq 1 ]]; then
+  gate_print "${STACK_PREFIX}"
+  # The probe's own code, so `--status` is usable in a script: 0 = fully deployed.
+  exit "${GATE_PRINT_RC}"
+fi
+
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account"
+
+# =========================================================================
+# Local deployment state — remembered inputs and the resume decision
+# =========================================================================
+# Sits HERE, between account resolution and the first thing derived from
+# AWS_REGION, because a remembered region has to be in place before REGISTRY,
+# STACK_UID, MODEL_BUCKET and friends are computed from it. Moving this later
+# would compute half the resource names from the default region and the other
+# half from the remembered one.
+#
+# Skipped entirely for --destroy / --ui-only / --export-only: none of them run
+# phases, so there is no progress to resume and nothing to remember. (--destroy
+# still clears the record; that happens inside its own block.)
+# State helpers and the follow decision are already loaded above (they had to run
+# before ACCOUNT_ID). This block continues with the parts that need the resolved
+# account and region.
+if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; then
+  _STATE_CLUSTER_NAME="${STACK_NAME}-triton"   # mirrors CLUSTER_NAME below
+  _STATE_CONFLICTS="$(state_start_run "${STACK_PREFIX}" "${ACCOUNT_ID}" "${AWS_REGION}" \
+    "${STACK_NAME}" "${_STATE_CLUSTER_NAME}" "${_DEPLOY_ARGV[@]+"${_DEPLOY_ARGV[@]}"}")"
+
+  # A conflict means the record describes a DIFFERENT environment under the same
+  # prefix key -- a different account, or a STACK_NAME env override. Reusing its
+  # values would silently point this run at the wrong place, so reuse is skipped
+  # wholesale. start-run already printed the detail to stderr.
+  _STATE_REUSE=1
+  if [[ -n "${_STATE_CONFLICTS}" ]]; then
+    _STATE_REUSE=0
+    warn "Not reusing remembered values for prefix '${STACK_PREFIX:-<none>}' (${_STATE_CONFLICTS} differ from the recorded run)."
+  fi
+
+  # --- Apply remembered values for flags this run did NOT give (FR-10/FR-11) ---
+  # Explicit always wins: each branch is gated on its _GIVEN_ marker. Every value
+  # actually applied is collected and printed, so reuse is never silent (FR-12).
+  _REUSED_LINES=()
+  _reuse() {  # _reuse <var-name> <remembered-key> <given-marker> [label]
+    local var="$1" key="$2" given="$3" label="${4:-$2}" stored
+    [[ "${_STATE_REUSE}" -eq 1 && "${given}" -eq 0 ]] || return 0
+    stored="$(state_read "${STACK_PREFIX}" "remembered.${key}")"
+    [[ -n "${stored}" ]] || return 0
+    eval "${var}=\"\${stored}\""
+    _REUSED_LINES+=("    ${label} = ${stored}")
+    return 0
+  }
+  _reuse AWS_REGION       region        "${_GIVEN_REGION}"           "AWS_REGION"
+  _reuse MAX_GPUS         maxGPUs       "${_GIVEN_MAXGPUS}"          "--maxGPUs"
+  _reuse ARTF_NODE_ROLE   artfNodeRole  "${_GIVEN_ARTF_NODE_ROLE}"   "--artf-node-role"
+  _reuse BEDROCK_MODEL_ID modelId       "${_GIVEN_MODEL_ID}"         "--model-id"
+  _reuse LOCAL_BUILD      localBuild    "${_GIVEN_LOCAL_BUILD}"      "--local-build"
+  _reuse WITH_RETRAINING  withRetraining "${_GIVEN_RETRAINING}"      "--with-retraining"
+  _reuse WITH_PREBID      withPrebid    "${_GIVEN_PREBID}"           "--with-prebid"
+  _reuse SKIP_AGENTCORE   skipAgentcore "${_GIVEN_SKIP_AGENTCORE}"   "--skip-agentcore"
+  # The NGC secret name is the case that prompted all of this: a re-run that
+  # omits --ngc-key should not re-prompt for a key already stored for this stack.
+  # Only applied when neither NGC flag was given on this invocation.
+  if [[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" ]]; then
+    _REMEMBERED_NGC="$(state_read "${STACK_PREFIX}" remembered.ngcSecretName)"
+    if [[ -n "${_REMEMBERED_NGC}" ]]; then
+      NGC_SECRET="${_REMEMBERED_NGC}"
+      _REUSED_LINES+=("    --ngc-secret = ${_REMEMBERED_NGC}")
+    fi
+  fi
+
+  if [[ ${#_REUSED_LINES[@]} -gt 0 ]]; then
+    say ""
+    say "  Reusing values from the last deploy of prefix '${STACK_PREFIX:-<none>}':"
+    for _line in "${_REUSED_LINES[@]}"; do say "${_line}"; done
+    say "    (pass the flag explicitly to override, or delete deployment/.deploy-state.json)"
+  fi
+
+  # --- Re-validate anything a remembered value could have changed ---
+  # The original validation ran before this block, against the defaults. A value
+  # restored from a hand-edited or older state file has not been checked yet.
+  if ! [[ "${MAX_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    fail "--maxGPUs must be a positive integer (got '${MAX_GPUS}', restored from deployment/.deploy-state.json). Pass --maxGPUs explicitly to override."
+  fi
+  if [[ "${ARTF_NODE_ROLE}" != "services" && "${ARTF_NODE_ROLE}" != "inference" ]]; then
+    fail "--artf-node-role must be 'services' or 'inference' (got '${ARTF_NODE_ROLE}', restored from deployment/.deploy-state.json). Pass --artf-node-role explicitly to override."
+  fi
+
+  # --- What is already deployed, according to AWS ---
+  #
+  # This replaced a resume PROMPT, and the prompt's removal is the point rather
+  # than a side effect. The prompt existed only because a local progress file
+  # could not be trusted, so the script had to ask a human whether to believe it.
+  # With AWS answering, there is nothing to ask: each phase is skipped if the
+  # resources it creates already exist, waited on if AWS is mid-operation, and run
+  # otherwise. Convergence, not interrogation.
+  #
+  # It also removes an entire failure mode. That prompt blocked on `read`, which
+  # meant a deploy could sit for an hour holding no resources and doing no work,
+  # invisible to anyone not looking at that exact terminal.
+  gate_refresh "${STACK_PREFIX}"
+  if [[ "${GATE_AVAILABLE}" -eq 1 ]]; then
+    say ""
+    gate_print "${STACK_PREFIX}"
+    say ""
+    if [[ "${DEPLOY_OVERALL}" == "ok" && "${_GIVEN_START_AT}" -eq 0 ]]; then
+      say "  Everything above is already deployed. Re-running is safe: each phase"
+      say "  checks AWS first, so this will confirm rather than rebuild."
+    fi
+  else
+    warn "Could not read deployment status from AWS; every phase will run."
+    warn "That is safe -- each phase is idempotent -- but slower than necessary."
+  fi
+
+  # --resume is kept as a no-op alias so existing scripts and docs do not break.
+  # It used to mean "trust the local file and skip ahead"; skipping ahead is now
+  # the default behaviour for anything AWS reports as already present.
+  if [[ "${RESUME}" -eq 1 ]]; then
+    say "  --resume is no longer needed: completed phases are detected from AWS."
+  fi
+
+  # Record this run's inputs so the NEXT run can reuse them. Written now rather
+  # than at the end, so a run that dies mid-way still leaves them behind.
+  state_set "${STACK_PREFIX}" remembered \
+    "region=${AWS_REGION}" \
+    "maxGPUs=${MAX_GPUS}" \
+    "artfNodeRole=${ARTF_NODE_ROLE}" \
+    "modelId=${BEDROCK_MODEL_ID}" \
+    "localBuild=${LOCAL_BUILD}" \
+    "withRetraining=${WITH_RETRAINING}" \
+    "withPrebid=${WITH_PREBID}" \
+    "skipAgentcore=${SKIP_AGENTCORE}"
+  # The secret NAME, never the key. remote_build.sh derives this same name from
+  # STACK_NAME, so recording it needs no round trip through the child script.
+  if [[ -n "${NGC_KEY}" ]]; then
+    state_set "${STACK_PREFIX}" remembered "ngcSecretName=${STACK_NAME}-ngc-api-key"
+  elif [[ -n "${NGC_SECRET}" ]]; then
+    state_set "${STACK_PREFIX}" remembered "ngcSecretName=${NGC_SECRET}"
+  fi
+fi
+
+# _run_phase <n> — should phase n execute?
+#
+# Three inputs, in order:
+#   1. --start-at N, which still wins. It is the explicit override for someone who
+#      knows something the probe cannot (e.g. "rebuild my container even though an
+#      image exists").
+#   2. AWS mid-operation: wait for it instead of starting a second one. This is why
+#      a second terminal is now useful rather than destructive.
+#   3. AWS already satisfied: skip, and say so.
+#
+# `unknown` runs the phase. Every phase is idempotent, so re-running one we could
+# not verify costs minutes; skipping one we could not verify ships a deployment
+# that claims to be complete and is not.
+_run_phase() {
+  local n="$1" st
+  [[ "${START_AT}" -le "${n}" ]] || return 1
+  gate_wait "${n}" "${STACK_PREFIX}" || true
+  if gate_should_run "${n}"; then
+    return 0
+  fi
+  st="$(gate_status "${n}")"
+  ok "Phase ${n}/5 already complete in AWS (${st}) — skipping"
+  return 1
+}
+
+# Tracks whether any subsystem failed without aborting the run. A non-zero value
+# suppresses the success banner and makes the script exit non-zero (FR-25/FR-26).
+_DEPLOY_DEGRADED=0
+_DEGRADED_DETAIL=""
+
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 # Deterministic UID for resource naming
@@ -523,7 +851,15 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   warn "ECR repos, the Prebid ARTF host stack (${PREBID_STACK}) with its Cognito"
   warn "domain, resource servers, M2M client and credential secret, and all"
   warn "Kubernetes resources. NOTHING is retained — this is not reversible."
-  read -r -p "Type 'destroy' to confirm: " CONFIRM
+  # Teardown genuinely needs a human, so unlike the resume prompt this does not
+  # fall back to a default -- it fails. But it must fail with a reason: an
+  # unguarded read here returns empty on EOF (or stops the process with SIGTTIN
+  # when backgrounded), and the operator then sees a bare "aborted" with no clue
+  # that the problem was the absence of a terminal.
+  if ! _can_prompt; then
+    fail "Teardown needs an interactive terminal (this process cannot read one -- backgrounded, piped, or no tty). Re-run ./deploy.sh --destroy in the foreground."
+  fi
+  read -r -p "Type 'destroy' to confirm: " CONFIRM || CONFIRM=""
   [[ "${CONFIRM}" == "destroy" ]] || fail "aborted"
 
   # AgentCore runtime names only allow [a-zA-Z0-9_] (no hyphens) and must start
@@ -796,7 +1132,11 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # deletion above leaves these behind by design; force-delete them explicitly
   # since nothing is meant to survive --destroy.
   say "Force-deleting retained DynamoDB tables..."
-  for TABLE in "${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store" "${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail" "${STACK_PREFIX:+${STACK_PREFIX}-}user-features"; do
+  # CONTAINER_REGISTRY_TABLE (defined above, ${STACK_NAME}-container-registry) was
+  # missing from this list, so it outlived a teardown that reports "No resources
+  # retained". Its DeletionPolicy is the same as the others' -- the omission was an
+  # oversight, not a decision.
+  for TABLE in "${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store" "${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail" "${STACK_PREFIX:+${STACK_PREFIX}-}user-features" "${CONTAINER_REGISTRY_TABLE}"; do
     aws dynamodb delete-table --table-name "${TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
   done
 
@@ -829,6 +1169,12 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     aws ecr delete-repository --repository-name "${REPO}" --force --region "${AWS_REGION}" 2>/dev/null || true
     say "  Deleted ${REPO}"
   done
+
+  # The local record for this prefix. After a teardown the next run legitimately
+  # starts from nothing, so keeping progress or resolved values would only invite
+  # a resume onto resources that no longer exist.
+  state_clear "${STACK_PREFIX}"
+  say "  Cleared local deployment state for prefix '${STACK_PREFIX:-<none>}'"
 
   say "Destroy complete. No resources retained."
   exit 0
@@ -967,10 +1313,16 @@ REPOS=(
   ${STACK_NAME}-agentcore
 )
 
-if [[ "${START_AT}" -le 1 ]]; then
+if _run_phase 1; then
 phase 1 "Preparing models"
-log "Step 1: Ensuring ECR repositories"
+step "Step 1: Ensuring ECR repositories"
 if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
+  # --local-build means every image is built here, so the daemon has to be up. Start
+  # it rather than failing at the first `docker login` with a connect error.
+  # shellcheck source=lib/deploy_docker.sh
+  source "${SCRIPT_DIR}/lib/deploy_docker.sh"
+  docker_ensure_running "build the container images locally (--local-build)"
+  docker_ensure_buildx
   aws ecr get-login-password --region "${AWS_REGION}" | \
     docker login --username AWS --password-stdin "${REGISTRY}"
 fi
@@ -985,7 +1337,7 @@ log "ECR repositories ready"
 # =========================================================================
 # Step 1.5: DynamoDB table for load test history
 # =========================================================================
-log "Step 1.5: Ensuring DynamoDB table for load test history"
+step "Step 1.5: Ensuring DynamoDB table for load test history"
 if ! aws dynamodb describe-table --table-name "${LOADTEST_TABLE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
   aws dynamodb create-table \
     --table-name "${LOADTEST_TABLE}" \
@@ -1047,7 +1399,7 @@ fi
 # =========================================================================
 # Step 2: Export PyTorch models to ONNX
 # =========================================================================
-log "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
+step "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
 # Part 2: Triton serves TensorRT engines (tensorrt_plan). The exported ONNX is the
 # SOURCE the Model Optimizer compiles into engines — it is uploaded to onnx-source/
 # (Step 3a), NOT served directly. Export to a staging dir so it does not collide
@@ -1096,7 +1448,7 @@ sys.exit(0 if xgboost.__version__ == '1.7.6' else 1)
   XGBOOST_OK=1
 fi
 
-log "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
+step "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
 if [[ "${XGBOOST_OK}" -ne 1 ]]; then
   log "  Installing ${XGBOOST_PIN}/onnxmltools (best-effort, non-blocking)..."
   ${PYTHON} -m pip install --quiet "${XGBOOST_PIN}" onnxmltools 2>/dev/null || true
@@ -1129,7 +1481,7 @@ fi
 # =========================================================================
 # Step 3: Upload model repository to S3
 # =========================================================================
-log "Step 3: Ensuring S3 model bucket ${MODEL_BUCKET}"
+step "Step 3: Ensuring S3 model bucket ${MODEL_BUCKET}"
 if ! aws s3api head-bucket --bucket "${MODEL_BUCKET}" 2>/dev/null; then
   aws s3 mb "s3://${MODEL_BUCKET}" --region "${AWS_REGION}"
 fi
@@ -1202,11 +1554,17 @@ fi # START_AT <= 1 (Phase 1)
 # =========================================================================
 # Step 4: Build and push container images
 # =========================================================================
-if [[ "${START_AT}" -le 2 ]]; then
+if _run_phase 2; then
 phase 2 "Building containers & provisioning infrastructure"
 log "  This typically takes 15-20 minutes (bounded by EKS cluster creation)."
 fi
 _PHASE2_START=$(date +%s)
+# Per-run log for the two long, chatty commands whose output is captured by
+# default (eksctl create cluster, and the Phase-3 kubectl apply loop). Named per
+# cluster and per run so a later run cannot overwrite the log of the one being
+# debugged. Never deleted.
+_EKSCTL_LOG="/tmp/${CLUSTER_NAME}-eksctl-$(date +%s).log"
+_KUBECTL_LOG="/tmp/${CLUSTER_NAME}-kubectl-$(date +%s).log"
 IMAGE_OUTPUTS="${SCRIPT_DIR}/.image-outputs.json"
 
 # Always read the outputs file if it exists (needed for --start-at to use the correct tag)
@@ -1445,9 +1803,9 @@ build_images() {
   done
 
   if [[ ${#MISSING_KEYS[@]} -eq 0 ]]; then
-    log "Step 4: All required images content-matched. Nothing to build."
+    step "Step 4: All required images content-matched. Nothing to build."
   elif [[ "${LOCAL_BUILD}" -eq 0 ]]; then
-    log "Step 4: Building changed images via CodeBuild (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
+    step "Step 4: Building changed images via CodeBuild (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
     NGC_FLAG=()
     if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
     elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
@@ -1458,7 +1816,7 @@ build_images() {
       --region "${AWS_REGION}" \
       "${NGC_FLAG[@]}"
   else
-    log "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
+    step "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
     aws ecr get-login-password --region "${AWS_REGION}" | \
       docker login --username AWS --password-stdin "${REGISTRY}"
     for key in "${MISSING_KEYS[@]}"; do
@@ -1504,7 +1862,20 @@ create_eks_cluster() {
       -e "s/__REGION__/${AWS_REGION}/g" \
       -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
       "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${CLUSTER_CONFIG}"
-  eksctl create cluster -f "${CLUSTER_CONFIG}"
+  # eksctl streams one line per CloudFormation waiter for 15-20 minutes, and it
+  # runs CONCURRENTLY with the image build, so the two interleave. Captured to a
+  # log file by default; the heartbeat in the orchestration block below is what
+  # keeps a working deploy from looking hung.
+  #
+  # Under --verbose it is NOT redirected: verbose exists for someone who wants the
+  # underlying stream, and a log file is a worse answer for them than the stream.
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    eksctl create cluster -f "${CLUSTER_CONFIG}"
+  else
+    say "  Creating the EKS cluster (15-20 min). Full eksctl output: ${_EKSCTL_LOG}"
+    say "    Follow it with: tail -f ${_EKSCTL_LOG}"
+    eksctl create cluster -f "${CLUSTER_CONFIG}" >>"${_EKSCTL_LOG}" 2>&1
+  fi
 }
 
 # Factored into a function (was previously inline) so it can run concurrently
@@ -1514,7 +1885,7 @@ create_eks_cluster() {
 # the caller checks the real exit code via `wait`.
 ensure_eks_cluster() {
   if eksctl get cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
+    step "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
     return 0
   fi
 
@@ -1532,7 +1903,7 @@ ensure_eks_cluster() {
     --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
 
   if [[ -z "${STACK_STATUS}" ]]; then
-    log "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
+    step "Step 5: Creating EKS cluster ${CLUSTER_NAME} (15-20 min)"
     create_eks_cluster
   else
     warn "Step 5: Found existing eksctl stack ${CLUSTER_STACK} (status: ${STACK_STATUS})"
@@ -1577,10 +1948,27 @@ ensure_eks_cluster() {
 if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
   ( ensure_eks_cluster ) &
   _cluster_pid=$!
+  # Heartbeat while the cluster is created. eksctl's own stream is now captured to
+  # a log file (see create_eks_cluster), and it was the only sign of life during a
+  # 15-20 minute wait -- without this a working deploy reads as hung.
+  _heartbeat_pid=""
+  if [[ "${VERBOSE}" -eq 0 ]]; then
+    (
+      while kill -0 "${_cluster_pid}" 2>/dev/null; do
+        sleep 60
+        kill -0 "${_cluster_pid}" 2>/dev/null || break
+        printf '  … still creating the EKS cluster (%dm elapsed) — tail %s\n' \
+          "$(( ( $(date +%s) - _PHASE2_START ) / 60 ))" "${_EKSCTL_LOG}"
+      done
+    ) &
+    _heartbeat_pid=$!
+  fi
   build_images
   if ! wait "${_cluster_pid}"; then
-    fail 2 "EKS cluster creation failed (see output above). Check: eksctl get cluster --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+    stop_bg "${_heartbeat_pid}"
+    fail 2 "EKS cluster creation failed. Full eksctl output: ${_EKSCTL_LOG}. Check: eksctl get cluster --name ${CLUSTER_NAME} --region ${AWS_REGION}"
   fi
+  stop_bg "${_heartbeat_pid}"
 elif [[ "${SKIP_IMAGES}" -eq 0 ]]; then
   build_images
   warn "Skipping EKS cluster creation (--skip-cluster)"
@@ -1603,7 +1991,7 @@ fi
 # principal to hold cloudformation:UpdateTerminationProtection; if that
 # action is denied (e.g. by a restrictive session policy), teardown will
 # need a session that allows it.
-log "Step 5.5: Disabling termination protection on eksctl-managed stacks"
+step "Step 5.5: Disabling termination protection on eksctl-managed stacks"
 EKSCTL_STACKS="$(aws cloudformation list-stacks \
   --region "${AWS_REGION}" \
   --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE \
@@ -1630,7 +2018,7 @@ aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
 # =========================================================================
 # Step 6: Install NVIDIA Kubernetes Device Plugin + Prometheus Operator CRDs
 # =========================================================================
-log "Step 6: Ensuring NVIDIA Kubernetes Device Plugin"
+step "Step 6: Ensuring NVIDIA Kubernetes Device Plugin"
 kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml 2>/dev/null || true
 
 log "  Ensuring Prometheus Operator CRDs (for Triton metrics)"
@@ -1646,7 +2034,7 @@ fi
 # =========================================================================
 # Step 7: IRSA — IAM role for Triton S3 model access
 # =========================================================================
-log "Step 7: Ensuring IRSA for Triton S3 access"
+step "Step 7: Ensuring IRSA for Triton S3 access"
 TRITON_POLICY_NAME="${STACK_NAME}-triton-s3-policy-${STACK_UID}"
 TRITON_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${TRITON_POLICY_NAME}"
 
@@ -1702,7 +2090,7 @@ log "  Triton IRSA role: ${TRITON_ROLE_ARN}"
 # The optimizer reads ONNX from onnx-source/ and writes TensorRT engines to
 # triton-models/ (base engines + canary engines). It needs read+write+list.
 # =========================================================================
-log "Step 7.1: Ensuring IRSA for the Model Optimizer S3 access"
+step "Step 7.1: Ensuring IRSA for the Model Optimizer S3 access"
 OPTIMIZER_POLICY_NAME="${STACK_NAME}-model-optimizer-s3-${STACK_UID}"
 OPTIMIZER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${OPTIMIZER_POLICY_NAME}"
 OPTIMIZER_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::${MODEL_BUCKET}/*\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":\"arn:aws:s3:::${MODEL_BUCKET}\"}]}"
@@ -1746,7 +2134,7 @@ log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
 # =========================================================================
 # Step 7.5: DynamoDB permissions for orchestrator pods
 # =========================================================================
-log "Step 7.5: Ensuring DynamoDB access for orchestrator"
+step "Step 7.5: Ensuring DynamoDB access for orchestrator"
 DYNAMO_POLICY_NAME="${STACK_NAME}-dynamo-loadtest-${STACK_UID}"
 DYNAMO_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DYNAMO_POLICY_NAME}"
 # Two statements, each scoped to one table ARN — no wildcard resource. The
@@ -1778,7 +2166,7 @@ if [[ -n "${SERVICES_NG_ROLE}" && "${SERVICES_NG_ROLE}" != "None" ]]; then
 fi
 
 # EKS nodegroup scaling policy — allows orchestrator to start/stop GPU nodes
-log "Step 7.6: Ensuring EKS nodegroup scaling access for orchestrator"
+step "Step 7.6: Ensuring EKS nodegroup scaling access for orchestrator"
 EKS_SCALE_POLICY_NAME="${STACK_NAME}-eks-gpu-scale-${STACK_UID}"
 EKS_SCALE_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${EKS_SCALE_POLICY_NAME}"
 EKS_SCALE_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"eks:UpdateNodegroupConfig\",\"eks:DescribeNodegroup\"],\"Resource\":\"arn:aws:eks:${AWS_REGION}:${ACCOUNT_ID}:nodegroup/${CLUSTER_NAME}/*\"}]}"
@@ -1808,7 +2196,7 @@ fi
 #   - lists/describes SageMaker model package versions
 # These stores are created by deploy_closed_loop.sh; the policy is scoped by
 # name/ARN patterns so it is valid whether or not a stack prefix is used.
-log "Step 7.7: Ensuring closed-loop (Part 2) access for orchestrator"
+step "Step 7.7: Ensuring closed-loop (Part 2) access for orchestrator"
 # Matches closed_loop_cfn.yaml's SageMakerTrainingExecutionRole naming
 # (prefixed if STACK_PREFIX is set, unprefixed otherwise) — the role the
 # governance UI's on-demand training trigger must be allowed to pass to
@@ -1875,9 +2263,9 @@ fi
 # =========================================================================
 # Step 8: Apply Kubernetes manifests (idempotent — kubectl apply)
 # =========================================================================
-if [[ "${START_AT}" -le 3 ]]; then
+if _run_phase 3; then
 phase 3 "Deploying workloads"
-log "Step 8: Applying Kubernetes manifests"
+step "Step 8: Applying Kubernetes manifests"
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
 log "  Provisioning Cognito User Pool (needed for orchestrator auth)..."
@@ -1904,6 +2292,13 @@ COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
 COGNITO_USER_POOL_ID="$(jq -r '.UserPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 COGNITO_CLIENT_ID="$(jq -r '.ClientId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 log "  Cognito Pool: ${COGNITO_USER_POOL_ID}  Client: ${COGNITO_CLIENT_ID}"
+# Recorded so a later --resume/--start-at run that skips this phase can still
+# print a working credential-reset command (see print_demo_credentials).
+state_set "${STACK_PREFIX}" resolved \
+  "cognitoUserPoolId=${COGNITO_USER_POOL_ID}" \
+  "cognitoClientId=${COGNITO_CLIENT_ID}" \
+  "modelBucket=${MODEL_BUCKET}" \
+  "imageTag=${IMAGE_TAG}"
 
 if [[ -z "${COGNITO_USER_POOL_ID}" ]]; then
   warn "Cognito pool ID is empty — orchestrator auth will be DISABLED until patched!"
@@ -1918,6 +2313,9 @@ fi
 IDENTITY_POOL_ID="$(jq -r '.IdentityPoolId // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 ID_POOL_AUTH_ROLE_NAME="$(jq -r '.AuthRoleName // empty' "${COGNITO_OUTPUTS}" 2>/dev/null || echo '')"
 log "  Identity Pool: ${IDENTITY_POOL_ID:-<none>}  Auth role: ${ID_POOL_AUTH_ROLE_NAME:-<none>}"
+state_set "${STACK_PREFIX}" resolved \
+  "identityPoolId=${IDENTITY_POOL_ID:-}" \
+  "authRoleName=${ID_POOL_AUTH_ROLE_NAME:-}"
 
 # NOTE: The closed-loop agent runtime ARNs are resolved and wired into the frontend
 # build in Step 11 (after the agents are deployed by deploy_closed_loop.sh). The
@@ -2034,7 +2432,8 @@ log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat 
 # NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
 # node group (role=services) since they call Triton over the network and hold no
 # GPU; --artf-node-role=inference co-locates them on the GPU node instead.
-for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml triton-hpa.yaml; do
+_APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml triton-hpa.yaml)
+for manifest in "${_APPLIED_MANIFESTS[@]}"; do
   PROCESSED="/tmp/${CLUSTER_NAME}-${manifest}"
   sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
       -e "s|__REGION__|${AWS_REGION}|g" \
@@ -2062,8 +2461,15 @@ for manifest in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
-  kubectl apply -f "${PROCESSED}"
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    kubectl apply -f "${PROCESSED}"
+  else
+    kubectl apply -f "${PROCESSED}" >>"${_KUBECTL_LOG}" 2>&1
+  fi
 done
+if [[ "${VERBOSE}" -eq 0 ]]; then
+  say "  Applied ${#_APPLIED_MANIFESTS[@]} manifests — full kubectl output: ${_KUBECTL_LOG}"
+fi
 
 # --- Prune pre-split Yield Optimizer objects.
 # `kubectl apply` only creates and updates; it NEVER deletes objects that were
@@ -2129,6 +2535,7 @@ while [[ -z "${NLB_DNS}" || "${NLB_DNS}" == "pending" ]]; do
   NLB_DNS="$(kubectl get svc orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
   if [[ -n "${NLB_DNS}" && "${NLB_DNS}" != "pending" ]]; then
     log "  LoadBalancer ready: ${NLB_DNS}"
+    state_set "${STACK_PREFIX}" resolved "orchestratorNlbDns=${NLB_DNS}"
     break
   fi
   if [[ "${LB_ELAPSED}" -ge "${LB_WAIT_TIMEOUT}" ]]; then
@@ -2144,7 +2551,7 @@ done
 # =========================================================================
 # Step 8.5: Schedule GPU node group shutdown at 8pm ET daily
 # =========================================================================
-log "Step 8.5: Configuring GPU scheduled shutdown (8pm ET daily)"
+step "Step 8.5: Configuring GPU scheduled shutdown (8pm ET daily)"
 
 # Find the ASG backing the GPU node group
 GPU_ASG_NAME="$(aws eks describe-nodegroup \
@@ -2180,9 +2587,9 @@ fi # START_AT <= 3 (Phase 3)
 # =========================================================================
 # Step 9: Deploy frontend to S3 + CloudFront (React UI)
 # =========================================================================
-if [[ "${START_AT}" -le 4 ]]; then
+if _run_phase 4; then
 phase 4 "Setting up access"
-log "Step 9: Deploying frontend"
+step "Step 9: Deploying frontend"
 
 # Cognito was already provisioned in Step 8 (before manifest apply).
 # Re-read outputs in case they're needed for frontend build.
@@ -2216,6 +2623,7 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
 
 PRIMARY_OUTPUTS="${SCRIPT_DIR}/.frontend-outputs.json"
 CF_DOMAIN="$(jq -r '.CloudFrontDomain // empty' "${PRIMARY_OUTPUTS}" 2>/dev/null || echo '')"
+state_set "${STACK_PREFIX}" resolved "cloudFrontDomain=${CF_DOMAIN}"
 
 # Update Cognito callback URLs now that we know the CF domain
 if [[ -n "${CF_DOMAIN}" && -n "${COGNITO_USER_POOL_ID}" ]]; then
@@ -2278,9 +2686,20 @@ fi # START_AT <= 4 (Phase 4)
 # =========================================================================
 # Step 10: Deploy AgentCore MCP runtime
 # =========================================================================
+# Phase 5 is gated like the others, but it had no START_AT guard to replace, so the
+# whole region is wrapped here. Everything the Summary reads from inside it
+# (COGNITO_USER_POOL_ID in particular) is referenced with a `:-` default, which is
+# what makes skipping this block safe.
+if _run_phase 5; then
 phase 5 "Registering agents"
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
-  log "Step 10: Deploying AgentCore MCP runtime"
+  step "Step 10: Deploying AgentCore MCP runtime"
+
+  # The AgentCore SDK logs progress at INFO, which put dozens of lines into the
+  # middle of an otherwise quiet deployment. It goes to a file like every other
+  # phase's detail; run_logged still tails it inline if the deploy fails.
+  _AC_LOG="${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-agentcore.log"
+  : > "${_AC_LOG}" 2>/dev/null || _AC_LOG="/tmp/deploy-agentcore-$$.log"
 
   ROLE_NAME="${STACK_NAME}-agentcore-role-${STACK_UID}"
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -2301,12 +2720,14 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
 
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
   AC_IMAGE="${REGISTRY}/${STACK_NAME}-agentcore:${IMAGE_TAG}"
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
-    --action deploy \
-    --runtime-name "${AC_RUNTIME_NAME}" \
-    --role-arn "${ROLE_ARN}" \
-    --container-uri "${AC_IMAGE}" \
-    --region "${AWS_REGION}"
+  run_logged "${_AC_LOG}" "Registering MCP runtime ${AC_RUNTIME_NAME}" \
+    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
+      --action deploy \
+      --runtime-name "${AC_RUNTIME_NAME}" \
+      --role-arn "${ROLE_ARN}" \
+      --container-uri "${AC_IMAGE}" \
+      --region "${AWS_REGION}" \
+    || fail "AgentCore MCP runtime registration failed (detail in ${_AC_LOG})"
 else
   warn "Skipping AgentCore deployment (--skip-agentcore)"
 fi
@@ -2316,7 +2737,7 @@ fi
 # =========================================================================
 if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   log ""
-  log "Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)"
+  step "Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)"
   log ""
 
   # Resolve VPC, subnets, and node role from the EKS cluster for the closed-loop stack
@@ -2345,7 +2766,28 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   if [[ -n "${NGC_KEY}" ]]; then
     CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-key ${NGC_KEY}"
   fi
+  # One --verbose on this script turns on the child too. Without this pass-through,
+  # deploy_closed_loop.sh's newly gated log() would hide its detail even from
+  # someone who explicitly asked for it.
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --verbose"
+  fi
 
+  # Phase 5's output is TEE'd, not just printed. deploy_closed_loop.sh writes to
+  # stdout only, so when it failed for real the error existed nowhere but the
+  # terminal scrollback -- and "check the output above" is useless to anyone who
+  # detached, closed the tab, or came back the next morning. It now lands in a file
+  # named by the failure message, and in the journal so a follower sees it too.
+  _CL_LOG="${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-closed-loop.log"
+  : > "${_CL_LOG}" 2>/dev/null || _CL_LOG="/tmp/deploy-closed-loop-$$.log"
+  _CL_TEE=("${_CL_LOG}")
+
+  # PIPESTATUS[0], not $?: a pipeline reports its LAST element, so `... | tee`
+  # would report tee's success and a failed Phase 5 would look fine. `set -o
+  # pipefail` is on and would also catch it, but reading the child's status
+  # directly does not depend on an option somebody could turn off later.
+  set +e
+  CL_DETAIL_LOG="${_CL_LOG}" \
   VPC_ID="${CL_VPC_ID}" \
   SUBNET_IDS="${CL_SUBNET_IDS}" \
   EKS_NODE_ROLE="${CL_NODE_ROLE_ARN}" \
@@ -2355,10 +2797,28 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID}" \
   GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID}" \
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
-  "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} || {
-    warn "Closed-loop deployment returned non-zero. Check output above for errors."
-    warn "The core EKS deployment succeeded — retraining infra may need manual intervention."
-  }
+  "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} 2>&1 \
+    | tee -a "${_CL_TEE[@]}"
+  _CL_RC=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "${_CL_RC}" -ne 0 ]]; then
+    # This block used to print two warnings and let the run continue to the full
+    # success banner. That is how a detached deploy reported success while the
+    # vpc-proxy and governance-eventbridge stacks did not exist -- the failure was
+    # visible only as two lines scrolled off the top of a 40-minute log.
+    _DEPLOY_DEGRADED=1
+    _DEGRADED_DETAIL="the closed-loop stack (deploy_closed_loop.sh exited non-zero)"
+    warn "Closed-loop deployment exited ${_CL_RC}."
+    # The last lines are almost always the error, and they are what a reader wants
+    # without opening a file. The full log is named right after.
+    warn "Last 15 lines of its output:"
+    tail -15 "${_CL_LOG}" 2>/dev/null | while IFS= read -r _cl_line; do
+      printf '         %s\n' "${_cl_line}"
+    done
+    warn "Full Phase 5 output: ${_CL_LOG}"
+    report_closed_loop_stacks
+  fi
 
   # deploy_closed_loop.sh (Step 7) grants the Identity-Pool auth role scoped
   # InvokeAgentRuntime and rebuilds+redeploys the UI with the now-known agent runtime
@@ -2374,7 +2834,15 @@ else
   log "  This includes: NeMo-RL training container, SageMaker Model Registry,"
   log "  Glue ETL, EventBridge scheduled retraining, and AgentCore agents."
 fi
-ok "Agents registered"
+# Phase 5 is the one phase whose ok() can be reached after a failure: the
+# closed-loop and Prebid calls below deliberately do not abort the run, they set
+# _DEPLOY_DEGRADED instead. So its completion is conditional, where the other four
+# phases can attach unconditionally to their ok().
+if [[ "${_DEPLOY_DEGRADED}" -eq 0 ]]; then
+  ok "Agents registered"
+else
+  warn "Phase 5/5 incomplete: ${_DEGRADED_DETAIL}"
+fi
 
 # =========================================================================
 # Step 12 (optional): Deploy Prebid Server as the sell-side ARTF host
@@ -2390,8 +2858,14 @@ ok "Agents registered"
 # =========================================================================
 if [[ "${WITH_PREBID}" -eq 1 ]]; then
   log ""
-  log "Step 12: Deploying Prebid Server as the sell-side ARTF host (--with-prebid)"
+  step "Step 12: Deploying Prebid Server as the sell-side ARTF host (--with-prebid)"
   log ""
+  # COGNITO_USER_POOL_ID is assigned in Phase 3 and re-read in Phase 4, so on a
+  # --start-at 5 / --resume run it is unset here -- and the --user-pool-id
+  # pass-through below is conditional on it being non-empty. That combination
+  # silently deployed the Prebid host with no user pool. Fall back to the recorded
+  # value so a resumed run behaves like a full one.
+  COGNITO_USER_POOL_ID="${COGNITO_USER_POOL_ID:-$(state_read "${STACK_PREFIX}" resolved.cognitoUserPoolId)}"
   PREBID_ARGS=""
   if [[ -n "${STACK_PREFIX}" ]]; then
     PREBID_ARGS="--prefix ${STACK_PREFIX}"
@@ -2402,8 +2876,9 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
   fi
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
   "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} || {
-    warn "Prebid deployment returned non-zero. Check output above for errors."
-    warn "The core EKS deployment succeeded — the Prebid ARTF host may need attention."
+    _DEPLOY_DEGRADED=1
+    _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the Prebid ARTF host (deploy_prebid.sh exited non-zero)"
+    warn "Prebid deployment returned non-zero. Check the output above for the real error."
     warn "Re-run on its own: ${SCRIPT_DIR}/deploy_prebid.sh ${PREBID_ARGS}"
   }
 else
@@ -2413,11 +2888,98 @@ else
   log "  a Secrets Manager credential, and the artfhouse demand endpoint."
 fi
 
+fi # _run_phase 5 (Phase 5)
+
 # =========================================================================
-# Summary — always printed regardless of --verbose (FR-6: "print ONLY what
-# the user needs to get started"), so this block uses say() (always-visible)
-# rather than log() (verbose-gated).
+# Summary
 # =========================================================================
+# Always printed regardless of --verbose ("print ONLY what the user needs to get
+# started"), so this block uses say() (always-visible) rather than log().
+#
+# Values a SKIPPED phase would have resolved are read back from the state file.
+# Without this, every --start-at 4 / --resume run printed "(pending)" for the
+# frontend URL and endpoint even though both already existed -- the phase that
+# assigns those variables simply had not run this time.
+CF_DOMAIN="${CF_DOMAIN:-$(state_read "${STACK_PREFIX}" resolved.cloudFrontDomain)}"
+NLB_DNS="${NLB_DNS:-$(state_read "${STACK_PREFIX}" resolved.orchestratorNlbDns)}"
+COGNITO_USER_POOL_ID="${COGNITO_USER_POOL_ID:-$(state_read "${STACK_PREFIX}" resolved.cognitoUserPoolId)}"
+
+# print_demo_credentials(): the login block, called from BOTH the success and the
+# partial-completion summaries.
+#
+# The reset command prints in every case, with the real pool ID substituted, so it
+# is copy-pasteable rather than a template. Cognito cannot disclose an existing
+# user's password -- it is hashed, AdminGetUser returns no credential, and
+# AdminCreateUser does not return the temporary password it set -- so a password
+# that has scrolled past can only be reset, never recovered. That is what this
+# command is for, and why it is not hidden behind the 'existing' case.
+print_demo_credentials() {
+  say "  Demo Login (Cognito):"
+  case "${DEMO_LOGIN_STATUS:-no-auth}" in
+    created)
+      say "    Username:  ${DEMO_USER_EMAIL}"
+      say "    Password:  ${DEMO_USER_TEMP_PASSWORD}"
+      say "    Note:      Temporary, and shown ONLY here — save it now. You'll set a"
+      say "               permanent password on first login."
+      ;;
+    existing)
+      say "    Username:  ${DEMO_USER_EMAIL}"
+      say "    Password:  (existing user — Cognito does not disclose it; reset it below)"
+      ;;
+    *)
+      say "    (Cognito auth not configured — orchestrator auth is disabled)"
+      ;;
+  esac
+  if [[ -n "${COGNITO_USER_POOL_ID:-}" ]]; then
+    say "    Lost it?   aws cognito-idp admin-set-user-password \\"
+    say "                 --user-pool-id ${COGNITO_USER_POOL_ID} \\"
+    say "                 --username ${DEMO_USER_EMAIL:-admin@example.com} \\"
+    say "                 --password '<new-password>' --permanent --region ${AWS_REGION}"
+    say "               See README \"Demo credentials\" for the full walkthrough."
+  elif [[ "${DEMO_LOGIN_STATUS:-no-auth}" != "no-auth" ]]; then
+    # Better to say the ID is unknown than to print a command with an empty
+    # --user-pool-id that fails on paste.
+    say "    Reset:     the user pool ID could not be resolved from this run or from"
+    say "               deployment/.deploy-state.json. Find it with:"
+    say "                 aws cognito-idp list-user-pools --max-results 60 --region ${AWS_REGION}"
+    say "               then see README \"Demo credentials\"."
+  fi
+  return 0
+}
+
+# ---- Partial completion: a failed subsystem must not print a success banner ----
+if [[ "${_DEPLOY_DEGRADED}" -ne 0 ]]; then
+  say ""
+  say "========================================================="
+  say "  Accelerator-optimized Agentic Bidding — PARTIALLY DEPLOYED"
+  say "========================================================="
+  say ""
+  warn "This deploy did not finish. What failed: ${_DEGRADED_DETAIL}."
+  say ""
+  # Re-probed AFTER the failure, so this describes what the account actually holds
+  # rather than how far the script believed it got. Those are different things, and
+  # the difference is the whole reason this report is trustworthy now.
+  gate_refresh "${STACK_PREFIX}"
+  gate_print "${STACK_PREFIX}"
+  say ""
+  say "  What already works:"
+  say "    Frontend:  https://${CF_DOMAIN:-'(not deployed)'}"
+  say "    Endpoint:  http://${NLB_DNS:-'(not deployed)'}/v1/mutations"
+  say ""
+  print_demo_credentials
+  say ""
+  say "  To finish it, run the same command again:"
+  say "    ./deploy.sh${STACK_PREFIX:+ --prefix ${STACK_PREFIX}}"
+  say ""
+  say "  It will skip everything above that is already done — no flags needed, and"
+  say "  nothing needs tearing down first. To look without deploying:"
+  say "    ./deploy.sh${STACK_PREFIX:+ --prefix ${STACK_PREFIX}} --status"
+  say ""
+  # Non-zero, so the failure is visible to anything scripting around this and is
+  # not mistaken for a clean deploy.
+  exit 1
+fi
+
 say ""
 say "========================================================="
 say "  Accelerator-optimized Agentic Bidding — Deployed (EKS + Triton)"
@@ -2430,24 +2992,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
 say "  AgentCore:   See runtime ARN above"
 fi
 say ""
-say "  Demo Login (Cognito):"
-case "${DEMO_LOGIN_STATUS:-no-auth}" in
-  created)
-    say "    Username:  ${DEMO_USER_EMAIL}"
-    say "    Password:  ${DEMO_USER_TEMP_PASSWORD}"
-    say "    Note:      Temporary password, shown only here — you'll set a permanent one on first login."
-    ;;
-  existing)
-    say "    Username:  ${DEMO_USER_EMAIL}"
-    say "    Password:  (existing user — password unchanged, not displayed)"
-    say "    Reset:     aws cognito-idp admin-set-user-password \\"
-    say "                 --user-pool-id ${COGNITO_USER_POOL_ID} --username ${DEMO_USER_EMAIL} \\"
-    say "                 --password '<new-password>' --permanent --region ${AWS_REGION}"
-    ;;
-  *)
-    say "    (Cognito auth not configured — orchestrator auth is disabled)"
-    ;;
-esac
+print_demo_credentials
 say ""
 say "  NVIDIA Triton Inference Server:"
 say "    EKS Cluster:   ${CLUSTER_NAME}"
@@ -2495,4 +3040,10 @@ say ""
 say "  Monitoring:"
 say "    kubectl port-forward svc/triton-inference-server 8002:8002"
 say "    curl localhost:8002/metrics  # Prometheus metrics"
+say ""
+say "  Check this deployment any time, from anywhere, without deploying:"
+say "    ./deploy.sh${STACK_PREFIX:+ --prefix ${STACK_PREFIX}} --status"
+say ""
+say "  Remembered inputs (so --ngc-key and friends need not be repeated):"
+say "    ${DEPLOY_STATE_FILE}"
 say ""

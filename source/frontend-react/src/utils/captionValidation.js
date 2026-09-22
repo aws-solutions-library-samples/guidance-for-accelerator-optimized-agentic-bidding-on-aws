@@ -280,11 +280,25 @@ function isSupported(claim, allowed) {
 
 /* -------------------------------------------------------------- the two tiers */
 
-function factualViolations(text, beat, context) {
+function factualViolations(text, beat, context, extra) {
   const out = [];
-  const literals = sourcedLiterals(beat, context);
+  const literals = [
+    ...sourcedLiterals(beat, context),
+    ...(extra?.literals ?? []).filter((s) => typeof s === "string" && s.length > 0),
+  ].sort((a, b) => b.length - a.length);
   const masked = maskLiterals(text, literals);
-  const allowed = allowedNumericClaims(beat, context);
+  const allowed = [...allowedNumericClaims(beat, context), ...(extra?.numbers ?? [])];
+
+  // Numbers inside the extra literals are sourced for the same reason they are
+  // when they come from the beat: a caption may quote an identifier without its
+  // surrounding text.
+  for (const literal of extra?.literals ?? []) {
+    if (typeof literal !== "string") continue;
+    for (const match of literal.match(/\d+(?:\.\d+)?/g) ?? []) {
+      const n = Number.parseFloat(match);
+      if (Number.isFinite(n)) allowed.push({ value: n, unit: UNIT.BARE });
+    }
+  }
 
   for (const claim of extractNumericClaims(masked)) {
     if (!isSupported(claim, allowed)) {
@@ -301,20 +315,22 @@ function countSentences(text) {
   return text.split(/[.!?](?=\s|$)/).filter((s) => s.trim().length > 0).length;
 }
 
-function registerViolations(text) {
+function registerViolations(text, limits) {
   const out = [];
   const lower = text.toLowerCase();
+  const charCeiling = limits?.charCeiling ?? CHAR_CEILING;
+  const wordCeiling = limits?.wordCeiling ?? WORD_CEILING;
 
   if (text.trim().length === 0) {
     out.push(violation("BR3-21", "empty or whitespace-only"));
     return out;
   }
-  if (text.length > CHAR_CEILING) {
-    out.push(violation("BR3-20", `${text.length} characters exceeds ${CHAR_CEILING}`));
+  if (text.length > charCeiling) {
+    out.push(violation("BR3-20", `${text.length} characters exceeds ${charCeiling}`));
   }
   const words = text.trim().split(/\s+/).length;
-  if (words > WORD_CEILING) {
-    out.push(violation("BR3-20", `${words} words exceeds ${WORD_CEILING}`));
+  if (words > wordCeiling) {
+    out.push(violation("BR3-20", `${words} words exceeds ${wordCeiling}`));
   }
   const bannedChar = BANNED_CHARS.exec(text);
   if (bannedChar) {
@@ -342,19 +358,31 @@ function registerViolations(text) {
  * is not satisfied by the caption also being too long. Each violation names the
  * business rule it broke.
  *
+ * `opts` exists for the run summary, which is validated by the same two tiers
+ * against a wider set of sources: it describes the auction as well as the
+ * mutations, so its legal numbers include the cleared price and its legal
+ * literals include campaign names, and it is allowed more words than one beat's
+ * caption. Defaults are the per-beat limits, so every existing caller is
+ * unaffected.
+ *
  * @param {string} text
  * @param {object} beat
  * @param {object} [context]
+ * @param {object} [opts]
+ * @param {number} [opts.wordCeiling]
+ * @param {number} [opts.charCeiling]
+ * @param {string[]} [opts.literals] additional sourced literals
+ * @param {{value: number, unit: string}[]} [opts.numbers] additional allowed claims
  * @returns {{ok: true, text: string} | {ok: false, violations: {rule: string, detail: string}[]}}
  */
-export function validateCaption(text, beat, context) {
+export function validateCaption(text, beat, context, opts) {
   if (typeof text !== "string") {
     return { ok: false, violations: [violation("BR3-21", `not a string (${typeof text})`)] };
   }
   const trimmed = text.trim();
   const violations = [
-    ...factualViolations(trimmed, beat, context),
-    ...registerViolations(trimmed),
+    ...factualViolations(trimmed, beat, context, opts),
+    ...registerViolations(trimmed, opts),
   ];
   return violations.length === 0 ? { ok: true, text: trimmed } : { ok: false, violations };
 }

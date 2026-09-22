@@ -19,6 +19,12 @@ import {
   ComparisonLayout,
 } from "./components/comparison";
 
+/**
+ * The guided demo tour. Kept in the codebase and switched off at one place rather
+ * than deleted, so turning it back on is a one-line change rather than a revert.
+ */
+const SHOW_DEMO_TOUR = false;
+
 function AppContent() {
   const [showContainers, setShowContainers] = useState(false);
   const [view, setView] = useState("scenarios");
@@ -30,6 +36,10 @@ function AppContent() {
   const [annotationText, setAnnotationText] = useState(null);
   const [annotationVisible, setAnnotationVisible] = useState(false);
   const [annotationTarget, setAnnotationTarget] = useState(null);
+
+  // The scenario panel collapses to a rail when the Theater opens, and the reader
+  // can expand it again from there.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const { mode, standalone, fabric, submitScenario } = useComparison();
 
@@ -97,13 +107,23 @@ function AppContent() {
     return submitScenario(payload, "REST");
   };
 
-  // Opening the Theater collapses the sidebar, so the walkthrough's three columns
-  // get the full width. Closing restores both, and the timeline for whatever ran
-  // last is still there — the run is not discarded.
+  // Opening the Theater COLLAPSES the sidebar to a rail; it does not unmount it.
+  // The Theater is a view inside this application, so the header and the scenario
+  // panel stay visible around it. Expanding the rail again pushes the Theater
+  // right and the layout scrolls horizontally rather than compressing the
+  // walkthrough's three columns.
+  //
+  // Closing restores the panel, and the timeline for whatever ran last is still
+  // there — the run is not discarded.
   const handleOpenTheater = useCallback((scenario, params) => {
     setTheaterRun({ scenario, params });
+    setSidebarCollapsed(true);
   }, []);
-  const handleCloseTheater = useCallback(() => setTheaterRun(null), []);
+  const handleCloseTheater = useCallback(() => {
+    setTheaterRun(null);
+    setSidebarCollapsed(false);
+  }, []);
+  const handleToggleSidebar = useCallback(() => setSidebarCollapsed((c) => !c), []);
 
   const theaterOpen = !!theaterRun;
 
@@ -115,7 +135,9 @@ function AppContent() {
   // Show scenario view only when a scenario has been submitted (not the default)
   const showScenarioView = !!(activeResult || lastPayload);
 
-  const showSidebar = view !== "adaptive" && view !== "governance" && !theaterOpen;
+  // The Theater no longer removes the sidebar — it collapses it. The two pages
+  // that genuinely own the whole width still do.
+  const showSidebar = view !== "adaptive" && view !== "governance";
 
   return (
     <div className="app">
@@ -126,12 +148,23 @@ function AppContent() {
         view={view}
         onViewChange={setView}
       />
-      <div className={`app-layout${theaterOpen ? " app-layout--theater" : ""}`}>
+      {/* Two markers, because the Theater sizes differently against a rail than
+          against an expanded panel: against the rail it must fit the remaining
+          space exactly, and only an expanded panel makes it refuse to compress
+          and scroll horizontally instead. */}
+      <div
+        className={
+          `app-layout${theaterOpen ? " app-layout--theater" : ""}` +
+          `${theaterOpen && !sidebarCollapsed ? " app-layout--panel-open" : ""}`
+        }
+      >
         {showSidebar && (
           <Sidebar
             submit={handleSubmit}
             onOpenTheater={handleOpenTheater}
             demoActive={demoActive}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={handleToggleSidebar}
           />
         )}
         <main className="app-main">
@@ -178,7 +211,11 @@ function AppContent() {
         </main>
       </div>
       {showContainers && <ContainersPanel onClose={() => setShowContainers(false)} />}
-      <DemoToggle isActive={demoActive} onToggle={handleDemoToggle} />
+      {/* The demo tour is hidden, not removed. Its floating button sat above every
+          other surface (inline zIndex 9100) and the guided walkthrough now covers
+          what it was for. Flip SHOW_DEMO_TOUR to bring it back; the orchestrator,
+          the engine and the toggle handler above are all still wired. */}
+      {SHOW_DEMO_TOUR && <DemoToggle isActive={demoActive} onToggle={handleDemoToggle} />}
       <AnnotationOverlay text={annotationText} visible={annotationVisible} targetElement={annotationTarget} />
 
     </div>

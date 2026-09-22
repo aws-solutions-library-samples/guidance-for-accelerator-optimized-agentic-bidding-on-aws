@@ -546,9 +546,8 @@ Each container meets the IAB Tech Lab ARTF v1.0 specification:
 
 ### Industry Standards
 
-- [IAB Tech Lab: Agentic RTB Framework (ARTF) v1.0 Specification](https://iabtechlab.com/artf)
-- [ARTF Reference Implementation (Go)](https://github.com/nicholasgasior/artf)
-- [ARTF MCP Integration Guide](https://iabtechlab.com/artf-mcp)
+- [IAB Tech Lab: Agentic Real Time Framework (ARTF) v1.0 Specification](https://iabtechlab.com/standards/artf/)
+- [ARTF schema and Go reference implementation](https://github.com/IABTechLab/agentic-realtime-framework) — IAB Tech Lab's own repository, and the source of the Protocol Buffers schema vendored in `source/proto/`
 - [OpenRTB 2.6 Specification](https://iabtechlab.com/openrtb)
 - [Model Context Protocol (MCP) Specification](https://modelcontextprotocol.io)
 

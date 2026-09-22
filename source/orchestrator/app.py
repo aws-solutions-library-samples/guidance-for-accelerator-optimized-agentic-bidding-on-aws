@@ -31,7 +31,14 @@ from starlette.routing import Route
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.artf_types import ContainerInvocationModel, Metadata, Mutation, RTBRequest, RTBResponse  # noqa: E402
+from shared.artf_types import (  # noqa: E402
+    ConflictModel,
+    ContainerInvocationModel,
+    Metadata,
+    Mutation,
+    RTBRequest,
+    RTBResponse,
+)
 from orchestrator.container_registry import (  # noqa: E402
     ERROR_STATUSES,
     RAN_STATUSES,
@@ -44,8 +51,10 @@ from orchestrator.container_registry import (  # noqa: E402
     RegistryEntry,
     RegistryRecordNotFound,
     RegistryStoreUnavailable,
+    build_claims,
     derive_status,
     merge_registry,
+    resolve_conflicts,
     select_active,
     shared_intents,
 )
@@ -156,6 +165,53 @@ def _effective_registry() -> tuple[list[RegistryEntry], list[str]]:
     which merges to exactly the six code-defined containers.
     """
     return merge_registry(CONTAINERS, _registry_store().get_records())
+
+
+def _priorities() -> dict[str, int]:
+    """Container name to precedence, from the same TTL-cached registry.
+
+    Separate from ``_fan_out`` on purpose. ``_fan_out`` already returns
+    invocations in registry order, so the ordering half of the tie-break is
+    derivable from the list it returns and only the priority has to be looked up.
+    Widening ``_fan_out``'s return type would have forced churn in the tests that
+    pin its behaviour, for information already in hand.
+
+    Adds no I/O: the registry is cached, so this is a dict comprehension over
+    values already in memory (NFR-1).
+    """
+    entries, _ = _effective_registry()
+    return {e.name: e.priority for e in entries}
+
+
+def _resolve_for_response(
+    invocations: list[ContainerInvocationModel],
+) -> tuple[list[Mutation], list[ConflictModel]]:
+    """Resolve competing mutations and annotate the invocations in place.
+
+    Two containers may claim the same intent, and both get called. But a consumer
+    applies the list in order and, for a deal floor, the applier overwrites — so
+    only the last mutation for a given path had any effect. Returning both left
+    the earlier one looking applied when it was not.
+
+    Per-container ``mutations`` is deliberately left intact: the container really
+    did compute it, and the Auction Theater and the pipeline read their stops from
+    ``metadata.containers`` rather than from the flattened list, so the displaced
+    mutation stays visible there. Only the flattened list is filtered, and
+    ``superseded`` records how many of each container's mutations lost.
+    """
+    claims = build_claims(invocations, _priorities())
+    survivors, conflicts, superseded = resolve_conflicts(claims)
+
+    for inv in invocations:
+        inv.superseded = superseded.get(inv.name, 0)
+
+    conflict_models = [
+        ConflictModel(
+            path=c.path, intent=c.intent, winner=c.winner, losers=list(c.losers)
+        )
+        for c in conflicts
+    ]
+    return survivors, conflict_models
 
 
 def _filter_containers(applicable_intents: list[str] | None) -> list[dict]:
@@ -484,8 +540,11 @@ async def get_mutations(request: Request) -> JSONResponse:
     )
 
     # Preserve canonical registry order for both the flattened mutations list
-    # and the per-container attribution surfaced via metadata.
-    all_mutations: list[Mutation] = [m for inv in all_invocations for m in inv.mutations]
+    # and the per-container attribution surfaced via metadata. Competing claims
+    # on the same (path, intent) are resolved here rather than left for the
+    # consumer to overwrite, so both the Prebid hook and the frontend receive one
+    # already-decided set.
+    all_mutations, conflicts = _resolve_for_response(all_invocations)
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -511,6 +570,9 @@ async def get_mutations(request: Request) -> JSONResponse:
             api_version="1.0",
             model_version=f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)",
             containers=all_invocations,
+            # None rather than [] so a reader can tell "nothing was contested"
+            # from "this orchestrator does not report contests".
+            conflicts=conflicts or None,
         ),
     )
     # Merge network_path into the serialized response metadata
@@ -673,6 +735,7 @@ async def list_containers(request: Request) -> JSONResponse:
                     "intents": sorted(c.intents),
                     "active": False,
                     "configurable": c.configurable,
+                    "priority": c.priority,
                     "source": c.source,
                     "grpc": c.grpc,
                     "mcp": c.endpoint,
@@ -746,6 +809,10 @@ async def list_containers(request: Request) -> JSONResponse:
                 "intents": sorted(c.intents),
                 "active": True,
                 "configurable": c.configurable,
+                # Precedence when two containers claim the same intent. Higher
+                # wins; equal falls back to registry order, which is the
+                # behaviour that predates precedence existing.
+                "priority": c.priority,
                 "source": c.source,
                 "grpc": c.grpc,
                 "mcp": c.endpoint,
@@ -871,7 +938,7 @@ async def set_container_active(request: Request) -> JSONResponse:
 
     ttl = int(store.ttl_seconds)
     verb = "active" if active else "inactive"
-    return JSONResponse({
+    payload = {
         "ok": True,
         "container": name,
         "active": bool(record.get("active", active)),
@@ -881,7 +948,67 @@ async def set_container_active(request: Request) -> JSONResponse:
             f"{entry.display_name or name} is now {verb}. Orchestrator replicas read the "
             f"registry on a {ttl}s cache, so bid traffic reflects this within {ttl} seconds."
         ),
-    })
+    }
+
+    # Activating a container that shares an intent with an already-active one is
+    # allowed, and both will be called. But only one mutation per (path, intent)
+    # survives, so the operator needs to be told which — otherwise the losing
+    # container looks like it is contributing when it is not.
+    if active:
+        contest = _describe_intent_contest(name)
+        if contest:
+            payload["intentContest"] = contest
+
+    return JSONResponse(payload)
+
+
+def _describe_intent_contest(name: str) -> dict | None:
+    """Who else claims this container's intents, and who would win.
+
+    Returns None when nothing is contested. The winner is derived from the same
+    rule the bid path uses — higher priority, then later registry order — so the
+    message cannot disagree with what actually happens.
+    """
+    entries, _ = _effective_registry()
+    by_name = {e.name: e for e in entries}
+    subject = by_name.get(name)
+    if subject is None:
+        return None
+
+    order = {e.name: i for i, e in enumerate(entries)}
+    contested: list[dict] = []
+
+    for intent in sorted(subject.intents):
+        rivals = [
+            e for e in entries
+            if e.name != name and e.active and intent in e.intents
+        ]
+        if not rivals:
+            continue
+        claimants = [subject, *rivals]
+        winner = max(claimants, key=lambda e: (e.priority, order.get(e.name, 0)))
+        contested.append({
+            "intent": intent,
+            "claimants": [
+                {"name": e.name, "priority": e.priority, "source": e.source}
+                for e in claimants
+            ],
+            "winner": winner.name,
+        })
+
+    if not contested:
+        return None
+
+    return {
+        "contested": contested,
+        "message": (
+            "More than one active container claims these intents. Every claimant is "
+            "called, but for a given path only the highest-priority one's mutation is "
+            "returned; equal priorities fall back to registry order, where store "
+            "containers follow built-in ones. Set 'priority' on a registry record to "
+            "change the outcome."
+        ),
+    }
 
 
 async def health(request: Request) -> JSONResponse:
@@ -944,7 +1071,10 @@ async def mcp_proxy(request: Request) -> JSONResponse:
                 payload, payload_bytes, applicable, timeout_s=timeout_s
             )
 
-            all_mutations: list[Mutation] = [m for inv in all_invocations for m in inv.mutations]
+            # Same resolution as POST /v1/mutations. These two paths have drifted
+            # before, which is why the fan-out was unified; the resolution goes
+            # through the same helper for the same reason.
+            all_mutations, conflicts = _resolve_for_response(all_invocations)
 
             elapsed_ms = (time.monotonic() - start) * 1000
             resp = RTBResponse(
@@ -953,6 +1083,7 @@ async def mcp_proxy(request: Request) -> JSONResponse:
                     api_version="1.0",
                     model_version=f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)",
                     containers=all_invocations,
+                    conflicts=conflicts or None,
                 ),
             )
             # Emit bid outcome event (fire-and-forget, non-blocking)

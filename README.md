@@ -9,16 +9,19 @@ Run AI models that price bids, activate audience segments, and manage private ma
 1. [Quick start](#quick-start)
 2. [What just happened?](#what-just-happened)
 3. [Try it](#try-it)
+    - [Demo credentials](#demo-credentials)
 4. [Go deeper](#go-deeper)
     - [Architecture](#architecture)
     - [Cost](#cost)
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
+    - [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings)
     - [Building your own ARTF container](#building-your-own-artf-container)
     - [Part 2: closed-loop learning](#part-2-closed-loop-learning)
     - [Variant: Prebid Server as a second ARTF host (sell side)](#variant-prebid-server-as-a-second-artf-host-sell-side)
     - [Next steps](#next-steps)
 5. [Cleanup](#cleanup)
+    - [Stopping a deployment in progress](#stopping-a-deployment-in-progress)
 6. [Notices](#notices)
 
 ## Quick start
@@ -179,7 +182,22 @@ yield models are currently single-version and loaded directly, with no router.
 
 ### The 5 deployment phases
 
-`deploy.sh` prints its progress as 5 numbered phases (`Phase N/5: ...`). Pass `--verbose` to see every underlying command instead of just the phase summaries; use `--start-at N` to resume from a given phase (for example after fixing a one-off failure) without redoing earlier ones.
+`deploy.sh` prints its progress as 5 numbered phases (`Phase N/5: ...`), naming each step as it enters it and marking it `✓` or `✗` as it finishes:
+
+```
+=== Phase 5/5  Registering agents ===
+  -> Step 10: Deploying AgentCore MCP runtime
+  ✓ Registering bt1_nvidia_artf_recommenders_mcp
+  -> Step 11: Deploying closed-loop retraining infrastructure
+  ✓ Building Adaptive Bidding agent image (arm64)
+  ✗ Registering bt1_adaptive_bidding_agent (HTTP) — exit 1
+    last 15 lines of deployment/.deploy-bt1-closed-loop.log:
+      botocore: connect timeout to bedrock-agentcore
+```
+
+While a step is running its line animates in place, so a long wait is visibly a wait rather than a hang. The genuinely noisy commands — arm64 image builds, the AgentCore SDK's INFO logging — write their output to `deployment/.deploy-*.log` instead of the terminal. **A failure is never quiet:** the last 15 lines of the log are printed inline and the file is named, so you do not have to know where to look.
+
+Pass `--verbose` to see every underlying command instead of just the step summaries; use `--start-at N` to resume from a given phase (for example after fixing a one-off failure) without redoing earlier ones. Set `DEPLOY_NO_SPINNER=1` to hold the line still. The animation is skipped automatically when output is redirected, so a `nohup`-ed log stays readable text.
 
 | Phase | What happens |
 |-------|---------------|
@@ -202,7 +220,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
 ## Try it
 
-1. Open the frontend URL from the deployment summary and sign in with the demo username and password shown there. On first login, Cognito will prompt you to set a new password.
+1. Open the frontend URL from the deployment summary and sign in with the demo username and password shown there. On first login, Cognito will prompt you to set a new password. See [Demo credentials](#demo-credentials) below if you missed them or need to reset the password.
 
 2. Click **Containers** in the navigation to check status. The GPU node group scales to zero when idle to save cost — if Triton shows *offline*, click **Start GPUs** (takes about 3–5 minutes).
 
@@ -231,6 +249,33 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
 
 5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any single container — including either yield container, selectable independently. This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. A **Traffic scenario** selector shapes the synthetic requests each run generates — a balanced default, or recognisable demand shapes such as a Black Friday retail surge or NFL-Sunday sports traffic (each a weighted mix of publisher domains, content categories, devices, and deal-floor ranges). It shapes the request inputs the pipeline processes; it does not replay real traffic recorded during those events. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
+
+### Demo credentials
+
+`deploy.sh` creates one Cognito user for you in Phase 4 and prints it in the deployment summary:
+
+| | |
+|---|---|
+| **Username** | `admin@example.com` (set `DEMO_USER_EMAIL` before deploying to use a different address) |
+| **Password** | A 16-character temporary password, generated locally and **printed only once**, in the summary |
+| **First login** | Cognito requires you to set a permanent password — the user is created with a *temporary* one, so the password change is forced, not optional |
+
+**If you missed the password, or it has scrolled past.** It cannot be recovered. Cognito stores passwords hashed, `admin-get-user` returns no credential, and `admin-create-user` does not return the temporary password it set — so the only option is to set a new one. The deployment summary prints this command with your real User Pool ID already filled in; if you no longer have the summary, find the ID first:
+
+```bash
+# Find your User Pool ID (look for <prefix->nvidia-artf-recommenders)
+aws cognito-idp list-user-pools --max-results 60 --region us-east-1
+
+# Set a permanent password — you will NOT be prompted to change it at next login
+aws cognito-idp admin-set-user-password \
+  --user-pool-id <your-user-pool-id> \
+  --username admin@example.com \
+  --password '<new-password>' --permanent --region us-east-1
+```
+
+It is also recorded locally: `jq -r '.deployments[""].resolved.cognitoUserPoolId' deployment/.deploy-state.json` (use the prefix as the key if you deployed with `--prefix`).
+
+**If you have deployed before, your old login will not work.** Each deployment creates its own user pool, and `--prefix` creates a separate one per prefix. A user in a pool from an earlier deployment has no relationship to the new pool, and `--destroy` deletes the pool along with its users. Sign in with the credentials from the **current** deployment's summary, or reset the password in the current pool using the commands above.
 
 ## Go deeper
 
@@ -295,7 +340,8 @@ docker buildx version                            # only needed for --local-build
 ./deploy.sh --maxGPUs 5                    # raise the GPU node group's max size (default 3)
 ./deploy.sh --artf-node-role inference     # co-locate the model containers on the GPU node
 ./deploy.sh --start-at 3                   # resume from Phase 3 (see the breaking-change note below)
-./deploy.sh --verbose                      # print full detailed logs, not just phase summaries
+./deploy.sh --verbose                      # print every underlying command, not just step summaries
+DEPLOY_NO_SPINNER=1 ./deploy.sh            # hold the progress line still (no animation)
 AWS_REGION=us-west-2 ./deploy.sh           # deploy to a different Region
 ```
 
@@ -309,6 +355,90 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ```
 
 **Breaking change:** `deploy.sh --start-at` now takes a phase number 1–5 instead of the old internal step numbers. If you have scripts referencing the old numbering, see the old-step-to-new-phase mapping table in [RENAME_MAP.md](RENAME_MAP.md).
+
+### Resuming, re-running, and remembered settings
+
+**Re-running does not require a teardown first.** Every phase is idempotent: existing ECR repositories, DynamoDB tables and EKS clusters are reused, images whose source has not changed are not rebuilt, manifests are re-applied, and the demo Cognito user is left alone if it already exists. Run `./deploy.sh` again as often as you like. Use `--destroy` when you actually want the resources gone — to stop paying for them, or to start from a genuinely clean account — not as a precaution before redeploying.
+
+**Where did I get to? Ask AWS.**
+
+```
+./deploy.sh --prefix bt1 --status
+```
+
+```
+Deployment status — prefix 'bt1'
+  account 123456789012 · region us-east-1 · stack bt1-nvidia-artf-recommenders
+  (read live from AWS — safe to run any time, from anywhere, while a deploy is running)
+
+  ✓         Phase 1/5  Preparing models
+  ✗ missing Phase 2/5  Building containers & provisioning infrastructure
+            ✗ missing container images — repos exist but hold no image: adaptive-bidding-agent
+            ✓         EKS cluster — bt1-nvidia-artf-recommenders-triton ACTIVE
+            ✓         node group gpu-inference — 1 node(s) registered, ['g5.xlarge']
+  ✓         Phase 3/5  Deploying workloads
+  ✓         Phase 4/5  Setting up access
+  ✗ missing Phase 5/5  Registering agents
+            ✗ missing stack bt1-governance-eventbridge — not created
+            ✗ missing agent runtime *AdaptiveBiddingStrategyAgent — not created
+```
+
+`✓` is deployed and `✗` is not; the word after the cross says which kind of "not",
+because *never created* and *created and broken* need different responses:
+
+| Mark | Meaning |
+|---|---|
+| `✓` | Present and ready |
+| `✗ missing` | Does not exist. Re-running the phase creates it |
+| `✗ FAILED` | Exists and is broken — a rolled-back stack, a pod that will not schedule. Needs a look, not just a re-run |
+| `· working` | AWS is mid-operation. A re-run waits for it rather than competing |
+| `? unknown` | Could not be determined (usually no `kubectl` context for the cluster). The phase is **run**, not skipped |
+
+Terminals without UTF-8 get `+`, `x` and `.` instead. These are the same marks the
+deploy itself prints, so a phase looks identical whether you are watching it happen
+or asking about it afterwards.
+
+That comes from CloudFormation stack statuses, CodeBuild build states, EKS nodegroups **and the nodes actually registered in the cluster**, ECR images, Kubernetes readiness, CloudFront, Cognito and AgentCore runtimes — not from a local file. So it works from any machine, after a reboot, for a colleague, and while a deploy is running, because it only reads. It exits 0 only when everything expected is present, so it is usable in a script.
+
+**If a deploy stops part-way, run the same command again.** No flags, no prompt:
+
+```
+./deploy.sh --prefix bt1
+```
+
+It probes AWS first, prints the table above, then does only what is missing:
+
+- A phase whose resources already exist is **skipped**, and says so.
+- If AWS is **mid-operation** — a stack creating, a CodeBuild build running — it **waits for that** rather than starting a competing one. Two terminals running this at once is therefore safe, and useful, instead of a race.
+- A phase whose state **cannot be verified** is run, not skipped. Every phase is idempotent, so re-running one costs time; skipping one would ship a deployment that claims to be complete and is not.
+- `--start-at N` still forces a starting phase, for when you know something the probe cannot — "rebuild my container even though an image exists".
+
+There is no resume prompt, because there is no longer a question to ask. `--resume` is accepted as a no-op so older scripts and notes keep working.
+
+If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, and the output prints the exact `aws eks update-kubeconfig` command. It will never report another cluster's pods as yours — which matters, because every deploy rewrites the shared `~/.kube/config`.
+
+**Detaching is supported.** With no terminal attached — `nohup`, a detached session, CI — nothing prompts. If a subsystem fails, the run prints a partial-completion summary with a freshly probed status table, names what failed, and **exits non-zero**. It will not print a success banner for a deploy that did not finish.
+
+**Docker is started for you when it is needed.** Phase 5 builds the two AgentCore agent images locally by design (AgentCore needs arm64, and the builds are small). If the Docker daemon is not running at that point, `deploy.sh` starts it and waits instead of failing with a connect error. Same for `--local-build`.
+
+
+**Settings are remembered per `--prefix`.** Flags you omit are filled in from the last run of that prefix, and every value applied is printed at startup:
+
+```
+  Reusing values from the last deploy of prefix '<none>':
+    AWS_REGION = us-east-1
+    --maxGPUs = 3
+    --ngc-secret = nvidia-artf-recommenders-ngc-api-key
+    (pass the flag explicitly to override, or delete deployment/.deploy-state.json)
+```
+
+The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
+
+Three things worth knowing about the record:
+
+- It is keyed on `--prefix`, so `./deploy.sh` and `./deploy.sh --prefix stg` never read each other's values. If the record's account or stack name disagrees with the current invocation, nothing is reused and the script says why.
+- It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password — only the *name* of the Secrets Manager secret.
+- It records **no progress**. That was tried and removed: a file describing what the script had done disagreed with what the account actually contained, and reported a phase complete for a workload that had never started. Progress comes from `--status`.
 
 ### Building your own ARTF container
 
@@ -355,9 +485,88 @@ An inactive, absent, broken or slow container never breaks the flow: the other c
 
 The registry record is authoritative for routing. Changing only the env var leaves the orchestrator filtering on the old intent, so your container never gets called.
 
-`ADD_CIDS` is the default intent because it is the one intent in the ARTF enum that no shipped container implements — the template fills a gap rather than shadowing working code. Two containers *may* claim the same intent: both are called and both sets of mutations merge, which is a way to compare your implementation against a built-in. The panel flags a shared intent, because merge order then decides which value survives downstream.
+`ADD_CIDS` is the default intent because it is the one intent in the ARTF enum that no shipped container implements — the template fills a gap rather than shadowing working code. Two containers *may* claim the same intent: both are called, and the orchestrator then decides which one's mutation is returned for a given path. See [Precedence](#precedence-when-two-containers-claim-the-same-intent) below. The panel flags a shared intent and names who wins.
 
 The six shipped containers stay defined in the orchestrator's code and cannot be renamed, re-targeted or deactivated from the UI or the registry table — the real-time bidding path is deliberately not UI-mutable.
+
+### Attaching a container built outside this guidance
+
+The registry table accepts containers this repository did not build. A container prepared elsewhere — for example the Contextual Yield Agent from [Guidance for Containerized Advertising Context on AWS](https://github.com/aws-solutions-library-samples/guidance-for-containerized-semantic-context-on-aws) — attaches with **no orchestrator code change and no Java change**, because the Prebid ARTF hook calls the orchestrator rather than the containers and inherits whatever the registry resolves.
+
+That producer emits an `artf-registry-record.json` describing the container and a Kubernetes example manifest. `deployment/attach_artf_container.sh` consumes both.
+
+**Everything in one block:**
+
+```bash
+cd deployment
+
+# 1. Attach: validate, copy the image into this account's ECR, render the manifest,
+#    probe POST /mutate, and write the registry record (inactive).
+./attach_artf_container.sh \
+  --record   /path/to/guidance-for-containerized-semantic-context-on-aws/deployment/artf-registration/artf-registry-record.json \
+  --template /path/to/guidance-for-containerized-semantic-context-on-aws/deployment/k8s/artf-container.example.yaml \
+  --stack    "${STACK_NAME}" \
+  --region   us-east-1 \
+  --priority 0
+
+# 2. Review the rendered manifest, then apply it.
+cat eks/external-contextual-yield-agent.yaml
+kubectl apply -f eks/external-contextual-yield-agent.yaml
+
+# 3. Activate it — in the Container Health panel, or here.
+aws dynamodb update-item \
+  --table-name "${STACK_NAME}-container-registry" --region us-east-1 \
+  --key '{"registry":{"S":"artf-containers"},"name":{"S":"contextual-yield-agent"}}' \
+  --update-expression 'SET active = :a' \
+  --expression-attribute-values '{":a":{"BOOL":true}}'
+
+# 4. Teardown — record first, then workload. The script enforces that order.
+./attach_artf_container.sh --detach contextual-yield-agent --stack "${STACK_NAME}"
+```
+
+**What the script refuses, and why:**
+
+| Refusal | Reason |
+|---|---|
+| An endpoint that is not cluster-internal | ARTF conformance. A container reachable from outside the cluster is a different deployment model with a different security posture |
+| An endpoint with a path, no port, or an IP address | The orchestrator appends `/mutate` itself, and an IP does not survive the pod being rescheduled |
+| `--variant gpu` when the image's `agent-manifest` label does not advertise a GPU serving mode | The label is the authority. A manifest can be rendered for a shape the image cannot serve, and the failure would then appear as a startup refusal instead of a refusal to attach |
+| Detaching a built-in container | Built-ins have no registry record, so the deletion would silently succeed and change nothing |
+
+**The cross-account image pull is not something this repository can grant.** The image lives in the producer's account. Copying it into yours still requires `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on *their* repository, which only they can grant with a repository policy. What the copy buys is *where and when* that gap surfaces: once, at attach time, with a named error — rather than on every node, continuously, as `ImagePullBackOff` after a registry record that already looks healthy. Use `--no-copy` to register the foreign reference directly and take the ongoing dependency instead.
+
+#### Precedence: when two containers claim the same intent
+
+Both containers are called. For any given `(path, intent)` only one mutation is returned, and the orchestrator decides which:
+
+1. **Higher `priority` wins.** It is an integer on the registry record, defaulting to `0`.
+2. **Equal priority falls back to registry order**, where code-defined containers come first and store-defined ones follow.
+
+Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent — and the built-in's mutation is computed and then discarded. That is not new behaviour: it is what a consumer applying an unresolved mutation list already did, since the last write to a path is the one that sticks. What is new is that it is now decided in one place, reported, and controllable.
+
+`contextual-yield-agent` claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer** also claims. So attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
+
+```bash
+./attach_artf_container.sh --record ... --stack "${STACK_NAME}" --priority -1
+```
+
+Built-in containers are pinned at priority `0` and **cannot be deactivated** — the bid path is not UI-mutable. Priority is the only lever, which is why it exists.
+
+The losing mutation is not hidden. `metadata.conflicts` names the path, the intent, the winner and the losers; each container's `superseded` count says how many of its mutations lost; and its own `mutations` list still shows what it computed. The Container Health panel shows the priority and who wins, and the flow pipeline marks a container whose work was overridden.
+
+**Where the knobs live:**
+
+| Knob | Where | Default |
+|---|---|---|
+| Precedence | `priority` on the registry record; `--priority` on the attach script | `0` |
+| Copied-image repository | `--dest-repo` | `${STACK_NAME}-external-artf/<name>` |
+| CPU or GPU shape | `--variant` | `cpu` |
+| Skip the image copy | `--no-copy` | off (the copy runs) |
+| Rendered manifest path | `--out` | `deployment/eks/external-<name>.yaml` |
+| Namespace | `--namespace`, else the record's | the record's (`default`) |
+| Registry table | `--table`, else `${STACK_NAME}-container-registry` | derived from the stack |
+
+**Not verified.** The GPU variant is implemented and guarded but **untested**: only the CPU image is published today (`serving_modes: ["cpu"]`), so there is nothing to pull and nothing to run. The guard refuses it rather than rendering a manifest for an image that does not exist. This cluster's GPU nodes *would* be compatible — `g5.*` is A10G, `sm_86`, which the container builds for — but that is a static compatibility check, not a run.
 
 ### Part 2: closed-loop learning
 
@@ -690,6 +899,103 @@ The script prompts for confirmation — type `destroy` to proceed. Include the s
 **Retained by design:** Amazon ECR repositories persist across deployments so cached images survive between runs. Delete them manually from the ECR console or CLI if you no longer need them.
 
 **Required permission for teardown:** disabling CloudFormation termination protection (which `eksctl` enables automatically) needs `cloudformation:UpdateTerminationProtection`. If your session denies that action, `--destroy` logs a warning and the EKS stacks won't delete — re-run it from a session that allows the action.
+
+### Stopping a deployment in progress
+
+**Ctrl+C stops the script, not the deployment.** None of `deploy.sh`, `deploy_prebid.sh` or `remote_build.sh` installs a signal handler, so interrupting them kills the local shell loop and leaves every AWS-side operation running: CloudFormation stacks keep creating, `eksctl`'s cluster and node-group stacks keep going, and a CodeBuild build keeps building. A half-created cluster bills for its control plane, its nodes and its NAT gateway exactly like a finished one.
+
+So the first decision is not *how* to stop — it is whether to stop at all.
+
+**First, see where things actually got to.** `--status` reads live from AWS and is safe to run while a deploy is still going, from any machine:
+
+```bash
+cd deployment
+./deploy.sh --prefix <your-prefix> --status
+```
+
+That tells you which of the five phases completed and, for anything missing, whether it was never created or created and broken. Two things it does not cover, because they are not deploy phases:
+
+```bash
+export AWS_PROFILE=default AWS_REGION=us-east-1
+STACK_NAME=<your-prefix>-nvidia-artf-recommenders
+
+# Is a local script still running? (Ctrl+C only ever stops this part)
+ps -eo pid,etime,command | grep -E "deploy\.sh|deploy_prebid|eksctl|remote_build" | grep -v grep
+
+# Is a remote image build still going?
+aws codebuild list-builds-for-project --project-name "${STACK_NAME}-image-builder" \
+  --region "$AWS_REGION" --max-items 5 --query 'ids' --output text \
+  | xargs -n1 -I{} aws codebuild batch-get-builds --ids {} --region "$AWS_REGION" \
+      --query 'builds[0].[id,buildStatus]' --output text
+```
+
+#### Option 1 — resume instead of stopping (usually right)
+
+The EKS cluster takes 15–20 minutes and an interrupted run does not lose it. Every phase is idempotent, so re-running picks up where it left off:
+
+```bash
+cd deployment
+./deploy.sh --resume
+```
+
+See [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings) for how `--resume`, `--start-at` and the remembered flags in `.deploy-state.json` interact. The short version: you do not need to tear down before redeploying, and `--destroy` is for when you want the resources *gone*, not as a precaution.
+
+#### Option 2 — stop the in-flight work, keep what exists
+
+```bash
+# Stop a running build. Immediate, and it cannot leave a usable-looking bad image:
+# a container manifest is pushed after its layers, so an interrupted push leaves
+# untagged blobs rather than a tag pointing at something incomplete.
+aws codebuild stop-build --id "<build-id>" --region "$AWS_REGION"
+```
+
+**A CloudFormation stack mid-`CREATE` cannot be cancelled.** `cancel-update-stack` applies only to `UPDATE_IN_PROGRESS`; there is no equivalent for a create. Your choices are to let it reach `CREATE_COMPLETE` or `CREATE_FAILED`, or to call `delete-stack`, which queues the deletion behind the create it is already performing. Waiting is normally faster and always less confusing.
+
+#### Option 3 — tear it all down
+
+```bash
+cd deployment
+./deploy.sh --destroy --prefix <your-prefix>
+```
+
+Three things to know before you run it on an interrupted deployment:
+
+- **It needs an interactive terminal.** It prompts for the word `destroy` and fails outright if it cannot read a TTY — so it will not work backgrounded, piped, or from CI.
+- **Let the in-flight stacks settle first.** `--destroy` clears `eksctl`'s termination protection only on stacks in `CREATE_COMPLETE`, `UPDATE_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`. A stack still in `CREATE_IN_PROGRESS` — precisely what an interrupted deploy leaves — is not in that list, so its protection stays on and the delete can stall. Wait for the status to settle, then destroy.
+- **ECR repositories are retained by design**, including any created by `attach_artf_container.sh`. Delete them separately if you want them gone.
+
+**If a stack is wedged**, deal with `eksctl`'s stacks through `eksctl` rather than CloudFormation, because it knows the dependency order between the cluster and its node groups:
+
+```bash
+eksctl delete cluster --name "${STACK_NAME}-triton" --region "$AWS_REGION" --wait
+```
+
+Should that still fail, clear termination protection by hand and retry:
+
+```bash
+for s in $(aws cloudformation list-stacks --region "$AWS_REGION" \
+    --query "StackSummaries[?starts_with(StackName,'eksctl-${STACK_NAME}-triton-')].StackName" \
+    --output text); do
+  aws cloudformation update-termination-protection --stack-name "$s" \
+    --no-enable-termination-protection --region "$AWS_REGION"
+done
+```
+
+#### After an interrupted run
+
+Two local state files survive and are safe to delete, though deleting the first loses your remembered flags:
+
+| File | Holds |
+|---|---|
+| `deployment/.deploy-state.json` | The flags the last run was given — what `--resume` reads |
+| `deployment/.bootstrap-status.json` | Progress of the model-optimizer TensorRT build, which runs in the background and outlives the script by design |
+
+The optimizer bootstrap is deliberately fire-and-forget: `deploy.sh` does not block on it, so a Job may still be compiling engines after the script exits normally. That is expected, not a leftover.
+
+```bash
+kubectl get job model-optimizer-bootstrap
+cat deployment/.bootstrap-status.json
+```
 
 ## Notices
 

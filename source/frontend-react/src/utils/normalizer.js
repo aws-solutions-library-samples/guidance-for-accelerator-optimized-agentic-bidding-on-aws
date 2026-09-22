@@ -88,6 +88,7 @@ function makePlaceholderContainerStop(id) {
     status: "unknown",
     latency: null,
     mutations: [],
+    superseded: 0,
   };
 }
 
@@ -119,6 +120,12 @@ function containerEntryToStop(entry) {
   // absent from the pipeline entirely rather than merely unlabelled. Synthesize
   // a stop instead, and take its label from the response since no build-time
   // lookup can know the name.
+  // How many of this container's mutations lost a contest for a (path, intent)
+  // to a higher-priority container. The mutations above still list them, because
+  // the container really did compute them -- this count is what lets the UI say
+  // "ran and was overridden" rather than showing a mutation that looks applied.
+  const superseded = isFiniteNumber(entry.superseded) ? entry.superseded : 0;
+
   if (!stopId) {
     return {
       id: `${DYNAMIC_STOP_PREFIX}${name}`,
@@ -128,6 +135,7 @@ function containerEntryToStop(entry) {
       status,
       latency,
       mutations,
+      superseded,
     };
   }
 
@@ -142,6 +150,7 @@ function containerEntryToStop(entry) {
     status,
     latency,
     mutations,
+    superseded,
   };
 }
 
@@ -245,6 +254,9 @@ function buildInferredContainerStops(mutations) {
     status: "unknown",
     latency: null,
     mutations: buckets[id],
+    // The inferred path has no per-container metadata to read a count from, so
+    // 0 here means "not known", not "nothing was overridden".
+    superseded: 0,
   }));
 }
 
@@ -292,6 +304,11 @@ export function normalize(raw, transport, submittedPayload) {
     stops,
     packet: summarizePacket(safePayload, raw),
     attribution: hasExplicitContainers ? "explicit" : "inferred",
+    // Contests for a (path, intent) claimed by more than one container. Always an
+    // array: an orchestrator predating precedence omits the key, and for a
+    // renderer "nothing to show" and "this build cannot tell you" both mean
+    // render nothing.
+    conflicts: Array.isArray(raw?.metadata?.conflicts) ? raw.metadata.conflicts : [],
     lifecycle,
     isResponseLifecycle,
     error: null,

@@ -153,6 +153,12 @@ class ContainerInvocationModel(BaseModel):
     store-defined containers, whose names are not known when the frontend is
     built — without it a user's own container cannot be labelled at all. Empty
     for callers that do not set it, so existing readers are unaffected.
+
+    ``superseded`` counts this container's mutations that lost a contest for a
+    ``(path, intent)`` to a higher-priority container. ``mutations`` still lists
+    them: the container did compute them, and a reader needs to be able to tell
+    "ran and was overridden" from "ran and produced nothing". See
+    ``orchestrator/container_registry.resolve_conflicts``.
     """
     name: str
     status: str
@@ -160,12 +166,37 @@ class ContainerInvocationModel(BaseModel):
     mutations: list[Mutation] = []
     model_version: str = ""
     display_name: str = ""
+    superseded: int = 0
+
+
+class ConflictModel(BaseModel):
+    """One (path, intent) claimed by more than one container.
+
+    Two containers may legitimately claim the same intent — the fan-out calls
+    both and both return mutations. But a consumer applies mutations in order,
+    so for a given path only the last one it applies has any effect. Reporting
+    the contest is what turns "two mutations, one of which quietly did nothing"
+    into something a reader can act on.
+
+    ``losers`` names the containers whose mutation for this key was not the one
+    returned. Their mutation is still present on their own
+    ``ContainerInvocationModel.mutations``, because it was really computed.
+    """
+
+    path: str
+    intent: int
+    winner: str
+    losers: list[str] = []
 
 
 class Metadata(BaseModel):
     api_version: str = "1.0"
     model_version: str = ""
     containers: list[ContainerInvocationModel] | None = None
+    # None rather than [] when nothing was contested, so "no conflicts" stays
+    # distinguishable from "this orchestrator does not report conflicts" for a
+    # client older than this field.
+    conflicts: list[ConflictModel] | None = None
 
 
 class RTBResponse(BaseModel):

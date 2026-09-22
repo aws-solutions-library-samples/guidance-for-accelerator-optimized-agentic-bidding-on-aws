@@ -1,5 +1,12 @@
 // useBeatCaption.js — the caption for the current beat.
 //
+// NOT CURRENTLY MOUNTED. The Theater generated one caption per beat until the
+// narration moved to the centre-stage card, which states the beat's real values
+// derived rather than generated. Generated prose is now one summary per run, in
+// useRunSummary.js. Nothing in the application calls this hook, so no per-beat
+// model invocation happens; the module and its tests are kept because the
+// per-beat path is intact and correct, and reinstating it is an import away.
+//
 // The only module in this unit that knows about time.
 //
 // Fallback-first: the factual caption is written synchronously the moment a beat
