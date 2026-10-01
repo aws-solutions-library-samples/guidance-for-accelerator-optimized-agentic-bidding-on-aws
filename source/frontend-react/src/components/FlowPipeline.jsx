@@ -334,7 +334,7 @@ export default function FlowPipeline({ result, loading, error }) {
             <span>{timeData.maxLatency.toFixed(0)}ms</span>
           </div>
 
-          <TotalLatency latencyMs={result?.totalLatencyMs} browserElapsedMs={result?.browserElapsedMs} stops={result?.stops} />
+          <TotalLatency latencyMs={result?.totalLatencyMs} stops={result?.stops} />
         </div>
       )}
     </div>

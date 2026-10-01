@@ -22,7 +22,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, model_validator
 
 from shared.feedback_collector import FeedbackCollector
-from shared.feedback_models import BidShadingOutcomeEvent
+from shared.feedback_models import BidShadingOutcomeEvent, OutcomeProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,10 @@ class DownstreamSignal(BaseModel):
     signal_type: SignalType
     conversion_value: Optional[float] = None
     timestamp: float
+    #: Where this signal came from. Defaults to "observed" so an existing caller is
+    #: unchanged; the outcome simulator sets "simulated", and that label travels into
+    #: the enriched event, the training record and the model manifest.
+    provenance: OutcomeProvenance = "observed"
 
     @model_validator(mode="after")
     def _validate_signal(self) -> "DownstreamSignal":
@@ -237,7 +241,13 @@ class SignalAssociator:
         - click implies impression implies won
         - impression implies won
 
-        The original event's `won` field is preserved; it was set at auction time.
+        The original event's `won` field is preserved unless an impression implies it.
+
+        Signals not covered by the reported one stay at whatever the original event
+        carried, which for a bid-time event is None -- "not reported". They are NOT
+        set to False: an impression says nothing about whether a click will follow,
+        and recording "no click" on the strength of an impression signal invents an
+        outcome.
         """
         # Start from the current state of the event
         impression = original.impression
@@ -259,25 +269,35 @@ class SignalAssociator:
         elif signal.signal_type == SignalType.IMPRESSION:
             impression = True
 
-        # BidShadingOutcomeEvent is frozen, so we need to create a new instance
-        return BidShadingOutcomeEvent(
-            request_id=original.request_id,
-            timestamp=original.timestamp,
-            model_version=original.model_version,
-            source=original.source,
-            original_price=original.original_price,
-            shaded_price=original.shaded_price,
-            bid_floor=original.bid_floor,
-            won=True if impression else original.won,  # impression implies won
-            price_paid=original.price_paid,
-            impression=impression,
-            click=click,
-            conversion=conversion,
-            conversion_value=conversion_value,
-            user_id_hash=original.user_id_hash,
-            site_domain=original.site_domain,
-            device_type=original.device_type,
-            hour_of_day=original.hour_of_day,
-            shade_factor_used=original.shade_factor_used,
-            conversion_value_estimate_used=original.conversion_value_estimate_used,
+        # The event is frozen, so enrichment means building a new one. Copy the
+        # original's fields wholesale and override only the outcome — do NOT
+        # enumerate them.
+        #
+        # Enumerating is what broke this: the list omitted day_of_week, geo_country
+        # and has_video, so every enriched event silently reverted them to their
+        # field defaults (0 / "" / False). Confirmed in S3: 9 enriched rows carried
+        # day_of_week=0 on a Sunday and an empty geo_country while their originals
+        # carried 6 and a real country. Two of the DLRM's three categoricals were
+        # being destroyed on exactly the rows that have labels. Any future field
+        # added to the event is now carried automatically.
+        #
+        # model_dump()/re-construct rather than model_copy(update=...) because
+        # model_copy skips validation, and the monotonic outcome rules are the thing
+        # most worth re-checking at this point.
+        data = original.model_dump()
+        data.update(
+            {
+                # `is True`, not truthiness: impression is tri-state now, and None
+                # must not be read as False when deciding whether it implies a win.
+                "won": True if impression is True else original.won,
+                "impression": impression,
+                "click": click,
+                "conversion": conversion,
+                "conversion_value": conversion_value,
+                # The signal's own provenance replaces the event's "unresolved".
+                # This is what keeps a simulated outcome labelled as one all the way
+                # into the training record and the model manifest.
+                "outcome_provenance": signal.provenance,
+            }
         )
+        return BidShadingOutcomeEvent(**data)

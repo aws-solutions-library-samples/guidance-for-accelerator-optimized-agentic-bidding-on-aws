@@ -49,7 +49,9 @@ async def receive_signal(
             "request_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
             "signal_type": "impression" | "click" | "conversion",
             "conversion_value": 10.5,   // optional, only for conversion signals
-            "timestamp": 1718000000.0   // optional, defaults to current time
+            "timestamp": 1718000000.0,  // optional, defaults to current time
+            "provenance": "observed"    // optional; "simulated" for synthetic
+                                        // signals from the outcome simulator
         }
 
     Responses:
@@ -96,6 +98,7 @@ async def receive_signal(
             signal_type=SignalType(signal_event.signal_type),
             conversion_value=signal_event.conversion_value,
             timestamp=signal_event.timestamp,
+            provenance=signal_event.provenance,
         )
         associated = await signal_associator.handle_signal(downstream_signal)
     except Exception:

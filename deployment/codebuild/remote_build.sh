@@ -309,15 +309,42 @@ rm -f "${SOURCE_ZIP}"
 # =========================================================================
 # Step 5: Determine which CodeBuild project(s) to trigger
 # =========================================================================
-# For ARM-only builds (agents with --target agents), use the ARM project
-# For everything else, use x86 project (it does cross-compile via buildx for ARM when needed)
-# Strategy: use x86 project for all/part1/nemo; use ARM for native ARM builds
+# Pick the builder by the architecture of what is being built.
 #
-# Actually for simplicity and reliability, we use the x86 project for all builds.
-# The x86 project uses buildx to cross-compile ARM images (--push instead of --load).
-# This avoids needing to coordinate two builds.
+# Three images here are arm64 (they back AgentCore runtimes, which are arm64-only):
+# agentcore, adaptive-bidding-agent, model-promotion-governance-agent. Everything
+# else is amd64.
+#
+# A build containing ONLY arm64 images goes to the ARM project, which runs natively
+# on Graviton (ARM_CONTAINER / amazonlinux-aarch64-standard) and needs no emulation.
+# Anything else -- mixed, or amd64-only -- goes to the x86 project, which
+# cross-compiles any arm64 image with QEMU + buildx.
+#
+# This used to send every build to the x86 project unconditionally, leaving
+# CB_PROJECT_ARM defined and never used. That made `--target agents` cross-compile
+# on x86 for no reason, and put it behind a Docker Hub anonymous pull of
+# multiarch/qemu-user-static that CodeBuild regularly loses. The buildspec's own
+# rate-limit guidance tells the reader to run `--target agents` *because* it builds
+# natively on Graviton; until now that was not true of this script.
+_ARM_ONLY=0
+if [[ -n "${BUILD_ONLY}" ]]; then
+  _ARM_ONLY=1
+  for _img in ${BUILD_ONLY}; do
+    case "${_img}" in
+      agentcore|adaptive-bidding-agent|model-promotion-governance-agent) ;;
+      *) _ARM_ONLY=0 ;;
+    esac
+  done
+elif [[ "${BUILD_TARGET}" == "agents" ]]; then
+  _ARM_ONLY=1
+fi
 
-CB_PROJECT="${CB_PROJECT_X86}"
+if [[ "${_ARM_ONLY}" -eq 1 ]]; then
+  CB_PROJECT="${CB_PROJECT_ARM}"
+  log "Build is arm64-only — using the native Graviton project (no QEMU needed)"
+else
+  CB_PROJECT="${CB_PROJECT_X86}"
+fi
 
 # Build environment overrides
 ENV_OVERRIDES="[

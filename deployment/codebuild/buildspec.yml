@@ -77,17 +77,38 @@ phases:
       # CodeBuild egresses from shared addresses, so that limit is reached by
       # other tenants, not by this account's build frequency.
       #
-      # The condition below must stay in step with the agentcore block in the
-      # build phase -- that is the only arm64 image here.
+      # The condition below must stay in step with EVERY arm64 block in the build
+      # phase. There are three: agentcore, adaptive-bidding-agent, and
+      # model-promotion-governance-agent. It once listed only agentcore, which was
+      # accurate when written; the two agent images were added later and the
+      # condition did not follow. The visible effect was that `--target agents`
+      # skipped binfmt setup and then asked buildx for linux/arm64 anyway.
+      #
+      # Emulation is also only needed when the HOST is not already arm64. On the
+      # Graviton project an arm64 build is native, so QEMU is both unnecessary and a
+      # pointless Docker Hub pull.
       - |
-        NEEDS_ARM=0
+        HAS_ARM_IMAGE=0
         if [ -n "${BUILD_ONLY}" ]; then
-          case " ${BUILD_ONLY} " in *" agentcore "*) NEEDS_ARM=1 ;; esac
-        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ]; then
-          NEEDS_ARM=1
+          case " ${BUILD_ONLY} " in
+            *" agentcore "*|*" adaptive-bidding-agent "*|*" model-promotion-governance-agent "*) HAS_ARM_IMAGE=1 ;;
+          esac
+        elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "part1" ] || [ "${BUILD_TARGET}" = "agents" ]; then
+          HAS_ARM_IMAGE=1
+        fi
+        HOST_ARCH="$(uname -m)"
+        NEEDS_ARM=0
+        if [ "${HAS_ARM_IMAGE}" = "1" ]; then
+          case "${HOST_ARCH}" in
+            aarch64|arm64) NEEDS_ARM=0 ;;
+            *)             NEEDS_ARM=1 ;;
+          esac
         fi
         export NEEDS_ARM
-        if [ "${NEEDS_ARM}" = "0" ]; then
+        if [ "${HAS_ARM_IMAGE}" = "1" ] && [ "${NEEDS_ARM}" = "0" ]; then
+          echo "arm64 image(s) in this build, and this host is ${HOST_ARCH} — building natively."
+          echo "Skipping QEMU/binfmt setup, so nothing is pulled from Docker Hub."
+        elif [ "${NEEDS_ARM}" = "0" ]; then
           echo "No arm64 image in this build (target=${BUILD_TARGET} only=${BUILD_ONLY:-none})."
           echo "Skipping QEMU/binfmt setup, so nothing is pulled from Docker Hub."
         else
@@ -277,6 +298,16 @@ phases:
             aws ecr create-repository --repository-name "${TRAINING_REPO}" \
               --region "${AWS_DEFAULT_REGION}" \
               --image-scanning-configuration scanOnPush=true >/dev/null
+
+          # Copy the shared modules the trainer imports (shared/dlrm_features.py)
+          # into the build context, which is training/container/ and so cannot
+          # reach source/shared/ on its own. Run unconditionally rather than
+          # relying on the uploaded tree already carrying a staged copy: the
+          # directory is gitignored, so a fresh checkout has none, and
+          # remote_build.sh can be invoked directly without going through
+          # deploy_closed_loop.sh. The script is idempotent, so re-staging an
+          # already-staged upload is a no-op that leaves NEMO_SRC_TAG accurate.
+          sh "${SOURCE_DIR}/training/stage_shared.sh"
 
           # Use the default builder (not multiarch) for this native amd64 build
           # to avoid QEMU/platform confusion with the large NeMo base image

@@ -14,19 +14,19 @@ input [
     dims: [ 4 ]
   },
   {
-    name: "sparse_user"
+    name: "sparse_site_domain"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }
   },
   {
-    name: "sparse_domain"
+    name: "sparse_device_type"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }
   },
   {
-    name: "sparse_device"
+    name: "sparse_geo_country"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }

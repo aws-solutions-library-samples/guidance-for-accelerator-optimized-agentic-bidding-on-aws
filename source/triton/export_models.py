@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -40,10 +41,29 @@ sys.path.insert(0, REPO_ROOT)
 # DLRM Model (matches containers/dlrm_bid_shader/app.py)
 # ---------------------------------------------------------------------------
 
+from shared import dlrm_features  # noqa: E402  (needs REPO_ROOT on sys.path)
+from shared import onnx_compat  # noqa: E402
+
 EMBEDDING_DIM = 16
-NUM_DENSE = 4
-NUM_SPARSE = 3
-VOCAB_SIZE = 1000
+
+# Widths, vocabulary sizes and served input names all come from the feature
+# spec. They used to be local constants, and the local NUM_SPARSE=3 with a
+# single VOCAB_SIZE=1000 sized every embedding table identically — so an index
+# from a larger vocabulary was an out-of-range lookup, and the served input
+# names described a feature set the container does not send.
+NUM_DENSE = dlrm_features.DENSE_WIDTH
+NUM_SPARSE = dlrm_features.CATEGORICAL_WIDTH
+
+# The export signature below takes its categorical inputs as three positional
+# arguments, because ONNX export traces a fixed arity. Adding a categorical
+# feature to the spec therefore requires editing this function, and this
+# assertion is what makes that a loud failure at export rather than a silent
+# mismatch in a served engine.
+assert NUM_SPARSE == 3, (
+    f"export_dlrm exports {NUM_SPARSE} categorical inputs as fixed positional "
+    "arguments; update export_dlrm and the Triton config.pbtxt files to match "
+    "the feature spec before changing CATEGORICAL_COLUMNS."
+)
 
 
 class DLRMModel(nn.Module):
@@ -59,9 +79,12 @@ class DLRMModel(nn.Module):
         # host node should not be folded into myelin" — Error Code 2). A plain
         # Embedding lookup exports as a single Gather with no control flow, so
         # trtexec can build the engine, with no change to the model's outputs.
+        #
+        # One table per categorical feature, each sized to that feature's own
+        # vocabulary, in the spec's column order.
         self.embeddings = nn.ModuleList([
-            nn.Embedding(VOCAB_SIZE, EMBEDDING_DIM)
-            for _ in range(NUM_SPARSE)
+            nn.Embedding(dlrm_features.VOCAB_SIZES[column], EMBEDDING_DIM)
+            for column in dlrm_features.CATEGORICAL_COLUMNS
         ])
         self.bottom_mlp = nn.Sequential(
             nn.Linear(NUM_DENSE, 32), nn.ReLU(),
@@ -120,29 +143,56 @@ def export_dlrm(output_dir: str) -> str:
     model.eval()
 
     dense = torch.randn(1, NUM_DENSE)
-    s0 = torch.tensor([42])
-    s1 = torch.tensor([7])
-    s2 = torch.tensor([99])
+    # One trace index per categorical, each inside its own vocabulary. Tracing
+    # an index past a table's end would fail the export itself.
+    s0, s1, s2 = (
+        torch.tensor([min(42, dlrm_features.VOCAB_SIZES[column] - 1)])
+        for column in dlrm_features.CATEGORICAL_COLUMNS
+    )
 
     model_dir = os.path.join(output_dir, "dlrm_bid_shader", "1")
     os.makedirs(model_dir, exist_ok=True)
     onnx_path = os.path.join(model_dir, "model.onnx")
 
+    # Input names come from the spec, which the container also reads, so the
+    # served signature and the tensors the container sends cannot disagree.
+    input_names = [
+        dlrm_features.TRITON_DENSE_INPUT,
+        *dlrm_features.TRITON_CATEGORICAL_INPUTS,
+    ]
     torch.onnx.export(
         model, (dense, s0, s1, s2), onnx_path,
-        input_names=["dense_features", "sparse_user", "sparse_domain", "sparse_device"],
+        input_names=input_names,
         output_names=["ctr_prediction"],
         dynamic_axes={
-            "dense_features": {0: "batch"},
-            "sparse_user": {0: "batch"},
-            "sparse_domain": {0: "batch"},
-            "sparse_device": {0: "batch"},
+            **{name: {0: "batch"} for name in input_names},
             "ctr_prediction": {0: "batch"},
         },
         opset_version=17,
-        dynamo=False,
+        **onnx_compat.onnx_export_kwargs(dynamo=False),
     )
+    # Provenance beside the artifact, in the same shape the trainer writes. Both
+    # producers emit one so the promotion path has a single rule -- a model with no
+    # manifest is refused -- rather than an exemption for genesis artifacts that
+    # would also silently cover a trainer that stopped writing it.
+    #
+    # These weights are seeded initialisation, not a trained checkpoint. Saying so
+    # here means a reader of the manifest does not have to infer it from the path.
+    manifest_path = os.path.join(model_dir, dlrm_features.MANIFEST_FILENAME)
+    with open(manifest_path, "w") as f:
+        json.dump(
+            dlrm_features.manifest(
+                "dlrm_bid_shader",
+                producer="triton/export_models.py",
+                weights="seeded_initialisation",
+                torch_manual_seed=42,
+            ),
+            f,
+            indent=2,
+        )
+
     print(f"  Exported DLRM → {onnx_path}")
+    print(f"  Wrote manifest → {manifest_path}")
     return onnx_path
 
 
@@ -224,7 +274,7 @@ def export_ncf(output_dir: str) -> str:
             "relevance_scores": {0: "batch"},
         },
         opset_version=17,
-        dynamo=False,
+        **onnx_compat.onnx_export_kwargs(dynamo=False),
     )
     print(f"  Exported NCF → {onnx_path}")
     return onnx_path

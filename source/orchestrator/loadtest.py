@@ -286,6 +286,45 @@ _USER_AGENTS = {
     "tablet_ipad": "Mozilla/5.0 (iPad; CPU OS 17_0) AppleWebKit/605.1",
 }
 
+#: OpenRTB 2.x device type for each user agent above, keyed by the UA string so
+#: a profile that reorders or reweights `user_agents` stays consistent.
+#: 2 = Personal Computer, 4 = Phone, 5 = Tablet (OpenRTB 2.5 Table 5.21).
+#:
+#: Generated requests carry `device.devicetype` because the containers' feature
+#: specs read it (source/shared/dlrm_features.py). A template that omits it
+#: leaves the serving path reading an absent categorical, so the load test would
+#: not exercise the feature at all -- and the outcome rows it produces would
+#: carry no device variation for training either.
+_DEVICE_TYPES = {
+    _USER_AGENTS["desktop_win"]: 2,
+    _USER_AGENTS["desktop_mac"]: 2,
+    _USER_AGENTS["mobile_ios"]: 4,
+    _USER_AGENTS["mobile_android"]: 4,
+    _USER_AGENTS["tablet_ipad"]: 5,
+}
+
+#: Countries the generator samples, so `device.geo.country` varies rather than
+#: being a constant. ISO-3166-1 alpha-3, as OpenRTB specifies.
+_GEO_COUNTRIES = ("USA", "USA", "USA", "CAN", "GBR", "DEU", "AUS")
+
+
+def _device_block(rng: random.Random, p: TrafficProfile) -> dict:
+    """A device object with a UA, its matching devicetype, and a geo country.
+
+    One helper so every template that needs a device produces the same shape.
+    `devicetype` is looked up from the chosen UA rather than drawn separately,
+    which keeps the two consistent -- an iPhone UA reporting devicetype 2 would
+    be a contradiction the containers could learn from.
+    """
+    ua = rng.choice(p.user_agents)
+    return {
+        "ua": ua,
+        "devicetype": _DEVICE_TYPES.get(ua, 2),
+        "ip": _rand_ip(rng),
+        "geo": {"country": rng.choice(_GEO_COUNTRIES)},
+    }
+
+
 _BANNER_SIZES = [
     (728, 90), (300, 250), (160, 600), (320, 50),
     (970, 250), (300, 600), (468, 60), (336, 280),
@@ -561,7 +600,7 @@ def _tmpl_shade(rng: random.Random, idx: int, p: TrafficProfile) -> dict:
             "imp": [{"id": f"imp-{idx}-0", "banner": {"w": 728, "h": 90}, "pos": 1, "bidfloor": round(rng.uniform(*p.bidfloor_range), 2)}],
             "site": {"domain": rng.choice(p.domains), "cat": [rng.choice(p.iab_cats)]},
             "user": {"id": f"user-{rng.randint(100000, 999999)}", "yob": rng.randint(1970, 2000)},
-            "device": {"ua": rng.choice(p.user_agents), "ip": _rand_ip(rng)},
+            "device": _device_block(rng, p),
         },
         "bid_response": {
             "seatbid": [{"bid": [{"id": f"bid-{idx}", "impid": f"imp-{idx}-0", "price": round(rng.uniform(*p.bid_price_range), 2)}]}]
@@ -888,6 +927,10 @@ async def _run_load_test(
                             test_id, request_index, inv.model_version, target_model_type,
                             seed=seed,
                             shaded_price=_shaded_price_from_mutations(inv.mutations),
+                            # The generated request itself, so the outcome row
+                            # records the domain/device/geo the traffic carried
+                            # instead of a constant marker.
+                            bid_request=payload.get("bid_request"),
                         )
                         # None means the container returned no price for this
                         # request, so there is no model decision to score.

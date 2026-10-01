@@ -13,6 +13,9 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from spark_java import SKIP_REASON, resolve_java_home
 
 pyspark = pytest.importorskip("pyspark", reason="PySpark required for Glue ETL tests")
 
@@ -109,6 +112,9 @@ def _make_record(
 @pytest.fixture(scope="session")
 def spark():
     """Create a local SparkSession for testing."""
+    if resolve_java_home() is None:
+        pytest.skip(SKIP_REASON)
+
     session = (
         SparkSession.builder.master("local[1]")
         .appName("test_glue_deal_yield_etl")

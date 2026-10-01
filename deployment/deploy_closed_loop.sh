@@ -458,12 +458,21 @@ fi
 RAW_OUTCOMES_GLUE_DATABASE="$(get_stack_output "${FEEDBACK_STACK}" "GlueDatabaseName" 2>/dev/null || echo '')"
 RAW_OUTCOMES_GLUE_DATABASE="${RAW_OUTCOMES_GLUE_DATABASE:-feedback_pipeline}"
 
+# How far in the past the ETL's rolling window ends, so a bid is only processed once
+# its downstream signals have had time to arrive. This also decides when an absent
+# response becomes a negative label rather than staying unlabelled, so it is a
+# label-semantics setting and not only a scheduling one -- see glue_etl_cfn.yaml's
+# ConversionLagHours description. Defaults to the template's own 0, which processes up
+# to the present moment and accepts that a late conversion is never joined.
+CONVERSION_LAG_HOURS="${CONVERSION_LAG_HOURS:-0}"
+
 deploy_cfn_stack "${GLUE_STACK}" "${SCRIPT_DIR}/glue_etl_cfn.yaml" \
   "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
   "ParameterKey=GlueScriptS3Path,ParameterValue=${GLUE_SCRIPT_S3_PATH}" \
   "ParameterKey=DealYieldGlueScriptS3Path,ParameterValue=${DEAL_YIELD_GLUE_SCRIPT_S3_PATH}" \
   "ParameterKey=TrainingDataBucketName,ParameterValue=${TRAINING_DATA_BUCKET}" \
-  "ParameterKey=RawOutcomesGlueDatabaseName,ParameterValue=${RAW_OUTCOMES_GLUE_DATABASE}"
+  "ParameterKey=RawOutcomesGlueDatabaseName,ParameterValue=${RAW_OUTCOMES_GLUE_DATABASE}" \
+  "ParameterKey=ConversionLagHours,ParameterValue=${CONVERSION_LAG_HOURS}"
 
 # =========================================================================
 # Step 3: Closed-Loop Core (DynamoDB/DAX/SageMaker Model Registry/SNS)
@@ -637,6 +646,16 @@ MANIFEST_FILES
   printf '%s' "${manifest}" | _nemo_sha256 | awk '{print substr($1,1,16)}'
 }
 
+# Copy the shared modules the trainer imports into the build context. Must come
+# BEFORE the hash below: the staged files live inside the hashed directory, so
+# staging first is what makes an edit to source/shared/dlrm_features.py change
+# the src-<hash> tag and force a rebuild. Stage after, and SageMaker keeps
+# running an image built from the previous feature spec while the hash says the
+# source is unchanged. See source/training/stage_shared.sh.
+if ! sh "${SCRIPT_DIR}/../source/training/stage_shared.sh" >/dev/null; then
+  fail "Could not stage shared modules into source/training/container/ — the training image would be built without them."
+fi
+
 NEMO_SRC_HASH="$(_nemo_source_hash || echo '')"
 if [[ -n "${NEMO_SRC_HASH}" ]]; then
   NEMO_SRC_TAG="src-${NEMO_SRC_HASH}"
@@ -761,23 +780,47 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   IMAGE_TAG="$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo latest)"
 
-  # The two agent images below are built locally and on purpose -- AgentCore needs
-  # arm64 and the builds are small. So make sure Docker is actually running FIRST,
-  # and start it if not.
+  # The two agent images below are built locally when that is possible -- AgentCore
+  # needs arm64 and the builds are small, so a local build is usually the right tool.
   #
-  # This is where Phase 5 used to die. With the daemon down, `docker buildx build`
-  # failed with a raw connect error after the ECR repository had already been
-  # created, aborting the rest of Phase 5: no agent runtimes, no
-  # governance-eventbridge stack. The only evidence left behind was an ECR
-  # repository holding zero images, which reads like nothing in particular.
+  # Two things have made a local build impossible in practice, and each used to take
+  # the whole of Phase 5 down with it: a stopped daemon (raw connect error), and a
+  # Docker Desktop Config Profile that accepts `docker info` and `docker login` and
+  # then refuses every build unless the user signs in to a named organization. In
+  # both cases the only evidence left behind was an ECR repository holding zero
+  # images, which reads like nothing in particular.
+  #
+  # So the decision is made HERE, before anything is created: if a local build can
+  # run, build locally; if it cannot, build the same two images in CodeBuild, which
+  # produces the same artifacts in the same repositories under the same tag. The
+  # second path is a different builder, not a different result -- and it is reported
+  # as what it is.
   # shellcheck source=lib/deploy_docker.sh
   source "${SCRIPT_DIR}/lib/deploy_docker.sh"
-  docker_ensure_running "build the AgentCore agent images"
-  docker_ensure_buildx
 
-  # Authenticate to ECR once for all agent image pushes
-  aws ecr get-login-password --region "${AWS_REGION}" | \
-    docker login --username AWS --password-stdin "${REGISTRY}" 2>/dev/null
+  AGENT_BUILD_MODE="local"
+  if ! docker_build_usable "build the AgentCore agent images"; then
+    AGENT_BUILD_MODE="remote"
+    warn "  Local image build is unavailable: ${DOCKER_UNUSABLE_REASON}."
+    warn "  Building the two agent images in CodeBuild instead (same images, same tag)."
+  fi
+
+  if [[ "${AGENT_BUILD_MODE}" == "local" ]]; then
+    # Authenticate to ECR once for all agent image pushes
+    aws ecr get-login-password --region "${AWS_REGION}" | \
+      docker login --username AWS --password-stdin "${REGISTRY}" 2>/dev/null
+  else
+    # One CodeBuild run builds AND pushes both agent images (buildspec --target
+    # agents), so the per-image build/push steps below are skipped. Done before the
+    # repositories are touched, so a failure here leaves nothing half-made.
+    run_logged "${CL_DETAIL_LOG}" "Building both agent images in CodeBuild (arm64)" \
+      bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
+        --stack-name "${STACK_NAME}" \
+        --target agents \
+        --tag "${IMAGE_TAG}" \
+        --region "${AWS_REGION}" \
+      || fail "Remote build of the agent images failed (detail in ${CL_DETAIL_LOG})"
+  fi
 
   # -----------------------------------------------------------------------
   # 5a. Adaptive Bidding Strategy Agent (HTTP, Bedrock reasoning agent)
@@ -792,15 +835,24 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # An arm64 buildx build emits hundreds of layer lines. They go to CL_DETAIL_LOG;
   # the screen gets one line per step. run_logged tails the log if a build fails, so
   # the quiet path never costs a diagnosis.
-  run_logged "${CL_DETAIL_LOG}" "Building Adaptive Bidding agent image (arm64)" \
-    docker buildx build \
-      --platform linux/arm64 \
-      -f "${SCRIPT_DIR}/../source/Dockerfile.adaptive-bidding-agent" \
-      -t "${ADAPTIVE_BIDDING_IMAGE}" --load "${SCRIPT_DIR}/../source" \
-    || fail "Adaptive Bidding agent image build failed (detail in ${CL_DETAIL_LOG})"
-  run_logged "${CL_DETAIL_LOG}" "Pushing ${ADAPTIVE_BIDDING_REPO}:${IMAGE_TAG}" \
-    docker push "${ADAPTIVE_BIDDING_IMAGE}" \
-    || fail "docker push failed for ${ADAPTIVE_BIDDING_IMAGE} (detail in ${CL_DETAIL_LOG})"
+  if [[ "${AGENT_BUILD_MODE}" == "local" ]]; then
+    run_logged "${CL_DETAIL_LOG}" "Building Adaptive Bidding agent image (arm64)" \
+      docker buildx build \
+        --platform linux/arm64 \
+        -f "${SCRIPT_DIR}/../source/Dockerfile.adaptive-bidding-agent" \
+        -t "${ADAPTIVE_BIDDING_IMAGE}" --load "${SCRIPT_DIR}/../source" \
+      || fail "Adaptive Bidding agent image build failed (detail in ${CL_DETAIL_LOG})"
+    run_logged "${CL_DETAIL_LOG}" "Pushing ${ADAPTIVE_BIDDING_REPO}:${IMAGE_TAG}" \
+      docker push "${ADAPTIVE_BIDDING_IMAGE}" \
+      || fail "docker push failed for ${ADAPTIVE_BIDDING_IMAGE} (detail in ${CL_DETAIL_LOG})"
+  fi
+
+  # Whichever builder produced it, the image has to actually be in ECR before a
+  # runtime is pointed at it. The remote path pushes from CodeBuild, so this is the
+  # first point at which its result is observable here.
+  aws ecr describe-images --repository-name "${ADAPTIVE_BIDDING_REPO}" \
+    --image-ids "imageTag=${IMAGE_TAG}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+    || fail "${ADAPTIVE_BIDDING_REPO}:${IMAGE_TAG} is not in ECR after the ${AGENT_BUILD_MODE} build (detail in ${CL_DETAIL_LOG})"
 
   # deploy_to_agentcore.py logs to STDERR and prints only the ARN on stdout, so the
   # ARN is still capturable with the INFO chatter diverted to the log.
@@ -834,15 +886,21 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     aws ecr create-repository --repository-name "${GOVERNANCE_REPO}" --region "${AWS_REGION}" \
       --image-scanning-configuration scanOnPush=true >/dev/null
 
-  run_logged "${CL_DETAIL_LOG}" "Building Model Promotion Governance agent image (arm64)" \
-    docker buildx build \
-      --platform linux/arm64 \
-      -f "${SCRIPT_DIR}/../source/Dockerfile.governance" \
-      -t "${GOVERNANCE_IMAGE}" --load "${SCRIPT_DIR}/../source" \
-    || fail "Governance agent image build failed (detail in ${CL_DETAIL_LOG})"
-  run_logged "${CL_DETAIL_LOG}" "Pushing ${GOVERNANCE_REPO}:${IMAGE_TAG}" \
-    docker push "${GOVERNANCE_IMAGE}" \
-    || fail "docker push failed for ${GOVERNANCE_IMAGE} (detail in ${CL_DETAIL_LOG})"
+  if [[ "${AGENT_BUILD_MODE}" == "local" ]]; then
+    run_logged "${CL_DETAIL_LOG}" "Building Model Promotion Governance agent image (arm64)" \
+      docker buildx build \
+        --platform linux/arm64 \
+        -f "${SCRIPT_DIR}/../source/Dockerfile.governance" \
+        -t "${GOVERNANCE_IMAGE}" --load "${SCRIPT_DIR}/../source" \
+      || fail "Governance agent image build failed (detail in ${CL_DETAIL_LOG})"
+    run_logged "${CL_DETAIL_LOG}" "Pushing ${GOVERNANCE_REPO}:${IMAGE_TAG}" \
+      docker push "${GOVERNANCE_IMAGE}" \
+      || fail "docker push failed for ${GOVERNANCE_IMAGE} (detail in ${CL_DETAIL_LOG})"
+  fi
+
+  aws ecr describe-images --repository-name "${GOVERNANCE_REPO}" \
+    --image-ids "imageTag=${IMAGE_TAG}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+    || fail "${GOVERNANCE_REPO}:${IMAGE_TAG} is not in ECR after the ${AGENT_BUILD_MODE} build (detail in ${CL_DETAIL_LOG})"
 
   # ---- Resolve VPC networking + in-cluster endpoints for the governance runtime ----
   # The governance agent reaches the Model Optimizer + Triton over their INTERNAL

@@ -76,6 +76,18 @@ Parameters:
     MaxValue: 168
     Description: Duration of the processing window in hours (matches schedule interval by default)
 
+  ConversionLagHours:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 168
+    Description: >-
+      How far in the past the rolling window ends, so a bid is only processed once its
+      downstream signals have had time to arrive. The window filters on the bid's own
+      timestamp, so a conversion that lands after its bid's window was processed can
+      never be joined and that row stays unlabelled. Set this to the longest signal lag
+      you expect. 0 processes up to the present moment and accepts that loss.
+
 Conditions:
   HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
   # Deal yield ETL resources (job, schedule, extra catalog-access policy) are
@@ -339,6 +351,9 @@ Resources:
             # work, unlike the previous --start_timestamp/--end_timestamp
             # arguments which passed literal placeholder text.
             '--window_hours': !Ref WindowDurationHours
+            # Holds the window back so downstream signals have landed before a
+            # bid is processed -- see ConversionLagHours' description.
+            '--conversion_lag_hours': !Ref ConversionLagHours
 
   # ---------------------------------------------------------------------------
   # AWS Glue ETL Job - Deal Yield (Yield Optimizer floor/margin outcomes)

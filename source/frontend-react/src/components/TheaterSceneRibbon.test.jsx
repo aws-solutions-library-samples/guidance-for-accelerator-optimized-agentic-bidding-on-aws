@@ -144,3 +144,54 @@ describe("TheaterSceneRibbon", () => {
     expect(Object.keys(facets())).toHaveLength(5);
   });
 });
+
+/**
+ * The ribbon absorbed the scenario name and the exit control when the bar above
+ * it was removed to reclaim a row. Both had to survive the move: the exit is the
+ * only way out of the embedded theater.
+ */
+describe("TheaterSceneRibbon — scenario name and exit", () => {
+  const q = (id) => host.querySelector(`[data-testid="${id}"]`);
+
+  it("shows the scenario name when given one", () => {
+    act(() => root.render(
+      <TheaterSceneRibbon context={null} revealed stepLabel="Step 1 of 7"
+        scenarioName="Home & Lifestyle — Four-Way Deal Contest" />,
+    ));
+    expect(q("theater-scenario-name").textContent).toBe("Home & Lifestyle — Four-Way Deal Contest");
+  });
+
+  it("falls back to the product label when no scenario name is given", () => {
+    act(() => root.render(
+      <TheaterSceneRibbon context={null} revealed stepLabel="Step 1 of 7" />,
+    ));
+    expect(q("theater-scenario-name").textContent).toBe("ARTF Auction Theater");
+  });
+
+  it("carries the exit control, and calls onExit when it is clicked", () => {
+    let exits = 0;
+    act(() => root.render(
+      <TheaterSceneRibbon context={null} revealed stepLabel="Step 1 of 7"
+        scenarioName="S" onExit={() => { exits += 1; }} />,
+    ));
+    const btn = q("theater-exit");
+    expect(btn).not.toBeNull();
+    act(() => btn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(exits).toBe(1);
+  });
+
+  it("renders no exit control when there is nothing to exit to", () => {
+    act(() => root.render(
+      <TheaterSceneRibbon context={null} revealed stepLabel="Step 1 of 7" scenarioName="S" />,
+    ));
+    expect(q("theater-exit")).toBeNull();
+  });
+
+  it("still carries the step label beside the new controls", () => {
+    act(() => root.render(
+      <TheaterSceneRibbon context={null} revealed stepLabel="Step 6 of 7"
+        scenarioName="S" onExit={() => {}} />,
+    ));
+    expect(q("theater-progress-label").textContent).toBe("Step 6 of 7");
+  });
+});

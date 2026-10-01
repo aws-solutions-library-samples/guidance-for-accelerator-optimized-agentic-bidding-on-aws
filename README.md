@@ -617,6 +617,16 @@ the previous one finishing, so the order matters:
    picker only lists runs a sweep has already covered, so the run you just
    finished appears a few minutes later — check the timestamp so you aren't
    retraining on an older test.
+
+   The trainer checks the dataset before it trains and **refuses** a run it cannot
+   learn anything from, rather than producing a model whose loss falls convincingly
+   and means nothing. The common refusal is a single-class label: bid shading needs
+   both responses and non-responses, and a non-response cannot be observed directly
+   — nothing emits a "no click" event. The Bid Pricer therefore needs the optional
+   **outcome simulator** enabled and a `CONVERSION_LAG_HOURS` set, which is what
+   turns "no conversion reported, and its attribution window has closed" into a real
+   negative. See [where the bid shader's labels come
+   from](CLOSED_LOOP.md#bid-pricer-where-the-bid-shaders-labels-come-from).
 4. **Let governance run.** When training completes, the new version registers in
    its SageMaker Model Package Group automatically, which triggers the Model
    Promotion Governance Agent: compile TensorRT → stage a canary → live A/B test →
@@ -638,6 +648,8 @@ empty list:
 | *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
 | *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now — a challenger-targeted test is refused rather than quietly run against the stable model. |
 | **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail) — this is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
+| Training job failed with *"a single-class label trains the model to predict a constant"* | The dataset gate working as intended. Every labelled row has the same outcome, so there is nothing to learn. Enable the outcome simulator and set `CONVERSION_LAG_HOURS` — see [step 3](#testing-the-governance-flow-end-to-end). |
+| Training job failed with *"all N rows have a NULL label"* | No response signal reached the dataset at all for the chosen objective. The outcome simulator is off, or no win notice / pixel path is wired in. |
 
 **Reading the comparison.** The primary metric is advertiser surplus — the
 impression's value to the advertiser minus what was actually paid, and zero on a
@@ -645,10 +657,22 @@ loss. Higher is better, and it has an interior optimum: bidding too low forfeits
 winnable impressions and bidding too high overpays for them, so it rewards what
 bid shading is actually for rather than simply winning more.
 
-**One caveat on the yield models.** Floor and margin load-test outcomes are not
-yet a function of those models' own floor/margin decisions, so a yield
-canary-vs-stable comparison should not be read as a verdict on the model. Bid
-Pricer and Deal Scorer are unaffected.
+**Caveats on what a comparison can prove.** Two of them, and both are about
+whether the outcome depends on the decision being compared.
+
+*The yield models.* Floor and margin load-test outcomes are not yet a function of
+those models' own floor/margin decisions, so a yield canary-vs-stable comparison
+should not be read as a verdict on the model.
+
+*The Bid Pricer, when the outcome simulator is supplying the labels.* The simulator
+derives each outcome from the request ID alone — deliberately, because that is what
+makes a training run reproducible — so the same request yields the same
+win/impression/click/conversion no matter what price was bid. A simulated dataset
+therefore contains no relationship between price and winning, which has two
+consequences worth being explicit about: the model cannot learn one from it, and a
+canary-vs-stable comparison over simulated outcomes is not evidence about pricing,
+because both variants meet identical outcomes. Wire in real win notices and
+conversion pixels and both limitations go away. Deal Scorer is unaffected.
 
 See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 

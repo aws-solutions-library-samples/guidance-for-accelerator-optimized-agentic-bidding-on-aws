@@ -16,11 +16,13 @@
 # config.pbtxt and place the ONNX model as model.onnx in the version directory.
 # Triton's TRT backend accepts ONNX directly and compiles at load time.
 #
-# Inputs:
-#   dense_features: [batch, 4] float32 — bidfloor, hour, age_norm, has_video
-#   sparse_user:    [batch]    int64   — hashed user ID (0..999)
-#   sparse_domain:  [batch]    int64   — hashed site domain (0..999)
-#   sparse_device:  [batch]    int64   — hashed device UA (0..999)
+# Inputs — defined by source/shared/dlrm_features.py, which the serving
+# container, the exporter and the trainer all read. Index 0 is reserved in every
+# vocabulary for an absent value.
+#   dense_features:      [batch, 4] float32 — bid_floor, hour_norm, is_weekend, has_video
+#   sparse_site_domain:  [batch]    int64   — hashed site domain (0..9999)
+#   sparse_device_type:  [batch]    int64   — hashed device type (0..31)
+#   sparse_geo_country:  [batch]    int64   — hashed country code (0..255)
 #
 # Output:
 #   ctr_prediction: [batch]    float32 — predicted click-through rate
@@ -36,19 +38,19 @@ input [
     dims: [ 4 ]
   },
   {
-    name: "sparse_user"
+    name: "sparse_site_domain"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }
   },
   {
-    name: "sparse_domain"
+    name: "sparse_device_type"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }
   },
   {
-    name: "sparse_device"
+    name: "sparse_geo_country"
     data_type: TYPE_INT64
     dims: [ 1 ]
     reshape: { shape: [] }

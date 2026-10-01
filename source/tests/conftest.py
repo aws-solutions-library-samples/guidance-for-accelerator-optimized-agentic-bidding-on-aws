@@ -23,6 +23,19 @@ setting it here (module level, at import time) is early enough.
 """
 
 import os
+import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+# Resolve a JDK for the PySpark-backed ETL tests before any SparkSession is built.
+# Homebrew's openjdk is keg-only, so a machine with Java installed commonly has
+# neither JAVA_HOME set nor java on PATH -- and pyspark's failure in that state names
+# neither the cause nor the fix. See tests/spark_java.py.
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    from spark_java import resolve_java_home
+
+    resolve_java_home()
+except Exception:  # pragma: no cover - never block collection
+    pass

@@ -44,11 +44,22 @@ function AuctionFaultNotice({ fault }) {
   );
 }
 
-export function OffersPanel({ viewModel, revealed, auctionFault }) {
+/**
+ * @param revealed        the bids have landed (the BIDS beat has been reached)
+ * @param winnerRevealed  the auction has been called (the RECAP beat)
+ *
+ * Two gates, not one. Between them the column shows every bid with none of them
+ * marked, which is the state the bids beat exists to show: the seats have
+ * responded and the outcome is not yet claimed. `winnerRevealed` defaults to
+ * `revealed` so a caller that passes only the old prop gets the old behaviour
+ * rather than a column that never names a winner.
+ */
+export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault }) {
   const offers = viewModel?.offers ?? [];
   const bidRows = viewModel?.bidRows ?? [];
   const groups = viewModel?.groups ?? [];
   const winner = viewModel?.winner ?? null;
+  const showWinner = winnerRevealed === undefined ? revealed : winnerRevealed;
 
   return (
     <div
@@ -98,7 +109,10 @@ export function OffersPanel({ viewModel, revealed, auctionFault }) {
                     <OfferRow
                       key={offer.key}
                       offer={offer}
-                      isWinner={winner != null && winner.offerKey === offer.key}
+                      // Unmarked until the auction is called, so the bids beat
+                      // cannot give the winner away a step early.
+                      isWinner={showWinner && winner != null && winner.offerKey === offer.key}
+                      outcomeRevealed={showWinner}
                     />
                   ))}
                 </div>
@@ -128,6 +142,13 @@ export function OffersPanel({ viewModel, revealed, auctionFault }) {
                     </span>
                   </summary>
                   <div className="th-rows th-offers-group-rows">
+                    {/*
+                      These keep their outcome even before the auction is called,
+                      and that is not an inconsistency with the bid rows above: a
+                      campaign that was suppressed or ruled ineligible was decided
+                      by ARTF or the demand endpoint BEFORE the auction ran. Only
+                      won/lost is an auction result, and nothing here won or lost.
+                    */}
                     {group.rows.map((offer) => (
                       <OfferRow key={offer.key} offer={offer} isWinner={false} />
                     ))}
@@ -146,7 +167,22 @@ export function OffersPanel({ viewModel, revealed, auctionFault }) {
             A null winner is an explicit unsold state, distinct from an empty or
             missing one (BR-17) — an empty render looks like a failed lookup.
           */}
-          {winner != null ? (
+          {!showWinner ? (
+            /*
+              Bids in, outcome not yet claimed. This states that the auction has
+              not been called rather than rendering nothing in the winner's place,
+              for the same reason the unsold state is explicit: an empty slot where
+              an outcome belongs reads as a failed lookup.
+            */
+            <div className="th-offers-pending-winner" data-testid="offers-panel-pending-winner">
+              <span className="th-row-key">Auction not yet called</span>
+              <span className="th-row-val">
+                {bidRows.length === 1
+                  ? "1 bid is in — the winner is announced next"
+                  : `${bidRows.length} bids are in — the winner is announced next`}
+              </span>
+            </div>
+          ) : winner != null ? (
             <div className="th-offers-winner" data-testid="offers-panel-winner">
               <span className="th-row-key">Winning deal</span>
               <span className="th-row-val">{winner.dealId ?? "unknown deal"}</span>

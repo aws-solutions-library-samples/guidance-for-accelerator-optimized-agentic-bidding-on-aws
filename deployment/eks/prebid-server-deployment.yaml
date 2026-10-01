@@ -180,6 +180,26 @@ spec:
             # accident of a missing ECS variable.
             - name: ECS_CONTAINER_METADATA_URI_V4
               value: ""
+            # ---------------------------------------------------------------------
+            # THE RUNTIME HALF OF --inject-plugin.
+            #
+            # deploy_prebid.sh replaces the marker line below with one env entry per
+            # --plugin-env / --plugin-secret-env, and removes it entirely when there
+            # are none. An injected bidder is COMPILED IN, but its endpoint and
+            # credentials arrive here -- and an injected bidder.yaml conventionally
+            # interpolates them with no default value, so a bidder that is in the jar
+            # with no variables set does not degrade, it stops the pod:
+            #
+            #   PlaceholderResolutionException: Could not resolve placeholder
+            #   'SOME_BIDDER_TOKEN_ENDPOINT' <-- "${adapters.<name>.token-endpoint}"
+            #
+            # Spring resolves placeholders before anything consults `enabled`, so this
+            # is not conditional on the bidder being switched on.
+            #
+            # Nothing about any specific plugin is written here. The operator names
+            # both the variables and any Secret they come from on the command line.
+            # ---------------------------------------------------------------------
+            # __PLUGIN_ENV__
           # Sized against MEASURED headroom on this cluster rather than guessed.
           resources:
             requests:

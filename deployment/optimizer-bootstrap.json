@@ -1,16 +1,17 @@
 {
-  "_comment": "Base-engine bootstrap spec for the Model Optimizer. __MODEL_BUCKET__ is replaced by deploy.sh, which uploads this to s3://<bucket>/optimizer-bootstrap/spec.json and points the optimizer at it via OPTIMIZER_BOOTSTRAP_URI. On startup the optimizer builds any missing <model>_stable/1/model.plan from the exported ONNX. input_profiles/max batch match source/triton/model_repository/<model>_stable/config.pbtxt and source/deployment/model_deployer.py::_MODEL_INPUT_PROFILES. Wide & Deep (widedeep_segment_activator) is intentionally absent: it is now rule-based (no Triton/TensorRT model) — see source/containers/widedeep_segment_activator/app.py.",
+  "_comment": "Base-engine bootstrap spec for the Model Optimizer. __MODEL_BUCKET__ and __FEATURE_SPEC_VERSION__ are replaced by deploy.sh, which uploads this to s3://<bucket>/optimizer-bootstrap/spec.json and points the optimizer at it via OPTIMIZER_BOOTSTRAP_URI. __FEATURE_SPEC_VERSION__ comes from source/shared/dlrm_features.py's FEATURE_SPEC_VERSION, so the version this deployment expects is not restated here; the optimizer refuses to compile a DLRM artifact whose manifest.json declares a different one, or none. ncf_deal_manager has no entry because its feature vector is not versioned. On startup the optimizer builds any missing <model>_stable/1/model.plan from the exported ONNX. input_profiles/max batch match source/triton/model_repository/<model>_stable/config.pbtxt and source/deployment/model_deployer.py::_MODEL_INPUT_PROFILES. Wide & Deep (widedeep_segment_activator) is intentionally absent: it is now rule-based (no Triton/TensorRT model) — see source/containers/widedeep_segment_activator/app.py.",
   "models": [
     {
       "model_name": "dlrm_bid_shader",
       "source_model_uri": "s3://__MODEL_BUCKET__/onnx-source/dlrm_bid_shader/model.onnx",
       "output_uri": "s3://__MODEL_BUCKET__/triton-models/dlrm_bid_shader_stable/1/model.plan",
       "precision": "fp16",
+      "expected_feature_spec_version": __FEATURE_SPEC_VERSION__,
       "input_profiles": {
         "dense_features": { "min": [1, 4], "opt": [8, 4], "max": [64, 4] },
-        "sparse_user": { "min": [1], "opt": [8], "max": [64] },
-        "sparse_domain": { "min": [1], "opt": [8], "max": [64] },
-        "sparse_device": { "min": [1], "opt": [8], "max": [64] }
+        "sparse_site_domain": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_device_type": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_geo_country": { "min": [1], "opt": [8], "max": [64] }
       }
     },
     {
@@ -19,11 +20,12 @@
       "source_model_uri": "s3://__MODEL_BUCKET__/onnx-source/dlrm_bid_shader/model.onnx",
       "output_uri": "s3://__MODEL_BUCKET__/triton-models/dlrm_bid_shader_canary/1/model.plan",
       "precision": "fp16",
+      "expected_feature_spec_version": __FEATURE_SPEC_VERSION__,
       "input_profiles": {
         "dense_features": { "min": [1, 4], "opt": [8, 4], "max": [64, 4] },
-        "sparse_user": { "min": [1], "opt": [8], "max": [64] },
-        "sparse_domain": { "min": [1], "opt": [8], "max": [64] },
-        "sparse_device": { "min": [1], "opt": [8], "max": [64] }
+        "sparse_site_domain": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_device_type": { "min": [1], "opt": [8], "max": [64] },
+        "sparse_geo_country": { "min": [1], "opt": [8], "max": [64] }
       }
     },
     {

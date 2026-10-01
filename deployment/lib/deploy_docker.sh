@@ -137,3 +137,87 @@ docker_ensure_buildx() {
        is not available. It ships with Docker Desktop; on a plain Docker Engine
        install the buildx plugin separately."
 }
+
+# docker_can_build — can this daemon actually execute a build?
+#
+# A running daemon does not imply a usable one. Docker Desktop under an
+# administrator Config Profile accepts `docker info` and `docker login`, then
+# refuses every build:
+#
+#   ERROR: failed to build: Error response from daemon: Sign in to continue using
+#   Docker Desktop. Membership in the [<org>] organization is required.
+#
+# So the daemon check passes, ECR login succeeds, and the build dies anyway. The
+# caller needs to know that BEFORE it starts creating repositories, so it can route
+# the work to CodeBuild instead.
+#
+# The probe is `FROM scratch` with a cacheonly output: it pulls no base image and
+# writes no artifact, so it costs nothing and cannot itself fail on a registry rate
+# limit — but it does reach the daemon's policy gate, which is the thing in question.
+#
+# The context is a fresh empty directory, and that detail is load-bearing twice over.
+# Piping the Dockerfile in as `-f -` while also passing `-` as the context is rejected
+# outright ("can't use stdin for both build context and dockerfile"), which would make
+# this probe answer "cannot build" on a perfectly healthy daemon. Pointing it at an
+# existing directory instead is no good either: buildx sends the whole context, and a
+# single unreadable file in it fails the build for reasons that have nothing to do with
+# the daemon ("failed to xattr ...: permission denied"). An empty directory has neither
+# problem, so a failure here means what it is supposed to mean.
+#
+# Returns 0 if a build can run, 1 if not. Never exits.
+docker_can_build() {
+  local _ctx _rc=0
+  _ctx="$(mktemp -d)" || return 1
+  printf 'FROM scratch\n' > "${_ctx}/Dockerfile" || { rm -rf "${_ctx}"; return 1; }
+  docker buildx build -f "${_ctx}/Dockerfile" --output type=cacheonly "${_ctx}" >/dev/null 2>&1 || _rc=1
+  rm -rf "${_ctx}"
+  return "${_rc}"
+}
+
+# docker_build_usable [purpose] — the whole local-build question, answered without exiting.
+#
+# Checks, in order: docker installed, daemon up (starting it if not), buildx present,
+# and a build actually permitted. Prints one reason line when the answer is no, so the
+# caller can say why it is routing the work elsewhere.
+#
+# This is the non-fatal sibling of docker_ensure_running. Use it where a remote build
+# is a real alternative; use docker_ensure_running where a local build is the only way.
+docker_build_usable() {
+  local purpose="${1:-build a container image}" waited=0 started_by
+
+  if ! command -v docker >/dev/null 2>&1; then
+    DOCKER_UNUSABLE_REASON="the 'docker' command is not installed"
+    return 1
+  fi
+
+  if ! _docker_daemon_up; then
+    say "  Docker is needed to ${purpose}, and its daemon is not running. Starting it..."
+    if ! started_by="$(_docker_try_start)"; then
+      DOCKER_UNUSABLE_REASON="the Docker daemon is not running and could not be started automatically"
+      return 1
+    fi
+    say "    start requested via ${started_by}; waiting for it to accept connections..."
+    while ! _docker_daemon_up; do
+      if [[ "${waited}" -ge "${DOCKER_START_TIMEOUT}" ]]; then
+        DOCKER_UNUSABLE_REASON="the Docker daemon did not accept connections within ${DOCKER_START_TIMEOUT}s of being started by ${started_by}"
+        return 1
+      fi
+      sleep "${DOCKER_POLL}"
+      waited=$(( waited + DOCKER_POLL ))
+    done
+    ok "Docker daemon ready after ${waited}s"
+  fi
+
+  if ! docker buildx version >/dev/null 2>&1; then
+    DOCKER_UNUSABLE_REASON="docker buildx is not available, so --platform builds cannot run"
+    return 1
+  fi
+
+  if ! docker_can_build; then
+    DOCKER_UNUSABLE_REASON="the Docker daemon is running but refuses to build — typically Docker Desktop requiring an organization sign-in enforced by a Config Profile"
+    return 1
+  fi
+
+  DOCKER_UNUSABLE_REASON=""
+  return 0
+}

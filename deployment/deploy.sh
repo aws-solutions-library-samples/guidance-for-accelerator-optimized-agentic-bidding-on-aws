@@ -831,6 +831,21 @@ FEEDBACK_STREAM_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}bid-outcome-stream"
 # Same pattern, for DealYieldOutcomeStream (deal floor/margin outcomes —
 # see source/orchestrator/deal_yield_feedback.py).
 DEAL_YIELD_FEEDBACK_STREAM_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}deal-yield-outcome-stream"
+# Outcome simulator (source/orchestrator/outcome_simulator.py) — SYNTHETIC
+# win/impression/click/conversion outcomes. Off unless the caller sets
+# OUTCOME_SIMULATOR_ENABLED=true in the environment before running this script.
+# Everything it emits is labelled provenance="simulated" all the way into the model
+# manifest, so an enabled deployment stays honest about what its models learned from.
+OUTCOME_SIMULATOR_ENABLED="${OUTCOME_SIMULATOR_ENABLED:-false}"
+# Funnel rates for that simulator. Empty is meaningful: outcome_simulator._env_float
+# reads an empty value as "use the code default" (win 0.40, impression 0.95, click
+# 0.02, conversion 0.05, value 25.0), so leaving these unset reproduces the code's
+# own behaviour rather than pinning a second copy of the defaults here.
+OUTCOME_SIMULATOR_WIN_RATE="${OUTCOME_SIMULATOR_WIN_RATE:-}"
+OUTCOME_SIMULATOR_IMPRESSION_RATE="${OUTCOME_SIMULATOR_IMPRESSION_RATE:-}"
+OUTCOME_SIMULATOR_CLICK_RATE="${OUTCOME_SIMULATOR_CLICK_RATE:-}"
+OUTCOME_SIMULATOR_CONVERSION_RATE="${OUTCOME_SIMULATOR_CONVERSION_RATE:-}"
+OUTCOME_SIMULATOR_CONVERSION_VALUE="${OUTCOME_SIMULATOR_CONVERSION_VALUE:-}"
 
 log "Account=${ACCOUNT_ID}  Region=${AWS_REGION}  Stack=${STACK_NAME}  Tag=${IMAGE_TAG}"
 log "EKS Cluster=${CLUSTER_NAME}  Model Bucket=${MODEL_BUCKET}"
@@ -1502,6 +1517,14 @@ YIELD_MODELS=(deal_yield_manager_floor deal_yield_manager_margin)
 for m in "${RECOMMENDER_MODELS[@]}"; do
   aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
     "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
+  # manifest.json goes NEXT TO the ONNX, which is where the optimizer looks for it.
+  # Only the exporters that write one produce this file; a model without one is
+  # uploaded without one, and the optimizer then refuses it if its bootstrap entry
+  # declares an expected version.
+  if [[ -f "${ONNX_STAGING}/${m}/1/manifest.json" ]]; then
+    aws s3 cp "${ONNX_STAGING}/${m}/1/manifest.json" \
+      "s3://${MODEL_BUCKET}/onnx-source/${m}/manifest.json" --region "${AWS_REGION}"
+  fi
 done
 log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
 
@@ -1541,9 +1564,26 @@ rm -rf "${SERVED_STAGING}"
 log "  Triton served repo (routers + engine configs) uploaded; engines built at Step 8b"
 
 # 3c. Upload the Model Optimizer bootstrap spec (base-engine build instructions).
+#
+# __FEATURE_SPEC_VERSION__ is read from source/shared/dlrm_features.py rather than
+# written into the JSON, so the version this deployment expects has one definition.
+# The optimizer refuses to compile a DLRM artifact whose manifest.json declares a
+# different version, or none at all -- an ONNX graph with the right input names and
+# widths is not evidence that the producer and the serving container agree on what
+# each position means.
+FEATURE_SPEC_VERSION="$(${PYTHON} -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}/../source')
+from shared import dlrm_features
+print(dlrm_features.FEATURE_SPEC_VERSION)
+")" || fail "Could not read FEATURE_SPEC_VERSION from source/shared/dlrm_features.py"
+log "  DLRM feature spec version: ${FEATURE_SPEC_VERSION}"
 BOOTSTRAP_TMP="$(mktemp)"
-sed "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+sed -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+    -e "s|__FEATURE_SPEC_VERSION__|${FEATURE_SPEC_VERSION}|g" \
   "${SCRIPT_DIR}/optimizer-bootstrap.json" > "${BOOTSTRAP_TMP}"
+grep -q '__FEATURE_SPEC_VERSION__' "${BOOTSTRAP_TMP}" \
+  && fail "optimizer-bootstrap.json still has an unsubstituted __FEATURE_SPEC_VERSION__"
 aws s3 cp "${BOOTSTRAP_TMP}" \
   "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
 rm -f "${BOOTSTRAP_TMP}"
@@ -1809,7 +1849,7 @@ build_images() {
     NGC_FLAG=()
     if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
     elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
-    "${SCRIPT_DIR}/codebuild/remote_build.sh" \
+    bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
       --stack-name "${STACK_NAME}" \
       --only "${MISSING_KEYS[*]}" \
       --tag "${IMAGE_TAG}" \
@@ -2458,6 +2498,12 @@ for manifest in "${_APPLIED_MANIFESTS[@]}"; do
       -e "s|__XGBOOST_TRAINING_IMAGE_URI__|${XGBOOST_TRAINING_IMAGE_URI}|g" \
       -e "s|__FEEDBACK_STREAM_NAME__|${FEEDBACK_STREAM_NAME}|g" \
       -e "s|__DEAL_YIELD_FEEDBACK_STREAM_NAME__|${DEAL_YIELD_FEEDBACK_STREAM_NAME}|g" \
+      -e "s|__OUTCOME_SIMULATOR_ENABLED__|${OUTCOME_SIMULATOR_ENABLED}|g" \
+      -e "s|__OUTCOME_SIMULATOR_WIN_RATE__|${OUTCOME_SIMULATOR_WIN_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_IMPRESSION_RATE__|${OUTCOME_SIMULATOR_IMPRESSION_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CLICK_RATE__|${OUTCOME_SIMULATOR_CLICK_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CONVERSION_RATE__|${OUTCOME_SIMULATOR_CONVERSION_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CONVERSION_VALUE__|${OUTCOME_SIMULATOR_CONVERSION_VALUE}|g" \
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
@@ -2797,7 +2843,7 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID}" \
   GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID}" \
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
-  "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} 2>&1 \
+  bash "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} 2>&1 \
     | tee -a "${_CL_TEE[@]}"
   _CL_RC=${PIPESTATUS[0]}
   set -e
@@ -2874,8 +2920,12 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
   if [[ -n "${COGNITO_USER_POOL_ID:-}" ]]; then
     PREBID_ARGS="${PREBID_ARGS} --user-pool-id ${COGNITO_USER_POOL_ID}"
   fi
+  # Invoked through `bash` rather than executed directly: the execute bit is a
+  # property of the checkout, not of the code, and losing it turned a working deploy
+  # into "Permission denied" at Step 12 with Phases 1-4 already applied. Nothing here
+  # needs the mode bit to be right.
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
-  "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} || {
+  bash "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} || {
     _DEPLOY_DEGRADED=1
     _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the Prebid ARTF host (deploy_prebid.sh exited non-zero)"
     warn "Prebid deployment returned non-zero. Check the output above for the real error."

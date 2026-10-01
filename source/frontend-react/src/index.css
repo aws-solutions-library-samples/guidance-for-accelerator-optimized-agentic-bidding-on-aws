@@ -760,18 +760,9 @@ body {
   border-radius: 12px;
 }
 
-.total-latency-summary {
-  font-size: clamp(14px, 1.3vw, 17px);
-  font-weight: 600;
-  color: var(--text);
-  text-align: center;
-  margin-bottom: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.total-latency-summary strong {
-  font-weight: 800;
-}
+/* `.total-latency-summary` and the `--network` segment/dot rules are gone with the
+   markup they styled: the browser round-trip is not part of a bid path, and a
+   total that folded it in was not a figure worth showing. */
 
 .latency-bar-stack {
   display: flex;
@@ -795,9 +786,6 @@ body {
   background: #f59e0b;
 }
 
-.latency-bar-segment--network {
-  background: var(--text-muted);
-}
 
 .latency-breakdown-legend {
   display: flex;
@@ -829,9 +817,6 @@ body {
   background: #f59e0b;
 }
 
-.latency-legend-dot--network {
-  background: var(--text-muted);
-}
 
 .latency-legend-label {
   color: var(--text-secondary);
@@ -3640,6 +3625,14 @@ h1, h2, h3, .sg-display {
   letter-spacing: -0.01em;
   color: var(--th-enrich);
   white-space: nowrap;
+  /* Now a scenario name rather than a fixed product label, so its length is not
+     ours to predict. Bounded and elided: an unbounded nowrap title squeezes the
+     scene items it sits beside. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 26ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .th-ribbon-scene {
   display: flex;
@@ -4031,6 +4024,17 @@ h1, h2, h3, .sg-display {
 .th-offer-NotAttempted .th-offer-campaign,
 .th-offer-NotAttempted .th-offer-price { color: var(--th-ink-2); }
 
+/* A bid that is in, before the auction is called. Every such row looks IDENTICAL
+   — no gold, no accent that separates one from another — because at that point in
+   the walkthrough nothing distinguishes them yet. The indigo left edge marks them
+   as live in the auction without ranking them. */
+.th-offer-pending {
+  border-left-color: rgba(99, 102, 241, 0.55);
+  background: var(--th-panel);
+}
+.th-offer-pending .th-offer-price { color: var(--th-ink-1); }
+.th-offer-pending .th-offer-mark { color: rgba(99, 102, 241, 0.9); }
+
 /* Folded groups for everything that did not bid. Quieter than a bid row and set
    apart from them, so the bids read as the content and these as the footnote. */
 .th-offers-group {
@@ -4080,7 +4084,8 @@ h1, h2, h3, .sg-display {
 /* The outcome, set apart from the candidate rows: the winning deal leads, the
    campaign and cleared price support it. */
 .th-offers-winner,
-.th-offers-unsold {
+.th-offers-unsold,
+.th-offers-pending-winner {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   column-gap: 10px;
@@ -4113,6 +4118,23 @@ h1, h2, h3, .sg-display {
 .th-offers-unsold {
   border: 1px dashed var(--th-hair-2);
   background: var(--th-panel);
+}
+/* Bids in, auction not yet called. Deliberately NOT gold: the gold treatment is
+   the winner's, and wearing it a step early would read as an announced outcome.
+   The soft indigo halo marks it as in-progress, matching the processing state
+   used elsewhere. */
+.th-offers-pending-winner {
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  background: var(--th-panel);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.02),
+    0 4px 16px rgba(99, 102, 241, 0.12);
+}
+.th-offers-pending-winner .th-row-val {
+  font-family: inherit;
+  font-weight: 400;
+  text-align: left;
+  color: var(--th-ink-3);
 }
 .th-offers-unsold .th-row-val {
   font-family: inherit;
@@ -4649,24 +4671,20 @@ h1, h2, h3, .sg-display {
   min-height: 0;
 }
 
-.th-embedded-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 4px 8px;
-  flex: none;
-}
-.th-embedded-scenario {
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-  color: var(--th-ink-2);
-}
+/* The scenario name and Close moved into the ribbon, so `.th-embedded-bar` and
+   `.th-embedded-scenario` are gone along with the row they occupied. */
 .th-stage-embedded .th-ribbon {
   border: 1px solid var(--th-hair);
   border-radius: 14px;
   margin-bottom: 10px;
+}
+/* Pinned right, past the step pill. `margin-left: auto` would fight the ribbon's
+   flex gap on a narrow viewport; ordering it last and letting the scene block
+   flex-grow keeps it at the edge. */
+.th-ribbon-close {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 11px;
 }
 
 /* ---- controls, in flow ----
@@ -4742,7 +4760,16 @@ h1, h2, h3, .sg-display {
   transform: translate(-50%, -50%);
   width: min(620px, 78%);
   z-index: 46;
+  /* Click-through: the card covers the request card it is describing, and the
+     reader must be able to reach the columns underneath without dismissing it.
+     .th-mstage-close re-enables pointer events for itself alone. */
   pointer-events: none;
+  opacity: 1;
+}
+/* The dwell has elapsed, or the reader dismissed it. The duration here must match
+   MUTATION_STAGE_FADE_MS, which is when the card unmounts. */
+.th-mstage-wrap.is-leaving {
+  opacity: 0;
 }
 .th-mstage {
   /* Opaque enough to read as a surface ABOVE the columns rather than a tint over
@@ -4772,7 +4799,29 @@ h1, h2, h3, .sg-display {
   letter-spacing: 0.1em;
   color: var(--th-ink-3);
 }
+/* Attribution and the dismiss control travel together on the right, so adding the
+   button does not pull the attribution into the middle of a space-between row. */
+.th-mstage-head-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .th-mstage-attr { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.th-mstage-close {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  border: none;
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.th-mstage-close:hover { background: var(--th-hair); }
+.th-mstage-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(107, 63, 181, 0.4);
+}
 .th-mstage-container {
   font-size: 12px;
   font-weight: 700;
@@ -4818,6 +4867,9 @@ h1, h2, h3, .sg-display {
     from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
   }
+  /* Entry animates the inner card, exit animates the wrapper, so the two never
+     drive the same property on the same element. */
+  .th-mstage-wrap { transition: opacity 240ms ease; }
 }
 
 /* ===================================================================
@@ -5061,6 +5113,37 @@ h1, h2, h3, .sg-display {
 .gov-step-blurb { font-size: 10px; line-height: 1.4; color: var(--text-secondary); }
 
 .gov-step-panel { display: block; }
+
+/* ── Load test: controls beside results ──
+   The launcher and the results are two halves of one activity, so they share a
+   row instead of stacking full width. align-items: start keeps both cards
+   pinned to the top of the row rather than stretching to the tallest. */
+.gov-loadtest-split {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+/* Both cards carry standalone-layout margins from when they were the only
+   thing on their row; inside the grid the gap provides the spacing. */
+.gov-loadtest-split > .loadtest-panel { margin-top: 0; }
+.gov-loadtest-split > #flow-canvas {
+  margin-bottom: 0;
+  /* Centring made sense for the pipeline canvas this rule was written for; the
+     results content is top-aligned so the two card headers line up. */
+  justify-content: flex-start;
+  min-height: 0;
+}
+
+/* Four presets in ~380px is tight — give them a real basis so they drop to a
+   2x2 grid instead of squeezing "100,000 req" onto two lines. */
+.gov-loadtest-split .loadtest-presets { flex-wrap: wrap; }
+.gov-loadtest-split .loadtest-preset { flex: 1 1 72px; }
+
+@media (max-width: 980px) {
+  .gov-loadtest-split { grid-template-columns: 1fr; }
+}
 
 /* ---------------------------------------------------------------------------
    Mutation precedence

@@ -33,6 +33,7 @@ References:
 from __future__ import annotations
 
 import os
+import threading
 
 import numpy as np
 import tritonclient.http as httpclient
@@ -40,26 +41,32 @@ from tritonclient.utils import InferenceServerException
 
 TRITON_URL = os.environ.get("TRITON_URL", "localhost:8000")
 
-_client: httpclient.InferenceServerClient | None = None
+_local = threading.local()
 
 
 def get_client() -> httpclient.InferenceServerClient:
-    """Process-wide lazily-created Triton HTTP client.
+    """Lazily-created Triton HTTP client, one per thread.
 
-    One instance per container process (each yield container is its own
-    process, so there is no sharing of connection state between the floor and
-    margin models).
+    Per-thread rather than per-process: `mutate()` runs on a ThreadPoolExecutor
+    of ARTF_MUTATE_WORKERS threads (shared/server.py), and tritonclient.http's
+    connection pool is greenlet-bound to the thread that opened it, so a
+    process-wide client raises "Cannot switch to a different thread" for every
+    request that lands on a worker other than the one that built it.
+
+    Each yield container is still its own process, so the floor and margin
+    models share no connection state.
     """
-    global _client
-    if _client is None:
-        _client = httpclient.InferenceServerClient(
+    client = getattr(_local, "client", None)
+    if client is None:
+        client = httpclient.InferenceServerClient(
             url=TRITON_URL,
             verbose=False,
             concurrency=4,
             connection_timeout=5.0,
             network_timeout=10.0,
         )
-    return _client
+        _local.client = client
+    return client
 
 
 def infer_single_output(model_name: str, feature_vector: list[float]) -> float | None:

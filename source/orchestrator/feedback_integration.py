@@ -51,6 +51,104 @@ if _FEEDBACK_STREAM_NAME:
     )
 
 
+# The SignalAssociator whose cache a later signal is looked up in. Injected by the
+# orchestrator at import time (app.py owns the singleton, because POST /v1/signals
+# must resolve the SAME instance this module registers into — two associators means
+# every signal misses).
+_signal_associator = None
+
+
+def set_signal_associator(associator) -> None:
+    """Give this module the associator that POST /v1/signals reads from."""
+    global _signal_associator
+    _signal_associator = associator
+
+
+def get_feedback_collector() -> Optional[FeedbackCollector]:
+    """The collector the bid path emits through, or None when emission is off.
+
+    Exposed so the signal endpoint and the SignalAssociator write to the SAME stream
+    the bid events went to. They must: the ETL joins a signal to its bid by
+    `request_id` within one table, so a signal emitted to a different stream can never
+    be joined, and nothing reports an error — the row simply stays unlabelled.
+    """
+    return _feedback_collector
+
+
+def feedback_stream_name() -> Optional[str]:
+    """The Kinesis stream name in use, or None when emission is disabled."""
+    return _FEEDBACK_STREAM_NAME
+
+
+#: The outcome simulator, built lazily on first use and only when switched on. A
+#: deployment with a real signal feed never constructs one.
+_outcome_simulator = None
+_outcome_simulator_checked = False
+
+
+def _get_outcome_simulator():
+    """The simulator, or None when it is switched off or unusable.
+
+    Resolved once per process. Returns None when OUTCOME_SIMULATOR_ENABLED is unset
+    — which is the default, so a deployment gets no synthetic outcomes unless it asks
+    for them.
+    """
+    global _outcome_simulator, _outcome_simulator_checked
+    if _outcome_simulator_checked:
+        return _outcome_simulator
+    _outcome_simulator_checked = True
+
+    if _signal_associator is None:
+        return None
+    try:
+        try:
+            from orchestrator.outcome_simulator import OutcomeSimulator, is_enabled
+        except ImportError:  # pragma: no cover - container-relative import
+            from container.outcome_simulator import OutcomeSimulator, is_enabled
+        if not is_enabled():
+            return None
+        _outcome_simulator = OutcomeSimulator(_signal_associator)
+        logger.warning(
+            "Outcome simulator ENABLED: win=%.3f impression=%.3f click=%.3f "
+            "conversion=%.3f. All outcomes are SYNTHETIC and labelled "
+            "provenance='simulated'.",
+            _outcome_simulator.config.win_rate,
+            _outcome_simulator.config.impression_rate,
+            _outcome_simulator.config.click_rate,
+            _outcome_simulator.config.conversion_rate,
+        )
+    except Exception:
+        logger.warning("Outcome simulator not available", exc_info=True)
+        _outcome_simulator = None
+    return _outcome_simulator
+
+
+def reset_outcome_simulator() -> None:
+    """Drop the resolved simulator so the next call re-reads the environment.
+
+    For tests that toggle OUTCOME_SIMULATOR_ENABLED; not used in production.
+    """
+    global _outcome_simulator, _outcome_simulator_checked
+    _outcome_simulator = None
+    _outcome_simulator_checked = False
+
+
+def register_bid_context(event: BidShadingOutcomeEvent) -> None:
+    """Make a bid findable by a later signal.
+
+    A no-op when no associator has been injected, which is the case in unit tests
+    and in any deployment without the signal path wired — an unregistered bid means
+    a dropped signal, not a failed bid.
+    """
+    if _signal_associator is None:
+        return
+    try:
+        _signal_associator.register_bid(event)
+    except Exception:
+        logger.warning("Failed to register bid context for signal association",
+                       exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -99,10 +197,28 @@ def emit_bid_outcome(
         event = _build_bid_outcome_event(
             req, resp, start_time, source=source, model_version=model_version
         )
+
+        # Register the bid so a later signal can find it.
+        #
+        # SignalAssociator.register_bid had NO production caller — only a test — so
+        # its cache was always empty and every signal arriving at POST /v1/signals
+        # was dropped with "bid context not found". The signal path existed end to
+        # end and could never complete. This is the missing call.
+        register_bid_context(event)
+
         fire_and_forget_emit(
             _feedback_collector.emit(event),
             description=f"bid outcome emit (request={event.request_id})",
         )
+
+        # Synthetic outcomes, only when explicitly switched on. Scheduled AFTER the
+        # register above, since a signal for an unregistered bid is dropped.
+        simulator = _get_outcome_simulator()
+        if simulator is not None:
+            fire_and_forget_emit(
+                simulator.apply(event),
+                description=f"simulated outcome (request={event.request_id})",
+            )
     except Exception:
         # Never impact the bid response path
         logger.warning("Failed to emit bid outcome event", exc_info=True)
@@ -129,6 +245,7 @@ def emit_load_test_bid_outcome(
     conversion_value: float | None,
     shade_factor_used: float,
     conversion_value_estimate_used: float,
+    bid_request: dict | None = None,
 ) -> None:
     """Fire-and-forget: emit a real, load-test-origin BidShadingOutcomeEvent.
 
@@ -161,6 +278,11 @@ def emit_load_test_bid_outcome(
             click=click,
             conversion=conversion,
             conversion_value=conversion_value,
+            # A load test's outcomes are generated from a scenario pattern, not
+            # reported by anything that saw an auction. Labelled accordingly so a
+            # model trained on load-test traffic is distinguishable from one trained
+            # on observed outcomes.
+            outcome_provenance="simulated",
             # A real hash of the request_id (deterministic per request, no
             # actual user identity involved) rather than the literal string
             # "load-test" -- the ETL's validate_no_raw_pii() checks
@@ -170,9 +292,7 @@ def emit_load_test_bid_outcome(
             # this fix). site_domain/device_type are not hash-checked columns,
             # so the literal "load-test" marker is fine for those.
             user_id_hash=hashlib.sha256(f"load-test-{request_id}".encode()).hexdigest()[:16],
-            site_domain="load-test",
-            device_type="load-test",
-            hour_of_day=datetime.now(timezone.utc).hour,
+            **_load_test_context(bid_request),
             shade_factor_used=shade_factor_used,
             conversion_value_estimate_used=conversion_value_estimate_used,
         )
@@ -182,6 +302,54 @@ def emit_load_test_bid_outcome(
         )
     except Exception:
         logger.warning("Failed to emit load-test bid outcome event", exc_info=True)
+
+
+def _load_test_context(bid_request: dict | None) -> dict:
+    """The context columns for a load-test event, from the request that was sent.
+
+    The load-test generator varies `site.domain`, `device.devicetype` and
+    `device.geo.country` (see loadtest.py's `_device_block` and each profile's
+    `domains` pool), so the faithful thing is to record what the request
+    actually carried rather than a marker. Two categoricals held at a constant
+    across a run give their embedding tables one value to separate, which is
+    indistinguishable from a trained table that learned nothing.
+
+    Falls back to the `"load-test"` marker when no request is supplied, so
+    callers that have not been threaded through still produce a valid event.
+    `site_domain` and `device_type` are not hash-checked by the ETL's
+    `validate_no_raw_pii`, so the marker is safe for them -- unlike
+    `user_id_hash`, which must look like a hash or every record is dropped.
+    """
+    if not bid_request:
+        now = datetime.now(timezone.utc)
+        return {
+            "site_domain": "load-test",
+            "device_type": "load-test",
+            "geo_country": "",
+            "has_video": False,
+            "hour_of_day": now.hour,
+            "day_of_week": now.weekday(),
+        }
+
+    imps = bid_request.get("imp") or [{}]
+    first_imp = imps[0] if imps else {}
+    site = bid_request.get("site") or bid_request.get("app") or {}
+    device = bid_request.get("device") or {}
+    geo = device.get("geo") or {}
+
+    device_type = device.get("devicetype", "unknown")
+    if isinstance(device_type, int):
+        device_type = str(device_type)
+
+    now = datetime.now(timezone.utc)
+    return {
+        "site_domain": site.get("domain", "unknown"),
+        "device_type": device_type,
+        "geo_country": geo.get("country", "") or "",
+        "has_video": bool(first_imp.get("video")),
+        "hour_of_day": now.hour,
+        "day_of_week": now.weekday(),
+    }
 
 
 def _build_bid_outcome_event(
@@ -258,8 +426,18 @@ def _build_bid_outcome_event(
     if isinstance(device_type, int):
         device_type = str(device_type)
 
-    # Compute hour_of_day from current time
-    hour_of_day = datetime.now(timezone.utc).hour
+    # geo_country and has_video are read by the DLRM feature spec
+    # (source/shared/dlrm_features.py). Absent encodes to "" / False, which the
+    # spec maps to its reserved "absent" slot rather than to a real value's.
+    geo = device.get("geo", {}) or {}
+    geo_country = geo.get("country", "") or ""
+    has_video = bool(first_imp.get("video"))
+
+    # One clock read for both calendar fields, so hour_of_day and day_of_week
+    # cannot straddle a midnight boundary between two separate calls.
+    now = datetime.now(timezone.utc)
+    hour_of_day = now.hour
+    day_of_week = now.weekday()
 
     # Generate a proper UUID request_id
     request_id = req.id
@@ -278,16 +456,25 @@ def _build_bid_outcome_event(
         original_price=original_price,
         shaded_price=shaded_price,
         bid_floor=bid_floor,
-        won=False,
+        # Not known yet. This event is written AT BID TIME: the auction has not
+        # resolved, and no impression, click or conversion could have occurred. These
+        # used to be `False`, which the ETL read as confirmed negatives — the reason
+        # every training dataset was entirely negative. The outcome arrives later, via
+        # POST /v1/signals → SignalAssociator, which re-emits this event enriched.
+        won=None,
         price_paid=None,
-        impression=False,
-        click=False,
-        conversion=False,
+        impression=None,
+        click=None,
+        conversion=None,
         conversion_value=None,
+        outcome_provenance="unresolved",
         user_id_hash=user_id_hash,
         site_domain=site_domain,
         device_type=device_type,
         hour_of_day=hour_of_day,
+        day_of_week=day_of_week,
+        geo_country=geo_country,
+        has_video=has_video,
         shade_factor_used=shade_factor_used,
         conversion_value_estimate_used=conversion_value_estimate_used,
     )

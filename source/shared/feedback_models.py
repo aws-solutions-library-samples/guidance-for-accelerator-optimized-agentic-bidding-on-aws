@@ -42,6 +42,29 @@ _UUID_RE = re.compile(
 # frozen=True below).
 OutcomeSource = Literal["live", "load_test"]
 
+#: An outcome signal that may not be known yet.
+#:
+#: These fields used to be plain `bool`, so a bid-time event -- written before the
+#: auction has resolved and long before any impression, click or conversion could
+#: occur -- recorded `False` on every dimension. The ETL then read those as
+#: CONFIRMED NEGATIVES, which is why every training dataset was entirely negative
+#: and why a model trained on it learned to predict zero.
+#:
+#: None means "not known yet". False means "known not to have happened".
+OutcomeSignal = Optional[bool]
+
+#: Where a record's outcome signals came from.
+#:
+#: Carried on the record and into the model manifest so a model trained on
+#: simulated outcomes can never be mistaken for one trained on observed ones. A
+#: dataset's provenance mix is reported by the trainer's dataset gate.
+#:
+#:   unresolved -- no outcome has been reported for this bid yet
+#:   simulated  -- from source/orchestrator/outcome_simulator.py, a labelled
+#:                 simulator. NOT a real advertiser response.
+#:   observed   -- reported by something that actually saw the outcome
+OutcomeProvenance = Literal["unresolved", "simulated", "observed"]
+
 _VALID_MODEL_TYPES = frozenset(
     {"dlrm_bid_shader", "ncf_deal_manager", "widedeep_segment_activator"}
 )
@@ -82,23 +105,44 @@ class BidShadingOutcomeEvent(BaseModel):
     shaded_price: float
     bid_floor: float
 
-    # Outcome
-    won: bool
+    # Outcome. None until reported — see OutcomeSignal.
+    won: OutcomeSignal = None
     price_paid: Optional[float] = None
 
     # Downstream signals
-    impression: bool
-    click: bool
-    conversion: bool
+    impression: OutcomeSignal = None
+    click: OutcomeSignal = None
+    conversion: OutcomeSignal = None
     conversion_value: Optional[float] = None
 
+    #: Where the signals above came from. Defaulted so stored events stay valid;
+    #: the emit paths set it explicitly.
+    outcome_provenance: OutcomeProvenance = "unresolved"
+
     # Context features
+    #
+    # These are the columns the DLRM feature spec reads
+    # (source/shared/dlrm_features.py). A column the spec names must be carried
+    # here, or the training side reads a default while the serving side supplies
+    # a real value -- the two would agree on width and disagree on meaning.
     user_id_hash: str
     site_domain: str
     device_type: str
     hour_of_day: int = Field(ge=0, le=23)
+    # Defaulted rather than required: events already stored, and the other
+    # producers of this type, stay valid. The two emit paths populate them
+    # (orchestrator/feedback_integration.py), so a defaulted value in a fresh
+    # event means an emitter has not been updated.
+    day_of_week: int = Field(ge=0, le=6, default=0)
+    geo_country: str = ""
+    has_video: bool = False
 
     # Model parameters at time of bid
+    #
+    # Recorded for provenance, deliberately NOT model features: a prediction
+    # conditioned on the policy that produced its own training data cannot be
+    # used to evaluate a change to that policy. Excluded by
+    # dlrm_features.py's held-out set.
     shade_factor_used: float
     conversion_value_estimate_used: float
 
@@ -156,11 +200,12 @@ class BidShadingOutcomeRecord(BaseModel):
     bid_floor: float
     price_paid: Optional[float] = None
 
-    # Outcome signals
-    won: bool
-    impression: bool
-    click: bool
-    conversion: bool
+    # Outcome signals. None until reported — see OutcomeSignal.
+    won: OutcomeSignal = None
+    impression: OutcomeSignal = None
+    click: OutcomeSignal = None
+    conversion: OutcomeSignal = None
+    outcome_provenance: OutcomeProvenance = "unresolved"
     conversion_value: Optional[float] = None
 
     # Features (for retraining)
@@ -317,11 +362,11 @@ def validate_bid_outcome(
     original_price: float,
     shaded_price: float,
     bid_floor: float,
-    won: bool,
+    won: OutcomeSignal,
     price_paid: Optional[float],
-    impression: bool,
-    click: bool,
-    conversion: bool,
+    impression: OutcomeSignal,
+    click: OutcomeSignal,
+    conversion: OutcomeSignal,
     conversion_value: Optional[float],
 ) -> list[str]:
     """Validate bid outcome fields against design rules.
@@ -365,27 +410,36 @@ def validate_bid_outcome(
             f"shaded_price ({shaded_price}) must be <= original_price ({original_price})"
         )
 
-    # Rule 4: price_paid is null if won == false
-    if not won and price_paid is not None:
-        errors.append("price_paid must be null when won is false")
+    # Rules 4-6 read the signals as TRI-STATE: True, False, or None for "not
+    # reported yet". `not won` would treat None as False, which is the conflation
+    # this change exists to remove -- so each rule tests `is True` / `is not True`
+    # explicitly.
 
-    # Rule 5: conversion_value is null if conversion == false
-    if not conversion and conversion_value is not None:
-        errors.append("conversion_value must be null when conversion is false")
+    # Rule 4: price_paid only when the bid is known to have won
+    if won is not True and price_paid is not None:
+        state = "unknown" if won is None else "false"
+        errors.append(f"price_paid must be null when won is {state}")
 
-    # Rule 6: Monotonic outcome signals: conversion → click → impression → won
-    if conversion and not click:
-        errors.append(
-            "Monotonic violation: conversion is true but click is false"
-        )
-    if click and not impression:
-        errors.append(
-            "Monotonic violation: click is true but impression is false"
-        )
-    if impression and not won:
-        errors.append(
-            "Monotonic violation: impression is true but won is false"
-        )
+    # Rule 5: conversion_value only when a conversion is known to have happened
+    if conversion is not True and conversion_value is not None:
+        state = "unknown" if conversion is None else "false"
+        errors.append(f"conversion_value must be null when conversion is {state}")
+
+    # Rule 6: Monotonic outcome signals: conversion → click → impression → won.
+    # A reported downstream signal implies its upstream HAPPENED, so an upstream
+    # that is unknown is as much a violation as one that is false — a conversion
+    # cannot coexist with an unknown click.
+    for downstream_name, downstream, upstream_name, upstream in (
+        ("conversion", conversion, "click", click),
+        ("click", click, "impression", impression),
+        ("impression", impression, "won", won),
+    ):
+        if downstream is True and upstream is not True:
+            state = "unknown" if upstream is None else "false"
+            errors.append(
+                f"Monotonic violation: {downstream_name} is true but "
+                f"{upstream_name} is {state}"
+            )
 
     return errors
 
@@ -401,12 +455,12 @@ def _validate_common_fields(
     original_price: float,
     shaded_price: float,
     bid_floor: float,
-    won: bool,
+    won: OutcomeSignal,
     price_paid: Optional[float],
-    conversion: bool,
+    conversion: OutcomeSignal,
     conversion_value: Optional[float],
-    impression: bool,
-    click: bool,
+    impression: OutcomeSignal,
+    click: OutcomeSignal,
 ) -> None:
     """Run shared validation rules and raise ValueError on failure.
 
@@ -453,6 +507,10 @@ class SignalEvent(BaseModel):
     timestamp: float  # When the signal occurred
     conversion_value: Optional[float] = None  # Only for conversion signals
     record_type: str = Field(default="signal", frozen=True)
+    #: Where this signal came from. Travels with the signal into the enriched
+    #: outcome event and on into the training record, so a dataset's provenance
+    #: mix is recoverable at training time.
+    provenance: OutcomeProvenance = "observed"
 
     @model_validator(mode="after")
     def _validate_signal_event(self) -> "SignalEvent":

@@ -104,6 +104,23 @@ adapters:
     enabled: __AMT_ENABLED__
     endpoint: "__AMT_SIMULATOR_ENDPOINT__"
 
+  # THIRD-PARTY SEATS from --inject-plugin, enabled by --plugin-adapter NAME.
+  #
+  # This overlay REPLACES the release default file rather than merging with it, so a
+  # seat that is compiled into the image is still absent from the running server
+  # unless it appears here. PBS-Java defaults a bidder to enabled: false, and a
+  # disabled bidder answers every request for it with
+  #
+  #   <name> is not configured properly on this Prebid Server deploy.
+  #
+  # which names a configuration fault rather than a missing seat -- so a plugin that
+  # injected, compiled and started cleanly still returns no bid, and the reason is
+  # reported against the bidder.
+  #
+  # Only `enabled` is set. A plugin's own bidder-config/<name>.yaml carries its
+  # endpoint and credentials, resolved from the container environment supplied by
+  # --plugin-env, so nothing about a specific plugin is written into this template.
+  # __PLUGIN_ADAPTERS__
   # The upstream default file enables appnexus, ix, openx, pubmatic and rubicon. They
   # are NOT re-enabled here: this deployment has no credentials for them and calling
   # them would produce timeouts that look like ARTF failures. Their absence is a

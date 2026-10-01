@@ -112,6 +112,14 @@ class ContainerCallOutcome:
     mutations: list[Mutation] = field(default_factory=list)
     model_version: str = ""
     error: str | None = None
+    # A container's own explanation for returning no mutations, read from its
+    # response metadata. Distinct from ``error``: the container answered correctly,
+    # and is reporting that it declined to act and why.
+    #
+    # Without this, "the model saw no reason to shade" and "the model could not be
+    # reached for a prediction" both arrive as an empty mutation list. The bid
+    # shader's abstention is exactly the second case.
+    abstained_reason: str | None = None
 
 
 @dataclass(frozen=True)

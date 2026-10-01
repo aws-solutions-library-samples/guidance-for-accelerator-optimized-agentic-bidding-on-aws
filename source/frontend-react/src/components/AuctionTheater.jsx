@@ -13,7 +13,7 @@ import { useMemo, useEffect, useRef, useState, useCallback } from "react";
 import { useTheaterRun, RUN_IDLE, RUN_SUBMITTING, RUN_READY, RUN_FAILED } from "../hooks/useTheaterRun.js";
 import { useBeatStepper } from "../hooks/useBeatStepper.js";
 import { useRunSummary } from "../hooks/useRunSummary.js";
-import { visibleValues, cardStateFor, BEAT_RECAP } from "../utils/theaterBeats.js";
+import { visibleValues, cardStateFor, BEAT_BIDS, BEAT_RECAP } from "../utils/theaterBeats.js";
 import { factualCaption, mutationNarration } from "../utils/theaterCaptions.js";
 import { buildOfferViewModel } from "../utils/offerPresentationService.js";
 import { capturedBidResponse } from "../utils/bidResponseFixture.js";
@@ -72,6 +72,15 @@ export default function AuctionTheater({ scenario, params, onExit }) {
 
   const sawOrigin = !!beats && index >= 0;
   const atRecap = currentBeat?.kind === BEAT_RECAP;
+
+  // The bids are on screen from the BIDS beat onward — including at the recap,
+  // which follows it. Derived from having REACHED the beat rather than from
+  // standing on it, because the offers must not disappear when the reader steps
+  // past them to the recap.
+  const sawBids = useMemo(() => {
+    if (!Array.isArray(beats)) return false;
+    return beats.slice(0, index + 1).some((b) => b.kind === BEAT_BIDS);
+  }, [beats, index]);
 
   // The offers column derives entirely from a bid response. Until the Prebid stack
   // is deployed that response is the captured fixture, and the notice the panel
@@ -168,24 +177,15 @@ export default function AuctionTheater({ scenario, params, onExit }) {
 
   return (
     <div className="th-stage th-stage-embedded">
-      <div className="th-embedded-bar">
-        <span className="th-embedded-scenario" data-testid="theater-scenario-name">
-          {scenario?.name ?? "No scenario"}
-        </span>
-        <button
-          type="button"
-          className="th-btn th-btn-ghost th-embedded-close"
-          onClick={onExit}
-          data-testid="theater-exit"
-        >
-          Close
-        </button>
-      </div>
-
+      {/* The scenario name and the Close control used to sit in their own bar
+          above the ribbon. They are in the ribbon now: one row instead of two,
+          which is vertical space the columns get back on a laptop screen. */}
       <TheaterSceneRibbon
         context={run.context}
         revealed={sawOrigin && run.status === RUN_READY}
         stepLabel={stepLabel}
+        scenarioName={scenario?.name ?? "No scenario"}
+        onExit={onExit}
       />
 
       {/* RUN_IDLE is now only the instant between mount and the start effect
@@ -258,7 +258,8 @@ export default function AuctionTheater({ scenario, params, onExit }) {
               */}
               <OffersPanel
                 viewModel={offerViewModel}
-                revealed={atRecap}
+                revealed={sawBids}
+                winnerRevealed={atRecap}
                 auctionFault={run.auctionFault}
               />
             </div>

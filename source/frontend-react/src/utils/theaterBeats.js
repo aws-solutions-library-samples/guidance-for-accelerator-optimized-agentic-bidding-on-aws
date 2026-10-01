@@ -18,13 +18,17 @@ const EXPLORE_SUFFIX = ":explore";
 /** Beat kinds. */
 export const BEAT_ORIGIN = "origin";
 export const BEAT_CONTAINER = "container";
+export const BEAT_BIDS = "bids";
 export const BEAT_RECAP = "recap";
 
 /** Where attention travels for each beat kind (BR-20). */
 const MOVEMENT_BY_KIND = Object.freeze({
   [BEAT_ORIGIN]: "sell-to-request",
   [BEAT_CONTAINER]: "none",
-  [BEAT_RECAP]: "request-to-buy",
+  // Attention crosses to the buy side when the BIDS land, not at the recap: the
+  // bids are the first thing the offers column shows, so that is the move.
+  [BEAT_BIDS]: "request-to-buy",
+  [BEAT_RECAP]: "none",
 });
 
 function isFiniteNumber(n) {
@@ -256,6 +260,18 @@ export function buildBeats(submittedPayload, normalizedResult) {
       }
     }
   }
+
+  // The bids land between the last mutation and the recap, so the reader sees the
+  // seats respond to the enriched request before anything names a winner.
+  //
+  // Structural, like origin and recap — NOT derived from the bid response, and
+  // deliberately so. The auction is fired only after buildBeats returns (see
+  // useTheaterRun), so the bid count is unknowable here. Deriving this beat would
+  // mean rebuilding the sequence when the auction resolves, which would change the
+  // step total while the reader is partway through it. The beat is therefore always
+  // present and the offers column states whatever is actually true when it is
+  // reached: real bids, no bids, the fixture with its own notice, or a fault.
+  beats.push(makeBeat(beats.length, BEAT_BIDS, {}));
 
   // The recap restates what actually changed. A container that produced nothing
   // is absent from it, consistent with having produced no beat (BR-9 of the

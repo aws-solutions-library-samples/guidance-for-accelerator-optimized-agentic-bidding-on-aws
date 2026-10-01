@@ -186,6 +186,40 @@ spec:
             # for why. Same "unset -> disabled, not fabricated" contract.
             - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
               value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
+            # Outcome simulator (source/orchestrator/outcome_simulator.py).
+            # SYNTHETIC win/impression/click/conversion outcomes, for a deployment
+            # with no exchange win notice and no advertiser pixel — without them the
+            # bid-shading training loop has no labels and every `cpa` retrain is
+            # refused by the trainer's dataset gate.
+            #
+            # OFF by default, and it must stay that way unless a deployment
+            # deliberately wants synthetic labels. Everything it emits carries
+            # provenance="simulated", which travels into the training record and the
+            # model manifest, so a model trained this way is always identifiable as
+            # one. Set to "true" to enable.
+            - name: OUTCOME_SIMULATOR_ENABLED
+              value: "__OUTCOME_SIMULATOR_ENABLED__"
+            # Funnel rates for the simulator above. Each is left EMPTY by default,
+            # which outcome_simulator._env_float reads as "use the code default"
+            # (win 0.40, impression 0.95, click 0.02, conversion 0.05, value 25.0).
+            # Those defaults sit in the range display advertising actually sees, so a
+            # simulated dataset is not trivially separable.
+            #
+            # A short demo that needs labels quickly can raise the click and
+            # conversion rates well above realistic levels to reach the trainer's
+            # dataset gate in minutes rather than days. That trade is legitimate but
+            # it is not a measurement: rates set this way describe the simulator, not
+            # any campaign, and the resulting model carries provenance="simulated".
+            - name: OUTCOME_SIMULATOR_WIN_RATE
+              value: "__OUTCOME_SIMULATOR_WIN_RATE__"
+            - name: OUTCOME_SIMULATOR_IMPRESSION_RATE
+              value: "__OUTCOME_SIMULATOR_IMPRESSION_RATE__"
+            - name: OUTCOME_SIMULATOR_CLICK_RATE
+              value: "__OUTCOME_SIMULATOR_CLICK_RATE__"
+            - name: OUTCOME_SIMULATOR_CONVERSION_RATE
+              value: "__OUTCOME_SIMULATOR_CONVERSION_RATE__"
+            - name: OUTCOME_SIMULATOR_CONVERSION_VALUE
+              value: "__OUTCOME_SIMULATOR_CONVERSION_VALUE__"
             # Glue ETL job names (source/orchestrator/governance_api.py's
             # trainable_runs_handler) -- used to check whether a completed
             # Glue job run has actually swept a load test's data into

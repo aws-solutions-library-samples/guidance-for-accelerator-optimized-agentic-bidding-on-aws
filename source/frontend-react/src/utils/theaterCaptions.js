@@ -12,7 +12,7 @@
 // degrades to it, and importing it from the component that consumes the caption
 // service would be circular. AuctionTheater.jsx re-exports it.
 
-import { BEAT_RECAP } from "./theaterBeats.js";
+import { BEAT_BIDS, BEAT_RECAP } from "./theaterBeats.js";
 
 /**
  * Human wording for an ARTF intent, for the pill beside the container name.
@@ -94,6 +94,17 @@ export function mutationNarration(beat, context) {
       text: parts.length
         ? `The bid request arrives from ${parts.join(", ")}.`
         : "The bid request arrives from the exchange.",
+    };
+  }
+
+  if (beat.kind === BEAT_BIDS) {
+    // No count here on purpose. This beat is built before the auction is fired, so
+    // the number of bids is not known to it; the offers column is what states how
+    // many arrived and from which seats. Naming a number here would either be
+    // wrong or require the beat to wait on the auction.
+    return {
+      ...base,
+      text: "The seats bid against the enriched request. No winner yet.",
     };
   }
 

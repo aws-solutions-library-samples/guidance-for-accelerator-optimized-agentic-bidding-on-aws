@@ -3,7 +3,10 @@
 // Grouped in one module because each is small and they share the same value
 // vocabulary. All are pure functions of their props; none reads the stepper.
 
+import { useRef } from "react";
+
 import { ValueVisual, UNKNOWN } from "./theaterVisualisers.jsx";
+import { useScrollToFoot } from "../hooks/useScrollToFoot.js";
 
 /* ------------------------------------------------------------------ ribbon */
 
@@ -24,7 +27,16 @@ function assertedSegmentNames(context) {
  * Publisher, page, content, audience and deals, entirely from real request
  * fields (FR-13).
  */
-export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
+/**
+ * @param scenarioName  shown in place of a static product label — the reader
+ *                      already knows which product they are in, and not which
+ *                      scenario is running.
+ * @param onExit        when present, the ribbon carries the exit control. It used
+ *                      to live in its own bar above this one; folding it in here
+ *                      reclaims that row's vertical space without removing the
+ *                      only way out of the theater.
+ */
+export function TheaterSceneRibbon({ context, revealed, stepLabel, scenarioName, onExit }) {
   const items = [
     { key: "publisher", label: "Publisher", value: context?.publisher },
     { key: "page", label: "Page", value: context?.page },
@@ -53,7 +65,9 @@ export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
 
   return (
     <div className="th-ribbon">
-      <div className="th-ribbon-title">ARTF Auction Theater</div>
+      <div className="th-ribbon-title" data-testid="theater-scenario-name">
+        {scenarioName ?? "ARTF Auction Theater"}
+      </div>
       <div className="th-ribbon-scene">
         {items.map(({ key, label, value }) => (
           <div key={key} className={`th-scene-item${revealed ? " is-on" : ""}`}>
@@ -63,6 +77,16 @@ export function TheaterSceneRibbon({ context, revealed, stepLabel }) {
         ))}
       </div>
       <div className="th-ribbon-step" data-testid="theater-progress-label">{stepLabel}</div>
+      {onExit ? (
+        <button
+          type="button"
+          className="th-btn th-btn-ghost th-ribbon-close"
+          onClick={onExit}
+          data-testid="theater-exit"
+        >
+          Close
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -160,6 +184,16 @@ export function TheaterRequestCard({
   context, visible, landingValues, cardState, contributors, taxonomyNames,
   view = CARD_VIEW.VISUAL, onViewChange, codeSlot, infoSlot,
 }) {
+  // The visual body scrolls, and every mutation is appended to the foot of it.
+  // The revision covers both things that grow: the contributed values, and the
+  // contributions block that appears at the recap. The code and info views are
+  // static across steps, so neither needs following.
+  const visualBodyRef = useRef(null);
+  useScrollToFoot(
+    visualBodyRef,
+    `${visible?.length ?? 0}:${contributors?.length ?? 0}`,
+  );
+
   const baseFields = [
     ["request", context?.requestId],
     ["format", context?.impressionFormat],
@@ -201,7 +235,7 @@ export function TheaterRequestCard({
           <TheaterCardViewToggle view={view} onChange={onViewChange} />
         ) : null}
       </div>
-      <div className="th-card-body" data-testid="theater-card-body-visual">
+      <div className="th-card-body" data-testid="theater-card-body-visual" ref={visualBodyRef}>
         <div className="th-group">
           <div className="th-group-label">As sent by the exchange</div>
           <div className="th-chips">

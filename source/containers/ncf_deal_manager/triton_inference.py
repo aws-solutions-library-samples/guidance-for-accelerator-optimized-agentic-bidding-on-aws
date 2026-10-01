@@ -11,6 +11,7 @@ References:
 from __future__ import annotations
 
 import os
+import threading
 
 import numpy as np
 import tritonclient.http as httpclient
@@ -19,20 +20,26 @@ from tritonclient.utils import InferenceServerException
 TRITON_URL = os.environ.get("TRITON_URL", "localhost:8000")
 MODEL_NAME = "ncf_deal_manager"
 
-_client: httpclient.InferenceServerClient | None = None
+# One client per thread. `mutate()` runs on a ThreadPoolExecutor of
+# ARTF_MUTATE_WORKERS threads (shared/server.py), and tritonclient.http's
+# connection pool is greenlet-bound to the thread that opened it, so a client
+# built on one worker thread raises "Cannot switch to a different thread" when
+# a later request lands on another.
+_local = threading.local()
 
 
 def _get_client() -> httpclient.InferenceServerClient:
-    global _client
-    if _client is None:
-        _client = httpclient.InferenceServerClient(
+    client = getattr(_local, "client", None)
+    if client is None:
+        client = httpclient.InferenceServerClient(
             url=TRITON_URL,
             verbose=False,
             concurrency=4,
             connection_timeout=5.0,
             network_timeout=10.0,
         )
-    return _client
+        _local.client = client
+    return client
 
 
 def predict_relevance(

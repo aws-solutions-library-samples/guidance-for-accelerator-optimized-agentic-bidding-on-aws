@@ -96,19 +96,54 @@ shading down from the maximum bid based on how likely the impression is to
 convert, so the platform doesn't overpay for impressions it would have won at a
 lower price.
 
-**How:** Predicts click-through rate (CTR) from sparse categorical features (user
-IDs, site categories, device types) and dense numerical features (bid floors,
-time of day, user age, video presence), then converts that prediction into a
-shaded price: `shaded_price = min(original_bid, predicted_CTR × $12
-conversion_value × 0.65 shade_factor)`, floored at the publisher's bidfloor.
+**How:** Two separate steps, deliberately kept apart — a prediction about the
+world, then a decision about strategy.
 
-**Model (implementation detail):** A Deep Learning Recommendation Model (DLRM).
-Bottom MLPs (4→32→16) transform dense features into embedding space; 3
-EmbeddingBag tables (vocab=1000, dim=16) encode sparse features; dot-product
-interaction layers capture feature crosses; a top MLP (22→64→32→1→sigmoid)
-produces the CTR prediction. Served by Triton as model `dlrm_bid_shader` (ONNX
-backend, max batch size 64, 2× GPU instances, dynamic batching with preferred
-sizes [8, 16, 32] and 500μs max queue delay).
+First the model estimates **how likely the response the advertiser pays for is**.
+Which response that is comes from the training objective: `cpa` (the default)
+trains against conversions, `cpc` against clicks, `profitable_win` against a
+profitable win. The objective is recorded in the model's manifest, so a served
+artifact always states which response its probability refers to.
+
+Then an explicit policy turns that probability into a price. Expected value is
+`predicted_probability × conversion_value`, and the policy is a parametric curve
+over it:
+
+```
+price = clamp(base + slope × expected_value ^ curvature, bid_floor, original_bid)
+```
+
+The three coefficients live in `source/shared/shading_policy.py` and are read at
+serving time from Parameter Store, so pricing behaviour can be retuned without
+redeploying the model. The shipped values — `base=0.0, slope=0.65, curvature=1.0`
+— reduce the curve to `min(original_bid, expected_value × 0.65)` floored at the
+publisher's bidfloor, which is the straight-line case. Raising `curvature` above
+1 bids proportionally less on low-value impressions and more on high-value ones;
+`base` sets a floor the policy will not shade below.
+
+Separating the two matters because they are learned differently. The probability
+is fitted by gradient descent and its calibration is measured; the coefficients
+are searched against an ROI objective, and gradient descent is deliberately kept
+away from the probability head so that search cannot quietly undo the
+calibration.
+
+**Features:** four dense (`bid_floor`, `hour_norm`, `is_weekend`, `has_video`)
+and three categorical (`site_domain`, `device_type`, `geo_country`, with vocabs
+of 10000 / 32 / 256). The vector is defined once in
+`source/shared/dlrm_features.py` and imported by both the trainer and the serving
+container, so the two cannot disagree about what position two means. It is
+versioned: a served artifact carries its `feature_spec_version`, and the
+promotion path refuses a model whose version it cannot interpret.
+
+**Model (implementation detail):** A Deep Learning Recommendation Model (DLRM),
+168,881 parameters. A bottom MLP (4→32→16) lifts the dense features into
+embedding space; three `nn.Embedding` tables (dim=16) encode the categoricals; a
+dot-product interaction layer captures feature crosses; a top MLP (22→64→32→1)
+produces a logit. The sigmoid is applied by the export wrapper rather than inside
+the top MLP, so the trained network and the served graph share one definition of
+the probability. Served by Triton as model `dlrm_bid_shader` (ONNX backend, max
+batch size 64, 2× GPU instances, dynamic batching with preferred sizes
+[8, 16, 32] and 500μs max queue delay).
 
 #### Audience Activator: audience segment activation (ACTIVATE_SEGMENTS)
 

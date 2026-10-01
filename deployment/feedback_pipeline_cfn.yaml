@@ -241,10 +241,26 @@ Resources:
               Type: string
             - Name: hour_of_day
               Type: int
+            # day_of_week / geo_country / has_video are read by the DLRM feature
+            # spec (source/shared/dlrm_features.py). They were added to
+            # BidShadingOutcomeEvent without being added here, so Firehose dropped
+            # all three during JSON->Parquet conversion and they never reached a
+            # training dataset -- exactly the failure the comment above warns about.
+            - Name: day_of_week
+              Type: int
+            - Name: geo_country
+              Type: string
+            - Name: has_video
+              Type: boolean
             - Name: shade_factor_used
               Type: double
             - Name: conversion_value_estimate_used
               Type: double
+            # Where this row's outcome came from: unresolved / simulated / observed.
+            # Carried into the trainer's dataset report and the model manifest, so a
+            # model trained on simulated outcomes stays identifiable as one.
+            - Name: outcome_provenance
+              Type: string
           Location: !Sub 's3://${RawOutcomesBucket}/raw-outcomes/'
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat

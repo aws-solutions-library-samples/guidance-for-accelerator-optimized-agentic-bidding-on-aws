@@ -10,6 +10,7 @@ import {
   cardStateFor,
   BEAT_ORIGIN,
   BEAT_CONTAINER,
+  BEAT_BIDS,
   BEAT_RECAP,
 } from "./theaterBeats.js";
 
@@ -88,16 +89,47 @@ const payloadWithDeal = {
 /* ------------------------------------------------------ beat count, BR-1..4 */
 
 describe("buildBeats sequence shape", () => {
-  it("is origin + one beat per mutation + recap", () => {
+  it("is origin + one beat per mutation + bids + recap", () => {
     const beats = buildBeats(payloadWithDeal, result([
       stop("metrics", [metricsMutation]),
       stop("widedeep", [segmentsMutation]),
       stop("yield-floor", [floorMutation]),
     ]));
-    expect(beats).toHaveLength(1 + 3 + 1);
+    expect(beats).toHaveLength(1 + 3 + 1 + 1);
     expect(beats[0].kind).toBe(BEAT_ORIGIN);
+    expect(beats[beats.length - 2].kind).toBe(BEAT_BIDS);
     expect(beats[beats.length - 1].kind).toBe(BEAT_RECAP);
-    expect(beats.slice(1, -1).every((b) => b.kind === BEAT_CONTAINER)).toBe(true);
+    expect(beats.slice(1, -2).every((b) => b.kind === BEAT_CONTAINER)).toBe(true);
+  });
+  it("puts the bids beat AFTER every container and BEFORE the recap", () => {
+    const beats = buildBeats(payloadWithDeal, result([
+      stop("metrics", [metricsMutation]),
+      stop("yield-floor", [floorMutation]),
+    ]));
+    const bidsAt = beats.findIndex((b) => b.kind === BEAT_BIDS);
+    const recapAt = beats.findIndex((b) => b.kind === BEAT_RECAP);
+    const lastContainerAt = beats.reduce(
+      (acc, b, i) => (b.kind === BEAT_CONTAINER ? i : acc), -1,
+    );
+    expect(lastContainerAt).toBeGreaterThan(-1);
+    expect(bidsAt).toBeGreaterThan(lastContainerAt);
+    expect(recapAt).toBe(bidsAt + 1);
+  });
+  it("emits exactly one bids beat, and it carries no values", () => {
+    const beats = buildBeats(payloadWithDeal, result([
+      stop("metrics", [metricsMutation]),
+      stop("widedeep", [segmentsMutation]),
+    ]));
+    const bids = beats.filter((b) => b.kind === BEAT_BIDS);
+    expect(bids).toHaveLength(1);
+    expect(bids[0].values).toEqual([]);
+  });
+  it("moves attention to the buy side on the bids beat, not the recap", () => {
+    const beats = buildBeats(payloadWithDeal, result([stop("metrics", [metricsMutation])]));
+    const bids = beats.find((b) => b.kind === BEAT_BIDS);
+    const recap = beats.find((b) => b.kind === BEAT_RECAP);
+    expect(bids.movement).toBe("request-to-buy");
+    expect(recap.movement).toBe("none");
   });
 
   it("gives a metrics mutation ONE beat carrying TWO values", () => {
@@ -117,7 +149,12 @@ describe("buildBeats sequence shape", () => {
 
   it("ignores the ssp and dsp bookend stops", () => {
     const beats = buildBeats(payloadWithDeal, result([]));
-    expect(beats.map((b) => b.kind)).toEqual([BEAT_ORIGIN, BEAT_RECAP]);
+    expect(beats.map((b) => b.kind)).toEqual([BEAT_ORIGIN, BEAT_BIDS, BEAT_RECAP]);
+  });
+  it("still emits the bids beat when NO container mutated", () => {
+    // Structural, not derived: nothing was enriched, but the seats still bid.
+    const beats = buildBeats(payloadWithDeal, result([stop("yield-floor", [])]));
+    expect(beats.some((b) => b.kind === BEAT_BIDS)).toBe(true);
   });
 
   it("preserves stop order", () => {
@@ -329,12 +366,26 @@ const arbStops = fc.array(
 }));
 
 describe("buildBeats properties", () => {
-  it("beat count is always 2 + the total number of mutations", () => {
+  // Three structural beats — origin, bids, recap — regardless of what the
+  // containers did. Only the container beats vary with the response.
+  it("beat count is always 3 + the total number of mutations", () => {
     fc.assert(fc.property(arbStops, (res) => {
       const mutationCount = res.stops
         .filter((s) => s.id !== "ssp" && s.id !== "dsp")
         .reduce((n, s) => n + s.mutations.length, 0);
-      expect(buildBeats(payloadWithDeal, res)).toHaveLength(mutationCount + 2);
+      expect(buildBeats(payloadWithDeal, res)).toHaveLength(mutationCount + 3);
+    }), { numRuns: 200 });
+  });
+  it("always emits exactly one origin, one bids and one recap beat", () => {
+    fc.assert(fc.property(arbStops, (res) => {
+      const kinds = buildBeats(payloadWithDeal, res).map((b) => b.kind);
+      expect(kinds.filter((k) => k === BEAT_ORIGIN)).toHaveLength(1);
+      expect(kinds.filter((k) => k === BEAT_BIDS)).toHaveLength(1);
+      expect(kinds.filter((k) => k === BEAT_RECAP)).toHaveLength(1);
+      // Order is invariant: origin first, then bids, then recap last.
+      expect(kinds[0]).toBe(BEAT_ORIGIN);
+      expect(kinds.indexOf(BEAT_BIDS)).toBe(kinds.length - 2);
+      expect(kinds[kinds.length - 1]).toBe(BEAT_RECAP);
     }), { numRuns: 200 });
   });
 

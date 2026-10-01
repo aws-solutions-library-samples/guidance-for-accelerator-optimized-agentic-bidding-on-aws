@@ -7,10 +7,19 @@ https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/Recommendatio
 import torch
 import torch.nn as nn
 
+# In the training image this resolves to /opt/ml/code/shared/, staged from
+# source/shared/ by source/training/stage_shared.sh. Same file the serving
+# container imports.
+from shared import dlrm_features
+
 EMBEDDING_DIM = 16
-NUM_DENSE = 4
-NUM_SPARSE = 3
-VOCAB_SIZE = 1000
+
+# Widths and vocabulary sizes come from the feature spec. They were local
+# constants, and the single VOCAB_SIZE=1000 sized every embedding table
+# identically -- so an index drawn from the 10,000-entry site_domain vocabulary
+# was an out-of-range lookup that raised IndexError partway into a training run.
+NUM_DENSE = dlrm_features.DENSE_WIDTH
+NUM_SPARSE = dlrm_features.CATEGORICAL_WIDTH
 
 
 class DLRMModel(nn.Module):
@@ -31,9 +40,11 @@ class DLRMModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+        # One table per categorical feature, each sized to that feature's own
+        # vocabulary, in the spec's column order.
         self.embeddings = nn.ModuleList([
-            nn.Embedding(VOCAB_SIZE, EMBEDDING_DIM)
-            for _ in range(NUM_SPARSE)
+            nn.Embedding(dlrm_features.VOCAB_SIZES[column], EMBEDDING_DIM)
+            for column in dlrm_features.CATEGORICAL_COLUMNS
         ])
         self.bottom_mlp = nn.Sequential(
             nn.Linear(NUM_DENSE, 32), nn.ReLU(),
@@ -73,20 +84,31 @@ class DLRMModel(nn.Module):
 
 class DLRMExportModel(nn.Module):
     """Wraps a trained :class:`DLRMModel` to expose the SERVED input/output
-    signature for ONNX export: four named inputs (``dense_features``,
-    ``sparse_user``, ``sparse_domain``, ``sparse_device``) and a sigmoid'd
-    ``ctr_prediction`` output — the exact contract in
-    source/triton/export_models.py and the ``dlrm_bid_shader_stable`` Triton
-    config. Reuses the trained submodules (no weight copy), so the exported
-    engine serves exactly what was trained.
+    signature for ONNX export: one dense input plus one input per categorical
+    feature (``dlrm_features.TRITON_DENSE_INPUT`` and
+    ``TRITON_CATEGORICAL_INPUTS``), and a sigmoid'd ``ctr_prediction`` output —
+    the exact contract in source/triton/export_models.py and the
+    ``dlrm_bid_shader_stable`` Triton config. Reuses the trained submodules (no
+    weight copy), so the exported engine serves exactly what was trained.
+
+    The categorical inputs are three fixed positional arguments because ONNX
+    export traces a fixed arity; the assertion below is what turns a spec change
+    into a loud failure here rather than a silent mismatch in a served engine.
     """
 
     def __init__(self, model: "DLRMModel"):
         super().__init__()
+        assert NUM_SPARSE == 3, (
+            f"DLRMExportModel exports {NUM_SPARSE} categorical inputs as fixed "
+            "positional arguments; update this wrapper, export_to_onnx, "
+            "source/triton/export_models.py and the Triton config.pbtxt files "
+            "before changing CATEGORICAL_COLUMNS."
+        )
         self.model = model
 
-    def forward(self, dense_features, sparse_user, sparse_domain, sparse_device):
+    def forward(self, dense_features, sparse_site_domain, sparse_device_type, sparse_geo_country):
         logits = self.model.logits(
-            dense_features, [sparse_user, sparse_domain, sparse_device]
+            dense_features,
+            [sparse_site_domain, sparse_device_type, sparse_geo_country],
         )
         return torch.sigmoid(logits).reshape(-1)

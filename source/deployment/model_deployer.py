@@ -82,9 +82,9 @@ _DEFAULT_OPTIMIZATION_CONFIG: dict[str, Any] = {
 _MODEL_INPUT_PROFILES: dict[str, dict[str, dict[str, list[int]]]] = {
     "dlrm_bid_shader": {
         "dense_features": {"min": [1, 4], "opt": [8, 4], "max": [64, 4]},
-        "sparse_user": {"min": [1], "opt": [8], "max": [64]},
-        "sparse_domain": {"min": [1], "opt": [8], "max": [64]},
-        "sparse_device": {"min": [1], "opt": [8], "max": [64]},
+        "sparse_site_domain": {"min": [1], "opt": [8], "max": [64]},
+        "sparse_device_type": {"min": [1], "opt": [8], "max": [64]},
+        "sparse_geo_country": {"min": [1], "opt": [8], "max": [64]},
     },
     "ncf_deal_manager": {
         # ncf config.pbtxt uses max_batch_size 128, so the engine profile max must

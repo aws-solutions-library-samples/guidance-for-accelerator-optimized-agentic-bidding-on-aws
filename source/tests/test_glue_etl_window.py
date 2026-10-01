@@ -42,6 +42,7 @@ except ImportError:
     _fake_types = _types.ModuleType("pyspark.sql.types")
     _fake_types.IntegerType = object
     _fake_types.DoubleType = object
+    _fake_types.StringType = object
     sys.modules["pyspark"] = _types.ModuleType("pyspark")
     sys.modules["pyspark.sql"] = _fake_sql
     sys.modules["pyspark.sql.types"] = _fake_types

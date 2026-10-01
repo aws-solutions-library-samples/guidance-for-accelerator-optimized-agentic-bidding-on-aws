@@ -14,20 +14,10 @@
 // immediately and schedules nothing (NFR-3).
 
 import { useEffect, useRef, useState } from "react";
+import { prefersReducedMotion } from "../utils/reducedMotion.js";
 
 /** Per-character dwell. 18ms is ~55 chars/second: readable, not sluggish. */
 export const TYPE_INTERVAL_MS = 18;
-
-function prefersReducedMotion() {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-  try {
-    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  } catch {
-    // Some jsdom configurations implement matchMedia without the media query
-    // parser. A throw here means "no preference expressed", not "animate".
-    return false;
-  }
-}
 
 /**
  * @param {string} text

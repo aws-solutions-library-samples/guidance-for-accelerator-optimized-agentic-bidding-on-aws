@@ -1,0 +1,5 @@
+# Staged build input, written by source/training/stage_shared.sh before the
+# training image is built. Copies of modules whose single definition lives in
+# source/shared/ -- committing them would recreate the duplicate-definition
+# problem the staging step exists to remove.
+shared/

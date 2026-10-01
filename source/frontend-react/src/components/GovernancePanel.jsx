@@ -667,16 +667,21 @@ export default function GovernancePanel() {
       {step === "load-test" ? (
         <section className="gov-step-panel" data-testid="governance-panel-load-test">
           <div className="cl-section-title">Run load test</div>
-          <LoadTestPanel
-            onRunningChange={setLoadTestRunning}
-            onResultChange={setLoadTestState}
-          />
-          <LoadTestResults
-            progress={loadTestState?.progress}
-            result={loadTestState?.result}
-            running={loadTestState?.running || false}
-            error={loadTestState?.error}
-          />
+          {/* Controls and results sit side by side: neither needs the full
+              width, and keeping them on one screen means the run parameters
+              stay visible while the numbers come in. Stacks below ~980px. */}
+          <div className="gov-loadtest-split">
+            <LoadTestPanel
+              onRunningChange={setLoadTestRunning}
+              onResultChange={setLoadTestState}
+            />
+            <LoadTestResults
+              progress={loadTestState?.progress}
+              result={loadTestState?.result}
+              running={loadTestState?.running || false}
+              error={loadTestState?.error}
+            />
+          </div>
           <BidBubbleOverlay
             running={loadTestState?.running}
             progress={loadTestState?.progress}

@@ -59,6 +59,13 @@ TRTEXEC = os.environ.get("TRTEXEC_PATH", "trtexec")
 
 _VALID_PRECISIONS = {"fp32", "fp16", "int8"}
 
+# Provenance file a producer writes beside an exported model, and this service reads
+# before compiling it. Matches shared/dlrm_features.py's MANIFEST_FILENAME; that
+# module is not importable here (this image is built from source/Dockerfile.optimizer
+# plus source/optimizer alone), and tests/test_feature_spec_version_gate.py asserts
+# the two agree.
+MANIFEST_FILENAME = "manifest.json"
+
 
 def _valid_input_profiles(profiles: Any) -> bool:
     """Validate the input_profiles structure: {name: {min:[...],opt:[...],max:[...]}}."""
@@ -102,6 +109,10 @@ def _upload(src_path: str, uri: str) -> None:
     _s3().upload_file(src_path, bucket, key)
 
 
+class OptimizeRequestError(ValueError):
+    """Raised for an invalid /v1/optimize request body (maps to HTTP 400)."""
+
+
 def _resolve_onnx(source_model_uri: str, workdir: str) -> str:
     """Fetch the source artifact and return a local path to the .onnx file.
 
@@ -129,11 +140,130 @@ def _resolve_onnx(source_model_uri: str, workdir: str) -> str:
         raise ValueError(f"No .onnx file found inside archive {source_model_uri}")
 
     if local_artifact.endswith(".onnx"):
+        # A raw .onnx has no archive to carry its manifest, so the manifest is a
+        # SIBLING S3 OBJECT and has to be fetched separately. Without this the
+        # provenance check below sees an empty workdir and refuses every raw-.onnx
+        # source as unmanifested, including ones whose manifest is sitting next to
+        # them in the bucket. Found by a live bootstrap run doing exactly that.
+        _fetch_sibling_manifest(source_model_uri, os.path.dirname(local_artifact))
         return local_artifact
 
     raise ValueError(
         f"Unsupported source artifact (expected .onnx or .tar.gz): {source_model_uri}"
     )
+
+
+def _fetch_sibling_manifest(source_model_uri: str, dest_dir: str) -> None:
+    """Download `manifest.json` from the source's S3 prefix, if it is there.
+
+    A genuinely absent object leaves `dest_dir` without a manifest, which the
+    provenance check reports as "no manifest" — the correct outcome. Any OTHER S3
+    error is raised: a manifest that exists but could not be read is a different
+    fact from one that was never written, and reporting the second for the first
+    would turn a permissions problem into a false claim about the artifact.
+    """
+    bucket, key = _parse_s3(source_model_uri)
+    sibling_key = "/".join([*key.split("/")[:-1], MANIFEST_FILENAME])
+    dest = os.path.join(dest_dir, MANIFEST_FILENAME)
+    try:
+        _s3().download_file(bucket, sibling_key, dest)
+        logger.info("Fetched s3://%s/%s", bucket, sibling_key)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless it is a plain 404
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey"):
+            logger.info("No %s beside %s", MANIFEST_FILENAME, source_model_uri)
+            return
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Feature-spec provenance
+# ---------------------------------------------------------------------------
+# A model's inputs having the right NAMES and WIDTHS is not evidence that the
+# producer and the serving container mean the same thing by them. A vector whose
+# position two changed meaning, or whose vocabulary sizes changed, compiles and
+# serves cleanly and is simply wrong. The producer records what it built against
+# in a manifest beside the artifact; this is where that record is enforced.
+#
+# The expected version is supplied BY THE CALLER, not imported here. This service
+# compiles ONNX to TensorRT for every model in the repository and is not the
+# authority on any one model's feature contract -- and its image is built from
+# source/Dockerfile.optimizer plus source/optimizer alone, with no access to
+# source/shared. The callers that care (the bootstrap spec, and the governance
+# promotion path) hold the spec and state the version they expect.
+
+
+def _read_manifest(onnx_path: str, source_model_uri: str) -> dict[str, Any] | None:
+    """The manifest beside a resolved ONNX, or None if there is none.
+
+    Looks next to the .onnx first (both producers write it there), then anywhere
+    under the extraction directory, because a SageMaker archive may nest the model
+    inside a directory.
+    """
+    directory = os.path.dirname(onnx_path)
+    candidate = os.path.join(directory, MANIFEST_FILENAME)
+    if not os.path.exists(candidate):
+        for root, _dirs, files in os.walk(directory):
+            if MANIFEST_FILENAME in files:
+                candidate = os.path.join(root, MANIFEST_FILENAME)
+                break
+        else:
+            return None
+    try:
+        with open(candidate) as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OptimizeRequestError(
+            f"{MANIFEST_FILENAME} beside {source_model_uri} could not be read "
+            f"({exc}). Refusing to compile an artifact whose provenance record is "
+            "unreadable."
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise OptimizeRequestError(
+            f"{MANIFEST_FILENAME} beside {source_model_uri} is not a JSON object."
+        )
+    return loaded
+
+
+def _require_feature_spec_version(
+    onnx_path: str, source_model_uri: str, expected: int
+) -> int:
+    """Refuse unless the artifact declares exactly `expected`.
+
+    Returns the declared version so the caller can report it. Absent is refused,
+    not waved through: an artifact with no manifest was produced by something whose
+    feature contract is unknown, which is the case this check exists for.
+    """
+    manifest = _read_manifest(onnx_path, source_model_uri)
+    if manifest is None:
+        raise OptimizeRequestError(
+            f"{source_model_uri} has no {MANIFEST_FILENAME}, so the feature-spec "
+            f"version it was built against is unknown. Expected "
+            f"{expected}. Refusing to compile an engine whose feature contract "
+            "cannot be established — matching input names and widths do not "
+            "establish it."
+        )
+    declared = manifest.get("feature_spec_version")
+    if declared is None:
+        raise OptimizeRequestError(
+            f"{MANIFEST_FILENAME} beside {source_model_uri} declares no "
+            f"'feature_spec_version'. Expected {expected}."
+        )
+    if not isinstance(declared, int) or isinstance(declared, bool):
+        raise OptimizeRequestError(
+            f"{MANIFEST_FILENAME} beside {source_model_uri} declares "
+            f"feature_spec_version {declared!r}, which is not an integer."
+        )
+    if declared != expected:
+        raise OptimizeRequestError(
+            f"{source_model_uri} was built against feature-spec version "
+            f"{declared}; this deployment serves version {expected}. Refusing to "
+            "compile it. A vector of the same width with different meaning per "
+            "position produces a working engine and wrong predictions. Retrain "
+            f"against version {expected}, or deploy a build that serves "
+            f"version {declared}."
+        )
+    return declared
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +272,7 @@ def _resolve_onnx(source_model_uri: str, workdir: str) -> str:
 
 
 def _shapes_flag(input_profiles: dict, key: str) -> str:
-    """Build a trtexec shape flag value like 'dense_features:8x4,sparse_user:8'.
+    """Build a trtexec shape flag value like 'dense_features:8x4,sparse_site_domain:8'.
 
     key is one of 'min' | 'opt' | 'max'. Each profile entry maps an input name to
     {"min":[...],"opt":[...],"max":[...]} dim lists.
@@ -210,10 +340,6 @@ def _build_engine(
 # ---------------------------------------------------------------------------
 
 
-class OptimizeRequestError(ValueError):
-    """Raised for an invalid /v1/optimize request body (maps to HTTP 400)."""
-
-
 def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
     """Core optimize logic: validate the request, build the TensorRT engine, and
     upload it to output_uri. Returns the result dict on success.
@@ -234,6 +360,7 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
     calibration_cache_uri = body.get("calibration_cache_uri")
     max_batch_size = int(body.get("max_batch_size", 1))
     input_profiles = body.get("input_profiles")
+    expected_feature_spec_version = body.get("expected_feature_spec_version")
 
     if not source_model_uri or not output_uri or not model_name:
         raise OptimizeRequestError(
@@ -266,9 +393,28 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
             "Use precision 'fp16' or supply a calibration cache."
         )
 
+    if expected_feature_spec_version is not None and (
+        not isinstance(expected_feature_spec_version, int)
+        or isinstance(expected_feature_spec_version, bool)
+    ):
+        raise OptimizeRequestError(
+            "expected_feature_spec_version must be an integer; got "
+            f"{expected_feature_spec_version!r}"
+        )
+
     workdir = tempfile.mkdtemp(prefix="trt-opt-")
     try:
         onnx_path = _resolve_onnx(source_model_uri, workdir)
+
+        # Before spending a GPU on the compile, and before anything can serve the
+        # result. Omitting expected_feature_spec_version skips the check, for the
+        # models that have no feature-spec contract to check (the yield models are
+        # tree-based and never come through here; NCF's vector is not versioned).
+        declared_feature_spec_version = None
+        if expected_feature_spec_version is not None:
+            declared_feature_spec_version = _require_feature_spec_version(
+                onnx_path, source_model_uri, expected_feature_spec_version
+            )
 
         calib_cache_path = None
         if precision == "int8":
@@ -300,6 +446,9 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
             "source_model_uri": source_model_uri,
             "model_name": model_name,
             "duration_s": round(duration, 2),
+            # None when the caller asked for no check, so a reader can tell
+            # "verified against version 1" from "not checked".
+            "feature_spec_version": declared_feature_spec_version,
         }
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -357,6 +506,8 @@ def _bootstrap_one(entry: dict) -> None:
     max_workspace_size = int(entry.get("max_workspace_size", 4 * 1024 * 1024 * 1024))
     input_profiles = entry.get("input_profiles")
 
+    expected_feature_spec_version = entry.get("expected_feature_spec_version")
+
     if _s3_object_exists(output_uri):
         logger.info("Bootstrap: engine already present for %s (%s) — skipping", model_name, output_uri)
         return
@@ -364,6 +515,16 @@ def _bootstrap_one(entry: dict) -> None:
     workdir = tempfile.mkdtemp(prefix="trt-bootstrap-")
     try:
         onnx_path = _resolve_onnx(source_model_uri, workdir)
+        # Same gate as the promotion path. A genesis artifact is still an artifact
+        # whose feature contract has to match what will serve it -- the exporter and
+        # the container are built from one repo, but not necessarily at one commit.
+        if expected_feature_spec_version is not None:
+            declared = _require_feature_spec_version(
+                onnx_path, source_model_uri, expected_feature_spec_version
+            )
+            logger.info(
+                "Bootstrap: %s declares feature_spec_version %d", model_name, declared
+            )
         engine_path = os.path.join(workdir, "model.plan")
         _build_engine(onnx_path, engine_path, precision, max_workspace_size, None, input_profiles=input_profiles)
         _upload(engine_path, output_uri)

@@ -294,8 +294,17 @@ async def _call_mcp(
             if content_item.get("type") == "text":
                 rtb_resp = json.loads(content_item["text"])
                 mutations = [Mutation(**m) for m in rtb_resp.get("mutations", [])]
-                model_version = (rtb_resp.get("metadata") or {}).get("model_version", "") or ""
-                return ContainerCallOutcome(reached=True, mutations=mutations, model_version=model_version)
+                metadata = rtb_resp.get("metadata") or {}
+                model_version = metadata.get("model_version", "") or ""
+                return ContainerCallOutcome(
+                    reached=True,
+                    mutations=mutations,
+                    model_version=model_version,
+                    # Carried through rather than dropped here: an empty mutation
+                    # list with a reason attached is a different fact from an empty
+                    # one without, and only the container knows which it is.
+                    abstained_reason=metadata.get("abstained_reason") or None,
+                )
         # Some implementations put mutations directly on the result.
         if "mutations" in result:
             mutations = [Mutation(**m) for m in result.get("mutations", [])]
@@ -368,9 +377,13 @@ async def _call_container(
             try:
                 data = resp.json()
                 mutations = [Mutation(**m) for m in data.get("mutations", [])]
-                model_version = (data.get("metadata") or {}).get("model_version", "") or ""
+                metadata = data.get("metadata") or {}
+                model_version = metadata.get("model_version", "") or ""
                 return ContainerCallOutcome(
-                    reached=True, mutations=mutations, model_version=model_version
+                    reached=True,
+                    mutations=mutations,
+                    model_version=model_version,
+                    abstained_reason=metadata.get("abstained_reason") or None,
                 )
             except Exception as exc:
                 rest_error = f"unparseable /mutate response ({type(exc).__name__})"
@@ -443,6 +456,7 @@ async def _call_container_timed(
             mutations=outcome.mutations,
             model_version=outcome.model_version,
             display_name=display_name,
+            abstained_reason=outcome.abstained_reason,
         )
     except asyncio.TimeoutError:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -1241,20 +1255,61 @@ async def gpu_stop(request: Request) -> JSONResponse:
 # Signal Associator (downstream signal → bid association)
 # ---------------------------------------------------------------------------
 
-_KINESIS_STREAM = os.environ.get("FEEDBACK_KINESIS_STREAM", "artf-bid-outcomes")
+try:
+    from orchestrator.feedback_integration import (
+        get_feedback_collector as _get_feedback_collector,
+        set_signal_associator as _set_signal_associator,
+    )
+except ImportError:  # pragma: no cover - container-relative import
+    from container.feedback_integration import (  # type: ignore
+        get_feedback_collector as _get_feedback_collector,
+        set_signal_associator as _set_signal_associator,
+    )
+
+# Only a last-resort name for the enriched-event stream. The deployment sets
+# FEEDBACK_STREAM_NAME, which feedback_integration's collector already uses, and that
+# collector is what this module prefers -- a second collector on a second stream name
+# would put enriched outcome events somewhere the ETL never reads, with no error
+# anywhere: the rows would just stay unlabelled.
+_KINESIS_STREAM = os.environ.get(
+    "FEEDBACK_KINESIS_STREAM",
+    os.environ.get("FEEDBACK_STREAM_NAME", "artf-bid-outcomes"),
+)
 _SIGNAL_ASSOCIATOR: SignalAssociator | None = None
 
 
 def _get_signal_associator() -> SignalAssociator:
-    """Lazy-initialize the signal associator singleton."""
+    """Lazy-initialize the signal associator singleton.
+
+    The instance is handed to feedback_integration so the bid path registers into
+    the SAME cache this endpoint looks up in. Two associators would mean every
+    signal misses its bid, which is indistinguishable from no signals arriving.
+
+    It reuses the bid path's collector, so a bid event and the enriched event that
+    replaces it land on the same stream and the ETL can de-duplicate them by
+    request_id.
+    """
     global _SIGNAL_ASSOCIATOR
     if _SIGNAL_ASSOCIATOR is None:
-        collector = FeedbackCollector(
-            stream_name=_KINESIS_STREAM,
-            region=_AWS_REGION,
-        )
+        collector = _get_feedback_collector()
+        if collector is None:
+            collector = FeedbackCollector(
+                stream_name=_KINESIS_STREAM,
+                region=_AWS_REGION,
+            )
         _SIGNAL_ASSOCIATOR = SignalAssociator(feedback_collector=collector)
+        _set_signal_associator(_SIGNAL_ASSOCIATOR)
     return _SIGNAL_ASSOCIATOR
+
+
+# Wire the associator at import, not on the first signal. Lazily creating it when a
+# signal arrives means the bid path has nothing to register into until then, so every
+# signal before the first one misses — and a missed signal is indistinguishable from
+# no signal having been sent.
+try:
+    _get_signal_associator()
+except Exception as _exc:  # pragma: no cover - must never block startup
+    print(f"[orchestrator] signal associator not wired: {_exc}")
 
 
 async def receive_signal(request: Request) -> JSONResponse:
@@ -1267,10 +1322,14 @@ async def receive_signal(request: Request) -> JSONResponse:
     Requirements: 1.4
     """
     associator = _get_signal_associator()
+    # `_feedback_collector` used to be named here and was never defined in this
+    # module, so every request to this endpoint raised NameError and returned 500 --
+    # no SignalEvent ever reached Kinesis. The signal_receiver tests pass a collector
+    # in explicitly, so none of them exercised this wiring.
     return await _receive_signal_handler(
         request=request,
         signal_associator=associator,
-        feedback_collector=_feedback_collector,
+        feedback_collector=_get_feedback_collector(),
     )
 
 

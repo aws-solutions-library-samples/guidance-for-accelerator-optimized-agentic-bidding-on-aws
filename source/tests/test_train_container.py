@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -32,16 +33,22 @@ import pandas as pd
 import pytest
 import torch
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "training", "container")
+# APPENDED, not inserted at position 0. The container directory now holds a
+# staged `shared/` package (see source/training/stage_shared.sh) carrying only
+# dlrm_features.py. Prepending would make `shared` resolve there for the rest of
+# the pytest session, and every later `shared.feedback_models` import in the
+# suite would fail. Appending leaves source/shared/ -- the real package, which
+# the staged copy is copied from -- as the one that resolves, while `train` and
+# `models` still import because they exist nowhere else.
+sys.path.append(
+    os.path.join(os.path.dirname(__file__), "..", "training", "container")
 )
+
+from shared import dlrm_features  # noqa: E402
 
 import train as train_module  # noqa: E402
 from train import (  # noqa: E402
-    _DLRM_DENSE_COLUMNS,
-    _DLRM_SPARSE_COLUMNS,
     _HP_DEFAULTS,
-    _hash_to_idx,
     build_dlrm_features,
     build_features,
     load_hyperparameters,
@@ -108,15 +115,26 @@ class TestLoadTrainingData:
 
 
 def _make_dlrm_df(n_rows=5):
-    """A DataFrame shaped like real Glue ETL output for dlrm_bid_shader."""
+    """A DataFrame shaped like real Glue ETL output for dlrm_bid_shader.
+
+    Carries the columns the feature spec reads AND several it deliberately does
+    not (shade_factor_used, conversion_value_estimate_used, win_rate_bucket),
+    so the leakage assertions below have something to be true about.
+    """
     return pd.DataFrame({
+        # Read by the spec.
         "bid_floor": [2.0 + i * 0.1 for i in range(n_rows)],
         "hour_of_day": [i % 24 for i in range(n_rows)],
+        "day_of_week": [0, 5, 6, 2, 3][:n_rows],
+        "has_video": [False, True, False, True, True][:n_rows],
+        "site_domain": ["espn.com", "cnn.com", "espn.com", "nyt.com", "cnn.com"][:n_rows],
+        "device_type": [2, 1, 5, 2, 1][:n_rows],
+        "geo_country": ["USA", "CAN", "USA", "GBR", "CAN"][:n_rows],
+        # Present in the ETL output, held out of the vector by design.
         "shade_factor_used": [0.65] * n_rows,
         "conversion_value_estimate_used": [12.0] * n_rows,
-        "device_type": ["mobile", "desktop", "tablet", "mobile", "desktop"][:n_rows],
-        "site_domain": ["espn.com", "cnn.com", "espn.com", "nyt.com", "cnn.com"][:n_rows],
         "win_rate_bucket": [3, 5, 2, 3, 5][:n_rows],
+        # Label and outcomes.
         "label": [1, 0, 1, 0, 1][:n_rows],
         "won": [True, False, True, False, True][:n_rows],
         "price_paid": [1.8, None, 2.1, None, 1.9][:n_rows],
@@ -125,23 +143,47 @@ def _make_dlrm_df(n_rows=5):
 
 
 class TestBuildDlrmFeatures:
-    def test_output_shape_is_dense_plus_sparse(self):
+    """The trainer's vector comes from shared/dlrm_features.py.
+
+    These assertions are stated against the shared spec rather than against
+    lists in train.py, because lists in train.py were the defect: they agreed
+    with the serving container on width and disagreed on meaning, which nothing
+    detected. Cross-side equality itself is asserted in
+    tests/test_dlrm_feature_parity.py.
+    """
+
+    def test_output_shape_is_dense_plus_categorical(self):
         """DLRMModel.forward() slices [:NUM_DENSE] and
-        [NUM_DENSE:NUM_DENSE+NUM_SPARSE] from a single tensor — width must
-        be exactly len(dense_columns) + len(sparse_columns) = 7."""
+        [NUM_DENSE:NUM_DENSE+NUM_SPARSE] from a single tensor — width must be
+        exactly the spec's FEATURE_WIDTH."""
         df = _make_dlrm_df()
 
         features = build_dlrm_features(df)
 
-        assert features.shape == (5, len(_DLRM_DENSE_COLUMNS) + len(_DLRM_SPARSE_COLUMNS))
+        assert features.shape == (5, dlrm_features.FEATURE_WIDTH)
         assert features.shape[1] == 7
 
     def test_no_feature_columns_are_leaked_targets(self):
-        """shaded_price/shade_ratio (the model's own past decision) and roi
-        (computed from post-bid outcomes) must never be selected as inputs."""
-        leaked = {"shaded_price", "shade_ratio", "roi", "won", "price_paid", "conversion_value", "label"}
-        assert leaked.isdisjoint(_DLRM_DENSE_COLUMNS)
-        assert leaked.isdisjoint(_DLRM_SPARSE_COLUMNS)
+        """The shader's own parameters and the bid's consequences stay out.
+
+        shaded_price/shade_ratio/roi are outcomes of the bid; shade_factor_used
+        and conversion_value_estimate_used are the policy that produced the
+        row, and a prediction conditioned on them cannot be used to evaluate a
+        change to that policy.
+        """
+        leaked = {
+            "shaded_price",
+            "shade_ratio",
+            "roi",
+            "won",
+            "price_paid",
+            "conversion_value",
+            "label",
+            "shade_factor_used",
+            "conversion_value_estimate_used",
+        }
+        assert leaked.isdisjoint(dlrm_features.DENSE_COLUMNS)
+        assert leaked.isdisjoint(dlrm_features.CATEGORICAL_COLUMNS)
 
     def test_hour_of_day_normalized_to_unit_interval(self):
         df = _make_dlrm_df(n_rows=1)
@@ -149,21 +191,61 @@ class TestBuildDlrmFeatures:
 
         features = build_dlrm_features(df)
 
-        hour_col_idx = _DLRM_DENSE_COLUMNS.index("hour_of_day")
+        hour_col_idx = dlrm_features.DENSE_COLUMNS.index("hour_norm")
         assert features[0, hour_col_idx].item() == pytest.approx(0.5)
 
-    def test_sparse_columns_are_hashed_consistently(self):
+    def test_categorical_columns_are_hashed_consistently(self):
         """Same categorical value must hash to the same index whether it
         appears in row 0 or row N (i.e. hashing is a pure function of the
-        string, not row-dependent)."""
+        value, not row-dependent)."""
         df = _make_dlrm_df()
 
         features = build_dlrm_features(df)
 
-        device_col_idx = len(_DLRM_DENSE_COLUMNS) + _DLRM_SPARSE_COLUMNS.index("device_type")
-        # Rows 0 and 3 are both "mobile" in _make_dlrm_df.
+        device_col_idx = dlrm_features.DENSE_WIDTH + dlrm_features.CATEGORICAL_COLUMNS.index(
+            "device_type"
+        )
+        # Rows 0 and 3 are both devicetype 2 in _make_dlrm_df.
         assert features[0, device_col_idx].item() == features[3, device_col_idx].item()
-        assert features[0, device_col_idx].item() == float(_hash_to_idx("mobile"))
+        assert features[0, device_col_idx].item() == float(
+            dlrm_features.hash_to_idx(2, "device_type")
+        )
+
+    def test_each_categorical_stays_inside_its_own_vocabulary(self):
+        """Per-feature vocab sizes: an index past a table's end is an
+        out-of-range embedding lookup at training time."""
+        features = build_dlrm_features(_make_dlrm_df())
+
+        for offset, column in enumerate(dlrm_features.CATEGORICAL_COLUMNS):
+            col = features[:, dlrm_features.DENSE_WIDTH + offset]
+            vocab = dlrm_features.VOCAB_SIZES[column]
+            assert col.min().item() >= 0
+            assert col.max().item() < vocab, (
+                f"{column} index {col.max().item()} exceeds its vocabulary of {vocab}"
+            )
+
+    def test_weekend_flag_derived_from_day_of_week(self):
+        """day_of_week follows datetime.weekday(): Monday 0, Sunday 6."""
+        df = _make_dlrm_df()
+        weekend_idx = dlrm_features.DENSE_COLUMNS.index("is_weekend")
+
+        flags = [features.item() for features in build_dlrm_features(df)[:, weekend_idx]]
+
+        # _make_dlrm_df's day_of_week is [0, 5, 6, 2, 3] -> Mon, Sat, Sun, Wed, Thu.
+        assert flags == [0.0, 1.0, 1.0, 0.0, 0.0]
+
+    def test_absent_categorical_encodes_to_the_reserved_index(self):
+        """A row missing a categorical must not share an embedding with a real
+        value. Slot 0 is reserved so "missing" is learnable."""
+        df = _make_dlrm_df(n_rows=1)
+        df["site_domain"] = [None]
+
+        features = build_dlrm_features(df)
+
+        domain_idx = dlrm_features.DENSE_WIDTH + dlrm_features.CATEGORICAL_COLUMNS.index(
+            "site_domain"
+        )
+        assert features[0, domain_idx].item() == float(dlrm_features.UNKNOWN_INDEX)
 
     def test_forward_pass_through_real_dlrm_model_succeeds(self):
         """End-to-end shape check against the actual DLRMModel used in
@@ -217,14 +299,34 @@ class TestOutcomeColumnSelection:
         assert "revenue" not in df.columns
 
 
+def _config_input_names(config_path):
+    """Input tensor names declared by a Triton config.pbtxt, in order.
+
+    A deliberately small reader: the file's `input [ { name: "x" ... } ]` block
+    is the contract a served engine must satisfy, and parsing it is what lets
+    these tests compare the exported graph against the thing Triton will load
+    rather than against a list restated in the test.
+    """
+    text = Path(config_path).read_text()
+    start = text.index("input [")
+    end = text.index("]", text.index("output [") - 1) if "output [" in text else len(text)
+    block = text[start : text.index("output [")] if "output [" in text else text[start:end]
+    return re.findall(r'name:\s*"([^"]+)"', block)
+
+
 class TestExportToOnnxServingSignature:
     """export_to_onnx() for DLRM must emit the SERVING signature so a retrained
     artifact is loadable by dlrm_bid_shader_stable/_canary and compilable by the
-    Model Optimizer: four named inputs (dense_features FP32 [b,4];
-    sparse_user/domain/device INT64 [b]) and a sigmoid'd ctr_prediction output —
-    matching source/triton/export_models.py::export_dlrm. (Previously it exported
-    a single width-7 ``features`` input named ``output``, which no served config
-    accepts.)
+    Model Optimizer: one dense input (FP32 [b, DENSE_WIDTH]) plus one INT64 [b]
+    input per categorical feature, and a sigmoid'd ctr_prediction output —
+    matching source/triton/export_models.py's export_dlrm. (Previously it
+    exported a single width-7 ``features`` input named ``output``, which no
+    served config accepts.)
+
+    The names are asserted against shared/dlrm_features.py and against the
+    Triton config.pbtxt files themselves, not against a list written out here.
+    Restating them in each place is how the exporter, the container and the
+    served config came to disagree about what an input is called.
     """
 
     def test_dlrm_export_passes_four_named_serving_inputs(self, tmp_path, monkeypatch):
@@ -244,16 +346,18 @@ class TestExportToOnnxServingSignature:
 
         assert os.path.exists(onnx_path)
         args = captured["args"]
-        # Four positional inputs, not a single combined tensor.
-        assert isinstance(args, tuple) and len(args) == 4
-        dense, s_user, s_domain, s_device = args
+        # Separate positional inputs, not a single combined tensor.
+        expected_arity = 1 + dlrm_features.CATEGORICAL_WIDTH
+        assert isinstance(args, tuple) and len(args) == expected_arity
+        dense, *categorical = args
         assert tuple(dense.shape) == (1, NUM_DENSE)
         assert dense.dtype == torch.float32
-        for s in (s_user, s_domain, s_device):
+        for s in categorical:
             assert tuple(s.shape) == (1,)
             assert s.dtype == torch.int64
         assert captured["kwargs"]["input_names"] == [
-            "dense_features", "sparse_user", "sparse_domain", "sparse_device",
+            dlrm_features.TRITON_DENSE_INPUT,
+            *dlrm_features.TRITON_CATEGORICAL_INPUTS,
         ]
         assert captured["kwargs"]["output_names"] == ["ctr_prediction"]
 
@@ -269,17 +373,62 @@ class TestExportToOnnxServingSignature:
         onnx_path = train_module.export_to_onnx(DLRMModel(), "dlrm_bid_shader", str(tmp_path))
         graph = onnx.load(onnx_path).graph
 
-        input_names = [i.name for i in graph.input]
-        assert input_names == [
-            "dense_features", "sparse_user", "sparse_domain", "sparse_device",
+        expected = [
+            dlrm_features.TRITON_DENSE_INPUT,
+            *dlrm_features.TRITON_CATEGORICAL_INPUTS,
         ]
+        input_names = [i.name for i in graph.input]
+        assert input_names == expected
         assert [o.name for o in graph.output] == ["ctr_prediction"]
 
         # elem_type: 1 = FLOAT, 7 = INT64 (onnx.TensorProto).
         by_name = {i.name: i for i in graph.input}
-        assert by_name["dense_features"].type.tensor_type.elem_type == onnx.TensorProto.FLOAT
-        for name in ("sparse_user", "sparse_domain", "sparse_device"):
+        assert (
+            by_name[dlrm_features.TRITON_DENSE_INPUT].type.tensor_type.elem_type
+            == onnx.TensorProto.FLOAT
+        )
+        for name in dlrm_features.TRITON_CATEGORICAL_INPUTS:
             assert by_name[name].type.tensor_type.elem_type == onnx.TensorProto.INT64
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "dlrm_bid_shader/config.pbtxt",
+            "dlrm_bid_shader/config_tensorrt.pbtxt",
+            "dlrm_bid_shader_stable/config.pbtxt",
+            "dlrm_bid_shader_canary/config.pbtxt",
+        ],
+    )
+    def test_exported_graph_matches_every_served_config(self, tmp_path, config_name):
+        """Every config Triton can load must declare exactly what we export.
+
+        The router config additionally declares an optional `target_variant`
+        input, which is control-plane and not part of the model signature; it is
+        excluded here. Everything else must match name-for-name and in order,
+        because Triton binds inputs by name and an unmatched name is a load-time
+        or request-time failure rather than a wrong number.
+        """
+        import onnx
+
+        import train as train_module
+        from models import DLRMModel
+
+        repo = Path(__file__).resolve().parents[1] / "triton" / "model_repository"
+        declared = [
+            n
+            for n in _config_input_names(repo / config_name)
+            if n != "target_variant"
+        ]
+
+        onnx_path = train_module.export_to_onnx(
+            DLRMModel(), "dlrm_bid_shader", str(tmp_path)
+        )
+        exported = [i.name for i in onnx.load(onnx_path).graph.input]
+
+        assert exported == declared, (
+            f"{config_name} declares {declared} but the trainer exports "
+            f"{exported}. A retrained artifact would not load."
+        )
 
     def test_dlrm_forward_is_seeded_deterministic(self):
         """A seeded DLRMModel produces identical outputs across builds — the

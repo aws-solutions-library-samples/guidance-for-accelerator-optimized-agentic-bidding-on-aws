@@ -20,8 +20,31 @@ import pytest
 # Ensure source/ is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.artf_types import AdjustBidPayload, Mutation, RTBRequest, RTBResponse, Metadata
+from shared.artf_types import (
+    AdjustBidPayload,
+    Intent,
+    Metadata,
+    Mutation,
+    Operation,
+    RTBRequest,
+    RTBResponse,
+)
 from shared.feedback_models import BidShadingOutcomeEvent
+
+
+def _bid_shade_mutation(price: float, seat: int = 0, bid_id: str = "b1") -> Mutation:
+    """A BID_SHADE mutation shaped the way the shader container emits one.
+
+    `intent` is an IntEnum and `op`/`path` are required -- passing
+    `intent="BID_SHADE"` with neither, as these tests once did, fails validation
+    before the assertions are ever reached.
+    """
+    return Mutation(
+        intent=Intent.BID_SHADE,
+        op=Operation.REPLACE,
+        path=f"/seatbid/{seat}/bid/{bid_id}",
+        adjust_bid=AdjustBidPayload(price=price),
+    )
 
 
 class TestBuildBidShadingOutcomeEvent:
@@ -44,10 +67,7 @@ class TestBuildBidShadingOutcomeEvent:
             },
             ext={"model_params": {"shade_factor": 0.7, "conversion_value": 10.0}},
         )
-        mutation = Mutation(
-            intent="BID_SHADE",
-            adjust_bid=AdjustBidPayload(price=3.5),
-        )
+        mutation = _bid_shade_mutation(3.5)
         resp = RTBResponse(id=req.id, mutations=[mutation])
 
         event = self._build(req, resp)
@@ -60,10 +80,14 @@ class TestBuildBidShadingOutcomeEvent:
         assert event.bid_floor == 1.0
         assert event.site_domain == "example.com"
         assert event.device_type == "2"
-        assert event.won is False
-        assert event.impression is False
-        assert event.click is False
-        assert event.conversion is False
+        # Unreported, not negative. This event is written at bid time, before the
+        # auction has resolved -- these were once False, which the ETL read as
+        # confirmed negatives.
+        assert event.won is None
+        assert event.impression is None
+        assert event.click is None
+        assert event.conversion is None
+        assert event.outcome_provenance == "unresolved"
         assert event.price_paid is None
         assert event.conversion_value is None
         assert 0 <= event.hour_of_day <= 23
@@ -115,10 +139,7 @@ class TestBuildBidShadingOutcomeEvent:
             bid_request={"imp": [{"bidfloor": 2.0}]},
             ext={"model_params": {"shade_factor": 0.8, "conversion_value": 5.0}},
         )
-        mutation = Mutation(
-            intent="BID_SHADE",
-            adjust_bid=AdjustBidPayload(price=2.5),
-        )
+        mutation = _bid_shade_mutation(2.5)
         resp = RTBResponse(id=req.id, mutations=[mutation])
 
         event = self._build(req, resp)

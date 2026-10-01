@@ -47,7 +47,7 @@ def _body(resp) -> dict:
 
 _DLRM_PROFILE = {
     "dense_features": {"min": [1, 4], "opt": [8, 4], "max": [64, 4]},
-    "sparse_user": {"min": [1], "opt": [8], "max": [64]},
+    "sparse_site_domain": {"min": [1], "opt": [8], "max": [64]},
 }
 
 
@@ -135,5 +135,5 @@ class TestBatchProfileHelpers:
         assert _valid_input_profiles({"x": {"min": 1, "opt": 1, "max": 1}}) is False
 
     def test_shapes_flag_builds_trtexec_value(self):
-        assert _shapes_flag(_DLRM_PROFILE, "min") == "dense_features:1x4,sparse_user:1"
-        assert _shapes_flag(_DLRM_PROFILE, "max") == "dense_features:64x4,sparse_user:64"
+        assert _shapes_flag(_DLRM_PROFILE, "min") == "dense_features:1x4,sparse_site_domain:1"
+        assert _shapes_flag(_DLRM_PROFILE, "max") == "dense_features:64x4,sparse_site_domain:64"

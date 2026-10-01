@@ -60,6 +60,24 @@ fi
 #                        inject.sh; it is copied into the build context's injection slot
 #                        and sourced by copy-bidder-files.sh before Maven runs. Repeatable.
 #                        Nothing in this repository knows what a plugin injects.
+#   --plugin-env K=V     Set an extra environment variable on the Prebid container.
+#                        An injected bidder's config usually interpolates its endpoint
+#                        with NO default, so a compiled-in bidder whose variables are
+#                        missing is a pod that fails Spring placeholder resolution and
+#                        never starts. Repeatable. Values are never logged.
+#   --plugin-adapter NAME
+#                        Enable an injected bidder seat in the configuration overlay.
+#                        Compiling a seat in is not enough: this overlay replaces the
+#                        release default file, and PBS-Java defaults a bidder to
+#                        disabled, so an un-enabled seat answers every request with
+#                        "NAME is not configured properly on this Prebid Server
+#                        deploy". Repeatable.
+#   --plugin-secret-env VAR=SECRET/KEY
+#                        Set an extra environment variable from an existing Kubernetes
+#                        Secret in --namespace, as a secretKeyRef. Use this for a
+#                        bidder's client secret: the value stays in the Secret and
+#                        never enters this repository, the rendered manifest, or
+#                        `kubectl get deploy -o yaml`. Repeatable.
 #   --yes                Accept the cost disclosure without prompting
 #   --destroy            Tear down (Kubernetes first, then the CFN stack)
 #
@@ -107,6 +125,32 @@ WITH_SIMULATOR=1
 # plugins in this repository, and no plugin's contents are interpreted here.
 INJECT_PLUGINS=()
 
+# The runtime half of --inject-plugin. A Prebid bidder is COMPILED IN, but its endpoint
+# and credentials arrive as environment variables, and an injected bidder's yaml
+# conventionally interpolates them with no default value -- so a bidder that is in the
+# jar but has no variables set does not degrade, it stops the pod: Spring fails
+# placeholder resolution before anything consults `enabled`, and the error names the
+# missing property rather than the bidder.
+#
+# Two arrays because the two have different destinations in the manifest. Plain values
+# become `value:`; secret references become `valueFrom.secretKeyRef`, so the secret is
+# named here but its CONTENT is never read by this script, never written to the rendered
+# manifest under /tmp, and never visible in `kubectl get deploy -o yaml`.
+#
+# As with INJECT_PLUGINS, these are named ONLY by the operator at the command line.
+# There is no list of known plugins or known variables in this repository.
+PLUGIN_ENV=()
+PLUGIN_SECRET_ENV=()
+
+# The configuration half of --inject-plugin, from --plugin-adapter. A seat that is
+# compiled in and has its environment set is STILL not served: this deployment's
+# configuration overlay replaces the release default file instead of merging with it,
+# and PBS-Java defaults adapters.<name>.enabled to false. the pod
+# started, the bidder resolved all of its properties, and every auction returned
+# "<name> is not configured properly on this Prebid Server deploy" with no seat, which
+# reports a configuration fault against the bidder rather than a missing seat.
+PLUGIN_ADAPTERS=()
+
 # The cost of any node capacity the Prebid pods force. Passed to the disclosure
 # helper, which REQUIRES it: on a cluster without headroom it is the dominant term.
 # Left empty means "not yet known", and the disclosure then says so rather than
@@ -131,6 +175,12 @@ for arg in "$@"; do
     --start-at)        ;;
     --inject-plugin=*) INJECT_PLUGINS+=("${arg#--inject-plugin=}") ;;
     --inject-plugin)   ;;
+    --plugin-env=*)    PLUGIN_ENV+=("${arg#--plugin-env=}") ;;
+    --plugin-env)      ;;
+    --plugin-secret-env=*) PLUGIN_SECRET_ENV+=("${arg#--plugin-secret-env=}") ;;
+    --plugin-secret-env)   ;;
+    --plugin-adapter=*) PLUGIN_ADAPTERS+=("${arg#--plugin-adapter=}") ;;
+    --plugin-adapter)   ;;
     --skip-build)      SKIP_BUILD=1 ;;
     --no-simulator)    WITH_SIMULATOR=0 ;;
     --yes|--non-interactive) ASSUME_YES=1 ;;
@@ -145,6 +195,9 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--tag" ]];          then IMAGE_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]];     then START_AT="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--inject-plugin" ]]; then INJECT_PLUGINS+=("${arg}")
+      elif [[ "${_PREV_ARG:-}" == "--plugin-env" ]]; then PLUGIN_ENV+=("${arg}")
+      elif [[ "${_PREV_ARG:-}" == "--plugin-secret-env" ]]; then PLUGIN_SECRET_ENV+=("${arg}")
+      elif [[ "${_PREV_ARG:-}" == "--plugin-adapter" ]]; then PLUGIN_ADAPTERS+=("${arg}")
       fi
       ;;
   esac
@@ -506,6 +559,47 @@ publish_config_overlay() {
       -e "s|__AMT_ENABLED__|${amt_enabled}|g" \
       -e "s|__AMT_SIMULATOR_ENDPOINT__|${amt_endpoint}|g" \
       "${CONFIG_TEMPLATE}" >"${rendered}"
+
+  # Third-party seats from --plugin-adapter. Rendered here rather than by the sed
+  # above because each name contributes two lines and there may be none, and BEFORE
+  # the placeholder guard so an unrendered marker is caught like any other.
+  PLUGIN_ADAPTER_LINES="$(printf '%s\n' ${PLUGIN_ADAPTERS[@]+"${PLUGIN_ADAPTERS[@]}"})" \
+  RENDERED="${rendered}" python3 - <<'PY' || fail "Failed to render plugin adapters into the configuration"
+import os, re, sys
+
+path = os.environ["RENDERED"]
+MARKER = "# __PLUGIN_ADAPTERS__"
+# A Prebid bidder name. Restricted because this value is written into a YAML mapping
+# key: anything outside this set could alter the document's structure rather than add
+# to it.
+NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+names = [n.strip() for n in os.environ.get("PLUGIN_ADAPTER_LINES", "").split("\n") if n.strip()]
+for n in names:
+    if not NAME_RE.match(n):
+        sys.exit(f"--plugin-adapter {n!r} is not a valid Prebid bidder name (lowercase letters, digits and underscores, starting with a letter).")
+
+lines = open(path).read().split("\n")
+out, found = [], False
+for line in lines:
+    if line.strip() == MARKER:
+        found = True
+        indent = line[: len(line) - len(line.lstrip())]
+        for n in names:
+            out.append(f"{indent}{n}:")
+            out.append(f"{indent}  enabled: true")
+        continue
+    out.append(line)
+
+if not found:
+    sys.exit(f"{MARKER} is missing from {path}, so plugin adapters could not be enabled.")
+
+open(path, "w").write("\n".join(out))
+PY
+
+  if [[ ${#PLUGIN_ADAPTERS[@]} -gt 0 ]]; then
+    log "  Third-party seats enabled in the overlay: ${PLUGIN_ADAPTERS[*]}"
+  fi
 
   if grep -q '__[A-Z_]*__' "${rendered}"; then
     warn "Unsubstituted placeholders remain in the rendered configuration:"
@@ -1424,6 +1518,105 @@ if [[ "${START_AT}" -le 6 ]]; then
       -e "s|__ARTF_TOKEN_SCOPES__|${ARTF_TOKEN_SCOPES}|g" \
       -e "s|__AMT_SIMULATOR_ENDPOINT__|${AMT_SIMULATOR_ENDPOINT:-http://amt-simulator.not-deployed.invalid/}|g" \
       "${K8S_MANIFEST}" >"${PROCESSED}"
+
+  # ---------------------------------------------------------------------------
+  # THE RUNTIME HALF OF --inject-plugin.
+  #
+  # Rendered here rather than by the sed above because each flag contributes a
+  # multi-line YAML entry and there may be any number of them, including none.
+  # Done BEFORE the placeholder guard below, so a marker that failed to render is
+  # caught by the same check that catches every other unsubstituted placeholder.
+  #
+  # A referenced Secret is checked for EXISTENCE first. Kubernetes accepts a
+  # secretKeyRef to a Secret that does not exist -- it applies cleanly and the
+  # rollout then stalls on CreateContainerConfigError, which reads like an image
+  # problem. Failing here instead names the missing Secret.
+  # ---------------------------------------------------------------------------
+  if [[ ${#PLUGIN_SECRET_ENV[@]} -gt 0 ]]; then
+    if [[ ${#KUBECTL[@]} -eq 1 ]]; then resolve_kube_context || true; fi
+    for _spec in "${PLUGIN_SECRET_ENV[@]}"; do
+      [[ "${_spec}" == *=*/* ]] \
+        || fail "--plugin-secret-env ${_spec} is not VAR=SECRET/KEY."
+      _sref="${_spec#*=}"; _sname="${_sref%%/*}"; _skey="${_sref#*/}"
+      "${KUBECTL[@]}" get secret "${_sname}" -n "${NAMESPACE}" >/dev/null 2>&1 \
+        || fail "--plugin-secret-env ${_spec} references Secret ${_sname}, which does not exist in namespace ${NAMESPACE}. Create it first; this script will not create a Secret whose contents it does not own."
+      "${KUBECTL[@]}" get secret "${_sname}" -n "${NAMESPACE}" \
+        -o "jsonpath={.data.${_skey}}" 2>/dev/null | grep -q . \
+        || fail "--plugin-secret-env ${_spec}: Secret ${_sname} exists but has no key ${_skey}."
+    done
+    unset _spec _sref _sname _skey
+  fi
+
+  PLUGIN_ENV_LINES="$(printf '%s\n' ${PLUGIN_ENV[@]+"${PLUGIN_ENV[@]}"})" \
+  PLUGIN_SECRET_ENV_LINES="$(printf '%s\n' ${PLUGIN_SECRET_ENV[@]+"${PLUGIN_SECRET_ENV[@]}"})" \
+  PROCESSED="${PROCESSED}" python3 - <<'PY' || fail "Failed to render plugin environment into the manifest"
+import json, os, re, sys
+
+path = os.environ["PROCESSED"]
+MARKER = "# __PLUGIN_ENV__"
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def specs(var):
+    return [s for s in os.environ.get(var, "").split("\n") if s.strip()]
+
+entries = []
+for spec in specs("PLUGIN_ENV_LINES"):
+    if "=" not in spec:
+        sys.exit(f"--plugin-env {spec!r} is not KEY=VALUE.")
+    key, value = spec.split("=", 1)
+    if not NAME_RE.match(key):
+        sys.exit(f"--plugin-env key {key!r} is not a valid environment variable name.")
+    # json.dumps gives a double-quoted YAML scalar with the escaping YAML shares
+    # with JSON, so a value containing : # { } or a quote cannot break the document.
+    entries.append(f"- name: {key}\n  value: {json.dumps(value)}")
+
+for spec in specs("PLUGIN_SECRET_ENV_LINES"):
+    key, ref = spec.split("=", 1)
+    name, _, skey = ref.partition("/")
+    if not NAME_RE.match(key):
+        sys.exit(f"--plugin-secret-env key {key!r} is not a valid environment variable name.")
+    entries.append(
+        f"- name: {key}\n"
+        f"  valueFrom:\n"
+        f"    secretKeyRef:\n"
+        f"      name: {json.dumps(name)}\n"
+        f"      key: {json.dumps(skey)}"
+    )
+
+with open(path) as fh:
+    lines = fh.read().split("\n")
+
+out = []
+found = False
+for line in lines:
+    if line.strip() == MARKER:
+        found = True
+        indent = line[: len(line) - len(line.lstrip())]
+        for entry in entries:
+            for sub in entry.split("\n"):
+                out.append(indent + sub)
+        # No entries means the marker simply disappears, leaving the manifest
+        # byte-identical to a deployment with no plugins.
+        continue
+    out.append(line)
+
+if not found:
+    sys.exit(f"{MARKER} is missing from the manifest, so plugin environment could not be placed.")
+
+with open(path, "w") as fh:
+    fh.write("\n".join(out))
+PY
+
+  _n_plugin_env=$(( ${#PLUGIN_ENV[@]} + ${#PLUGIN_SECRET_ENV[@]} ))
+  if [[ ${_n_plugin_env} -gt 0 ]]; then
+    # Names only. A --plugin-env value can be a credential, and this line is the
+    # one thing here that reaches a terminal and a CI log.
+    log "  Plugin environment: ${_n_plugin_env} variable(s) -> $(
+      { printf '%s\n' ${PLUGIN_ENV[@]+"${PLUGIN_ENV[@]}"} | sed 's/=.*//'
+        printf '%s\n' ${PLUGIN_SECRET_ENV[@]+"${PLUGIN_SECRET_ENV[@]}"} | sed 's/=.*/ (from Secret)/'
+      } | grep . | paste -sd, - | sed 's/,/, /g')"
+  fi
+  unset _n_plugin_env
 
   if grep -q '__[A-Z_]*__' "${PROCESSED}"; then
     warn "Unsubstituted placeholders remain in ${PROCESSED}:"

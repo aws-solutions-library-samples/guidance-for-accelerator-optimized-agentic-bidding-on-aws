@@ -1,18 +1,29 @@
 import { useMemo } from "react";
 
 /**
- * TotalLatency — bottom latency display showing end-to-end time
- * with a stacked breakdown of latency sources:
- *   - Agent processing (max of concurrent containers)
+ * TotalLatency — where the SERVER-SIDE time went, broken into the two parts a
+ * bidder can act on:
+ *   - Agent processing (the ceiling of the concurrent containers)
  *   - Orchestrator overhead (serialization, aggregation, routing)
- *   - Network (round-trip from browser to server and back)
+ *
+ * It deliberately does NOT show the browser round-trip, and does not total the
+ * two figures.
+ *
+ * The round-trip used to be a third segment, and it dominated the bar — 27ms of
+ * 55ms in one observed run. But that leg is this demo's browser reaching
+ * CloudFront and an ALB; in a real bid path the caller is an exchange on a
+ * private path to the orchestrator, and nothing resembling it exists. Showing it
+ * made the demo's own delivery look like part of the bidding cost, and it moved
+ * with the reader's distance from the region rather than with anything the system
+ * does. A total that included it inherited the same problem, which is why the
+ * summary line went with it: the honest headline figure here is the pair, not
+ * their sum with a browser hop folded in.
  */
-export default function TotalLatency({ latencyMs, browserElapsedMs, stops }) {
+export default function TotalLatency({ latencyMs, stops }) {
   const breakdown = useMemo(() => {
     if (latencyMs == null || latencyMs === 0) return null;
 
     const serverMs = Math.round(latencyMs);
-    const browserMs = browserElapsedMs || 0;
 
     // Max container latency = the parallel execution ceiling
     const containerLatencies = (stops || [])
@@ -26,32 +37,24 @@ export default function TotalLatency({ latencyMs, browserElapsedMs, stops }) {
     // Orchestrator overhead = total server time minus the longest container
     const orchestratorMs = Math.max(0, serverMs - maxContainerMs);
 
-    // Network = browser round-trip minus server processing
-    const networkMs = browserMs > serverMs ? browserMs - serverMs : 0;
-
-    const totalMs = browserMs > 0 ? browserMs : serverMs;
-
     return {
-      totalMs,
       agentMs: Math.round(maxContainerMs),
       orchestratorMs: Math.round(orchestratorMs),
-      networkMs: Math.round(networkMs),
       containerCount: containerLatencies.length,
     };
-  }, [latencyMs, browserElapsedMs, stops]);
+  }, [latencyMs, stops]);
 
   if (!breakdown) return null;
 
-  const { totalMs, agentMs, orchestratorMs, networkMs, containerCount } = breakdown;
-  const barTotal = agentMs + orchestratorMs + networkMs || 1;
+  const { agentMs, orchestratorMs, containerCount } = breakdown;
+  const barTotal = agentMs + orchestratorMs || 1;
 
   return (
-    <div className="total-latency-breakdown" role="status" aria-label={`Total latency: ${totalMs}ms`}>
-      {/* Summary line */}
-      <div className="total-latency-summary">
-        Total <strong>{totalMs}ms</strong>
-      </div>
-
+    <div
+      className="total-latency-breakdown"
+      role="status"
+      aria-label={`Agent processing ${agentMs}ms, orchestrator overhead ${orchestratorMs}ms`}
+    >
       {/* Stacked bar */}
       <div className="latency-bar-stack">
         {agentMs > 0 && (
@@ -66,13 +69,6 @@ export default function TotalLatency({ latencyMs, browserElapsedMs, stops }) {
             className="latency-bar-segment latency-bar-segment--orchestrator"
             style={{ width: `${(orchestratorMs / barTotal) * 100}%` }}
             title={`Orchestrator: ${orchestratorMs}ms`}
-          />
-        )}
-        {networkMs > 0 && (
-          <div
-            className="latency-bar-segment latency-bar-segment--network"
-            style={{ width: `${(networkMs / barTotal) * 100}%` }}
-            title={`Network: ${networkMs}ms`}
           />
         )}
       </div>
@@ -91,13 +87,6 @@ export default function TotalLatency({ latencyMs, browserElapsedMs, stops }) {
           <span className="latency-legend-label">Orchestrator overhead</span>
           <span className="latency-legend-value">{orchestratorMs}ms</span>
         </div>
-        {networkMs > 0 && (
-          <div className="latency-legend-item">
-            <span className="latency-legend-dot latency-legend-dot--network" />
-            <span className="latency-legend-label">Network (round-trip)</span>
-            <span className="latency-legend-value">{networkMs}ms</span>
-          </div>
-        )}
       </div>
     </div>
   );

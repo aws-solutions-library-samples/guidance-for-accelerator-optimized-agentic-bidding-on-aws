@@ -46,6 +46,14 @@ COPY train.py /opt/ml/code/train.py
 COPY reward.py /opt/ml/code/reward.py
 COPY models/ /opt/ml/code/models/
 
+# Shared modules staged into this build context by source/training/stage_shared.sh,
+# which the build paths run beforehand. This is where the DLRM feature vector is
+# defined (shared/dlrm_features.py); the serving container imports the same file
+# from source/shared/. The build context cannot reach source/shared/ directly,
+# and a hand-maintained second copy is what previously let the trainer and the
+# bid shader build different vectors from the same data.
+COPY shared/ /opt/ml/code/shared/
+
 WORKDIR /opt/ml/code
 
 # SageMaker expects the entrypoint to be the training script

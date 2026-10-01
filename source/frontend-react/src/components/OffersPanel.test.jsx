@@ -392,3 +392,112 @@ describe("OffersPanel grouped non-bids", () => {
     expect(qa(".th-offers-group")).toHaveLength(0);
   });
 });
+
+/**
+ * The bids beat: the seats have responded and the auction has not been called.
+ * `revealed` and `winnerRevealed` are separate gates, so this state exists.
+ */
+describe("OffersPanel — bids in, winner not yet announced", () => {
+  const vm = () => buildOfferViewModel(capturedBidResponse);
+
+  it("shows the bid rows", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    expect(q("offers-panel-bids")).not.toBeNull();
+    expect(qa(".th-offer").length).toBeGreaterThan(0);
+  });
+
+  it("marks NO row as the winner", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    expect(qa(".th-offer.is-winner")).toHaveLength(0);
+  });
+
+  it("marks exactly one row once the winner IS revealed (guards the assertion above)", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed />);
+    expect(qa(".th-offer.is-winner")).toHaveLength(1);
+  });
+
+  /*
+    The regression this set exists for: gating only `isWinner` still showed the
+    winner, because the gold treatment comes from the category class and the word
+    "Won" comes from the outcome. All three had to be gated.
+  */
+  it("gives NO bid row the winning category class", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    const bids = container.querySelector('[data-testid="offers-panel-bids"]');
+    expect(bids.querySelectorAll(".th-offer-Won")).toHaveLength(0);
+  });
+
+  it("says 'Won' nowhere among the bid rows", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    const bids = container.querySelector('[data-testid="offers-panel-bids"]');
+    expect(bids.textContent).not.toMatch(/\bWon\b/);
+    expect(bids.textContent).not.toMatch(/Lost on price/);
+  });
+
+  it("makes every bid row indistinguishable — same category, same outcome text", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    const bids = container.querySelector('[data-testid="offers-panel-bids"]');
+    const rows = Array.from(bids.querySelectorAll(".th-offer"));
+    expect(rows.length).toBeGreaterThan(1);
+    expect(new Set(rows.map((r) => r.dataset.category))).toEqual(new Set(["pending"]));
+    for (const r of rows) {
+      expect(r.querySelector(".th-offer-outcome").textContent).toMatch(/In the auction/);
+    }
+  });
+
+  it("still shows each bid's price — the prices are not the secret", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    const bids = container.querySelector('[data-testid="offers-panel-bids"]');
+    expect(bids.textContent).toMatch(/\$\d+\.\d{2}/);
+  });
+
+  it("keeps the non-bidders' reasons, which are ARTF decisions and not auction results", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    // camp-harbour was suppressed before the auction ran, so its reason stands.
+    expect(q("offer-row-reason-camp-harbour")).not.toBeNull();
+  });
+
+  it("states that the auction is not yet called instead of leaving the slot empty", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    const pending = q("offers-panel-pending-winner");
+    expect(pending).not.toBeNull();
+    expect(pending.textContent).toMatch(/not yet called/i);
+    expect(q("offers-panel-winner")).toBeNull();
+    expect(q("offers-panel-unsold")).toBeNull();
+  });
+
+  it("counts the bids that are in, with singular wording for one", () => {
+    const oneBid = {
+      seatbid: [{
+        seat: "s",
+        bid: [{ id: "a", impid: "i", price: 2, ext: { prebid: { targeting: { hb_bidder: "s" } } } }],
+      }],
+    };
+    render(<OffersPanel viewModel={buildOfferViewModel(oneBid)} revealed winnerRevealed={false} />);
+    // No leading \b: the key and value render adjacent ("...called1 bid is in"),
+    // and "d" to "1" is not a word boundary.
+    expect(q("offers-panel-pending-winner").textContent).toMatch(/1 bid is in\b/);
+    expect(q("offers-panel-pending-winner").textContent).not.toMatch(/bids are in/);
+  });
+
+  it("names the winner once winnerRevealed flips, from the same view model", () => {
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed={false} />);
+    expect(q("offers-panel-winner")).toBeNull();
+    render(<OffersPanel viewModel={vm()} revealed winnerRevealed />);
+    expect(q("offers-panel-pending-winner")).toBeNull();
+    expect(q("offers-panel-winner")).not.toBeNull();
+  });
+
+  it("shows nothing at all before the bids land", () => {
+    render(<OffersPanel viewModel={vm()} revealed={false} winnerRevealed={false} />);
+    expect(q("offers-panel-pending")).not.toBeNull();
+    expect(q("offers-panel-bids")).toBeNull();
+    expect(q("offers-panel-pending-winner")).toBeNull();
+  });
+
+  it("defaults winnerRevealed to revealed, so an old two-state caller is unchanged", () => {
+    render(<OffersPanel viewModel={vm()} revealed />);
+    expect(q("offers-panel-winner")).not.toBeNull();
+    expect(q("offers-panel-pending-winner")).toBeNull();
+  });
+});

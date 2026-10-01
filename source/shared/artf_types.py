@@ -167,6 +167,16 @@ class ContainerInvocationModel(BaseModel):
     model_version: str = ""
     display_name: str = ""
     superseded: int = 0
+    # The container's own account of why it produced no mutations, when the reason
+    # is not simply "nothing to change" — read from its response metadata and passed
+    # through unaltered. None for a container that mutated, or that declined for
+    # ordinary reasons.
+    #
+    # ``status: no_mutations`` on its own cannot distinguish a model that found no
+    # reason to act from one that could not obtain a prediction. The bid shader's
+    # abstention is the second, and reporting it as the first is what let a broken
+    # inference path read as healthy.
+    abstained_reason: str | None = None
 
 
 class ConflictModel(BaseModel):
@@ -197,6 +207,14 @@ class Metadata(BaseModel):
     # distinguishable from "this orchestrator does not report conflicts" for a
     # client older than this field.
     conflicts: list[ConflictModel] | None = None
+    # Why a container that was invoked produced no mutation, when the reason is
+    # something other than "nothing to change". None means the container either
+    # mutated, or declined for ordinary reasons.
+    #
+    # An empty mutation list is otherwise ambiguous: a model that saw no reason to
+    # act and a model that could not be reached look identical, and the second was
+    # being served as the first.
+    abstained_reason: str | None = None
 
 
 class RTBResponse(BaseModel):

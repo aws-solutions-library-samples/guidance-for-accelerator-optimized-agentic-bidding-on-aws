@@ -45,14 +45,25 @@ function identityOf(offer) {
   return UNKNOWN;
 }
 
-export function OfferRow({ offer, isWinner }) {
+/**
+ * @param outcomeRevealed  has the auction been called? Defaults to true.
+ *
+ * When false the row shows identity, deal and price and NOTHING that betrays the
+ * result: no won/lost label, no category class, no reason. Gating only `isWinner`
+ * is not enough — the gold treatment comes from `th-offer-${category}` and the
+ * words come from `outcome`, so both leak the winner a step early on their own.
+ */
+export function OfferRow({ offer, isWinner, outcomeRevealed = true }) {
   const { outcome } = offer;
-  const category = outcome?.category ?? CATEGORY.NOT_ATTEMPTED;
+  const realCategory = outcome?.category ?? CATEGORY.NOT_ATTEMPTED;
+  // "pending" is not a CATEGORY value: it is the absence of one, and it must not
+  // collide with a real category in CSS or in `data-category` assertions.
+  const category = outcomeRevealed ? realCategory : "pending";
   const idForTest = offer.campaignId ?? offer.seat ?? "unknown";
 
   return (
     <div
-      className={`th-offer th-offer-${category}${isWinner ? " is-winner" : ""}`}
+      className={`th-offer th-offer-${category}${isWinner && outcomeRevealed ? " is-winner" : ""}`}
       data-testid={`offer-row-${idForTest}`}
       data-category={category}
     >
@@ -65,11 +76,21 @@ export function OfferRow({ offer, isWinner }) {
       </span>
 
       <span className="th-offer-outcome" data-testid={`offer-row-outcome-${idForTest}`}>
-        {OUTCOME_LABEL[outcome?.outcome] ?? "No offer"}
-        <span className="th-offer-mark">{CATEGORY_MARK[category]}</span>
+        {outcomeRevealed ? (
+          <>
+            {OUTCOME_LABEL[outcome?.outcome] ?? "No offer"}
+            <span className="th-offer-mark">{CATEGORY_MARK[category]}</span>
+          </>
+        ) : (
+          <>
+            In the auction
+            <span className="th-offer-mark">pending</span>
+          </>
+        )}
       </span>
 
-      {outcome?.reason ? (
+      {/* The reason explains an outcome, so it waits for the outcome. */}
+      {outcomeRevealed && outcome?.reason ? (
         <span className="th-offer-reason" data-testid={`offer-row-reason-${idForTest}`}>
           {outcome.reason}
         </span>

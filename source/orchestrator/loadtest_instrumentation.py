@@ -198,6 +198,7 @@ def emit_load_test_outcome(
     *,
     seed: int,
     shaded_price: float | None,
+    bid_request: dict | None = None,
 ) -> float | None:
     """Construct and emit exactly one load-test-origin BidShadingOutcomeEvent.
 
@@ -266,6 +267,9 @@ def emit_load_test_outcome(
         conversion_value=sample.conversion_value,
         shade_factor_used=_SHADE_FACTOR_USED,
         conversion_value_estimate_used=_CONVERSION_VALUE_ESTIMATE_USED,
+        # The request that was actually sent, so the recorded context is the
+        # traffic's own rather than a constant marker.
+        bid_request=bid_request,
     )
     if not sample.won or sample.price_paid is None:
         # Lost the auction: nothing served and nothing spent, so zero surplus.
