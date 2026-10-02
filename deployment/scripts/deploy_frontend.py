@@ -490,8 +490,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
+                        help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
     parser.add_argument("--orchestrator-url", default="http://localhost:8080")
     args = parser.parse_args(argv)
+    if args.profile:
+        # One place for both credential paths: boto3 clients created below, and any
+        # subprocess (aws/kubectl) that reads AWS_PROFILE from the environment.
+        os.environ["AWS_PROFILE"] = args.profile
+        boto3.setup_default_session(profile_name=args.profile, region_name=args.region)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     if args.action == "deploy":

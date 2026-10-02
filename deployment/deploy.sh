@@ -47,11 +47,13 @@ fi
 # old ad-hoc step numbers. See RENAME_MAP.md for the old-step -> new-phase
 # mapping if you have scripts referencing the previous numbering.
 #
-# Usage:
-#   ./deploy.sh                                # full deploy
-#   ./deploy.sh --prefix v1                    # resources named v1-nvidia-artf-*
-#   ./deploy.sh --prefix prod --skip-agentcore # combine flags
-#   ./deploy.sh                                # FULL stack incl. Part 2 closed-loop (default)
+# Usage (--prefix is REQUIRED on every run: exactly 3 characters, a letter then
+# letters/digits, e.g. dv1, bt3, nv5 -- it keys the stack names, the EKS cluster,
+# the AgentCore runtime names and the local .deploy-state.json record):
+#   ./deploy.sh --prefix dv1                   # full deploy; resources named dv1-nvidia-artf-*
+#   ./deploy.sh --prefix dv1 --profile myprof  # use a named AWS CLI profile (see below)
+#   ./deploy.sh --prefix dv1 --skip-agentcore  # combine flags
+#   ./deploy.sh --prefix dv1                   # FULL stack incl. Part 2 closed-loop (default)
 #   ./deploy.sh --no-retraining                # Part 1 only (skip NeMo-RL, Model Registry, Glue ETL, agents)
 #   ./deploy.sh --model-id global.anthropic.claude-opus-4-8  # override the agents' Bedrock model
 #   ./deploy.sh --local-build                  # build images locally with Docker (requires ~30 GB free disk)
@@ -67,6 +69,25 @@ fi
 #   ./deploy.sh --verbose                      # print full detailed logs alongside phase output
 #   ./deploy.sh --destroy                      # tear down the entire stack
 #   AWS_REGION=us-west-2 ./deploy.sh           # different region
+#   (every example above also needs --prefix <3-char>; omitted here for width)
+#
+# AWS PROFILE. Which credentials every aws/eksctl/kubectl/boto3 call uses:
+#
+#     ./deploy.sh --prefix dv1 --profile my-admin-profile
+#
+# Resolution order: --profile, then the AWS_PROFILE environment variable, then the
+# profile remembered in .deploy-state.json for this prefix, then the literal
+# "default". The result is exported as AWS_PROFILE and passed as an explicit
+# --profile argument to every child this script branches into (remote_build.sh,
+# deploy_closed_loop.sh, deploy_prebid.sh, the scripts/*.py helpers) and to
+# `aws eks update-kubeconfig`, so the kubeconfig it writes pins the same profile.
+#
+# Once a prefix has been deployed with a profile, that profile is REMEMBERED for
+# the prefix. A later run that names a different one (flag or env) STOPS before
+# touching AWS and says so -- the same prefix in two accounts is the mistake this
+# prevents. To switch on purpose, delete the prefix's record from
+# deployment/.deploy-state.json first. A named profile that does not exist in
+# ~/.aws/config or ~/.aws/credentials also stops the run before any phase.
 #
 # WHERE DID I GET TO? Ask AWS, not this script:
 #
@@ -152,7 +173,16 @@ _GIVEN_REGION=0
 _GIVEN_MAXGPUS=0
 _GIVEN_ARTF_NODE_ROLE=0
 _GIVEN_MODEL_ID=0
+_GIVEN_PROFILE=0
+# The profile this run was GIVEN -- by --profile (arg loop below) or by the
+# AWS_PROFILE environment variable. Empty means neither, and the remembered /
+# "default" fallbacks apply once the state file is readable (see "AWS profile"
+# below). Captured before the loop so an explicit value can never be confused
+# with a fallback.
+DEPLOY_PROFILE="${AWS_PROFILE:-}"
+DEPLOY_PROFILE_SOURCE="AWS_PROFILE environment variable"
 if [[ -n "${AWS_REGION:-}" ]];      then _GIVEN_REGION=1; fi
+if [[ -n "${AWS_PROFILE:-}" ]];     then _GIVEN_PROFILE=1; fi
 if [[ -n "${MAX_GPUS:-}" ]];        then _GIVEN_MAXGPUS=1; fi
 if [[ -n "${ARTF_NODE_ROLE:-}" ]];  then _GIVEN_ARTF_NODE_ROLE=1; fi
 if [[ -n "${BEDROCK_MODEL_ID:-}" ]];then _GIVEN_MODEL_ID=1; fi
@@ -244,13 +274,15 @@ for arg in "$@"; do
     --ngc-key)          ;; # value comes in next arg, handled below
     --prefix=*)         STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)           ;; # value comes in next arg, handled below
-    --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}"; _GIVEN_MAXGPUS=1 ;;
+    --maxGPUs=*)        MAX_GPUS="${arg#--maxGPUs=}"; _GIVEN_MAXGPUS=2 ;;
     --maxGPUs)          ;; # value comes in next arg, handled below
     --model-id=*)       BEDROCK_MODEL_ID="${arg#--model-id=}"; _GIVEN_MODEL_ID=1 ;;
     --model-id)         ;; # value comes in next arg, handled below
     --artf-node-role=*) ARTF_NODE_ROLE="${arg#--artf-node-role=}"; _GIVEN_ARTF_NODE_ROLE=1 ;;
     --artf-node-role)   ;; # value comes in next arg, handled below
     --artf-on-gpu)      ARTF_NODE_ROLE="inference"; _GIVEN_ARTF_NODE_ROLE=1 ;;
+    --profile=*)        DEPLOY_PROFILE="${arg#--profile=}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1 ;;
+    --profile)          ;; # value comes in next arg, handled below
     --start-at)         _GIVEN_START_AT=1 ;; # value comes in next arg, handled below
     # Print the documentation block -- everything between the first and second
     # `# =====` banner. Derived, not a hardcoded line range: the previous
@@ -272,12 +304,45 @@ for arg in "$@"; do
         NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then
         NGC_KEY="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
+        DEPLOY_PROFILE="${arg}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
+# A value-taking flag as the LAST argument used to be swallowed silently: the loop
+# records it in _PREV_ARG, no next arg ever arrives, and the run proceeds with the
+# default -- so `--profile` on its own deployed with whatever the shell had.
+case "${_PREV_ARG:-}" in
+  --prefix|--maxGPUs|--start-at|--model-id|--artf-node-role|--ngc-secret|--ngc-key|--profile)
+    printf '\033[0;31m[fail]\033[0m %s\n' "${_PREV_ARG} needs a value (it was the last argument)" >&2
+    exit 1 ;;
+esac
 unset _PREV_ARG
+
+# --prefix is required, and its shape is fixed: exactly three characters, a letter
+# followed by letters or digits. It is spliced into S3 bucket names (lowercase
+# only), AgentCore runtime names (must start with a letter) and the local state
+# record's key, and it is the ONLY thing separating two deployments in one account.
+# An optional prefix meant the no-prefix case was a real, un-namespaced deployment
+# that --destroy could reach by accident.
+if ! [[ "${STACK_PREFIX}" =~ ^[a-z][a-z0-9]{2}$ ]]; then
+  if [[ -z "${STACK_PREFIX}" ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "--prefix is required: exactly 3 characters, a letter then letters/digits (e.g. --prefix dv1)" >&2
+  else
+    printf '\033[0;31m[fail]\033[0m %s\n' "--prefix must be exactly 3 characters, a letter then letters/digits (got '${STACK_PREFIX}')" >&2
+  fi
+  exit 1
+fi
+
+# An EXPLICIT profile takes effect immediately, before anything else runs, so the
+# first process this script starts already sees it. The remembered/"default"
+# fallbacks need the state file and are resolved after the libraries load (see
+# "AWS profile" below); nothing between here and there talks to AWS.
+if [[ -n "${DEPLOY_PROFILE}" ]]; then
+  export AWS_PROFILE="${DEPLOY_PROFILE}"
+fi
 
 # --start-at: skip earlier PHASES by setting SKIP flags. BREAKING CHANGE —
 # this now takes a phase number 1-5 (see the header comment), not the old
@@ -555,6 +620,52 @@ source "${SCRIPT_DIR}/lib/deploy_state.sh"
 # shellcheck source=lib/deploy_gate.sh
 source "${SCRIPT_DIR}/lib/deploy_gate.sh"
 
+# =========================================================================
+# AWS profile -- resolved here, before the first AWS call in any mode
+# =========================================================================
+# Order: --profile, AWS_PROFILE env (both captured as DEPLOY_PROFILE above), the
+# profile remembered for this prefix in .deploy-state.json, then "default".
+#
+# This sits BEFORE --status and before ACCOUNT_ID on purpose. --status is the one
+# mode that skips the remembered-values block further down, and ACCOUNT_ID is the
+# first AWS call -- a profile resolved after it would have authenticated with the
+# wrong one. Every mode (deploy, --status, --destroy, --ui-only) passes through here.
+_REMEMBERED_PROFILE="$(state_read "${STACK_PREFIX}" remembered.profile)"
+if [[ -n "${DEPLOY_PROFILE}" ]]; then
+  # A profile remembered for this prefix is the one that created its resources. A
+  # different one now is either a typo or a second account, and both are stopped
+  # here rather than discovered as a CloudFormation name collision 20 minutes in.
+  # Deleting the prefix's record is the deliberate way to switch.
+  if [[ -n "${_REMEMBERED_PROFILE}" && "${_REMEMBERED_PROFILE}" != "${DEPLOY_PROFILE}" ]]; then
+    fail "AWS profile mismatch for prefix '${STACK_PREFIX}': this run resolved '${DEPLOY_PROFILE}' (from ${DEPLOY_PROFILE_SOURCE}) but the prefix was deployed with '${_REMEMBERED_PROFILE}' (remembered in ${DEPLOY_STATE_FILE}). Re-run with --profile ${_REMEMBERED_PROFILE}, or -- to move this prefix to another account on purpose -- remove its record from ${DEPLOY_STATE_FILE} first."
+  fi
+elif [[ -n "${_REMEMBERED_PROFILE}" ]]; then
+  DEPLOY_PROFILE="${_REMEMBERED_PROFILE}"
+  DEPLOY_PROFILE_SOURCE="remembered for prefix '${STACK_PREFIX}' in ${DEPLOY_STATE_FILE}"
+else
+  DEPLOY_PROFILE="default"
+  DEPLOY_PROFILE_SOURCE="fallback; no --profile, no AWS_PROFILE, nothing remembered"
+fi
+export AWS_PROFILE="${DEPLOY_PROFILE}"
+
+# A NAMED profile that is not configured locally fails on the first SDK call with a
+# message that names the step, not the cause. Check it once here instead. "default"
+# is exempt: botocore tolerates its absence (environment-variable credentials still
+# work), so refusing it would break a perfectly valid setup.
+#
+# Checked with botocore rather than `aws configure list-profiles`: that subcommand
+# is CLI v2 only, and a v1 binary earlier on PATH (observed on a developer Mac) makes
+# it print usage text and exit 0 -- which would have passed every profile.
+if [[ "${AWS_PROFILE}" != "default" ]]; then
+  if ! env -u AWS_PROFILE "${PYTHON}" -c '
+import sys, botocore.session
+sys.exit(0 if sys.argv[1] in botocore.session.Session().available_profiles else 1)
+' "${AWS_PROFILE}" 2>/dev/null; then
+    fail "AWS profile '${AWS_PROFILE}' (from ${DEPLOY_PROFILE_SOURCE}) is not configured in ~/.aws/config or ~/.aws/credentials. Available: $(env -u AWS_PROFILE "${PYTHON}" -c 'import botocore.session; print(" ".join(sorted(botocore.session.Session().available_profiles)))' 2>/dev/null || echo '(could not list)')"
+  fi
+fi
+say "  AWS profile: ${AWS_PROFILE} (${DEPLOY_PROFILE_SOURCE})"
+
 # --status: answer from AWS and stop. Deliberately before every other check --
 # it needs no credentials beyond read access, no kubeconfig, no Docker, and no
 # knowledge of whether anything is running.
@@ -565,7 +676,10 @@ if [[ "${STATUS_ONLY}" -eq 1 ]]; then
 fi
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-[[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account"
+[[ -n "${ACCOUNT_ID}" ]] || fail "cannot resolve AWS account (profile '${AWS_PROFILE}')"
+# Always visible, next to the profile line above: a run against the wrong account is
+# readable at the top of the output rather than from a stack-name collision later.
+say "  AWS account: ${ACCOUNT_ID}  region: ${AWS_REGION}  prefix: ${STACK_PREFIX}"
 
 # =========================================================================
 # Local deployment state — remembered inputs and the resume decision
@@ -681,7 +795,11 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
 
   # Record this run's inputs so the NEXT run can reuse them. Written now rather
   # than at the end, so a run that dies mid-way still leaves them behind.
+  # `profile` is what the mismatch check in the "AWS profile" block above compares
+  # against on the next run. It is the resolved value, so a run that fell back to
+  # "default" remembers "default" -- and a later --profile other-thing is stopped.
   state_set "${STACK_PREFIX}" remembered \
+    "profile=${AWS_PROFILE}" \
     "region=${AWS_REGION}" \
     "maxGPUs=${MAX_GPUS}" \
     "artfNodeRole=${ARTF_NODE_ROLE}" \
@@ -958,7 +1076,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   aws dynamodb delete-table --table-name "${LOADTEST_TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
 
   say "Deleting CloudFront + S3 frontend..."
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
   # deploy_frontend.py's destroy only disables the CloudFront distribution (AWS
   # requires Enabled=false to propagate before a distribution can be deleted) —
   # it does not delete the distribution or its S3 bucket. Nothing is retained
@@ -980,10 +1098,10 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   say "Deleting AgentCore MCP runtime..."
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
 
   say "Deleting Cognito User Pool..."
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" || true
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
 
   say "Deleting IAM policies..."
   TRITON_POLICY_NAME="${STACK_NAME}-triton-s3-policy-${STACK_UID}"
@@ -1172,7 +1290,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   say "Deleting Cognito (user pool, identity pool, authenticated role)..."
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy \
-    --stack-name "${STACK_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+    --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" 2>/dev/null || true
 
   # --- ECR repositories: previously retained. Every repo deploy.sh/remote_build.sh
   # creates is prefixed with STACK_NAME (see the REPOS array + ADAPTIVE_BIDDING_REPO/
@@ -1202,7 +1320,7 @@ if [[ "${UI_ONLY}" -eq 1 ]]; then
   log "UI-only deploy"
 
   # Get the NLB endpoint from the EKS cluster
-  aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+  aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" 2>/dev/null || true
   NLB_DNS="$(kubectl get svc orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
   if [[ -z "${NLB_DNS}" ]]; then
     warn "Could not read NLB endpoint from EKS. Using placeholder."
@@ -1256,6 +1374,7 @@ EOF
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
     --orchestrator-url "http://${NLB_DNS}"
 
   PRIMARY_OUTPUTS="${SCRIPT_DIR}/.frontend-outputs.json"
@@ -1854,6 +1973,7 @@ build_images() {
       --only "${MISSING_KEYS[*]}" \
       --tag "${IMAGE_TAG}" \
       --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
       "${NGC_FLAG[@]}"
   else
     step "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
@@ -2053,7 +2173,9 @@ else
   done
 fi
 
-aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+# --profile is written into the kubeconfig's exec block, so a kubectl run later from
+# a shell with a different AWS_PROFILE still authenticates as this deployment did.
+aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}"
 
 # =========================================================================
 # Step 6: Install NVIDIA Kubernetes Device Plugin + Prometheus Operator CRDs
@@ -2313,6 +2435,7 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
   --action deploy \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
+  --profile "${AWS_PROFILE}" \
   --cloudfront-domain "${CF_DOMAIN:-localhost}"
 
 # Bedrock grant for the Auction Theater captions. Applied HERE, in the base
@@ -2326,6 +2449,7 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
   --action grant-caption-invoke \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
+  --profile "${AWS_PROFILE}" \
   || warn "Caption grant failed - theater captions will fall back to factual text."
 
 COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
@@ -2665,6 +2789,7 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
   --action deploy \
   --stack-name "${STACK_NAME}" \
   --region "${AWS_REGION}" \
+  --profile "${AWS_PROFILE}" \
   --orchestrator-url "http://${NLB_DNS}"
 
 PRIMARY_OUTPUTS="${SCRIPT_DIR}/.frontend-outputs.json"
@@ -2677,6 +2802,7 @@ if [[ -n "${CF_DOMAIN}" && -n "${COGNITO_USER_POOL_ID}" ]]; then
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
     --cloudfront-domain "${CF_DOMAIN}"
 fi
 
@@ -2773,6 +2899,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
       --role-arn "${ROLE_ARN}" \
       --container-uri "${AC_IMAGE}" \
       --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
     || fail "AgentCore MCP runtime registration failed (detail in ${_AC_LOG})"
 else
   warn "Skipping AgentCore deployment (--skip-agentcore)"
@@ -2796,9 +2923,12 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
     --query 'nodegroup.nodeRole' --output text 2>/dev/null || echo '')"
 
   # Pass through the prefix and skip flags
-  CLOSED_LOOP_ARGS=""
+  # The resolved profile travels as an explicit argument, not only as inherited
+  # environment, so the child's own output names it and a standalone run of the
+  # child behaves the same way.
+  CLOSED_LOOP_ARGS="--profile ${AWS_PROFILE}"
   if [[ -n "${STACK_PREFIX}" ]]; then
-    CLOSED_LOOP_ARGS="--prefix ${STACK_PREFIX}"
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --prefix ${STACK_PREFIX}"
   fi
   if [[ "${SKIP_AGENTCORE}" -eq 1 ]]; then
     CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --skip-agentcore"
@@ -2916,7 +3046,7 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
   if [[ -n "${STACK_PREFIX}" ]]; then
     PREBID_ARGS="--prefix ${STACK_PREFIX}"
   fi
-  PREBID_ARGS="${PREBID_ARGS} --cluster ${CLUSTER_NAME} --region ${AWS_REGION} --yes"
+  PREBID_ARGS="${PREBID_ARGS} --cluster ${CLUSTER_NAME} --region ${AWS_REGION} --profile ${AWS_PROFILE} --yes"
   if [[ -n "${COGNITO_USER_POOL_ID:-}" ]]; then
     PREBID_ARGS="${PREBID_ARGS} --user-pool-id ${COGNITO_USER_POOL_ID}"
   fi

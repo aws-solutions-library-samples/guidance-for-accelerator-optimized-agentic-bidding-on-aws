@@ -173,16 +173,24 @@ def prefixed(prefix: str, name: str) -> str:
 
 class Probe:
     def __init__(self, prefix: str, region: str, *, retraining: bool,
-                 prebid: bool, agentcore: bool, manifest_dir: str):
+                 prebid: bool, agentcore: bool, manifest_dir: str,
+                 profile: Optional[str] = None):
         self.prefix = prefix
         self.region = region
+        self.profile = profile or None
+        # The kubectl subprocesses below authenticate through the kubeconfig's exec
+        # plugin (`aws eks get-token`), which reads AWS_PROFILE from the environment,
+        # not from this process's boto3 session. Export it so both paths agree.
+        if self.profile:
+            os.environ["AWS_PROFILE"] = self.profile
         self.retraining = retraining
         self.prebid = prebid
         self.agentcore = agentcore
         self.manifest_dir = manifest_dir
         self.stack = stack_name(prefix)
         self.notes: List[str] = []
-        self._session = boto3.session.Session(region_name=region) if boto3 else None
+        self._session = (boto3.session.Session(region_name=region, profile_name=self.profile)
+                         if boto3 else None)
         self.account = self._account()
         self.uid = stack_uid(self.stack, self.account, region) if self.account else ""
         self.cluster = f"{self.stack}-triton"
@@ -1006,6 +1014,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prefix", default="")
     ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    ap.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
+                    help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--shell", action="store_true",
                     help="emit eval-able DEPLOY_PHASE_n=... assignments for deploy.sh")
@@ -1022,7 +1032,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     probe = Probe(args.prefix, args.region, retraining=args.retraining,
                   prebid=args.prebid, agentcore=args.agentcore,
-                  manifest_dir=args.manifest_dir)
+                  manifest_dir=args.manifest_dir, profile=args.profile)
     result = probe.run()
     if args.shell:
         sys.stdout.write(render_shell(result) + "\n")

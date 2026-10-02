@@ -30,7 +30,12 @@ fi
 #   ./deploy_closed_loop.sh --prefix prod
 #   ./deploy_closed_loop.sh --skip-agentcore        # skip AgentCore deploy step
 #   ./deploy_closed_loop.sh --stack-only            # deploy CFN stacks only, no agents
+#   ./deploy_closed_loop.sh --profile myprof        # AWS CLI profile (default: $AWS_PROFILE, else "default")
 #   AWS_REGION=us-west-2 ./deploy_closed_loop.sh
+#
+# --profile is exported as AWS_PROFILE and passed on explicitly to remote_build.sh,
+# the scripts/*.py helpers and `aws eks update-kubeconfig`. deploy.sh supplies it;
+# a standalone run falls back to the shell's AWS_PROFILE, then "default".
 #
 # Required environment or parameters:
 #   VPC_ID         — VPC for the DAX cluster
@@ -62,6 +67,8 @@ CLUSTER_NAME="${CLUSTER_NAME:-}"
 VPC_ID="${VPC_ID:-}"
 SUBNET_IDS="${SUBNET_IDS:-}"
 START_AT=1
+# Resolved after the arg loop: --profile, then AWS_PROFILE, then "default".
+DEPLOY_PROFILE="${AWS_PROFILE:-}"
 # --verbose: print the full detailed log stream. Default (0) shows only the
 # always-visible say()/ok()/warn()/fail() lines. deploy.sh passes this through so
 # one --verbose on the parent turns on the child too.
@@ -82,6 +89,8 @@ for arg in "$@"; do
     --start-at)        ;;
     --prefix=*)        STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)          ;;
+    --profile=*)       DEPLOY_PROFILE="${arg#--profile=}" ;;
+    --profile)         ;;
     -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
@@ -92,12 +101,17 @@ for arg in "$@"; do
         NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then
         NGC_KEY="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
+        DEPLOY_PROFILE="${arg}"
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
 unset _PREV_ARG
+# Exported before the first aws call so every aws/kubectl/docker-login/python3
+# call below, and every child this script starts, uses the same credentials.
+export AWS_PROFILE="${DEPLOY_PROFILE:-default}"
 
 # Output helpers, matching deploy.sh's (see its say/log/warn/ok definitions).
 #
@@ -518,6 +532,7 @@ if [[ -n "${MODEL_BUCKET:-}" ]]; then
   python3 "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
     --model-bucket "${MODEL_BUCKET}" \
     --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
     --dlrm-package-group "${DLRM_PACKAGE_GROUP}" \
     --ncf-package-group "${NCF_PACKAGE_GROUP}" \
     --yield-floor-package-group "${YIELD_FLOOR_PACKAGE_GROUP}" \
@@ -565,6 +580,7 @@ log "  Seeding parameter store (idempotent) so the agent works on the EventBridg
 python3 "${SCRIPT_DIR}/scripts/init_parameter_store.py" \
   --table-name "${PARAM_TABLE_NAME}" \
   --region "${AWS_REGION}" \
+  --profile "${AWS_PROFILE}" \
   --model-types "dlrm_bid_shader" \
   || warn "  Parameter store seed failed — the agent will read empty until a UI scenario seeds it."
 
@@ -738,6 +754,7 @@ EOF
       --tag latest \
       --nemo-src-tag "${NEMO_SRC_TAG}" \
       --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
       --no-wait \
       ${NGC_FLAG})
     log "  NeMo build started: ${NEMO_BUILD_ID}"
@@ -819,6 +836,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
         --target agents \
         --tag "${IMAGE_TAG}" \
         --region "${AWS_REGION}" \
+        --profile "${AWS_PROFILE}" \
       || fail "Remote build of the agent images failed (detail in ${CL_DETAIL_LOG})"
   fi
 
@@ -860,6 +878,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     "Registering ${ADAPTIVE_BIDDING_RUNTIME_NAME} (HTTP)" \
     python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
       --action deploy \
+      --profile "${AWS_PROFILE}" \
       --runtime-name "${ADAPTIVE_BIDDING_RUNTIME_NAME}" \
       --role-arn "${ADAPTIVE_BIDDING_ROLE_ARN}" \
       --container-uri "${ADAPTIVE_BIDDING_IMAGE}" \
@@ -906,7 +925,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # The governance agent reaches the Model Optimizer + Triton over their INTERNAL
   # NLBs, which are only routable from inside the cluster VPC — hence VPC network mode.
   if [[ -n "${CLUSTER_NAME}" ]]; then
-    aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+    aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" >/dev/null 2>&1 || true
   fi
   # The Model Optimizer is now ON-DEMAND: the VPC proxy Lambda intercepts
   # POST .../v1/optimize and launches a one-shot K8s Job (no always-on optimizer
@@ -1015,6 +1034,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     "Registering ${GOVERNANCE_RUNTIME_NAME} (HTTP)" \
     python3 "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
       --action deploy \
+      --profile "${AWS_PROFILE}" \
       --runtime-name "${GOVERNANCE_RUNTIME_NAME}" \
       --role-arn "${GOVERNANCE_ROLE_ARN}" \
       --container-uri "${GOVERNANCE_IMAGE}" \
@@ -1148,6 +1168,7 @@ except Exception:
       --action grant-agent-invoke \
       --stack-name "${STACK_NAME}" \
       --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
       --adaptive-runtime-arn "${ADAPTIVE_BIDDING_RUNTIME_ARN}" \
       --governance-runtime-arn "${GOVERNANCE_RUNTIME_ARN}" \
       || warn "  Could not attach scoped InvokeAgentRuntime policy to the auth role"
@@ -1155,7 +1176,7 @@ except Exception:
     # Resolve the orchestrator NLB so the CloudFront /api origin (ALB) is preserved
     # on re-deploy. Requires cluster access (CLUSTER_NAME is passed by deploy.sh).
     if [[ -n "${CLUSTER_NAME}" ]]; then
-      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" >/dev/null 2>&1 || true
     fi
     UI_NLB_DNS=""
     if command -v kubectl >/dev/null 2>&1; then
@@ -1191,6 +1212,7 @@ EOF
         --action deploy \
         --stack-name "${STACK_NAME}" \
         --region "${AWS_REGION}" \
+        --profile "${AWS_PROFILE}" \
         --orchestrator-url "http://${UI_NLB_DNS}" \
         || warn "  Frontend re-deploy failed — UI still shows the previous (empty-ARN) build."
       log "  UI rebuilt with agent runtime ARNs."

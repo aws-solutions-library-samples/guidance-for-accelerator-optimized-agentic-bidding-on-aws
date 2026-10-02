@@ -53,6 +53,8 @@ fi
 #   --user-pool-id ID    Cognito user pool to extend (default: discovered)
 #   --namespace NAME     Kubernetes namespace (default: default)
 #   --region REGION      AWS region (default: $AWS_REGION or us-east-1)
+#   --profile NAME       AWS CLI profile (default: $AWS_PROFILE, else "default");
+#                        exported as AWS_PROFILE for every aws/kubectl call here
 #   --tag TAG            Image tag (default: pinned version + source hash)
 #   --start-at N         Resume from step N
 #   --skip-build         Reuse the image already in ECR
@@ -156,6 +158,8 @@ PLUGIN_ADAPTERS=()
 # Left empty means "not yet known", and the disclosure then says so rather than
 # printing a total that looks authoritative. Step 1 measures headroom and sets it.
 ADDITIONAL_NODE_MONTHLY_USD=""
+# Resolved after the arg loop: --profile, then AWS_PROFILE, then "default".
+DEPLOY_PROFILE="${AWS_PROFILE:-}"
 
 for arg in "$@"; do
   case "${arg}" in
@@ -169,6 +173,8 @@ for arg in "$@"; do
     --namespace)       ;;
     --region=*)        AWS_REGION="${arg#--region=}" ;;
     --region)          ;;
+    --profile=*)       DEPLOY_PROFILE="${arg#--profile=}" ;;
+    --profile)         ;;
     --tag=*)           IMAGE_TAG="${arg#--tag=}" ;;
     --tag)             ;;
     --start-at=*)      START_AT="${arg#--start-at=}" ;;
@@ -192,6 +198,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--user-pool-id" ]]; then USER_POOL_ID="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--namespace" ]];    then NAMESPACE="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--region" ]];       then AWS_REGION="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--profile" ]];      then DEPLOY_PROFILE="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--tag" ]];          then IMAGE_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]];     then START_AT="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--inject-plugin" ]]; then INJECT_PLUGINS+=("${arg}")
@@ -204,6 +211,10 @@ for arg in "$@"; do
   _PREV_ARG="${arg}"
 done
 unset _PREV_ARG
+# Exported before the first aws/kubectl call. kubectl authenticates through the
+# kubeconfig's `aws eks get-token` exec plugin, which reads AWS_PROFILE from the
+# environment, so the export covers both paths at once.
+export AWS_PROFILE="${DEPLOY_PROFILE:-default}"
 
 log()  { printf '\033[0;32m[prebid]\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m[prebid][warn]\033[0m %s\n' "$*"; }
@@ -358,7 +369,7 @@ resolve_kube_context() {
   warn "Falling back to the current context '${current}', whose cluster entry is"
   warn "  ${cluster_entry:-<unknown>}"
   warn "If that is not ${CLUSTER_NAME}, STOP and run:"
-  warn "  aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+  warn "  aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION} --profile ${AWS_PROFILE}"
   return 0
 }
 
@@ -816,7 +827,7 @@ if [[ "${START_AT}" -le 1 ]]; then
   fi
 
   kubectl config current-context >/dev/null 2>&1 \
-    || MISSING+=("no kubectl context - run: aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}")
+    || MISSING+=("no kubectl context - run: aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION} --profile ${AWS_PROFILE}")
 
   # CDK bootstrap: CHECKED, never created. Creating it silently provisions a bucket,
   # an ECR repo and IAM roles in the operator's account as a side effect of a flag

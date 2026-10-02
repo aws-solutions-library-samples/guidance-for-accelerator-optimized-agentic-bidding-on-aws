@@ -53,6 +53,10 @@ _gate_flags() {
   [[ "${WITH_RETRAINING:-1}" -eq 1 ]] || out+=(--no-retraining)
   [[ "${WITH_PREBID:-0}" -eq 1 ]] && out+=(--with-prebid)
   [[ "${SKIP_AGENTCORE:-0}" -eq 0 ]] || out+=(--skip-agentcore)
+  # deploy.sh resolves and exports AWS_PROFILE before sourcing this file. The probe
+  # would inherit it anyway; passing it explicitly keeps the probe's credentials
+  # visible in the command line and identical to every other child's.
+  [[ -n "${AWS_PROFILE:-}" ]] && out+=(--profile "${AWS_PROFILE}")
   printf '%s\n' "${out[@]+"${out[@]}"}"
 }
 

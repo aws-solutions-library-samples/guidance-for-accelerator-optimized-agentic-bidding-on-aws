@@ -19,6 +19,8 @@
 #   --ngc-secret NAME   Secrets Manager secret name for NGC API key
 #   --no-wait           Start build and exit without waiting for completion
 #   --region REGION     AWS region (default: $AWS_REGION or us-east-1)
+#   --profile NAME      AWS CLI profile (default: $AWS_PROFILE, else "default");
+#                       exported as AWS_PROFILE so every aws call here uses it
 #
 # Prerequisites:
 #   - The CodeBuild project stack must be deployed first:
@@ -91,6 +93,8 @@ for arg in "$@"; do
     --no-wait)      NO_WAIT=1 ;;
     --region=*)     AWS_REGION="${arg#--region=}" ;;
     --region)       ;; # value in next arg
+    --profile=*)    DEPLOY_PROFILE="${arg#--profile=}" ;;
+    --profile)      ;; # value in next arg
     *)
       if [[ "${_PREV_ARG:-}" == "--stack-name" ]]; then STACK_NAME="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--target" ]]; then BUILD_TARGET="${arg}"
@@ -100,6 +104,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--ngc-secret" ]]; then NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--region" ]]; then AWS_REGION="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then DEPLOY_PROFILE="${arg}"
       fi
       ;;
   esac

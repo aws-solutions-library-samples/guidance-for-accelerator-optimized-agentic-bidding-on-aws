@@ -28,6 +28,8 @@ import logging
 import os
 import sys
 
+import boto3
+
 # Make source/ importable so we can reuse the real ParameterStore (no logic fork).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source"))
 
@@ -66,12 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--table-name", required=True, help="Parameter store DynamoDB table name")
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
+                        help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
     parser.add_argument(
         "--model-types",
         default="dlrm_bid_shader",
         help="Comma-separated ARTF model types to seed (default: dlrm_bid_shader — the type the agent reads).",
     )
     args = parser.parse_args(argv)
+    if args.profile:
+        # One place for both credential paths: boto3 clients created below, and any
+        # subprocess (aws/kubectl) that reads AWS_PROFILE from the environment.
+        os.environ["AWS_PROFILE"] = args.profile
+        boto3.setup_default_session(profile_name=args.profile, region_name=args.region)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 

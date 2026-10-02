@@ -37,22 +37,26 @@ You'll also need an **NVIDIA NGC API key**. `deploy.sh` deploys the closed-loop 
 ```bash
 git clone https://github.com/aws-solutions-library-samples/guidance-for-accelerator-optimized-agentic-bidding-on-aws.git
 cd guidance-for-accelerator-optimized-agentic-bidding-on-aws/deployment
-./deploy.sh --ngc-key YOUR_NGC_API_KEY
+./deploy.sh --prefix dv1 --ngc-key YOUR_NGC_API_KEY
 ```
 
-`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same stack — you only need to pass `--ngc-key` once. It provisions everything: an EKS cluster with GPU and CPU node groups, NVIDIA Triton Inference Server, the bidding containers, the orchestrator, and a React frontend behind CloudFront. It takes roughly 30–40 minutes. When it finishes, it prints a URL and a demo login — open the URL in your browser.
+`--prefix` is required on every run: exactly three characters, a letter followed by letters or digits (`dv1`, `stg`, `bt3`). It names every resource the deployment creates (`dv1-nvidia-artf-*`), keys the local record of your settings, and is what lets two deployments share one account without colliding. Pick one and keep using it for that environment.
+
+`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix — you only need to pass `--ngc-key` once. It provisions everything: an EKS cluster with GPU and CPU node groups, NVIDIA Triton Inference Server, the bidding containers, the orchestrator, and a React frontend behind CloudFront. It takes roughly 30–40 minutes. When it finishes, it prints a URL and a demo login — open the URL in your browser.
 
 Don't want the closed-loop stack (and don't want to create an NGC account)? Skip it — the core real-time bidding pipeline doesn't need NGC credentials:
 
 ```bash
-./deploy.sh --no-retraining
+./deploy.sh --prefix dv1 --no-retraining
 ```
 
-Want a separate, namespaced deployment (for example to run more than one environment in the same account)? Add `--prefix`:
+Deploying with a named AWS CLI profile rather than your shell's default? Pass it once; it is remembered for the prefix:
 
 ```bash
-./deploy.sh --ngc-key YOUR_NGC_API_KEY --prefix stg
+./deploy.sh --prefix dv1 --profile my-admin-profile --ngc-key YOUR_NGC_API_KEY
 ```
+
+Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable, then the profile remembered for that prefix, then `default`. The result is exported and passed explicitly to every script the deploy branches into, and written into the kubeconfig it fetches, so `kubectl` from your own shell authenticates the same way. Once a prefix has been deployed with one profile, a later run that names a different one stops before touching AWS and tells you which profile the prefix belongs to — the point is that the same prefix never lands in two accounts by accident. To move a prefix deliberately, remove its record from `deployment/.deploy-state.json` first.
 
 ## What just happened?
 
@@ -273,7 +277,7 @@ aws cognito-idp admin-set-user-password \
   --password '<new-password>' --permanent --region us-east-1
 ```
 
-It is also recorded locally: `jq -r '.deployments[""].resolved.cognitoUserPoolId' deployment/.deploy-state.json` (use the prefix as the key if you deployed with `--prefix`).
+It is also recorded locally: `jq -r '.deployments["dv1"].resolved.cognitoUserPoolId' deployment/.deploy-state.json` (your prefix is the key).
 
 **If you have deployed before, your old login will not work.** Each deployment creates its own user pool, and `--prefix` creates a separate one per prefix. A user in a pool from an earlier deployment has no relationship to the new pool, and `--destroy` deletes the pool along with its users. Sign in with the credentials from the **current** deployment's summary, or reset the password in the current pool using the commands above.
 
@@ -331,19 +335,22 @@ docker buildx version                            # only needed for --local-build
 ### Customizing your deployment
 
 ```bash
-./deploy.sh --prefix v1                    # namespaced resources (v1-*)
-./deploy.sh --skip-images                  # reuse existing images
-./deploy.sh --skip-cluster                 # reuse an existing EKS cluster
-./deploy.sh --local-build                  # build images locally with Docker instead of CodeBuild
-./deploy.sh --no-retraining                # Part 1 only — skip the closed-loop stack (see below)
-./deploy.sh --ngc-secret my-secret-name    # reuse an NGC key already stored in Secrets Manager
-./deploy.sh --maxGPUs 5                    # raise the GPU node group's max size (default 3)
-./deploy.sh --artf-node-role inference     # co-locate the model containers on the GPU node
-./deploy.sh --start-at 3                   # resume from Phase 3 (see the breaking-change note below)
-./deploy.sh --verbose                      # print every underlying command, not just step summaries
-DEPLOY_NO_SPINNER=1 ./deploy.sh            # hold the progress line still (no animation)
-AWS_REGION=us-west-2 ./deploy.sh           # deploy to a different Region
+./deploy.sh --prefix dv1                   # REQUIRED on every run: 3 chars, letter then letters/digits (dv1-*)
+./deploy.sh --prefix dv1 --profile prof    # AWS CLI profile; remembered per prefix (default: $AWS_PROFILE, else "default")
+./deploy.sh --prefix dv1 --skip-images     # reuse existing images
+./deploy.sh --prefix dv1 --skip-cluster    # reuse an existing EKS cluster
+./deploy.sh --prefix dv1 --local-build     # build images locally with Docker instead of CodeBuild
+./deploy.sh --prefix dv1 --no-retraining   # Part 1 only — skip the closed-loop stack (see below)
+./deploy.sh --prefix dv1 --ngc-secret my-secret-name  # reuse an NGC key already stored in Secrets Manager
+./deploy.sh --prefix dv1 --maxGPUs 5       # raise the GPU node group's max size (default 3)
+./deploy.sh --prefix dv1 --artf-node-role inference   # co-locate the model containers on the GPU node
+./deploy.sh --prefix dv1 --start-at 3      # resume from Phase 3 (see the breaking-change note below)
+./deploy.sh --prefix dv1 --verbose         # print every underlying command, not just step summaries
+DEPLOY_NO_SPINNER=1 ./deploy.sh --prefix dv1   # hold the progress line still (no animation)
+AWS_REGION=us-west-2 ./deploy.sh --prefix dv1  # deploy to a different Region
 ```
+
+Re-deploying or resuming by hand is not a supported path: always go back through `deploy.sh --prefix <p>` (with `--start-at N` to resume from a phase). It is the one place the profile, region and remembered inputs are resolved, and every child script and helper receives them from it.
 
 By default, images build remotely on **AWS CodeBuild** — no local Docker required, and ARM64 images (AgentCore) build natively on Graviton. The first deploy provisions a CodeBuild stack automatically; later runs skip rebuilding images whose source hasn't changed. Pass `--local-build` if you'd rather build with Docker on your own machine (needs ~30 GB free disk, plus buildx for the ARM64 cross-compile).
 
@@ -432,11 +439,13 @@ If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, an
     (pass the flag explicitly to override, or delete deployment/.deploy-state.json)
 ```
 
-The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
+The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: the AWS profile, region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
+
+The AWS profile is the one remembered value that is also **enforced**: if a later run resolves a different profile (from `--profile` or `AWS_PROFILE`) than the one recorded for the prefix, the script stops before its first AWS call and names both. Remove the prefix's record from `.deploy-state.json` to move it to another account on purpose.
 
 Three things worth knowing about the record:
 
-- It is keyed on `--prefix`, so `./deploy.sh` and `./deploy.sh --prefix stg` never read each other's values. If the record's account or stack name disagrees with the current invocation, nothing is reused and the script says why.
+- It is keyed on `--prefix`, so `./deploy.sh --prefix dv1` and `./deploy.sh --prefix stg` never read each other's values. If the record's account or stack name disagrees with the current invocation, nothing is reused and the script says why.
 - It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password — only the *name* of the Secrets Manager secret.
 - It records **no progress**. That was tried and removed: a file describing what the script had done disagreed with what the account actually contained, and reported a phase complete for a workload that had never started. Progress comes from `--status`.
 
@@ -449,7 +458,7 @@ Everything except the logic is already done: the gRPC/MCP/health server, the ECR
 **Four steps:**
 
 1. **Write your logic** in `source/containers/artf_template/app.py`. There is one marked block, with a worked example, the intent-to-payload-field mapping, and pointers to the two containers worth copying.
-2. **Rebuild that one image**: `cd deployment && ./deploy.sh --start-at 2`
+2. **Rebuild that one image**: `cd deployment && ./deploy.sh --prefix <prefix> --start-at 2`
 3. **Restart that one Deployment**: `kubectl rollout restart deployment/artf-template`
    Don't skip this. `deploy.sh` reuses the previous image tag when the registry already has it, so `kubectl apply` is a no-op when only the image *content* changed and the old pod keeps serving your old code.
 4. **Activate it** in the Container Health panel. No redeploy — the flag lives in a DynamoDB registry table, and every orchestrator replica picks it up within the cache TTL (30s by default; the UI tells you the window).
@@ -684,7 +693,7 @@ It is **opt-in and additive**. Without it, nothing in the topology above changes
 
 ```bash
 cd deployment
-./deploy.sh --with-prebid                  # with a fresh deployment
+./deploy.sh --prefix <prefix> --with-prebid   # with a fresh deployment
 ./deploy_prebid.sh --prefix <prefix>       # onto an existing one
 ```
 
@@ -911,7 +920,7 @@ If you want Prebid Server in its own isolated VPC on ECS Fargate — with the up
 
 ```bash
 cd deployment
-./deploy.sh --destroy
+./deploy.sh --prefix <prefix> --destroy
 ```
 
 The script prompts for confirmation — type `destroy` to proceed. Include the same `--prefix` used at deploy time to tear down a specific namespaced stack.
@@ -940,7 +949,9 @@ cd deployment
 That tells you which of the five phases completed and, for anything missing, whether it was never created or created and broken. Two things it does not cover, because they are not deploy phases:
 
 ```bash
-export AWS_PROFILE=default AWS_REGION=us-east-1
+# Same profile the deploy used -- read it back from the prefix's record
+export AWS_PROFILE=$(jq -r '.deployments["<your-prefix>"].remembered.profile // "default"' deployment/.deploy-state.json)
+export AWS_REGION=us-east-1
 STACK_NAME=<your-prefix>-nvidia-artf-recommenders
 
 # Is a local script still running? (Ctrl+C only ever stops this part)
@@ -959,7 +970,7 @@ The EKS cluster takes 15–20 minutes and an interrupted run does not lose it. E
 
 ```bash
 cd deployment
-./deploy.sh --resume
+./deploy.sh --prefix <your-prefix> --resume
 ```
 
 See [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings) for how `--resume`, `--start-at` and the remembered flags in `.deploy-state.json` interact. The short version: you do not need to tear down before redeploying, and `--destroy` is for when you want the resources *gone*, not as a precaution.

@@ -313,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-bucket", required=True, help="S3 bucket holding onnx-source/<model>/model.onnx")
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
+                        help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
     parser.add_argument("--dlrm-package-group", required=True, help="Model Package Group name for dlrm_bid_shader")
     parser.add_argument("--ncf-package-group", required=True, help="Model Package Group name for ncf_deal_manager")
     parser.add_argument("--yield-floor-package-group", required=True, help="Model Package Group name for deal_yield_manager_floor")
@@ -324,6 +326,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--account-id", default="", help="AWS account id (resolved via STS if omitted)")
     args = parser.parse_args(argv)
+    if args.profile:
+        # One place for both credential paths: boto3 clients created below, and any
+        # subprocess (aws/kubectl) that reads AWS_PROFILE from the environment.
+        os.environ["AWS_PROFILE"] = args.profile
+        boto3.setup_default_session(profile_name=args.profile, region_name=args.region)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
