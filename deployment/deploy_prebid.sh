@@ -151,10 +151,10 @@ PLUGIN_SECRET_ENV=()
 # The configuration half of --inject-plugin, from --plugin-adapter. A seat that is
 # compiled in and has its environment set is STILL not served: this deployment's
 # configuration overlay replaces the release default file instead of merging with it,
-# and PBS-Java defaults adapters.<name>.enabled to false. the pod
-# started, the bidder resolved all of its properties, and every auction returned
-# "<name> is not configured properly on this Prebid Server deploy" with no seat, which
-# reports a configuration fault against the bidder rather than a missing seat.
+# and PBS-Java defaults adapters.<name>.enabled to false. Without this flag the pod
+# starts, the bidder resolves all of its properties, and every auction returns
+# "<name> is not configured properly on this Prebid Server deploy" with no seat,
+# reporting a configuration fault against the bidder rather than a missing seat.
 PLUGIN_ADAPTERS=()
 
 # The cost of any node capacity the Prebid pods force. Passed to the disclosure
@@ -1129,7 +1129,7 @@ if [[ "${START_AT}" -le 4 ]]; then
   # so it can place both the artfhouse adapter and the ARTF hook module into
   # src/main/java/... . No upstream file is edited, so U1-NFR-16 holds.
   #
-  # Establishing that route was the NFR-6 verification gate's job; see
+  # That route was established against the pinned release, not assumed.
   # -------------------------------------------------------------------------------
   INJECT_DIR="${BUILD_CONTEXT}/amt-bidder"
   PREBID_SRC="${REPO_ROOT}/source/prebid"
@@ -1714,8 +1714,8 @@ PY
   # Later in this step the orchestrator's ARTF_MUTATIONS_REQUIRED_SCOPE is set. An
   # orchestrator image built before this feature has no code that reads it, so the
   # flag is a SILENT NO-OP: the variable is present, the deployment rolls, and every
-  # machine token is still authorized on scope alone. a token with
-  # the wrong scope reached the handler instead of being refused with 403.
+  # machine token is still authorized on scope alone, and a token with the wrong
+  # scope reaches the handler instead of being refused with 403.
   #
   # Checked rather than assumed, and warned about rather than hidden, because a
   # security control that is set but not enforced is worse than one that is absent:

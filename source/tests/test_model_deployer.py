@@ -326,8 +326,8 @@ ENGINE_URI = f"s3://{MODEL_BUCKET}/optimized-models/dlrm_bid_shader/model.engine
 # FIL backend (deal_yield_manager_floor) — native XGBoost artifact, not a
 # TensorRT engine. stage_canary_fil()/promote_fil() are generic over
 # base_model, so this single-target name exercises them identically to how
-# deal_yield_manager_margin (the sibling single-target model -- see
-# FIL multi-output-limitation correction) would.
+# deal_yield_manager_margin (the sibling single-target model; Triton's FIL
+# backend does not support multi-output regression) would.
 FIL_BASE_MODEL = "deal_yield_manager_floor"
 FIL_ARTIFACT_URI = f"s3://{MODEL_BUCKET}/training-output/deal_yield_manager_floor/xgboost.json"
 _FIL_STABLE_CONFIG = (

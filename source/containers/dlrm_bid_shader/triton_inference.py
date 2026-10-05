@@ -87,10 +87,10 @@ def predict_ctr(
     0.5 x the conversion-value estimate x the shade factor is a plausible price, so
     a shaded bid was published on the strength of a number no model produced.
 
-    It also hides a deployment whose every inference fails: a container
-    was sending input names the served engine no longer declared; every inference
-    failed, and the only symptom was a slightly different shaded price. Triton's own
-    counter read `success=0` while the response said `status: ok`.
+    It also hides a deployment whose every inference fails: if the container sends
+    input names the served engine does not declare, the only symptom is a slightly
+    different shaded price, with Triton's own counter at `success=0` while the
+    response says `status: ok`.
 
     Raising instead lets the caller abstain. No mutation is a legitimate ARTF
     response — the auction proceeds on the original price — whereas a mutation
@@ -145,8 +145,7 @@ def predict_ctr(
         # cover not reaching the server at all: with Triton scaled to zero the client
         # raises a connection error, which escaped this function entirely, propagated
         # out of `mutate`, and arrived at the orchestrator as `status: error` with the
-        # abstention reason lost.
-        # `mutations: 0, status=error, abstained_reason=None`.
+        # abstention reason lost (`mutations: 0, status=error, abstained_reason=None`).
         #
         # Both cases are the same fact for a caller: there is no prediction. The
         # exception type is kept in the message so the two remain distinguishable in

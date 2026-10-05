@@ -62,43 +62,7 @@ Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable,
 
 ## What just happened?
 
-```
-Browser (React UI)
-    |                      sign in (Cognito) + HTTPS
-    |  GET /* (static)                 |  lambda:Invoke (SigV4)
-    v                                  v
-+---------------------+   +--------------------------------+
-|  CloudFront + S3    |   |  UI API proxy (Lambda, in VPC) |
-|  (serves the UI)    |   |  forwards /api/* calls         |
-+---------------------+   +--------------------------------+
-                                       |
-                                       |  http://orchestrator (ClusterIP)
-                                       v
-+------------------------------------------------------------+
-|  Orchestrator (EKS)                                        |
-|  verifies the login, runs the bid request through four     |
-|  sequential stages, applying each stage's mutations        |
-+------------------------------------------------------------+
-    |
-    |  4 stages, in order (parallel within a stage)
-    v
-+--------------------------------+
-|  6 ARTF containers (EKS)       |
-|  1 signals enricher,           |
-|    audience activator          |
-|  2 deal scorer                 |
-|  3 yield optimizer floor,      |
-|    yield optimizer margin      |
-|  4 bid pricer                  |
-+--------------------------------+
-    |
-    |  4 of the 6 call Triton
-    v
-+--------------------------------+
-|  NVIDIA Triton (GPU node)      |
-|  runs the AI models            |
-+--------------------------------+
-```
+![How a request travels from the browser to the GPU](docs/infographics/request-path.svg)
 
 `deploy.sh` deployed an Amazon EKS cluster with two node groups: a GPU node running NVIDIA Triton Inference Server, and CPU nodes running the orchestrator and six bidding containers, each responsible for one job in the pipeline:
 
@@ -510,7 +474,7 @@ Three things worth knowing about the record:
 
 **What the terminal shows, and where the rest went.** The terminal prints phases and steps only. Everything a step runs — the ONNX export, S3 copies, `eksctl`, every `kubectl apply`, CodeBuild polling, the AgentCore SDK's logging, and the `deploy_prebid.sh` and `deploy_closed_loop.sh` children — goes to one file per run, `deployment/.deploy-<prefix>.log` (the previous run is kept as `.deploy-<prefix>.prev.log`). The path is printed at the start of every run and again by every failure, and a failure also prints the last 15 lines of it inline. Pass `--verbose` to stream everything to the terminal instead.
 
-**A flag the script does not recognise stops the run.** Nothing is created first. This includes a flag whose leading dashes were turned into an em dash by a chat client or word processor (`—with-prebid`); the message says so, because that mistake is invisible on screen and used to be silently dropped — a run that was meant to include Prebid Server ran without it.
+**A flag the script does not recognise stops the run.** Nothing is created first. This includes a flag whose leading dashes were turned into an em dash by a chat client or word processor (`—with-prebid`); the message says so, because the substitution is invisible on screen and a dropped flag would otherwise deploy a different stack than the one asked for.
 
 ### Network layout: nothing in the VPC is internet-facing
 
@@ -783,7 +747,7 @@ cd deployment
 
 The upstream [Guidance for Deploying a Prebid Server on AWS](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) deploys Prebid Server to **ECS Fargate in its own VPC**. This variant deploys the same pinned upstream release into **the EKS cluster you already have**, beside the orchestrator and the ARTF containers.
 
-That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the hook's measured round trip to the orchestrator is **34–37 ms** at steady state (hook analytics `latency_ms`); a cross-VPC hop would come out of the same budget. Co-location is also closer to how a real bidding stack is laid out.
+That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the hook's measured round trip to the orchestrator is **19 to 21 ms** at steady state (hook analytics `latency_ms`, with 14.7 to 14.9 ms of that inside the orchestrator's three stages); a cross-VPC hop would come out of the same budget. Co-location is also closer to how a real bidding stack is laid out.
 
 **Nothing upstream is forked.** The pinned `prebid-server-java` release is fetched at deploy time and our sources are *added* to the checkout through the one extension point the upstream Dockerfile provides. The deploy proves it rather than asserting it — `diff -rq` against the pristine release reports **0 modified files, 0 removals, 5 additions**, and the deploy script prints `Upstream files modified by this step: 0 (additions only)` as it runs.
 
@@ -796,99 +760,52 @@ That is a deliberate deviation, on one ground: **Fargate in a second VPC reinsta
 
 The module is the sell side: it mutates the request every bidder then sees. The adapter is the buy side: it bids into the auction the module just shaped. Keeping them separate is what makes the two parties distinguishable rather than one program talking to itself.
 
-```
-+------------------------------------------------------------+
-|  Publisher page  (prebid.js in the browser)                |
-+------------------------------------------------------------+
-     |
-     |  1. POST /openrtb2/auction   (OpenRTB 2.x)
-     v
-+------------------------------------------------------------+
-|  Prebid Server (EKS, same cluster)                         |
-|                                                            |
-|  2. stage: processed-auction-request                       |
-|     +--------------------------------------------------+   |
-|     |  ARTF host module  'artf-orchestrator'           |   |
-|     |  budget check -> call -> apply mutations         |   |
-|     +--------------------------------------------------+   |
-+------------------------------------------------------------+
-     |                                        ^
-     |  3. POST /v1/mutations                 |  4. mutations
-     |     Bearer (client_credentials)        |     + per-container status
-     v                                        |
-+------------------------------------------------------------+
-|  Orchestrator (EKS)  -- the SAME one the UI calls          |
-|  runs stages 1-3 in order, applying between, replies       |
-+------------------------------------------------------------+
-     |
-     |  stage by stage (parallel within a stage)
-     v
-+------------------------------------------------------------+
-|  6 ARTF containers -> NVIDIA Triton (GPU)                  |
-+------------------------------------------------------------+
-
-                 ... back in Prebid Server ...
-
-+------------------------------------------------------------+
-|  5. bidder fan-out, on the ENRICHED request                |
-|     +--------------------------------------------------+   |
-|     |  'artfhouse' bid adapter                         |   |
-|     +--------------------------------------------------+   |
-+------------------------------------------------------------+
-     |
-     |  6. OpenRTB request -> demand endpoint
-     v
-+------------------------------------------------------------+
-|  artfhouse demand endpoint (API Gateway + Lambda)          |
-|  campaign catalog, deal matching, floor comparison         |
-+------------------------------------------------------------+
-     |
-     |  7. seatbid  (or nothing, with reasons)
-     v
-+------------------------------------------------------------+
-|  8. Prebid resolves: floors, currency, top bid per imp,    |
-|     targeting keys, ext.seatnonbid  -> response to page    |
-+------------------------------------------------------------+
-```
+![One page load through Prebid Server with the ARTF hook installed](docs/infographics/prebid-page-load.svg)
 
 #### The full scenario: one page load, end to end
 
-What actually happens, in order, when a browser loads a page carrying prebid.js. Timings are measured from the deployed stack, not estimates.
+What actually happens, in order, when a browser loads a page carrying prebid.js. The numbers are read from one deployed stack: five consecutive auctions of `source/prebid/fixtures/contested-auction-request.json` posted to the in-cluster Prebid Server with `ext.prebid.trace: verbose`, which makes Prebid return the hook's analytics tags in the response.
 
-1. **The page loads.** prebid.js builds an OpenRTB 2.x bid request from the ad units on the page — sizes, the page URL, first-party signals, any PMP deals the publisher has attached to the impression — and posts it to Prebid Server's `POST /openrtb2/auction` with a `tmax` (the total time the page will wait; 1500 ms in our test request).
+1. **The page loads.** prebid.js builds an OpenRTB 2.x bid request from the ad units on the page (sizes, the page URL, first-party signals, any PMP deals the publisher has attached to the impression) and posts it to Prebid Server's `POST /openrtb2/auction` with a `tmax`, the total time the page will wait. The fixture sets 1500 ms.
 
-2. **Prebid reaches the `processed-auction-request` stage.** This is *before* any bidder is called, which is the only place a request-side mutation can still affect every bidder equally. Prebid invokes the hooks named in its execution plan — here, `artf-orchestrator`.
+2. **Prebid reaches the `processed-auction-request` stage.** This is before any bidder is called, which is the only place a request-side mutation can still affect every bidder equally. Prebid invokes the hooks named in its execution plan, here `artf-orchestrator`.
 
-3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance and a reserve held back for bidder fan-out and auction resolution, and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget` — *not* an error, because nothing decided and nothing broke; the orchestrator was simply never asked.
+3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance (20 ms) and a reserve held back for bidder fan-out and auction resolution (60 ms), and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget`, which is not an error: nothing decided and nothing broke, the orchestrator was simply never asked.
 
-4. **The module calls the orchestrator.** `POST /v1/mutations` with a bearer token it already holds — a Cognito `client_credentials` token, refreshed on a timer, never fetched on the auction path. The orchestrator runs the ARTF containers through stages 1 to 3 (enrich, deals, yield; see [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)), four of the six call Triton on the GPU, and it replies with the stage-ordered list; the hook measured the earlier single-stage round trip at **34–37 ms** steady state (the `latency 36 ms` line below), and the reply carries per-container status with each container's own in-orchestrator latency:
-
-   ```
-   dlrm-bid-shader            skipped        (BID_SHADE is response-side; see below)
-   widedeep-segment-activator no_mutations   9.84 ms
-   ncf-deal-manager           error         16.71 ms
-   metrics-enricher           ok            10.79 ms
-   yield-optimizer-floor      error         15.20 ms
-   yield-optimizer-margin     error         15.94 ms
-   ```
-
-5. **The module applies the mutations to the bid request.** Segments onto `user.data`, deals activated or suppressed in `imp.pmp.deals`, quality metrics onto `imp.metric`, content ids, and deal floors — each write validated against what Prebid will actually accept, and each one either applied or **rejected with a reason**. A real run:
+4. **The module calls the orchestrator.** `POST /v1/mutations` with a bearer token it already holds, a Cognito `client_credentials` token refreshed on a timer and never fetched on the auction path. The orchestrator runs the containers through stages 1 to 3 (enrich, deals, yield; see [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)) and replies with the stage-ordered list plus per-container status. On the measured runs the hook saw the round trip at **19 to 21 ms** steady state, of which 14.7 to 14.9 ms was spent inside the orchestrator. One run, as the hook recorded it:
 
    ```
-   success / update in 44 ms
-     outcome            mutations_returned      latency  36 ms
-     request_mutated    True
-     applied            1        by intent  {ADD_METRICS: 1}
-     rejected           0
+   artf-extension-point   success
+     outcome              mutations_returned     latency_ms  19
+     request_mutated      true                   mutations_returned  1
+     model_version        orchestrator-v1 (1 mutations, 14.9ms)
+     containers
+       Signals Enricher             ok             3.56 ms
+       Audience Activator           no_mutations   3.98 ms
+       Deal Scorer                  no_mutations   5.50 ms
+       Yield Optimizer, Floor       no_mutations   4.01 ms
+       Yield Optimizer, Margin      no_mutations   3.77 ms
+       Bid Pricer                   skipped        (BID_SHADE is response-side; see below)
+       ARTF Template                disabled
    ```
 
-6. **Prebid fans out to the bidders** — on the enriched request. Every bidder, including third-party ones you add, sees the ARTF-shaped request. This is the property that makes the integration production-shaped rather than a side channel.
+   Four of the five containers that ran report `no_mutations` for this request, and that is the correct answer for it: the fixture already carries `deal-home-premium` on the impression, so the Deal Scorer has nothing to activate, and the yield containers have nothing to move. A container with nothing to say says so in a few milliseconds.
 
-7. **The `artfhouse` adapter bids.** It forwards the enriched request to the demand endpoint, which holds a campaign catalog, matches deals on the impression, compares each campaign's CPM against the resolved floor, and returns a `seatbid` — or returns nothing, with a per-campaign exclusion reason (`below_floor`, `deal_suppressed`, `not_targeted`, `no_deal_on_impression`).
+5. **The module applies the mutations to the bid request.** Segments onto `user.data`, deals activated or suppressed in `imp.pmp.deals`, quality metrics onto `imp.metric`, content ids, and deal floors. Each write is validated against what Prebid will actually accept, and each one is either applied or **rejected with a reason**. From the same run:
+
+   ```
+   artf-mutations         success
+     applied              1       applied_by_intent   {ADD_METRICS: 1}
+     rejected             0       rejections          []
+   ```
+
+6. **Prebid fans out to the bidders**, on the enriched request. Every bidder, including third-party ones you add, sees the ARTF-shaped request. This is the property that makes the integration production-shaped rather than a side channel.
+
+7. **The `artfhouse` adapter bids.** It forwards the enriched request to the demand endpoint, which holds a campaign catalog, matches deals on the impression, compares each campaign's CPM against the resolved floor, and returns a `seatbid`, or returns nothing with a per-campaign exclusion reason (`below_floor`, `deal_suppressed`, `not_targeted`, `no_deal_on_impression`).
 
 8. **Prebid resolves the auction.** Price-floor enforcement, currency conversion, the top bid per impression, `hb_*` targeting keys, and [`ext.seatnonbid`](https://docs.prebid.org/prebid-server/endpoints/openrtb2/pbs-endpoint-auction.html) saying why each losing bid lost. The response goes back to prebid.js, which passes the winning bid to the page's ad server.
 
-**Cold start, stated because you will see it.** The first auction or two after a rollout time out at around 91 ms against the 100 ms ARTF budget — JVM warm-up and first-connection cost — then settle at **34–37 ms**. The hook reports that honestly as a timeout and the auction proceeds unmutated, which is the designed behaviour: a fault in the module never rejects an auction.
+**Cold start, stated because you will see it.** The first auction after the hook has been idle times out: on the measured runs it took 91 ms against the 90 ms budget the calculator had derived for that call, so the hook reported `outcome: timeout`, `request_mutated: false`, and the auction proceeded on the publisher's request. The next four settled at 19 to 21 ms. That is the designed behaviour: a fault or a slow answer in the module never rejects an auction, and the timeout is reported as what it is rather than hidden.
 
 #### Seeing the auction from the browser
 

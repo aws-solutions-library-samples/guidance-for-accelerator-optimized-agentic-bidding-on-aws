@@ -1,8 +1,7 @@
 """Tests for shared.yield_features -- pure feature
 engineering for the Yield Optimizer (deal floor/margin) model.
 
-Property-based tests (PBT Partial mode -- pure functions, per this
-project's Extension Configuration) validate the invariants declared in
+Property-based tests validate the invariants of the pure feature functions.
 """
 
 import os

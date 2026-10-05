@@ -448,9 +448,8 @@ _INCONCLUSIVE = Scenario(
 )
 
 # NCF Deal Manager variants of the same three governance outcomes. Each set of
-# ab_samples below was verified against the real ABEvaluator (not just picked
-# to match DESIGN_BRIEF.md's illustrative figures) — see
-# for the exact evaluate() output each produces.
+# ab_samples below was verified against the real ABEvaluator, not picked to
+# match illustrative figures.
 
 _CHALLENGER_WINS_NCF = Scenario(
     key="challenger_wins_ncf",

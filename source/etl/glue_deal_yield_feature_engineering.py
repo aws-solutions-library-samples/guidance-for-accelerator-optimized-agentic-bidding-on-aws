@@ -12,10 +12,9 @@ FIL backend does not support multi-output regression, so the two targets
 are independently-trained single-output models with their own training data.
 
 Feature reconstruction is duplicated here rather than imported from
-shared.yield_features -- consistent with the
-"no cross-unit code dependency" boundary
-business-logic-model.md documents for deal_yield_feedback.py's own
-_classify_category_tier() mirror, and also a practical necessity: a Glue job
+shared.yield_features -- the same "no cross-unit code dependency" boundary
+deal_yield_feedback.py keeps with its own _classify_category_tier() mirror,
+and also a practical necessity: a Glue job
 script has no access to the containers/ package (it is not bundled into the
 Glue script upload). is_first_price/is_second_price/bidfloor_tier are
 recomputed here from auction_type/original_bidfloor (the same real fields

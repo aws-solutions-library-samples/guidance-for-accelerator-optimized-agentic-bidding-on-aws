@@ -21,8 +21,7 @@ xgb.train() call, not a fabricated file: every deal recommends "no change"
 until the first real closed-loop retraining job runs.
 
 Writes TWO artifacts per sub-model, matching the dual-format genesis
-convention already established for this feature (see
-business-logic-model.md Logic Flow 2):
+convention already established for this feature:
     1. Native XGBoost JSON (what Triton's FIL backend actually loads):
        <output-dir>/<model_type>/1/xgboost.json
     2. ONNX (registry-bookkeeping only, mirrors the DLRM/NCF onnx-source/

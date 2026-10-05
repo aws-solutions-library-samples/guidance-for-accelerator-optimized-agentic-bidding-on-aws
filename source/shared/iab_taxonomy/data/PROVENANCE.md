@@ -64,4 +64,4 @@ mappings. There is no Content-to-Audience file.
 
 The mapping this project uses is therefore **ours, not IAB's**. It joins a content category's tier path
 against Audience Taxonomy Interest tier paths, which works because the two taxonomies share tier
-vocabulary by design. It resolves 565 of the 705 Content 3.1 categories. See
+vocabulary by design. It resolves 565 of the 705 Content 3.1 categories.

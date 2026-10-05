@@ -9,10 +9,10 @@ one worker thread; every request landing on another raises
       Current:  <greenlet.greenlet object at ... current active started main>
       Expected: <greenlet.greenlet object at ... suspended active started main>
 
-which the container surfaces as `inference_unavailable` and no mutation. Observed
-2 of 6 identical sequential requests to the bid
-shader abstained, while Triton's own counter recorded all of them as successes --
-so server-side metrics could not see it.
+which the container surfaces as `inference_unavailable` and no mutation. Under
+load a fraction of identical sequential requests abstain this way while Triton's
+own counter records all of them as successes, so server-side metrics cannot see
+it.
 
 These tests assert the fix's invariant (distinct thread -> distinct client) rather
 than the absence of the error string, because the error only reproduces against a

@@ -227,8 +227,10 @@ spec:
             # Deal yield feedback pipeline (source/orchestrator/
             # deal_yield_feedback.py): emits real DealYieldOutcomeEvents for
             # ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN mutations. Separate stream
-            # from FEEDBACK_STREAM_NAME above -- see
-            # for why. Same "unset -> disabled, not fabricated" contract.
+            # from FEEDBACK_STREAM_NAME above: Firehose's Glue-schema Parquet
+            # conversion maps by column name, so a shared stream would silently
+            # drop this event's fields. Same "unset -> disabled, not fabricated"
+            # contract.
             - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
               value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
             # Outcome simulator (source/orchestrator/outcome_simulator.py).

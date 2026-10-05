@@ -1,6 +1,5 @@
 """The Triton call sends the spec's inputs, under the spec's names, in order.
 
-
 `predict_ctr` used to take four positionally-named arrays — `dense_features`,
 `sparse_user`, `sparse_domain`, `sparse_device` — which named a feature set the
 spec does not have. It now takes the spec's `(dense, categorical)` pair and

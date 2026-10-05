@@ -5,7 +5,7 @@ the Auction Theater feature that changes code on the live bid path, so requests 
 do not opt into a modern taxonomy must behave as they did before.
 
 The expected legacy output below was CAPTURED from the implementation as it stood
-before this change, not typed from an expectation. See
+before this change, not typed from an expectation.
 """
 
 from __future__ import annotations

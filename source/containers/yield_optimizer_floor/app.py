@@ -15,8 +15,6 @@ Mutation path/payload convention verified against the ARTF v1.0 proto
 (agenticrtbframework.proto): a deal is identified purely via
 `path: "/imp/{imp_id}/deals/{deal_id}"` -- AdjustDealPayload carries no
 deal_id field.
-
-design rationale (business-logic-model.md, business-rules.md).
 """
 
 from __future__ import annotations

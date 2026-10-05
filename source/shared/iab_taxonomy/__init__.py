@@ -12,7 +12,7 @@ but NOT between Content and Audience -- the ``Taxonomy Mappings`` folder has
 Content-to-Ad-Product, Content-to-Content, and genre mappings, and nothing joining
 Content to Audience. So this mapping is OURS. It joins on tier path, which works
 because the two taxonomies share tier vocabulary by design, and resolves 565 of the
-705 Content 3.1 categories with no hand-curation. See
+705 Content 3.1 categories with no hand-curation.
 
 **On Special Category Data.** IAB's implementation guidance describes the SCD
 extension as a control to reduce the risk that content categorisation gets used to

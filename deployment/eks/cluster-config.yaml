@@ -20,9 +20,9 @@ metadata:
 # Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
 # On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
 # two-AZ VPC is one capacity event away from a nodegroup that cannot launch at
-# all. €” g5.xlarge had no capacity in either of the two AZs
-# eksctl had chosen, while three other AZs in the region had it, and the VPC had
-# no subnets there to use. Spreading the VPC across AZs is the lever that buys
+# all: g5.xlarge can have no capacity in the two AZs eksctl chose while other AZs
+# in the region have it, and a two-AZ VPC has no subnets there to use.
+# Spreading the VPC across AZs is the lever that buys
 # capacity resilience; see the note on instanceTypes below for what does not.
 availabilityZones: ["__REGION__a", "__REGION__b", "__REGION__c"]
 
@@ -45,8 +45,8 @@ managedNodeGroups:
   # an Auto Scaling group whose On-Demand allocation strategy is `prioritized`,
   # which fulfils capacity from the first type in the list, then the second, then
   # the third â€” and on InsufficientInstanceCapacity it retries the first type, it
-  # does not descend. 28 of 28 launch attempts were g5.xlarge
-  # across two AZs while g5.2xlarge and g5.4xlarge were never tried. Keeping the
+  # does not descend: every launch attempt is g5.xlarge and the larger types are
+  # never tried. Keeping the
   # larger types listed costs nothing and lets an operator reorder them, but do not
   # expect them to rescue a stuck nodegroup. AZ spread (above) is what does that.
   # Reference: EC2 Auto Scaling "Allocation strategies for multiple instance types",
@@ -59,12 +59,12 @@ managedNodeGroups:
   # sm_89) here â€” it would silently break Triton engine loading.
   #
   # privateNetworking: true -- nodes launch in the private subnets with no public IP.
-  # eksctl's default places managed nodes in the PUBLIC subnets, and that is what
-  # fails in an account with VPC Block Public Access in block-ingress
-  # mode, under which only NAT-gateway traffic is allowed, so nodes routing via the
-  # internet gateway could not reach the EKS endpoint or ECR and never joined
-  # ("NodeCreationFailure: Instances failed to join the kubernetes cluster", on the
-  # CPU nodes as well as the GPU node). Nothing reaches a node directly, and
+  # eksctl's default places managed nodes in the PUBLIC subnets, which does not
+  # work in an account running VPC Block Public Access in block-ingress mode:
+  # only NAT-gateway traffic is allowed, so nodes routing via the internet gateway
+  # cannot reach the EKS endpoint or ECR and never join ("NodeCreationFailure:
+  # Instances failed to join the kubernetes cluster", CPU and GPU nodes alike).
+  # Nothing reaches a node directly, and
   # nothing in the cluster is internet-facing: the orchestrator is a ClusterIP
   # Service reached by the ui-api-proxy Lambda inside the VPC, Triton is behind
   # an internal NLB, Prebid Server is in-cluster over service DNS, and the VPC

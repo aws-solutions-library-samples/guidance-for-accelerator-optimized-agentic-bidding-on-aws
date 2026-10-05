@@ -3361,8 +3361,8 @@ h1, h2, h3, .sg-display {
 
 /* ══════════════════════════════════════════════════════════════════════════
    ARTF mutation framing (Model Governance panel) — mutation-intent cards,
-   technical popovers, verdict card, bidstream-impact card, session audit.
-   reference_prototype.html into the styleguide token system.
+   technical popovers, verdict card, bidstream-impact card, session audit,
+   built on the styleguide token system.
    ══════════════════════════════════════════════════════════════════════════ */
 
 /* ── Pipeline bar (top of page, icon steps) — sized and animated to match

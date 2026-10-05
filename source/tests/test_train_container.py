@@ -1,9 +1,6 @@
 """Unit tests for the NeMo-RL training container entrypoint (train.py).
 
-Covers real production bugs found while diagnosing live failed training
-jobs (dlrm-bid-shader-1787311543-72232191, base version
-dv1-artf-dlrm-bid-shader/1; dlrm-bid-shader-1787398867-e572c442) and their
-predecessors:
+Covers failure modes of live SageMaker training jobs:
 
 1. load_training_data() used a non-recursive glob, but the Glue ETL job
    writes Hive-style partitioned Parquet (window_start=.../window_end=.../

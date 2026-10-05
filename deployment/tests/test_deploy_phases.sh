@@ -907,10 +907,9 @@ test_unknown_args_rejected() {
 # =========================================================================
 # Test: the UI API path is private (no public ingress anywhere)
 # =========================================================================
-# The orchestrator used to sit behind an internet-facing load balancer, and an
-# account running VPC Block Public Access in block-ingress mode dropped every
-# packet to it at the internet gateway, so the
-# deploy stopped. The design now has NO internet-facing resource
+# An account running VPC Block Public Access in block-ingress mode drops every
+# packet to an internet-facing load balancer at the internet gateway, and the
+# operator may not be able to change that. The design has NO internet-facing resource
 # in the VPC: the orchestrator is a ClusterIP Service and the browser reaches it by
 # invoking the <prefix>-ui-api-proxy Lambda, attached to the cluster's private
 # subnets. These assertions pin that shape in the manifest, in deploy.sh, and in

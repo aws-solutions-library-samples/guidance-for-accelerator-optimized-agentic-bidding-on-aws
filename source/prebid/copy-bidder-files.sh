@@ -34,7 +34,7 @@
 #     builds the ROOT pom and ships target/prebid-server.jar, which is PBS-Core
 #     with no modules at all.
 #
-# Both were established by the NFR-6 verification gate; see
+# Both were established against the pinned release, not assumed.
 #
 # NO UPSTREAM FILE IS EDITED. Sources are ADDED to the checkout, which is what
 # keeps this an integration rather than a fork (U1-NFR-16).

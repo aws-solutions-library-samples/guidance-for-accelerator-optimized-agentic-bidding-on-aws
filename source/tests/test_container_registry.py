@@ -1,6 +1,6 @@
 """Tests for the ARTF container registry, status vocabulary, and activation.
 
-Covers the business rules from
+Covers the registry's business rules:
 
 - BR-1..BR-7   ``merge_registry``
 - BR-8..BR-11  ``select_active``
@@ -14,8 +14,7 @@ The transport and fan-out tests run on ``httpx.ASGITransport`` inside a single
 ``asyncio.run``, never starlette's threaded ``TestClient``. That is not a style
 preference: this project previously had a concurrency test that PASSED against
 broken code because ``TestClient`` gives each thread its own event-loop portal,
-so nothing was ever actually concurrent (see the ARTF Container Latency Fix
-notes in aidlc-state.md).
+so nothing was ever actually concurrent.
 """
 
 from __future__ import annotations

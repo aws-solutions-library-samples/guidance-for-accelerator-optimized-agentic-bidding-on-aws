@@ -4,8 +4,8 @@
  *
  * Auth: IAM SigV4 with temporary credentials from the Cognito Identity Pool.
  * The runtimes stay on SigV4 inbound auth (the same mechanism the production
- * EventBridge invokers use), so we can invoke them with the AWS SDK. See
- * SigV4 (not OAuth/JWT) is used here.
+ * EventBridge invokers use), so we can invoke them with the AWS SDK; a second
+ * OAuth/JWT inbound path would duplicate what Cognito already provides.
  *
  * Refs:
  * - https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/loading-browser-credentials-cognito.html

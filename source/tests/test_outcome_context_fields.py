@@ -1,6 +1,5 @@
 """The outcome event carries every column the DLRM feature spec reads.
 
-
 `BidShadingOutcomeEvent` gained `day_of_week`, `geo_country` and `has_video`
 because `shared/dlrm_features.py` names them. A column the spec reads but the
 event does not carry means the training side reads a default while the serving

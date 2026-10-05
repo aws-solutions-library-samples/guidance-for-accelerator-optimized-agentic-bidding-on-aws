@@ -172,9 +172,8 @@ Resources:
   # 3c. Deal Yield Manager (Yield Optimizer) Model Package Groups
   #
   # Trained via a SEPARATE path (XGBoost, source/training/xgboost_pipeline.py)
-  # from DLRM/NCF's NeMo-RL path -- see
-  # the same genesis-registration script/convention for cross-model-type
-  # consistency.
+  # from DLRM/NCF's NeMo-RL path. Registered through the same
+  # genesis-registration script/convention for cross-model-type consistency.
   #
   # CORRECTION (found during Unit 3 implementation): Triton's FIL backend
   # does not support multi-output regression models (confirmed against

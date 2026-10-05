@@ -4,9 +4,9 @@ orchestrator's bid path.
 Mirrors source/orchestrator/feedback_integration.py's emit_bid_outcome()
 contract exactly (fire-and-forget, never raises, < 1ms overhead), but for
 deal floor/margin outcomes rather than bid-shading outcomes. Deliberately a
-SEPARATE Kinesis stream from BidOutcomeStream -- see
-business-logic-model.md for why sharing the stream would silently drop this
-event's fields (Firehose's Glue-schema-based Parquet conversion maps by
+SEPARATE Kinesis stream from BidOutcomeStream, because sharing the stream
+would silently drop this event's fields (Firehose's Glue-schema-based Parquet
+conversion maps by
 field name).
 
 Env vars:

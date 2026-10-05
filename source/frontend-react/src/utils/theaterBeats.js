@@ -4,8 +4,6 @@
 // Pure: no I/O, no clock, no randomness. Given the same submitted payload and
 // normalized result it returns the same beats, which is what makes the stepper
 // reproducible and this module property-testable.
-//
-// this implements (BR-1 through BR-12).
 
 import { DISPLAY_NAME_BY_STOP_ID, CONTAINER_NAME_TO_STOP_ID } from "./intentMapping.js";
 import { findOriginalDealBidfloor } from "./applyMutations.js";

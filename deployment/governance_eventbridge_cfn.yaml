@@ -380,7 +380,7 @@ Resources:
   #
   # A Lambda cannot poll a training job to completion (jobs run far past the 15-min
   # Lambda limit), so this is split at the async boundary SageMaker already provides:
-  # the "SageMaker Training Job State Change" EventBridge event. See
+  # the "SageMaker Training Job State Change" EventBridge event.
   # ===========================================================================
 
   RetrainingTriggerFunction:

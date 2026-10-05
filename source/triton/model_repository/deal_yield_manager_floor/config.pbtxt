@@ -4,8 +4,7 @@
 # CORRECTION (found during Unit 3 implementation): Triton's FIL backend does
 # NOT support multi-output regression models, and requires exactly one input
 # tensor named "input__0" and one output tensor named "output__0" (confirmed
-# against NVIDIA's official FIL backend docs -- see
-# for the correction note). The originally-committed single
+# against NVIDIA's official FIL backend docs). The originally-committed single
 # `deal_yield_manager` model (one input "features", two outputs
 # "floor_multiplier"/"margin_value") would fail to load in Triton. Split into
 # two independent single-target FIL models -- this one (floor) and the

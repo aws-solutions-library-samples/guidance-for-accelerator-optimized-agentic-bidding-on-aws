@@ -133,5 +133,5 @@ response shape is unchanged.
 The mechanism is generic: a second store-defined container is a second record in
 the registry table, with no orchestrator code change. Its Kubernetes objects
 (Deployment, Service, HPA) and ECR repository still come from a deploy, so copy
-this directory and its nine registration sites — `RENAME_MAP.md` lists them, and
-with the reason each exists.
+this directory and its nine registration sites; `RENAME_MAP.md` lists them with
+the reason each exists.

@@ -5,10 +5,10 @@ is a fabricated prediction, and it is indistinguishable downstream from a real o
 0.5 x the conversion-value estimate x the shade factor is a plausible price, so a
 shaded bid was published on the strength of a number no model produced.
 
-It also hides a deployment whose every inference fails: a container was
-sending input names the served engine no longer declared. Every inference failed. The
-only symptom was a slightly different shaded price — Triton's own counter read
-`success=0` while the orchestrator response read `status: ok`.
+It also hides a deployment whose every inference fails: a container sending input
+names the served engine does not declare shows no symptom beyond a slightly
+different shaded price, with Triton's own counter at `success=0` while the
+orchestrator response reads `status: ok`.
 
 No mutation is a legitimate ARTF response: the auction proceeds at the original
 price. A mutation derived from a placeholder is a wrong answer presented as a right

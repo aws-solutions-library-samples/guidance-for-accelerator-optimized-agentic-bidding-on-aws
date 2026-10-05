@@ -488,7 +488,7 @@ Resources:
   # -based Parquet conversion maps by field name -- sharing BidOutcomeStream
   # would silently drop this event's distinguishing fields (deal_id, intent,
   # adjusted_bidfloor, etc.). Reuses the existing KMS key and S3 bucket (new
-  # prefix only) -- see
+  # prefix only).
   # ---------------------------------------------------------------------------
 
   DealYieldOutcomeStream:

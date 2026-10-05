@@ -15,6 +15,7 @@ ModelApprovalStatus=Approved (it IS the version currently serving production
 traffic via Triton). The registration is tagged genesis=true in
 CustomerMetadataProperties so it is honestly distinguishable from an actually
 trained version - this is NOT a trained result and must never be presented as
+one.
 
 Idempotent: if a Model Package Group already has any registered version, that
 group is skipped (re-running deploy never duplicates or overwrites a version).
@@ -61,8 +62,8 @@ _LOG = logging.getLogger("register_genesis_models")
 # XGBoost JSON artifact staged directly to each model's own Triton model
 # repository path (triton-models/deal_yield_manager_floor/1/xgboost.json,
 # .../deal_yield_manager_margin/1/xgboost.json), which this script does not
-# functional-design/business-logic-model.md (Logic Flow 2) for the full
-# rationale, and business-rules.md BR-5/the FIL multi-output-limitation
+# touch. Two single-output models rather than one two-output model because
+# Triton's FIL backend does not support multi-output regression; see the FIL
 # correction note for why this is two independent model types, not one.
 _MODEL_TYPES: list[tuple[str, str]] = [
     ("dlrm_bid_shader", "dlrm"),

@@ -1,12 +1,11 @@
 # =============================================================================
 # deploy_state.sh — remembered INPUTS for deploy.sh. Not progress.
 #
-# Sourced by deploy.sh. This file used to track which phases had completed, and
-# it recorded what the *script* had done, which is not what
-# *exists*. It reported "Phase 3 complete" for a deployment whose Triton pod had
-# never started, and it could not be read from another machine, after a reboot, or
-# by a colleague. Progress now comes from AWS -- see scripts/deploy_status.py and
-# lib/deploy_gate.sh.
+# Sourced by deploy.sh. Phase progress is deliberately NOT recorded here: a file
+# records what the *script* did, which is not what *exists* (it would say "Phase 3
+# complete" for a deployment whose Triton pod never started), and it cannot be read
+# from another machine or by a colleague. Progress comes from AWS -- see
+# scripts/deploy_status.py and lib/deploy_gate.sh.
 #
 # What is left is the part AWS genuinely cannot answer: the flags a previous run
 # was GIVEN. The NGC secret name is the case that justifies the file existing at

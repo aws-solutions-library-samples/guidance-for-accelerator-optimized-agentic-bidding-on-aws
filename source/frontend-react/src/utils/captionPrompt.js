@@ -20,7 +20,8 @@
 //     into "parents with children aged 35-39", whose more natural reading is
 //     false. Validation cannot detect this, so the prompt is the only control.
 //
-// for the output these constraints were derived from.
+// These constraints were derived from recorded model output (captionFixtures.js),
+// not from an expectation of it.
 
 import { BEAT_ORIGIN, BEAT_RECAP } from "./theaterBeats.js";
 

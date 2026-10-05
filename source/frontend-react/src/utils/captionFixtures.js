@@ -1,7 +1,7 @@
 // captionFixtures.js — real Haiku 4.5 output, captured during U3 NFR Requirements.
 //
-// These are not invented test strings. They are what the model actually wrote
-// when given the beat shapes below, recorded verbatim in
+// These are not invented test strings. They are what the caption model actually
+// wrote when given the beat shapes below, recorded verbatim.
 //
 // They exist because a validator written against imagined output would have
 // passed its own tests and rejected every real caption: the model writes

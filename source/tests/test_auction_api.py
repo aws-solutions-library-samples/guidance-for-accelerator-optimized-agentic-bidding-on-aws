@@ -466,9 +466,9 @@ def test_preparation_does_not_mutate_the_caller_s_request():
 def test_a_plain_text_rejection_is_reported_as_a_rejection(monkeypatch):
     # Prebid answers a malformed bid request with 400 and a bare sentence, not
     # JSON. Calling that "non-JSON" buries the reason, which is the one thing the
-    # caller needs since the fault is in the request they sent. Example:
-    # a scenario carried pmp.private_auction as a JSON boolean where OpenRTB
-    # specifies an integer, and Prebid rejected the whole request.
+    # caller needs since the fault is in the request they sent. Example: a
+    # scenario carrying pmp.private_auction as a JSON boolean where OpenRTB
+    # specifies an integer is rejected as a whole request.
     monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
     message = (
         "Invalid request format: Error decoding bidRequest: Cannot deserialize value "

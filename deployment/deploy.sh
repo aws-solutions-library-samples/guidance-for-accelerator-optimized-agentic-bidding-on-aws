@@ -44,7 +44,7 @@ fi
 #
 # A flag the script does not recognise STOPS the run before anything is touched --
 # including a flag typed with an em dash (—with-prebid), which a chat client or word
-# processor substitutes for two hyphens and which used to be silently dropped.
+# processor substitutes for two hyphens.
 #
 # NETWORK LAYOUT. Both EKS node groups sit in PRIVATE subnets behind one NAT gateway
 # per AZ (eks/cluster-config.yaml: privateNetworking: true, nat.gateway:
@@ -331,11 +331,11 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
         DEPLOY_PROFILE="${arg}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1
       else
-        # Anything else is a mistake, and a mistake that used to be silent: the token
-        # fell through every branch above and the run proceeded without it. For example,
-        # as "—with-prebid" pasted with an em dash, which deployed with
-        # Prebid OFF and said nothing. The em/en dash case gets its own hint because
-        # the two glyphs are indistinguishable from "--" in most terminal fonts.
+        # Anything else stops the run: a token that fell through every branch above
+        # would otherwise deploy a different stack than the one asked for ("—with-prebid"
+        # pasted with an em dash deploys with Prebid OFF). The em/en dash case gets its
+        # own hint because the two glyphs are indistinguishable from "--" in most
+        # terminal fonts.
         _dash_hint=""
         case "${arg}" in
           $'\xe2\x80\x94'*|$'\xe2\x80\x93'*) _dash_hint=" (that first character is an em/en dash, not two hyphens)" ;;
@@ -1372,9 +1372,9 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   # --- VPC proxy stack FIRST: its Lambda's ENIs live in the EKS cluster's
   # private subnets. If the cluster is deleted first, those ENIs are left
-  # behind and block subnet deletion (eksctl-*-cluster stack
-  # gets stuck DELETE_FAILED on "subnet has dependencies and cannot be
-  # deleted"). Wait for completion so the ENIs are gone before eksctl runs.
+  # behind and block subnet deletion (the eksctl-*-cluster stack goes
+  # DELETE_FAILED on "subnet has dependencies and cannot be deleted"). Wait
+  # for completion so the ENIs are gone before eksctl runs.
   # The UI API proxy Lambda (Part 1) has the same VPC-attached ENIs, so it goes
   # at the same point for the same reason.
   for _vpc_lambda_stack in "${UI_API_PROXY_STACK}" "${VPC_PROXY_STACK}"; do
@@ -1888,7 +1888,7 @@ run_step "Exporting DLRM and NCF to ONNX" \
 # and installed independently here, with a warn()-only fallback. If genesis
 # export doesn't succeed,
 # register_genesis_models.py (Step 3, deploy_closed_loop.sh) skips that
-# model type honestly (its own existing "missing artifact" path -- see
+# model type (its own existing "missing artifact" path) and
 # scheduled retraining/genesis registration can be re-run later once the
 # packages are available, using the exact same known bucket path/env vars
 # (MODEL_BUCKET, AWS_REGION) the rest of this script already uses -- no new
@@ -1991,9 +1991,8 @@ log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
 # (onnx-source/, matches the DLRM/NCF convention exactly so
 # register_genesis_models.py needs no format-specific branching) AND the
 # native XGBoost JSON form (triton-models/<model>/1/xgboost.json) --
-# Triton's FIL backend does NOT read ONNX, only the native format (see
-# business-logic-model.md Logic Flow 2). Skipped honestly per-model if Step
-# 2.5 did not produce that model's artifacts.
+# Triton's FIL backend does NOT read ONNX, only the native format. Skipped
+# per-model if Step 2.5 did not produce that model's artifacts.
 for m in "${YIELD_MODELS[@]}"; do
   if [[ -f "${ONNX_STAGING}/${m}/1/model.onnx" && -f "${ONNX_STAGING}/${m}/1/xgboost.json" ]]; then
     quiet "s3 cp ${m}/model.onnx -> onnx-source/" \
@@ -3003,8 +3002,8 @@ log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"
 # single `yield-optimizer` Deployment/Service/HPA and is now
 # `yield-optimizer-floor` + `yield-optimizer-margin`, so applying the new
 # manifest leaves the old trio Running on any cluster deployed before the split
-# (7 ARTF pods instead of 6, the stale pod still on the
-# pre-split combined image).
+# (7 ARTF pods instead of 6, the stale pod still on the pre-split combined
+# image).
 #
 # It receives no traffic -- the orchestrator's CONTAINERS registry no longer
 # lists it -- so this is not a correctness problem, but it holds a pod slot, its

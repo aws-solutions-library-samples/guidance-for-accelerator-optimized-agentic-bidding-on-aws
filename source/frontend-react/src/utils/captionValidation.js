@@ -14,8 +14,6 @@
 // A failing caption is never repaired, truncated or partially accepted (BR3-15).
 // Editing model output to make it pass would display prose that neither the
 // model nor the data authored.
-//
-// (BR3-13 to BR3-21) and nfr-requirements/nfr-requirements.md (NFR3-6, NFR3-7).
 
 const CHAR_CEILING = 260;   // NFR3-6: the caption strip holds ~3 lines of ~84 chars
 const WORD_CEILING = 45;    // NFR3-5: the constraint the model actually respects

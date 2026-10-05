@@ -7,7 +7,8 @@ frontend build (``deploy_frontend.py``) and the orchestrator to consume:
    bearer for the orchestrator API through CloudFront).
 2. A **Cognito Identity Pool** federated to that User Pool. The browser exchanges
    the User Pool ID token for temporary SigV4 credentials so it can invoke the
-   closed-loop AgentCore runtimes DIRECTLY (never through the orchestrator). See
+   closed-loop AgentCore runtimes DIRECTLY (never through the orchestrator), the
+   same SigV4 inbound auth the EventBridge invokers use.
 3. An **authenticated IAM role** attached to the Identity Pool. Its inline policy
    grants ``bedrock-agentcore:InvokeAgentRuntime`` scoped to the two closed-loop
    runtime ARNs (and their DEFAULT endpoint sub-resource) — least privilege, no
@@ -245,9 +246,8 @@ def _put_caption_policy(iam, *, role_name: str) -> None:
     The document is deliberately STATIC -- no account id, no region, no model id --
     so this function makes no ``sts`` or ``bedrock`` calls and is region-independent.
 
-    The wildcard resource is a documented, user-directed exception to the project's
-    least-privilege rule, recorded in
-    and in business rule BR3-5. It is what makes the ``global.`` cross-Region
+    The wildcard resource is a deliberate exception to the project's
+    least-privilege rule. It is what makes the ``global.`` cross-Region
     inference profile usable without the three-statement conditional policy pattern
     (profile ARN, in-Region model ARN, and the global model ARN with a
     ``aws:RequestedRegion: unspecified`` condition). Scoping it instead required
