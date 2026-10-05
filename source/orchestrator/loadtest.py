@@ -32,6 +32,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from orchestrator.container_registry import ERROR_STATUSES, RAN_STATUSES
 from orchestrator.deal_yield_feedback import emit_load_test_deal_yield_outcome
 from orchestrator.etl_trigger import SWEEP_DELAY_SECONDS, trigger_etl_sweep
+from orchestrator.loadtest_peers import any_peer_running, forward_to_owner, json_404
 from orchestrator.loadtest_instrumentation import (
     aggregate_run_model_version,
     emit_load_test_outcome,
@@ -1242,10 +1243,22 @@ async def start_loadtest(request: Request) -> JSONResponse:
 
     _cleanup_expired()
 
-    # Enforce single concurrent test
+    # Enforce single concurrent test, on this replica first (cheap) and then
+    # across the siblings: `_active_task` is per process, and with two or more
+    # replicas behind the NLB each one would otherwise happily start its own
+    # test, and every comparison downstream would be reading mixed traffic.
     if _active_task is not None and not _active_task.done():
         return JSONResponse(
             {"error": "A load test is already running. Cancel it first or wait for completion."},
+            status_code=409,
+        )
+    peer_running = await any_peer_running(request)
+    if peer_running:
+        return JSONResponse(
+            {
+                "error": "A load test is already running. Cancel it first or wait for completion.",
+                "running_id": peer_running,
+            },
             status_code=409,
         )
 
@@ -1325,12 +1338,31 @@ async def get_loadtest(request: Request) -> JSONResponse:
     test_id = request.path_params["id"]
     status = _active_tests.get(test_id)
     if status is None:
-        return JSONResponse({"error": "Load test not found"}, status_code=404)
+        # Not in this replica's memory. With several replicas behind the internal
+        # NLB the test is usually running on a sibling; ask them before answering
+        # 404 (orchestrator/loadtest_peers.py).
+        forwarded = await forward_to_owner(request)
+        return forwarded if forwarded is not None else json_404()
 
     body = status.model_dump()
     if status.state == "running":
         body.update(_live_progress(test_id))
     return JSONResponse(body)
+
+
+async def get_running_loadtest(request: Request) -> JSONResponse:
+    """GET /v1/loadtest/running — the id of the test running on THIS replica.
+
+    Siblings call this (loadtest_peers.any_peer_running) before starting a test,
+    so the single-concurrent-test rule holds across the deployment and not just
+    within one process. ``{"id": null}`` when idle. Never forwards.
+    """
+    _cleanup_expired()
+    if _active_task is not None and not _active_task.done():
+        for tid, status in _active_tests.items():
+            if status.state == "running":
+                return JSONResponse({"id": tid})
+    return JSONResponse({"id": None})
 
 
 async def get_loadtest_history(request: Request) -> JSONResponse:
@@ -1346,7 +1378,10 @@ async def cancel_loadtest(request: Request) -> JSONResponse:
     test_id = request.path_params["id"]
     status = _active_tests.get(test_id)
     if status is None:
-        return JSONResponse({"error": "Load test not found"}, status_code=404)
+        # Same as get_loadtest: the test may be running on a sibling replica, and
+        # a Stop that answers 404 leaves it running there.
+        forwarded = await forward_to_owner(request)
+        return forwarded if forwarded is not None else json_404()
 
     if status.state != "running":
         return JSONResponse({"error": f"Load test is not running (state: {status.state})"}, status_code=400)

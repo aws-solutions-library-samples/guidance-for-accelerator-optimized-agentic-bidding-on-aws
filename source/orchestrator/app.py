@@ -1773,9 +1773,9 @@ async def receive_signal(request: Request) -> JSONResponse:
 
 
 try:
-    from orchestrator.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest  # noqa: E402
+    from orchestrator.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest, get_running_loadtest  # noqa: E402
 except ImportError:
-    from container.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest  # noqa: E402
+    from container.loadtest import start_loadtest, get_loadtest, get_loadtest_history, cancel_loadtest, stream_loadtest, get_running_loadtest  # noqa: E402
 
 # Governance panel API (Train-from-Load-Test + Governance Outcome Comparison
 # feature, Unit 2: train-from-load-test). Imported defensively like the
@@ -1929,6 +1929,8 @@ routes = [
     Route("/v1/gpu/stop", gpu_stop, methods=["POST"]),
     Route("/v1/loadtest", start_loadtest, methods=["POST"]),
     Route("/v1/loadtest/history", get_loadtest_history, methods=["GET"]),
+    # Before the {id} route: "running" would otherwise be read as a test id.
+    Route("/v1/loadtest/running", get_running_loadtest, methods=["GET"]),
     Route("/v1/loadtest/{id}/stream", stream_loadtest, methods=["GET"]),
     Route("/v1/loadtest/{id}", get_loadtest, methods=["GET"]),
     Route("/v1/loadtest/{id}", cancel_loadtest, methods=["DELETE"]),
@@ -1945,6 +1947,8 @@ routes = [
     Route("/api/v1/gpu/stop", gpu_stop, methods=["POST"]),
     Route("/api/v1/loadtest", start_loadtest, methods=["POST"]),
     Route("/api/v1/loadtest/history", get_loadtest_history, methods=["GET"]),
+    # Before the {id} route: "running" would otherwise be read as a test id.
+    Route("/api/v1/loadtest/running", get_running_loadtest, methods=["GET"]),
     Route("/api/v1/loadtest/{id}/stream", stream_loadtest, methods=["GET"]),
     Route("/api/v1/loadtest/{id}", get_loadtest, methods=["GET"]),
     Route("/api/v1/loadtest/{id}", cancel_loadtest, methods=["DELETE"]),

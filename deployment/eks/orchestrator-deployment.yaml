@@ -128,6 +128,16 @@ spec:
             # trade toggle responsiveness against DynamoDB read volume.
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
+            # A running load test lives in one replica's memory. A replica that
+            # does not know a test id asks its siblings, found through the
+            # headless orchestrator-grpc Service below, and skips its own address
+            # (orchestrator/loadtest_peers.py).
+            - name: ORCHESTRATOR_PEER_DNS
+              value: "orchestrator-grpc"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: EKS_CLUSTER_NAME
               value: "__STACK_NAME__-triton"
             - name: GPU_NODEGROUP_NAME

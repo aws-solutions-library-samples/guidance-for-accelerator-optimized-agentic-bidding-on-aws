@@ -10,6 +10,10 @@ import { authFetch, isProxyTransport } from "../authFetch.js";
 // and bid bubbles moving without doubling the invoke count. With plain fetch (local
 // dev, port-forward) the SSE stream is tried first and polling is the fallback.
 export const POLL_INTERVAL_MS = 1000;
+// Consecutive non-OK polls before the panel treats the test as gone. One miss
+// is tolerated so a transient answer from a replica that does not (yet) know the
+// test cannot end the live view by itself.
+export const POLL_MISS_LIMIT = 3;
 
 const PRESETS = [
   { value: "100", label: "100", requests: 100 },
@@ -182,14 +186,20 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   // "running", so each tick carries real completed/rps/latency numbers.
   const startPolling = useCallback((testId) => {
     if (pollRef.current) return;
+    let misses = 0;
     pollRef.current = setInterval(async () => {
       try {
         const r = await authFetch(`/api/v1/loadtest/${testId}`);
         if (!r.ok) {
-          // Test gone (404) — completed and cleaned up
-          resetToIdle();
+          // A non-OK poll usually means the test expired and was cleaned up, but
+          // one bad answer is not proof: a replica that joined mid-run can miss
+          // a test for a tick while its sibling list catches up. Give up only
+          // after POLL_MISS_LIMIT consecutive misses.
+          misses += 1;
+          if (misses >= POLL_MISS_LIMIT) resetToIdle();
           return;
         }
+        misses = 0;
         const data = await r.json();
         if (data.state === "complete" || data.state === "error" || data.state === "cancelled") {
           setResult(data);
