@@ -53,6 +53,13 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
   const [result, setResult] = useState(null);
   // Why no live auction was read, when none was. `{ kind, detail }` or null.
   const [auctionFault, setAuctionFault] = useState(null);
+  // The BASELINE auction: the same request run through Prebid with the ARTF
+  // extension point asked to propose nothing (`?artf=off`). This is pass 1 of the
+  // walkthrough. It has no fixture to fall back to -- there is no captured
+  // baseline -- so when it is null the pass-1 offers column states the fault, and
+  // the comparison says the baseline was unavailable rather than inventing one.
+  const [baselineResponse, setBaselineResponse] = useState(null);
+  const [baselineFault, setBaselineFault] = useState(null);
   // Guards against a slow earlier submission overwriting a later one.
   const runTokenRef = useRef(0);
 
@@ -65,6 +72,8 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setError(null);
     setBidResponse(null);
     setAuctionFault(null);
+    setBaselineResponse(null);
+    setBaselineFault(null);
     setPayload(null);
     setResult(null);
   }, []);
@@ -80,18 +89,37 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
   // authFetch, not fetch: `/v1/auction/run` is not in the orchestrator's
   // _PUBLIC_PATHS, so an unauthenticated call is rejected before it reaches the
   // handler. Every other backend call in this app goes through authFetch.
-  const runAuction = useCallback(async (payload, token) => {
+  //
+  // `artf` selects the pass. "on" is the auction the Theater has always run, with
+  // the ARTF hook mutating the request inside Prebid; "off" asks the orchestrator
+  // to mark the request so the hook's call proposes nothing. The two write to
+  // separate state so one resolving cannot overwrite the other, and so a fault in
+  // one is attributed to the pass that produced it.
+  const runAuction = useCallback(async (payload, token, { artf = "on" } = {}) => {
+    const setResponse = artf === "off" ? setBaselineResponse : setBidResponse;
+    const setFault = artf === "off" ? setBaselineFault : setAuctionFault;
+
     const bidRequest = payload?.bid_request;
     if (!bidRequest?.imp?.length) {
-      setAuctionFault({
+      setFault({
         kind: AUCTION_FAILED,
         detail: "the scenario carries no OpenRTB bid request to auction",
       });
       return;
     }
 
+    // The scenario's ARTF intents travel as a query parameter so the orchestrator
+    // can state them on the request Prebid receives (top-level ext.artf). This is
+    // a record, not a control: the hook asks for its configured intent set
+    // regardless, so the with-ARTF auction is not narrowed by it.
+    const intents = Array.isArray(payload?.applicable_intents)
+      ? payload.applicable_intents.filter((i) => typeof i === "string" && i)
+      : [];
+    const params = new URLSearchParams({ artf });
+    if (intents.length) params.set("intents", intents.join(","));
+
     try {
-      const resp = await authFetch(`${baseUrl}/v1/auction/run`, {
+      const resp = await authFetch(`${baseUrl}/v1/auction/run?${params.toString()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bidRequest),
@@ -102,7 +130,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
       // used where it gives them, so the reason shown is the reason it reported.
       if (resp.status === 501) {
         const body = await resp.json().catch(() => null);
-        setAuctionFault({
+        setFault({
           kind: AUCTION_NOT_DEPLOYED,
           detail: body?.detail ?? "Prebid Server is not deployed.",
         });
@@ -111,7 +139,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
       if (!resp.ok) {
         const body = await resp.json().catch(() => null);
-        setAuctionFault({
+        setFault({
           kind: AUCTION_FAILED,
           detail: body?.detail ?? body?.error ?? `the auction endpoint returned HTTP ${resp.status}`,
           status: resp.status,
@@ -124,18 +152,18 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
       // Only a response that actually came from an exchange is used.
       if (!isLiveAuctionResponse(auction)) {
-        setAuctionFault({
+        setFault({
           kind: AUCTION_FAILED,
           detail: "the response did not identify itself as coming from the exchange",
         });
         return;
       }
 
-      setBidResponse(auction);
-      setAuctionFault(null);
+      setResponse(auction);
+      setFault(null);
     } catch (err) {
       if (token !== runTokenRef.current) return;
-      setAuctionFault({
+      setFault({
         kind: AUCTION_FAILED,
         detail: err instanceof Error ? err.message : String(err),
       });
@@ -162,6 +190,8 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setContext(null);
     setBidResponse(null);
     setAuctionFault(null);
+    setBaselineResponse(null);
+    setBaselineFault(null);
     setPayload(null);
     setResult(null);
 
@@ -187,10 +217,16 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
       setBeats(buildBeats(submitted, answered));
       setStatus(RUN_READY);
 
-      // The auction runs AFTER the walkthrough is ready. An unavailable auction
-      // leaves bidResponse null, and the offers panel then shows the captured
-      // fixture with its own notice rather than presenting a fixture as live.
-      void runAuction(submitted, token);
+      // Both auctions run AFTER the walkthrough is ready, and in parallel: they
+      // are independent, and the baseline pass hits no container, so firing them
+      // together costs nothing but saves a Prebid round trip of wall time. An
+      // unavailable with-ARTF auction leaves bidResponse null, and the offers
+      // panel then shows the captured fixture with its own notice rather than
+      // presenting a fixture as live. An unavailable baseline leaves
+      // baselineResponse null and has no fixture: the pass-1 column states the
+      // fault instead.
+      void runAuction(submitted, token, { artf: "off" });
+      void runAuction(submitted, token, { artf: "on" });
       return answered;
     } catch (err) {
       if (token !== runTokenRef.current) return null;
@@ -202,6 +238,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
   return {
     status, scenarioId, context, beats, error, bidResponse, auctionFault,
+    baselineResponse, baselineFault,
     payload, result, start, reset,
   };
 }

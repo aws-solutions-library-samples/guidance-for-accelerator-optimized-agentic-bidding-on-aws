@@ -15,11 +15,13 @@ from orchestrator import auction_api
 
 
 class FakeRequest:
-    """Minimal stand-in for a Starlette Request: the handler reads only json()."""
+    """Minimal stand-in for a Starlette Request: the handler reads json() and
+    query_params."""
 
-    def __init__(self, body, raise_exc=None):
+    def __init__(self, body, raise_exc=None, query=None):
         self._body = body
         self._raise = raise_exc
+        self.query_params = dict(query or {})
 
     async def json(self):
         if self._raise is not None:
@@ -728,3 +730,153 @@ def test_the_count_is_zero_rather_than_absent_when_nothing_could_be_annotated(mo
     )
     assert payload["artf_meta"]["seat_nonbids_annotated"] == 0
     assert payload["ext"]["seatnonbid"][0]["nonbid"][0] == {"impid": "imp-1", "statuscode": 0}
+
+
+# --------------------------------------------------------------------------- #
+# The `artf` mode: a per-request, opt-in way to run an auction with the ARTF
+# extension point proposing nothing. Exists for the Theater's baseline pass.
+#
+# What these tests protect: the DEFAULT. An absent parameter, an empty parameter,
+# and an explicit `on` all run the auction with ARTF, and nothing but an explicit
+# `off` on a single request can change that. There is no environment variable and
+# no config flag -- an operator cannot accidentally run the stack without ARTF.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("query", [None, {}, {"artf": ""}, {"artf": "on"}, {"artf": "ON"}])
+def test_the_default_is_artf_on_and_no_marker_is_stamped(monkeypatch, query):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query=query))))
+
+    sent = client.posted["json"]
+    assert "artf" not in sent["ext"]["prebid"]
+    assert payload["artf_meta"]["artf_mutations"] == "requested"
+    assert not any("bypass" in note for note in payload["artf_meta"]["prepared"])
+
+
+def test_artf_off_stamps_the_bypass_marker_and_reports_it(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    payload = body_of(
+        run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query={"artf": "off"})))
+    )
+
+    sent = client.posted["json"]
+    # The marker is the exact boolean the orchestrator's /v1/mutations checks for,
+    # on the TOP-LEVEL ext (Prebid drops unknown keys under ext.prebid).
+    assert sent["ext"]["artf"]["bypass"] is True
+    assert "artf" not in sent["ext"]["prebid"]
+    # Everything else the endpoint adds is still added: a baseline auction is the
+    # same auction, minus the extension point.
+    assert sent["ext"]["prebid"]["debug"] == 1
+    assert sent["ext"]["prebid"]["targeting"]["includewinners"] is True
+    assert sent["imp"][0]["ext"]["artfhouse"] == {}
+    # Stated on the response, and listed among what was added to the request.
+    assert payload["artf_meta"]["artf_mutations"] == "bypassed"
+    assert any("ext.artf.bypass" in note for note in payload["artf_meta"]["prepared"])
+
+
+@pytest.mark.parametrize("bad", ["true", "1", "yes", "false", "0", "disabled", "off; drop"])
+def test_a_value_outside_the_allowlist_is_a_400(monkeypatch, bad):
+    # SECURITY-05: an allowlist, not a truthiness check. "true" is not "off", and a
+    # request that asked for something unrecognised must not quietly get either
+    # behaviour.
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    response = run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query={"artf": bad})))
+
+    assert response.status_code == 400
+    assert body_of(response)["error"] == "invalid_artf_mode"
+    # Rejected before the hop: Prebid never saw the request.
+    assert client.posted is None
+
+
+def test_the_bypass_marker_keeps_what_the_caller_already_put_under_artf():
+    body = {
+        "id": "r",
+        "imp": [{"id": "imp-1"}],
+        "ext": {"artf": {"note": "kept"}, "prebid": {"debug": 1}},
+    }
+    snapshot = json.loads(json.dumps(body))
+
+    out, note = auction_api._with_artf_bypass(body)
+
+    assert out["ext"]["artf"] == {"note": "kept", "bypass": True}
+    # Siblings under ext are untouched; nothing is written under ext.prebid.
+    assert out["ext"]["prebid"] == {"debug": 1}
+    assert "bypass" in note
+    # Shallow copies all the way down: the caller's dict is untouched.
+    assert body == snapshot
+
+
+def test_artf_off_is_rejected_the_same_way_when_prebid_is_absent():
+    # The mode is validated, but a 501 for "not deployed" still wins over a 200 of
+    # anything. No auction, with or without ARTF, is invented in Prebid's absence.
+    response = run(
+        auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query={"artf": "off"}))
+    )
+    assert response.status_code == 501
+    assert body_of(response)["error"] == "prebid_not_deployed"
+
+
+# --------------------------------------------------------------- intents param
+
+
+def test_intents_are_stated_on_top_level_ext_artf_and_do_not_touch_ext_prebid(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    payload = body_of(run(auction_api.run_auction_handler(FakeRequest(
+        VALID_REQUEST, query={"artf": "on", "intents": "ACTIVATE_SEGMENTS,ADD_METRICS, activate_deals,ADD_METRICS"},
+    ))))
+
+    sent = client.posted["json"]
+    # Normalised, de-duplicated, order kept; on the ext Prebid carries through.
+    assert sent["ext"]["artf"]["applicable_intents"] == ["ACTIVATE_SEGMENTS", "ADD_METRICS", "ACTIVATE_DEALS"]
+    assert "artf" not in sent["ext"]["prebid"]
+    # Not a bypass: the marker is a separate key and is absent here.
+    assert "bypass" not in sent["ext"]["artf"]
+    assert payload["artf_meta"]["artf_mutations"] == "requested"
+    assert any("ext.artf.applicable_intents" in note for note in payload["artf_meta"]["prepared"])
+
+
+def test_intents_and_bypass_share_ext_artf_without_clobbering(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    run(auction_api.run_auction_handler(FakeRequest(
+        VALID_REQUEST, query={"artf": "off", "intents": "ACTIVATE_DEALS"},
+    )))
+
+    sent = client.posted["json"]
+    assert sent["ext"]["artf"] == {"bypass": True, "applicable_intents": ["ACTIVATE_DEALS"]}
+
+
+def test_absent_or_empty_intents_add_nothing(monkeypatch):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query={"intents": "  "})))
+    assert "artf" not in client.posted["json"]["ext"]
+
+
+@pytest.mark.parametrize("bad", ["ACTIVATE_SEGMENTS,BOGUS", "1,2", "ADD_METRICS;x", "<script>"])
+def test_an_unknown_intent_is_a_400_not_a_silent_drop(monkeypatch, bad):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    resp = run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST, query={"intents": bad})))
+    assert resp.status_code == 400
+    assert body_of(resp)["error"] == "invalid_intents"
+    assert client.posted is None

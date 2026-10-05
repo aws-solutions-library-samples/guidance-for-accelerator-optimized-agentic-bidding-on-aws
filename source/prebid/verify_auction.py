@@ -142,6 +142,37 @@ def seats_of(response: Any) -> list[str]:
     return [s.get("seat", "<unnamed>") for s in response.get("seatbid", []) or []]
 
 
+# The hook module's code (ArtfModule.CODE). Its analytics tags are keyed by it in
+# the module trace.
+ARTF_MODULE_CODE = "artf-orchestrator"
+
+
+def artf_activities(response: Any) -> list[dict]:
+    """Every analytics activity the ARTF hook wrote, from a verbose module trace.
+
+    The path is PBS-Java's: ext.prebid.modules.trace.stages[].outcomes[].groups[]
+    .invocationResults[].analyticsTags.activities[] (ArtfAnalyticsTagWriter's
+    javadoc cites the enricher that writes it). Absent at any level yields [].
+    """
+    if not isinstance(response, dict):
+        return []
+    trace = (((response.get("ext") or {}).get("prebid") or {}).get("modules") or {}).get("trace") or {}
+    found: list[dict] = []
+    for stage in trace.get("stages") or []:
+        for outcome in stage.get("outcomes") or []:
+            for group in outcome.get("groups") or []:
+                for inv in group.get("invocationresults") or group.get("invocationResults") or []:
+                    hook_id = inv.get("hookid") or inv.get("hookId") or {}
+                    module = hook_id.get("module-code") or hook_id.get("moduleCode") or ""
+                    if module and module != ARTF_MODULE_CODE:
+                        continue
+                    tags = inv.get("analyticstags") or inv.get("analyticsTags") or {}
+                    for activity in tags.get("activities") or []:
+                        if isinstance(activity, dict):
+                            found.append(activity)
+    return found
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", default=os.environ.get("STACK_PREFIX", ""))
@@ -271,6 +302,58 @@ def main() -> int:
     check(f"at least {args.expect_seats} seat(s) competed", _seats)
 
     if args.target == "prebid":
+        # --- the staged fan-out, as the hook saw it ------------------------
+        # The orchestrator runs the containers in four sequential stages (enrich,
+        # deals, yield, price) and applies each stage's mutations before the next
+        # stage runs, so a yield floor is only ever proposed for a deal that is in
+        # the request by the time the hook applies it. Before staging, the deal
+        # containers and the yield containers ran concurrently against the same
+        # unmodified request, and a floor for a deal activated in the same pass was
+        # rejected by the hook with "impression ... has no deal ...". The hook's
+        # analytics tags carry every rejection with its reason; they surface in
+        # ext.prebid.modules.trace only at verbose trace level, which is why this
+        # second post asks for it.
+        traced = json.loads(json.dumps(fixture))
+        traced.setdefault("ext", {}).setdefault("prebid", {})["trace"] = "verbose"
+        t_status, t_response = post(endpoint, token, traced)
+
+        def _mutation_activity():
+            if t_status != 200:
+                raise CheckFailed(f"traced request returned HTTP {t_status}")
+            found = []
+            for activity in artf_activities(t_response):
+                if activity.get("name") == "artf-mutations":
+                    for result in activity.get("results") or []:
+                        values = result.get("values") or {}
+                        if isinstance(values, dict):
+                            found.append(values)
+            if not found:
+                raise CheckFailed(
+                    "no 'artf-mutations' activity in ext.prebid.modules.trace; the hook "
+                    "did not report applying any mutations"
+                )
+            return found
+
+        def _no_floor_on_missing_deal():
+            offenders = []
+            applied_total = 0
+            for values in _mutation_activity():
+                applied_total += int(values.get("applied") or 0)
+                for rej in values.get("rejections") or []:
+                    intent = str(rej.get("intent") or "")
+                    reason = str(rej.get("reason") or "")
+                    if intent.startswith("ADJUST_DEAL") and "has no deal" in reason:
+                        offenders.append(f"{intent} {rej.get('path')}: {reason}")
+            if offenders:
+                raise CheckFailed(
+                    "a deal adjustment targeted a deal that was not in the request when "
+                    "the hook applied it; the deals stage did not run before the yield "
+                    "stage:\n    " + "\n    ".join(offenders)
+                )
+            return f"{applied_total} mutation(s) applied, no deal adjustment on a missing deal"
+
+        check("no yield floor was applied to a deal absent from the request", _no_floor_on_missing_deal)
+
         print()
         if failures:
             print(f"{len(failures)} check(s) failed: {', '.join(failures)}")

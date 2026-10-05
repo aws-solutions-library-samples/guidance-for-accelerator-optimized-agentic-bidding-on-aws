@@ -192,3 +192,112 @@ def test_renamed_array_yields_none(tmp_path):
     p.manifest_dir = str(tmp_path / "eks")
     p.prebid = False
     assert p._expected_manifest_files() is None
+
+
+# --- the UI API proxy stack is part of Phase 3 -----------------------------------
+#
+# The orchestrator is a ClusterIP Service; the browser's only route to it is the
+# <prefix>-ui-api-proxy Lambda stack created in deploy.sh Step 8.4. A probe that
+# reported Phase 3 OK with that stack missing would describe a UI that loads and
+# then cannot reach anything.
+
+class _FakeCfn:
+    def __init__(self, status=None, exc=None):
+        self._status, self._exc = status, exc
+        self.asked = []
+
+    def describe_stacks(self, StackName):
+        self.asked.append(StackName)
+        if self._exc:
+            raise self._exc
+        return {"Stacks": [{"StackStatus": self._status}]}
+
+
+def _stack_probe(cfn, prefix="dv1"):
+    p = Probe.__new__(Probe)
+    p.prefix = prefix
+    p._client = lambda service: cfn if service == "cloudformation" else None
+    return p
+
+
+def test_phase3_includes_the_ui_api_proxy_stack(monkeypatch):
+    from botocore.exceptions import ClientError
+    err = ClientError({"Error": {"Code": "ValidationError",
+                                 "Message": "Stack with id dv1-ui-api-proxy does not exist"}},
+                      "DescribeStacks")
+    cfn = _FakeCfn(exc=err)
+    p = _stack_probe(cfn)
+    # No cluster to look at: phase3 still has to say the proxy stack is missing.
+    p.kube_context = "arn:aws:eks:us-east-1:123456789012:cluster/dv1-nvidia-artf-recommenders-triton"
+    p.kube_reason = ""
+    p._manifest_deployments = lambda: ["orchestrator"]
+    p._kubectl = lambda *a, **k: type("P", (), {"returncode": 0, "stdout": '{"items": []}', "stderr": ""})()
+    checks = p.phase3()
+    proxy = [c for c in checks if "UI API proxy" in c["name"]]
+    assert len(proxy) == 1
+    assert proxy[0]["status"] == MISSING
+    assert cfn.asked == ["dv1-ui-api-proxy"]
+
+
+# ---------------------------------------------------------------------------
+# The orchestrator-internal Service (deployment/eks/orchestrator-internal-nlb.yaml)
+# is the address the UI API proxy forwards to. Phase 3 must report it: a probe
+# that called the phase OK with no NLB hostname would describe a UI whose every
+# call returns 502 orchestrator_unreachable, which is exactly what happened on the
+# first live deploy of the proxy.
+
+def _svc_probe(kubectl_result):
+    p = _stack_probe(_FakeCfn(status="CREATE_COMPLETE"))
+    p.kube_context = "arn:aws:eks:us-east-1:123456789012:cluster/dv1-nvidia-artf-recommenders-triton"
+    p.kube_reason = ""
+    p._kubectl = lambda *a, **k: kubectl_result
+    return p
+
+
+def _proc(returncode, stdout="", stderr=""):
+    return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+
+def test_orchestrator_internal_nlb_ok_when_hostname_assigned():
+    svc = '{"status": {"loadBalancer": {"ingress": [{"hostname": "a1b2-123.elb.us-east-1.amazonaws.com"}]}}}'
+    check = _svc_probe(_proc(0, svc))._orchestrator_internal_nlb()
+    assert check["name"] == "service orchestrator-internal"
+    assert check["status"] == OK
+    assert "a1b2-123.elb.us-east-1.amazonaws.com" in check["detail"]
+
+
+def test_orchestrator_internal_nlb_in_progress_without_hostname():
+    check = _svc_probe(_proc(0, '{"status": {"loadBalancer": {}}}'))._orchestrator_internal_nlb()
+    assert check["status"] == IN_PROGRESS
+
+
+def test_orchestrator_internal_nlb_missing_when_not_applied():
+    err = 'Error from server (NotFound): services "orchestrator-internal" not found'
+    check = _svc_probe(_proc(1, "", err))._orchestrator_internal_nlb()
+    assert check["status"] == MISSING
+
+
+def test_orchestrator_internal_nlb_unknown_without_kubectl():
+    check = _svc_probe(None)._orchestrator_internal_nlb()
+    assert check["status"] == UNKNOWN
+
+
+def test_phase3_lists_the_orchestrator_internal_service():
+    p = _svc_probe(_proc(0, '{"items": [], "status": {"loadBalancer": {}}}'))
+    p._manifest_deployments = lambda: []
+    names = [c["name"] for c in p.phase3()]
+    assert "service orchestrator-internal" in names
+    assert names.index("service orchestrator-internal") < names.index("UI API proxy (stack dv1-ui-api-proxy)")
+
+
+@pytest.mark.parametrize("cfn_status,expected", [
+    ("CREATE_COMPLETE", OK),
+    ("UPDATE_COMPLETE", OK),
+    ("UPDATE_IN_PROGRESS", IN_PROGRESS),
+    ("ROLLBACK_COMPLETE", FAILED),
+    ("CREATE_FAILED", FAILED),
+])
+def test_stack_check_maps_cloudformation_status(cfn_status, expected):
+    check = _stack_probe(_FakeCfn(status=cfn_status))._stack_check("dv1-ui-api-proxy", label="UI API proxy")
+    assert check["status"] == expected
+    assert check["name"] == "UI API proxy (stack dv1-ui-api-proxy)"

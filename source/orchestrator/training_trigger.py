@@ -237,6 +237,88 @@ def is_training_in_progress(model_type: str) -> tuple[bool, str | None]:
     return False, None
 
 
+# Statuses a job can hold before it reaches a terminal state. "Stopping" is
+# included: the job is still occupying the model's training slot and the UI
+# should keep showing it until SageMaker reports Stopped.
+_ACTIVE_STATUSES: frozenset[str] = frozenset({"InProgress", "Stopping"})
+_FAILED_STATUSES: frozenset[str] = frozenset({"Failed", "Stopped"})
+
+# How far back a terminal failure stays visible in the registry view. A job
+# that fails between two Refresh clicks would otherwise vanish without trace
+# (the registry only ever shows versions that completed and registered).
+_RECENT_FAILURE_WINDOW_SECONDS = 24 * 3600
+
+
+def _iso(ts) -> str | None:
+    """ISO-8601 for a boto3 datetime, or None. Mirrors how model versions are
+    serialized by closed_loop_demo.readers so the UI formats both the same way."""
+    if ts is None:
+        return None
+    return ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
+
+def list_training_jobs_for_display(model_type: str, *, now: float | None = None) -> list[dict]:
+    """Training jobs for model_type worth showing next to its registry versions.
+
+    Returns every active job (InProgress / Stopping) plus the single most recent
+    Failed/Stopped job from the last 24 hours, newest first. Completed jobs are
+    not returned: a completed job is represented by the model version it
+    registered, which the registry table already lists.
+
+    ListTrainingJobs is called WITHOUT StatusEquals on purpose. When StatusEquals
+    and MaxResults are combined, SageMaker takes MaxResults jobs first and filters
+    by status second (API reference, ListTrainingJobs), so an active job can be
+    hidden behind newer terminal ones. Fetching the most recent jobs by creation
+    time and filtering here avoids that.
+
+    Each entry: ``job_name``, ``status``, ``secondary_status``, ``created_at``,
+    ``ended_at``, ``model_type``, and ``failure_reason`` (only on the failed row,
+    from DescribeTrainingJob; None if that lookup fails).
+    """
+    client = _sagemaker_client()
+    resp = client.list_training_jobs(
+        NameContains=f"{_job_name_prefix(model_type)}-",
+        MaxResults=20,
+        SortBy="CreationTime",
+        SortOrder="Descending",
+    )
+    current = time.time() if now is None else now
+    cutoff = current - _RECENT_FAILURE_WINDOW_SECONDS
+
+    active: list[dict] = []
+    recent_failure: dict | None = None
+    for summary in resp.get("TrainingJobSummaries", []):
+        status = summary.get("TrainingJobStatus")
+        entry = {
+            "job_name": summary.get("TrainingJobName"),
+            "status": status,
+            "secondary_status": summary.get("SecondaryStatus"),
+            "created_at": _iso(summary.get("CreationTime")),
+            "ended_at": _iso(summary.get("TrainingEndTime")),
+            "model_type": model_type,
+        }
+        if status in _ACTIVE_STATUSES:
+            active.append(entry)
+        elif status in _FAILED_STATUSES and recent_failure is None:
+            ended = summary.get("TrainingEndTime") or summary.get("LastModifiedTime")
+            ended_epoch = ended.timestamp() if hasattr(ended, "timestamp") else None
+            if ended_epoch is not None and ended_epoch >= cutoff:
+                entry["failure_reason"] = _failure_reason(client, entry["job_name"])
+                recent_failure = entry
+
+    return active + ([recent_failure] if recent_failure else [])
+
+
+def _failure_reason(client, job_name: str | None) -> str | None:
+    if not job_name:
+        return None
+    try:
+        desc = client.describe_training_job(TrainingJobName=job_name)
+    except Exception:  # noqa: BLE001 - the row is still useful without the reason
+        return None
+    return desc.get("FailureReason")
+
+
 def _resolve_base_model_version(model_type: str) -> str:
     """Resolve base_model_version from the current Approved registry
     version — same resolution logic the scheduled Lambda already uses

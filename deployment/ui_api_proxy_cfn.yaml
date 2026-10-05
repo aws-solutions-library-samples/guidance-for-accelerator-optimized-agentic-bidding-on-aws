@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  UI API proxy Lambda. The React UI (served from S3 via CloudFront) invokes this
+  function with SigV4 credentials from the Cognito Identity Pool authenticated
+  role; the function, attached to the cluster VPC, forwards the request to the
+  orchestrator's internal Network Load Balancer and returns the HTTP response. The
+  orchestrator therefore has no public address: a VPC Lambda ENI is not an internet
+  path and an internal NLB has no public address, so
+  this works under VPC Block Public Access block-ingress, where a public load
+  balancer or a CloudFront VPC origin would not. The user's Cognito bearer token is
+  forwarded untouched, so the orchestrator's own JWT and scope checks still run.
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: artf
+    Description: Prefix for resource names.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs (cluster VPC) for the Lambda ENIs.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: >-
+      Security group IDs for the Lambda ENIs. Use the EKS cluster security group so
+      the function can reach the orchestrator Service on port 80.
+  OrchestratorBaseUrl:
+    Type: String
+    AllowedPattern: '^http://[A-Za-z0-9.-]+\.amazonaws\.com(\.cn)?(:[0-9]+)?$'
+    ConstraintDescription: >-
+      Must be the orchestrator's internal NLB URL (http://<name>.elb.<region>.amazonaws.com),
+      read from the orchestrator-internal Service by deploy.sh. A cluster.local name is not
+      accepted: the function resolves through the VPC resolver, which cannot answer it.
+    Description: >-
+      Base URL of the orchestrator's internal Network Load Balancer (no trailing slash).
+      No default on purpose; deploy.sh supplies it after the Service has a hostname.
+  ReservedConcurrency:
+    Type: Number
+    Default: 20
+    Description: Reserved concurrent executions. UI traffic is one browser at a time.
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+Resources:
+  ProxyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If [HasStackPrefix, !Sub '${StackPrefix}-ui-api-proxy-role', 'ui-api-proxy-role']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !If
+        - HasStackPrefix
+        - !Sub '/aws/lambda/${StackPrefix}-ui-api-proxy'
+        - '/aws/lambda/ui-api-proxy'
+      RetentionInDays: 90
+  ProxyFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProxyLogGroup
+    Properties:
+      FunctionName: !If [HasStackPrefix, !Sub '${StackPrefix}-ui-api-proxy', 'ui-api-proxy']
+      Description: Forwards UI API calls to the orchestrator's internal NLB inside the cluster VPC.
+      Runtime: python3.12
+      Handler: index.handler
+      # Longest orchestrator call behind the UI is the Theater auction hop (15 s);
+      # everything else returns in low seconds. 60 s fails a hung orchestrator fast.
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Role: !GetAtt ProxyFunctionRole.Arn
+      Environment:
+        Variables:
+          ORCHESTRATOR_BASE_URL: !Ref OrchestratorBaseUrl
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          # Set from the OrchestratorBaseUrl parameter; there is no fallback name because
+          # the only wrong value (a cluster.local Service name) fails silently at DNS.
+          BASE_URL = os.environ["ORCHESTRATOR_BASE_URL"].rstrip("/")
+          # The browser sends the same "/api/..." paths it sent through CloudFront; the
+          # orchestrator registers every UI route on that prefix, so the path is
+          # forwarded unchanged. Nothing outside "/api/" is reachable through the proxy.
+          ALLOWED_PREFIXES = ("/api/",)
+          ALLOWED_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
+          # Headers copied from the browser's request. Authorization carries the
+          # Cognito access token the orchestrator validates; Mcp-Session-Id keeps the
+          # UI's MCP session pinned across calls.
+          FORWARDED_HEADERS = {"authorization", "content-type", "accept", "mcp-session-id"}
+          # Upstream response headers handed back to the browser.
+          RETURNED_HEADERS = ("Content-Type", "Mcp-Session-Id")
+          # Time budget for one upstream call, under the function's 60 s so the caller
+          # sees a 504 from us rather than a Lambda timeout.
+          UPSTREAM_TIMEOUT_S = float(os.environ.get("UPSTREAM_TIMEOUT_S", "50"))
+
+          def _reply(status, body, headers=None, is_base64=False):
+              out = {"content-type": "application/json"}
+              out.update({k.lower(): v for k, v in (headers or {}).items() if v})
+              return {"status": status, "headers": out, "body": body, "isBase64": is_base64}
+
+          def _error(status, code, detail):
+              return _reply(status, json.dumps({"error": code, "detail": detail}))
+
+          def _picked(resp_headers):
+              if not resp_headers:
+                  return {"content-type": "application/octet-stream"}
+              picked = {name: resp_headers.get(name) for name in RETURNED_HEADERS}
+              picked.setdefault("Content-Type", None)
+              picked["Content-Type"] = picked["Content-Type"] or "application/octet-stream"
+              return picked
+
+          def _body_to_reply(status, resp_headers, raw):
+              headers = _picked(resp_headers)
+              try:
+                  return _reply(status, raw.decode("utf-8"), headers)
+              except UnicodeDecodeError:
+                  return _reply(status, base64.b64encode(raw).decode("ascii"), headers, is_base64=True)
+
+          def handler(event, context):
+              if not isinstance(event, dict):
+                  return _error(400, "bad_request", "event must be an object")
+              method = str(event.get("method", "GET")).upper()
+              path = str(event.get("path", ""))
+              if method not in ALLOWED_METHODS:
+                  return _error(405, "method_not_allowed", method)
+              if not path.startswith(ALLOWED_PREFIXES) or ".." in path or "//" in path:
+                  return _error(400, "path_not_allowed", path)
+              query = event.get("query") or {}
+              if not isinstance(query, dict):
+                  return _error(400, "bad_request", "query must be an object")
+              headers = {}
+              for name, value in (event.get("headers") or {}).items():
+                  if str(name).lower() in FORWARDED_HEADERS and value is not None:
+                      headers[str(name)] = str(value)
+              # A synchronous Invoke returns one payload; it cannot carry an SSE stream.
+              # Refuse up front so the UI falls back to polling at once instead of
+              # waiting out the upstream timeout.
+              accept = next((v for k, v in headers.items() if k.lower() == "accept"), "")
+              if "text/event-stream" in accept.lower():
+                  return _error(406, "streaming_not_supported",
+                                "Server-sent events are not available through the UI API proxy; poll instead.")
+              url = BASE_URL + path
+              if query:
+                  url += "?" + urllib.parse.urlencode({k: str(v) for k, v in query.items()})
+              body = event.get("body")
+              data = None
+              if body is not None and method != "GET":
+                  data = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
+                  headers.setdefault("Content-Type", "application/json")
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_S) as resp:
+                      return _body_to_reply(resp.status, resp.headers, resp.read())
+              except urllib.error.HTTPError as exc:
+                  # 4xx/5xx from the orchestrator are passed through so the UI's
+                  # existing error handling sees the same status and body it does today.
+                  return _body_to_reply(exc.code, exc.headers, exc.read())
+              except urllib.error.URLError as exc:
+                  reason = str(getattr(exc, "reason", exc))
+                  if "timed out" in reason.lower():
+                      return _error(504, "orchestrator_timeout", reason)
+                  return _error(502, "orchestrator_unreachable", reason)
+              except TimeoutError as exc:
+                  return _error(504, "orchestrator_timeout", str(exc))
+Outputs:
+  ProxyFunctionArn:
+    Value: !GetAtt ProxyFunction.Arn
+  ProxyFunctionName:
+    Value: !Ref ProxyFunction
+  ProxyFunctionRoleArn:
+    Value: !GetAtt ProxyFunctionRole.Arn

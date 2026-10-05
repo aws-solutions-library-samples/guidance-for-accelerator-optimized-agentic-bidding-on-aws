@@ -372,6 +372,42 @@ def _verify_token(token: str, region: str, pool_id: str) -> dict | None:
         return None
 
 
+def grpc_authenticate(authorization: str | None, path: str):
+    """Authenticate a gRPC call's ``authorization`` metadata the way the middleware
+    authenticates an HTTP request.
+
+    Returns ``(claims, None, "")`` on success, or ``(None, grpc.StatusCode, reason)``
+    naming the refusal. Same fail-closed rules as ``CognitoAuthMiddleware.dispatch``:
+    no pool or no verifier refuses every call (UNAVAILABLE, the 503 analogue), a
+    missing or invalid token is UNAUTHENTICATED (401), a valid token without the
+    route's scope is PERMISSION_DENIED (403). AUTH_DISABLED=true bypasses, as on HTTP.
+    Imports grpc lazily so this module stays importable where grpc is absent.
+    """
+    import grpc
+
+    if os.environ.get("AUTH_DISABLED", "").lower() == "true":
+        logger.warning("AUTH_DISABLED=true — gRPC authentication bypassed (local dev only)")
+        return {}, None, ""
+    pool_id = os.environ.get("COGNITO_USER_POOL_ID", "")
+    region = os.environ.get("COGNITO_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    if not pool_id:
+        logger.error("COGNITO_USER_POOL_ID not set — refusing gRPC call (fail closed)")
+        return None, grpc.StatusCode.UNAVAILABLE, "Authentication is not configured"
+    if not _SIGNATURE_VERIFIER_AVAILABLE:
+        logger.error("JWT signature verification unavailable — refusing gRPC call (fail closed)")
+        return None, grpc.StatusCode.UNAVAILABLE, "Authentication is not configured"
+    if not authorization or not authorization.startswith("Bearer "):
+        return None, grpc.StatusCode.UNAUTHENTICATED, "Authentication required: authorization metadata 'Bearer <token>'"
+    claims = _verify_token(authorization[7:], region, pool_id)
+    if claims is None:
+        return None, grpc.StatusCode.UNAUTHENTICATED, "Invalid or expired token"
+    allowed, reason = authorize(path, claims)
+    if not allowed:
+        logger.warning("Authorization refused for grpc %s: %s (client_id=%s)", path, reason, claims.get("client_id", "unknown"))
+        return None, grpc.StatusCode.PERMISSION_DENIED, reason
+    return claims, None, ""
+
+
 class CognitoAuthMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that enforces Cognito JWT auth on all non-health endpoints."""
 
@@ -434,6 +470,9 @@ class CognitoAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
+        # Timed so the request handler can report what authentication cost
+        # (metadata.timing.auth); the JWKS fetch on a cold cache lands here too.
+        auth_start = time.perf_counter()
         claims = _verify_token(token, region, pool_id)
         if claims is None:
             return JSONResponse(
@@ -465,4 +504,5 @@ class CognitoAuthMiddleware(BaseHTTPMiddleware):
         # signed-in user are indistinguishable downstream, so a handler cannot make a
         # different decision for one than for the other even when it should.
         request.state.auth_mechanism = granting_mechanism(request.url.path, claims)
+        request.state.auth_ms = round((time.perf_counter() - auth_start) * 1000.0, 3)
         return await call_next(request)

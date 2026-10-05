@@ -47,6 +47,11 @@ export const SUMMARY_SYSTEM_PROMPT = [
   "reasons recorded against the campaigns that did not win. Do not invent a reason.",
   "If the data records no reason, say the response records none.",
   "",
+  "Comparison: if auction_without_artf is present, end with one sentence stating how",
+  "the outcome of the same auction run without the services differed, using only the",
+  "winner and prices given there. If it says unavailable, say the comparison could not",
+  "be made. If it is absent, say nothing about it.",
+  "",
   "Register: plain and factual. No promotional adjectives. No emojis. No em-dashes or",
   "en-dashes. No exclamation marks. No questions. No first person or second person.",
   "Never mention how this text was produced.",
@@ -182,22 +187,41 @@ function describeAuction(viewModel) {
   });
 }
 
+/** The baseline auction, as the model may describe it. Null when there is none. */
+function describeBaseline(baseline) {
+  if (!baseline) return null;
+  if (baseline.unavailable) return { unavailable: baseline.unavailable };
+  return omitEmpty({
+    winner: baseline.sold
+      ? omitEmpty({
+        campaign: baseline.campaign,
+        deal_id: baseline.dealId,
+        cleared_price_usd: baseline.clearedPrice,
+      })
+      : "the response records no winner",
+  });
+}
+
 /**
  * Build the prompt for one completed run.
  *
  * @param {object[]} beats     the whole sequence
  * @param {object}   context   ScenarioContext
  * @param {object}   viewModel the offers view model, for the auction outcome
- * @param {object}  [deps]     { resolveSegmentLabel }
+ * @param {object}  [deps]     { resolveSegmentLabel, baseline }
  */
 export function buildRunSummaryPrompt(beats, context, viewModel, deps = {}) {
-  const { resolveSegmentLabel } = deps;
+  const { resolveSegmentLabel, baseline = null } = deps;
 
-  const message = JSON.stringify({
+  const message = JSON.stringify(omitEmpty({
     impression: describeImpression(context),
     changes_made_by_services: describeChanges(beats, resolveSegmentLabel),
     auction: describeAuction(viewModel),
-  }, null, 2);
+    // The same request auctioned with no service consulted. Present only when the
+    // Theater ran that pass; its winner and price are the only numbers the model
+    // may use for the comparison sentence.
+    auction_without_artf: describeBaseline(baseline),
+  }), null, 2);
 
   return {
     system: SUMMARY_SYSTEM_PROMPT,

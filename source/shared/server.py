@@ -39,6 +39,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from shared import hop_timing
 from shared.artf_types import RTBRequest, RTBResponse
 from shared.load_test_context import (
     HEADER_NAME,
@@ -89,6 +90,42 @@ async def _await_mutate(mutate_fn: MutateFunc, req: RTBRequest) -> RTBResponse:
     return await loop.run_in_executor(_mutate_executor, lambda: ctx.run(mutate_fn, req))
 
 
+def _timed_mutate(mutate_fn: MutateFunc, req: RTBRequest, timing: dict[str, float]) -> RTBResponse:
+    """Run mutate_fn and fill the ``queue``/``mutate``/``triton`` segments.
+
+    ``timing["_handler_start"]`` (perf_counter, set by the caller before the
+    offload) gives the queue wait; it is popped so only segments reach the wire.
+    Runs on the worker thread, so the Triton accumulator started by the caller is
+    the one the inference clients append to (same list object across the copied
+    context -- see hop_timing).
+    """
+    started = time.perf_counter()
+    handler_start = timing.pop("_handler_start", started)
+    timing["queue"] = hop_timing.ms(handler_start, started)
+    calls = hop_timing.start_triton_accumulator()
+    try:
+        resp = mutate_fn(req)
+    finally:
+        timing["mutate"] = hop_timing.ms(started)
+        timing["triton"] = hop_timing.triton_ms(calls)
+        hop_timing.clear_triton_accumulator()
+    return resp
+
+
+def _attach_timing(resp: RTBResponse, timing: dict[str, float], handler_start: float) -> dict:
+    """Serialise the response with ``metadata.timing`` filled in.
+
+    ``build`` is the model_dump cost; ``total`` is handler entry to this point.
+    Returns the dict ready for the wire so the JSON step is inside ``build``.
+    """
+    build_start = time.perf_counter()
+    data = resp.model_dump()
+    timing["build"] = hop_timing.ms(build_start)
+    timing["total"] = hop_timing.ms(handler_start)
+    data.setdefault("metadata", {})["timing"] = {k: timing[k] for k in hop_timing.CONTAINER_SEGMENTS if k in timing}
+    return data
+
+
 # ---------------------------------------------------------------------------
 # MCP Session Store
 # ---------------------------------------------------------------------------
@@ -129,6 +166,23 @@ _SERVICE = "com.iabtechlab.bidstream.mutation.services.v1.RTBExtensionPoint"
 _METHOD = f"/{_SERVICE}/GetMutations"
 
 
+def _load_test_signals(metadata) -> tuple[str | None, bool]:
+    """(target variant, is_load_test) from gRPC invocation metadata.
+
+    Same rule as mutate_rest: only "stable"/"canary" count as a variant; the
+    load-test flag is the literal "1". ``metadata`` is an iterable of
+    (key, value) pairs or None.
+    """
+    variant = None
+    is_load_test = False
+    for key, value in metadata or ():
+        if key == HEADER_NAME.lower() and value in ("stable", "canary"):
+            variant = value
+        elif key == IS_LOAD_TEST_HEADER_NAME.lower() and value == "1":
+            is_load_test = True
+    return variant, is_load_test
+
+
 class _RTBExtensionPointServicer:
     """gRPC servicer that delegates to the container's mutate function.
 
@@ -141,11 +195,21 @@ class _RTBExtensionPointServicer:
         self._mutate = mutate_fn
 
     def GetMutations(self, request_bytes: bytes, context: grpc.ServicerContext) -> bytes:
+        handler_start = time.perf_counter()
         try:
             data = json.loads(request_bytes)
             req = RTBRequest(**data)
-            resp = self._mutate(req)
-            return json.dumps(resp.model_dump()).encode()
+            timing: dict[str, float] = {"parse": hop_timing.ms(handler_start), "_handler_start": handler_start}
+            # The same two out-of-band signals /mutate reads from HTTP headers
+            # arrive here as gRPC metadata (the orchestrator lowercases the header
+            # names). Without this the load test's variant targeting silently
+            # stopped working the moment the fan-out moved to gRPC.
+            variant, is_load_test = _load_test_signals(context.invocation_metadata())
+            # No executor hop here: the gRPC server already runs this on one of
+            # its own worker threads, so queue is the time to reach mutate().
+            with target_variant_scope(variant), load_test_scope(is_load_test):
+                resp = _timed_mutate(self._mutate, req, timing)
+            return json.dumps(_attach_timing(resp, timing, handler_start)).encode()
         except Exception as exc:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(exc))
@@ -325,17 +389,21 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
           traffic never sends this header, so get_is_load_test() is always
           False on that path.
         """
+        handler_start = time.perf_counter()
         try:
             body = await request.json()
             req = RTBRequest(**body)
+            timing: dict[str, float] = {"parse": hop_timing.ms(handler_start), "_handler_start": handler_start}
             raw_variant = request.headers.get(HEADER_NAME.lower())
             variant = raw_variant if raw_variant in ("stable", "canary") else None
             is_load_test = request.headers.get(IS_LOAD_TEST_HEADER_NAME.lower()) == "1"
             # The scopes are entered BEFORE the offload so _await_mutate's
-            # copy_context() captures them for the worker thread.
+            # copy_context() captures them for the worker thread. The timing
+            # dict is mutated in place on that thread, which is why it is a
+            # dict and not a ContextVar value.
             with target_variant_scope(variant), load_test_scope(is_load_test):
-                resp = await _await_mutate(mutate_fn, req)
-            return JSONResponse(resp.model_dump())
+                resp = await _await_mutate(lambda r: _timed_mutate(mutate_fn, r, timing), req)
+            return JSONResponse(_attach_timing(resp, timing, handler_start))
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 

@@ -2,6 +2,8 @@ package org.prebid.server.hooks.modules.artf.spring.config;
 
 import io.vertx.core.Vertx;
 import org.prebid.server.hooks.modules.artf.client.ArtfExtensionPointClient;
+import org.prebid.server.hooks.modules.artf.client.ArtfExtensionPointGrpcClient;
+import org.prebid.server.hooks.modules.artf.client.ExtensionPointClient;
 import org.prebid.server.hooks.modules.artf.client.ArtfTokenRefresher;
 import org.prebid.server.hooks.modules.artf.client.TokenCache;
 import org.prebid.server.hooks.modules.artf.core.ArtfMutationApplier;
@@ -92,27 +94,53 @@ public class ArtfModuleConfiguration {
     }
 
     /**
-     * The extension-point client, on Prebid Server's own async HTTP client.
+     * The extension-point client, chosen by {@code hooks.artf-orchestrator.transport}.
      *
-     * <p>No new HTTP dependency: the framework's client keeps the module on the intended
-     * Vert.x threading model, and a blocking client here would stall unrelated auctions
-     * (U3-NFR-13, D1).
+     * <p>{@code http}: Prebid Server's own async HTTP client. {@code grpc}: an HTTP/2 client from
+     * the Vert.x core PBS already ships, speaking the gRPC wire format directly (see
+     * {@link ArtfExtensionPointGrpcClient} for why no gRPC library). Either way no new
+     * dependency enters the build and the module stays on the Vert.x event loop, where a
+     * blocking client would stall unrelated auctions (U3-NFR-13, D1).
+     *
+     * <p>An unknown value fails startup rather than silently picking one: a transport setting
+     * that reads "grpc" and runs HTTP would make every measurement under it a lie.
      */
     @Bean
-    ArtfExtensionPointClient artfExtensionPointClient(HttpClient httpClient,
-                                                     TokenCache artfTokenCache,
-                                                     Clock clock,
-                                                     ArtfModuleProperties artfModuleProperties) {
-        return new ArtfExtensionPointClient(
-                httpClient,
-                ObjectMapperProvider.mapper(),
-                artfTokenCache,
-                clock,
-                artfModuleProperties.getExtensionPointUrl());
+    ExtensionPointClient artfExtensionPointClient(HttpClient httpClient,
+                                                  Vertx vertx,
+                                                  TokenCache artfTokenCache,
+                                                  Clock clock,
+                                                  ArtfModuleProperties artfModuleProperties) {
+        final String transport = artfModuleProperties.getTransport() == null
+                ? "http"
+                : artfModuleProperties.getTransport().trim().toLowerCase();
+        return switch (transport) {
+            case "http" -> new ArtfExtensionPointClient(
+                    httpClient,
+                    ObjectMapperProvider.mapper(),
+                    artfTokenCache,
+                    clock,
+                    artfModuleProperties.getExtensionPointUrl());
+            case "grpc" -> {
+                if (artfModuleProperties.getGrpcTarget() == null
+                        || artfModuleProperties.getGrpcTarget().isBlank()) {
+                    throw new IllegalStateException(
+                            "hooks.artf-orchestrator.transport is grpc but grpc-target is not set");
+                }
+                yield new ArtfExtensionPointGrpcClient(
+                        vertx,
+                        ObjectMapperProvider.mapper(),
+                        artfTokenCache,
+                        clock,
+                        artfModuleProperties.getGrpcTarget());
+            }
+            default -> throw new IllegalStateException(
+                    "hooks.artf-orchestrator.transport must be http or grpc, got '" + transport + "'");
+        };
     }
 
     @Bean
-    MutationApplicationService artfMutationApplicationService(ArtfExtensionPointClient artfExtensionPointClient,
+    MutationApplicationService artfMutationApplicationService(ExtensionPointClient artfExtensionPointClient,
                                                              ArtfMutationApplier artfMutationApplier,
                                                              ArtfModuleProperties artfModuleProperties) {
         return new MutationApplicationService(

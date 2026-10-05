@@ -69,6 +69,10 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
           # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
@@ -253,6 +257,10 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
           # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
@@ -543,6 +551,10 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
             # Bounded epsilon-greedy exploration (breaks the genesis model's
@@ -672,6 +684,10 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
             # See the floor Deployment above for what this gates and why it is
@@ -884,3 +900,166 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+---
+# ---------------------------------------------------------------------------
+# Headless gRPC Services (gRPC transport plan, P2.4).
+#
+# A gRPC channel is one long-lived HTTP/2 connection. Through a ClusterIP
+# Service kube-proxy picks ONE pod when that connection opens and every call
+# then lands on it, so a two-replica container would serve all gRPC traffic
+# from one pod while the HPA reads half the load. A headless Service
+# (clusterIP: None) makes the name resolve to every pod IP instead, and the
+# orchestrator's channel (grpc.lb_policy_name=round_robin on a dns:/// target)
+# spreads calls across them and re-resolves as pods come and go.
+#
+# One per container, same selector as its ClusterIP Service, gRPC port only.
+# The orchestrator reaches these through the *_GRPC env vars in
+# orchestrator-deployment.yaml; the ClusterIP Services above stay as they are
+# for the REST/MCP transports and the health probes.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: bid-pricer-grpc
+  labels:
+    app: artf
+    model: dlrm
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: dlrm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audience-activator-grpc
+  labels:
+    app: artf
+    model: widedeep
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: widedeep
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deal-scorer-grpc
+  labels:
+    app: artf
+    model: ncf
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: ncf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signals-enricher-grpc
+  labels:
+    app: artf
+    model: metrics
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-floor-grpc
+  labels:
+    app: artf
+    model: yield-floor
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-floor
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-margin-grpc
+  labels:
+    app: artf
+    model: yield-margin
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-margin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artf-template-grpc
+  labels:
+    app: artf
+    model: template
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: template

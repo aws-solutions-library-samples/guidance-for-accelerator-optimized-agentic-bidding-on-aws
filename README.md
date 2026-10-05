@@ -8,6 +8,7 @@ Run AI models that price bids, activate audience segments, and manage private ma
 
 1. [Quick start](#quick-start)
 2. [What just happened?](#what-just-happened)
+    - [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)
 3. [Try it](#try-it)
     - [Demo credentials](#demo-credentials)
 4. [Go deeper](#go-deeper)
@@ -16,6 +17,7 @@ Run AI models that price bids, activate audience segments, and manage private ma
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
     - [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings)
+    - [Network layout: nothing in the VPC is internet-facing](#network-layout-nothing-in-the-vpc-is-internet-facing)
     - [Building your own ARTF container](#building-your-own-artf-container)
     - [Part 2: closed-loop learning](#part-2-closed-loop-learning)
     - [Variant: Prebid Server as a second ARTF host (sell side)](#variant-prebid-server-as-a-second-artf-host-sell-side)
@@ -42,7 +44,7 @@ cd guidance-for-accelerator-optimized-agentic-bidding-on-aws/deployment
 
 `--prefix` is required on every run: exactly three characters, a letter followed by letters or digits (`dv1`, `stg`, `bt3`). It names every resource the deployment creates (`dv1-nvidia-artf-*`), keys the local record of your settings, and is what lets two deployments share one account without colliding. Pick one and keep using it for that environment.
 
-`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix — you only need to pass `--ngc-key` once. It provisions everything: an EKS cluster with GPU and CPU node groups, NVIDIA Triton Inference Server, the bidding containers, the orchestrator, and a React frontend behind CloudFront. It takes roughly 30–40 minutes. When it finishes, it prints a URL and a demo login — open the URL in your browser.
+`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix — you only need to pass `--ngc-key` once. With no other flags it provisions, in `us-east-1`: an EKS cluster with one `g5.xlarge` GPU node and three `c5.2xlarge` CPU nodes in private subnets, NVIDIA Triton Inference Server, the six bidding containers, the orchestrator, a React frontend behind CloudFront with Cognito sign-in, an Amazon Bedrock AgentCore MCP runtime, and the Part 2 closed-loop learning stack (feedback pipeline, Glue ETL, SageMaker Model Registry, two Bedrock-backed agent runtimes and their schedules). Container images build on AWS CodeBuild, so Docker is not needed on your machine. It takes roughly 30–40 minutes. When it finishes, it prints a URL and a demo login — open the URL in your browser.
 
 Don't want the closed-loop stack (and don't want to create an NGC account)? Skip it — the core real-time bidding pipeline doesn't need NGC credentials:
 
@@ -62,31 +64,32 @@ Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable,
 
 ```
 Browser (React UI)
+    |                      sign in (Cognito) + HTTPS
+    |  GET /* (static)                 |  lambda:Invoke (SigV4)
+    v                                  v
++---------------------+   +--------------------------------+
+|  CloudFront + S3    |   |  UI API proxy (Lambda, in VPC) |
+|  (serves the UI)    |   |  forwards /api/* calls         |
++---------------------+   +--------------------------------+
+                                       |
+                                       |  http://orchestrator (ClusterIP)
+                                       v
++------------------------------------------------------------+
+|  Orchestrator (EKS)                                        |
+|  verifies the login, runs the bid request through four     |
+|  sequential stages, applying each stage's mutations        |
++------------------------------------------------------------+
     |
-    |  sign in (Cognito) + HTTPS
-    v
-+--------------------------------+
-|  Amazon CloudFront + S3        |
-|  (serves the UI)               |
-+--------------------------------+
-    |
-    |  POST /api/*
-    v
-+--------------------------------+
-|  Orchestrator (EKS)            |
-|  verifies the login, fans      |
-|  out the bid request           |
-+--------------------------------+
-    |
-    |  parallel calls
+    |  4 stages, in order (parallel within a stage)
     v
 +--------------------------------+
 |  6 ARTF containers (EKS)       |
-|  bid pricer, audience          |
-|  activator, deal scorer,       |
-|  signals enricher,             |
-|  yield optimizer floor,        |
-|  yield optimizer margin        |
+|  1 signals enricher,           |
+|    audience activator          |
+|  2 deal scorer                 |
+|  3 yield optimizer floor,      |
+|    yield optimizer margin      |
+|  4 bid pricer                  |
 +--------------------------------+
     |
     |  4 of the 6 call Triton
@@ -108,9 +111,32 @@ Browser (React UI)
 | **Yield Optimizer — Floor** | Publisher/SSP-side — adjusts the floor price on private marketplace deals |
 | **Yield Optimizer — Margin** | Publisher/SSP-side — adjusts the margin taken on private marketplace deals |
 
-The orchestrator fans out every incoming bid request to all six containers in parallel, merges their mutations, and returns a single response — the fan-out includes both yield containers, so each is exercised whenever a scenario carries a deal with the matching floor- or margin-adjustable intent. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
+The orchestrator runs every incoming bid request through the six containers in four sequential stages (enrich, deals, yield, price), applying each stage's mutations to a working copy of the request before the next stage runs, and returns a single stage-ordered response. Both yield containers run in stage 3, so each is exercised whenever a deal with the matching floor- or margin-adjustable intent is in the request by then, including deals the Deal Scorer activated in stage 2. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
 
 The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents — neither is gated on the other — so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
+
+### How the orchestrator sequences the containers
+
+A single parallel fan-out would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
+
+| Stage | Containers | Intents | What the next stage sees |
+|-------|------------|---------|--------------------------|
+| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ADD_CIDS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
+| 2 deals | Deal Scorer | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | matched deals added to `imp.pmp.deals`, poor-fit deals marked suppressed |
+| 3 yield | Yield Optimizer Floor, Yield Optimizer Margin | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | deal floors and `imp.bidfloor` adjusted, only for deals now in the request |
+| 4 price | Bid Pricer | `BID_SHADE` | `seatbid[].bid[].price` shaded; runs only when the request carries a `bid_response` |
+
+Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
+
+With Prebid Server as the host, the hook calls the orchestrator at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
+
+![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
+
+When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The endpoint, envelope and stage order are the same; only the caller's lifecycle and documents differ:
+
+![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
+
+The Auction Theater's two-pass run is unchanged by the staging. Pass 1 sends `ext.artf.bypass: true` and the orchestrator returns before stage 1 (so `metadata.stages` is absent and the UI shows the single parallel ceiling); pass 2 runs all stages. The comparison between the two passes is the baseline the Theater reports on, and it is not something to look for in the diagrams above.
 
 ### Which models exist, and how each one is served
 
@@ -206,12 +232,12 @@ Pass `--verbose` to see every underlying command instead of just the step summar
 | Phase | What happens |
 |-------|---------------|
 | **1/5 — Preparing models** | Creates the ECR repositories and the DynamoDB load-test-history table; exports the PyTorch DLRM/NCF models to ONNX and the yield optimizer's genesis XGBoost models (best-effort — the deploy continues even if this step is skipped); uploads all of it, plus the Triton router/model-config repository, to the S3 model bucket. |
-| **2/5 — Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster (GPU + CPU node groups) — the two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
-| **3/5 — Deploying workloads** | Provisions the Cognito user pool, then applies the Kubernetes manifests for Triton, the six ARTF containers, and the orchestrator. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node — this runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Also configures the included daily GPU-node scheduled shutdown. |
+| **2/5 — Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster: Kubernetes 1.31 across three Availability Zones, a `gpu-inference` node group (1 node, `g5.xlarge` with `g5.2xlarge`/`g5.4xlarge` as fallbacks, all NVIDIA A10G) and a `cpu-services` node group (3 `c5.2xlarge` nodes), both in private subnets behind one NAT gateway per AZ. The two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
+| **3/5 — Deploying workloads** | Provisions the Cognito user pool, app client and identity pool, then applies the Kubernetes manifests for Triton (behind an internal-only load balancer), the six ARTF containers, the orchestrator (a ClusterIP Service for in-cluster callers plus an internal-only NLB for the UI API proxy; no public address) and their Horizontal Pod Autoscalers. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node — this runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Deploys the `<prefix>-ui-api-proxy` Lambda that carries the browser's `/api/*` calls into the VPC, and creates the GPU node group's nightly scheduled shutdown (desired and minimum size set to 0 at 8:00 PM America/New_York every day; the **Start GPUs** button in the UI brings the node back). |
 | **4/5 — Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
-| **5/5 — Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime, then — unless you passed `--no-retraining` — deploys the entire Part 2 closed-loop stack: the bid-outcome feedback pipeline, the Glue ETL job, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously — this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
+| **5/5 — Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime (skip it with `--skip-agentcore`), then — unless you passed `--no-retraining` — deploys the entire Part 2 closed-loop stack: the bid-outcome and deal-yield feedback pipelines (two Kinesis streams, two Firehose delivery streams, a KMS key), the two Glue ETL jobs, the DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously — this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
 
-**Cost while it's running:** approximately **$762/month** with the included daytime-only GPU schedule (about **$1,250/month** if the GPU node runs 24/7) — this includes Part 2 (closed-loop learning), which deploys by default. See [Cost](#cost) for the breakdown. Deploy, try it, and [tear it down](#cleanup) when you're done — a short session costs a few dollars.
+**Cost while it's running:** approximately **$1,470/month** at `us-east-1` on-demand prices with the default settings and the included nightly GPU shutdown (about **$1,945/month** if the GPU node runs 24/7). That figure includes Part 2 (closed-loop learning), which deploys by default; about half of it is the three-node CPU node group. The Adaptive Bidding Agent calls Amazon Bedrock once every 24 hours by default, so it is a small line at that cadence; see [Cost](#cost) for what it becomes if you shorten the interval. Part 1 alone (`--no-retraining`) is about **$1,225/month**. See [Cost](#cost) for the line items and the assumptions behind them. Deploy, try it, and [tear it down](#cleanup) when you're done — a short session costs a few dollars.
 
 **Confirm everything is healthy:**
 
@@ -227,8 +253,6 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 1. Open the frontend URL from the deployment summary and sign in with the demo username and password shown there. On first login, Cognito will prompt you to set a new password. See [Demo credentials](#demo-credentials) below if you missed them or need to reset the password.
 
 2. Click **Containers** in the navigation to check status. The GPU node group scales to zero when idle to save cost — if Triton shows *offline*, click **Start GPUs** (takes about 3–5 minutes).
-
-   <img src="assets/images/containers-starting.png" alt="Containers starting" height="300">
 
    Once Triton has loaded its models, every container shows a green **ready** badge.
 
@@ -287,7 +311,7 @@ It is also recorded locally: `jq -r '.deployments["dv1"].resolved.cognitoUserPoo
 
 ![Architecture](assets/images/architecture.svg)
 
-An Amazon EKS cluster runs two node groups: a `g5`-family GPU node group (NVIDIA A10G, or the more powerful Amazon EC2 G7e) running NVIDIA Triton Inference Server, and a `c5.xlarge` CPU node group running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference — the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; an optional Amazon Bedrock AgentCore runtime exposes the same pipeline over MCP.
+An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in private subnets) runs two node groups: a `gpu-inference` node group of NVIDIA A10G instances (`g5.xlarge` by default, with `g5.2xlarge` and `g5.4xlarge` accepted as capacity fallbacks; the TensorRT engines are compiled for the A10G, so the group is pinned to the `g5` family) running NVIDIA Triton Inference Server, and a `cpu-services` node group of three `c5.2xlarge` instances running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference — the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; a `ui-api-proxy` Lambda inside the VPC carries the browser's API calls to the orchestrator, which has no public address; and an Amazon Bedrock AgentCore runtime, deployed by default and skippable with `--skip-agentcore`, exposes the same pipeline over MCP.
 
 Full component-by-component detail, model specifications, and a request-flow diagram: [assets/images/architecture.md](assets/images/architecture.md). Container-naming history (what changed, what didn't, and why): [RENAME_MAP.md](RENAME_MAP.md).
 
@@ -295,23 +319,41 @@ Full component-by-component detail, model specifications, and a request-flow dia
 
 ### Cost
 
-Sample estimate for the default settings in `us-east-1`, assuming the included scheduled GPU shutdown (~260 GPU-hours/month). `deploy.sh` deploys Part 2 (closed-loop learning) by default, so this table includes both parts, tagged by which part each line item belongs to:
+Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced from the public on-demand rates current when this was written (730 hours per month). `deploy.sh` deploys Part 2 (closed-loop learning) by default, so the table covers both parts, tagged by which part each line item belongs to. The assumptions that move the total are listed under the table.
 
-| AWS service | Part | Cost [USD/month] |
-| ----------- | ---- | ----------------- |
-| Amazon EKS | Part 1 | $73 |
-| Amazon EC2 (GPU, ~260 hrs/mo) | Part 1 | $262 |
-| Amazon EC2 (CPU) | Part 1 | $248 |
-| Everything else (S3, CloudFront, Cognito, DynamoDB, AgentCore) | Part 1 | ~$9 |
-| Amazon DynamoDB (parameter store, audit trail, user features) | Part 2 | ~$5 |
-| Amazon Bedrock AgentCore (Adaptive Bidding Agent) | Part 2 | ~$15 |
-| Amazon Bedrock AgentCore (Governance Agent) | Part 2 | ~$2 |
-| Amazon SageMaker Training | Part 2 | ~$60 |
-| AWS Glue (2 scheduled ETL jobs — bid outcomes, deal-yield outcomes) | Part 2 | ~$88 |
-| Amazon EventBridge Scheduler | Part 2 | <$1 |
-| **Total** | | **~$762** |
+| AWS service | What the default deploy creates | Part | Cost [USD/month] |
+| ----------- | -------------------------------- | ---- | ----------------- |
+| Amazon EKS | 1 cluster control plane | Part 1 | $73 |
+| Amazon EC2 (GPU) | `gpu-inference` node group, 1 × `g5.xlarge` at $1.006/h, ~260 h/mo on the nightly shutdown schedule | Part 1 | $262 |
+| Amazon EC2 (CPU) | `cpu-services` node group, 3 × `c5.2xlarge` at $0.34/h, 24/7 | Part 1 | $745 |
+| Amazon VPC NAT Gateway | 3 gateways (one per AZ) at $0.045/h, plus $0.045 per GB processed (image pulls, Triton model loads, AWS API calls) | Part 1 | $99 + data |
+| Elastic Load Balancing | 1 internal Network Load Balancer for Triton (`triton-internal`) at $0.0225/h, plus LCU usage | Part 1 | $16 + LCU |
+| Amazon EBS | gp3 node volumes: 100 GB (GPU) + 3 × 50 GB (CPU) at $0.08/GB-mo | Part 1 | $20 |
+| Everything else in Part 1 | S3 (models, frontend), CloudFront, Cognito, DynamoDB (`loadtest-history`, `container-registry`, on-demand), `ui-api-proxy` Lambda, CloudWatch Logs, AgentCore MCP runtime (consumption-billed, idle most of the time) | Part 1 | ~$10 |
+| **Part 1 subtotal** | | | **~$1,225** |
+| Amazon Kinesis Data Streams | 2 provisioned streams × 2 shards at $0.015/shard-h | Part 2 | $44 |
+| Amazon Data Firehose, S3, AWS KMS | 2 delivery streams, raw-outcomes + training-data + scripts buckets, 1 customer-managed key | Part 2 | ~$3 |
+| AWS Glue | 2 ETL jobs × 10 G.1X workers, each on a `cron(0 */6 * * ? *)` schedule (4 runs/day), ~5 min per run at $0.44/DPU-h | Part 2 | ~$88 |
+| Amazon DynamoDB | `parameter-store`, `audit-trail`, `user-features` (on-demand) | Part 2 | ~$5 |
+| Amazon SageMaker Training | up to 4 jobs per daily `rate(24 hours)` trigger on `ml.g5.2xlarge` at $1.515/h, ~30 min each | Part 2 | ~$91 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-4-8` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation | Part 2 | ~$3 |
+| Amazon Bedrock (Governance Agent) | same model, invoked on model registration and training-job completion events only | Part 2 | ~$10 |
+| Amazon Bedrock AgentCore | runtime consumption for both agents ($0.0895/vCPU-h, $0.00945/GB-h), ~30 s per invocation | Part 2 | ~$1 |
+| AWS Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC key secret ($0.40), 2 schedules, `vpc-optimizer-proxy` Lambda, alerts topic | Part 2 | ~$2 |
+| **Part 2 subtotal** | | | **~$245** |
+| **Total (default deploy, scheduled GPU)** | | | **~$1,470** |
 
-Running the GPU node 24/7 instead of on the included schedule raises the total to roughly **$1,250/month**. The `g5.xlarge` line item can be swapped for the more powerful Amazon EC2 G7e instances at higher cost. Skip Part 2 entirely with `--no-retraining` to drop the Part 2 rows above. Full line-item detail: [GUIDANCE.md](GUIDANCE.md#cost-estimation) (Part 1) and [GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) / [CLOSED_LOOP.md](CLOSED_LOOP.md#cost) (Part 2, including the optional DAX add-on not counted above).
+**Assumptions, and what changes them:**
+
+- **GPU hours.** The deploy installs one scheduled action: the GPU node group scales to zero at 8:00 PM America/New_York every day. Nothing scales it back up automatically; the **Start GPUs** button in the UI does. 260 hours per month corresponds to starting it each weekday morning. Running it 24/7 makes the GPU line $734 and the total roughly **$1,945**. Leaving it stopped makes the GPU line $0.
+- **CPU nodes.** The `cpu-services` node group starts at 3 nodes (minimum 2, maximum 8, `deployment/eks/cluster-config.yaml`). There is no Cluster Autoscaler in this deployment, so the node count only changes when you change it. Dropping to the minimum of 2 saves $248.
+- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count: about $8 at `rate(6 hours)`, $58 at `rate(1 hour)`, and $700 at `rate(5 minutes)`, at ~10K input and ~1K output tokens per invocation. The schedule can also be paused at runtime from the Adaptive Bidding page or the `/api/v1/closed-loop/schedule` endpoint, which takes this line to zero without a teardown. Model choice is `--model-id` (default `global.anthropic.claude-opus-4-8`); a smaller model lowers the per-token rate.
+- **SageMaker training** only runs when the ETL has produced a dataset that passes the trainer's gate; a fresh deployment with no traffic launches no jobs, so this line starts at $0 and grows with real data.
+- **Part 1 only.** `--no-retraining` removes every Part 2 row: about **$1,225/month** scheduled, **$1,700/month** with the GPU on 24/7.
+- **Prebid variant.** `--with-prebid` adds about $1/month (one more Secrets Manager secret and an API Gateway HTTP API billed per request); it runs in the existing cluster and adds no nodes or load balancers. See [its cost note](#variant-prebid-server-as-a-second-artf-host-sell-side).
+- **Not in the table:** CloudWatch Logs ingestion beyond a few GB, S3 request charges, CodeBuild build minutes (a per-build charge in Phase 2 only, incurred again only when an image's source changes), and data transfer out to the internet, all of which are small at demo volumes.
+
+Per-part line items are also in [GUIDANCE.md](GUIDANCE.md#cost-estimation) (Part 1) and [GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) / [CLOSED_LOOP.md](CLOSED_LOOP.md#cost) (Part 2).
 
 ### Prerequisites
 
@@ -326,31 +368,48 @@ brew install jq eksctl kubectl                   # or your Linux package manager
 docker buildx version                            # only needed for --local-build
 ```
 
-**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), S3 buckets, ECR repositories, CloudFront distributions, Cognito user pools, DynamoDB tables, and IAM roles. A `g5.xlarge` (NVIDIA A10G) service quota in your target Region — check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying.
+**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-4-8` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region — check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
 
-**NVIDIA NGC API key:** required by default, since Part 2 (closed-loop retraining) is on unless you pass `--no-retraining`. `nvcr.io/nvidia/tritonserver` itself is a public image and needs no key. See the [Quick start](#quick-start) above for how to get one.
+**NVIDIA NGC API key:** required by default, since Part 2 (closed-loop retraining) is on unless you pass `--no-retraining`; it is used only to pull the gated NeMo-RL base image, and is stored once in Secrets Manager as `<prefix>-nvidia-artf-recommenders-ngc-api-key`. `nvcr.io/nvidia/tritonserver` itself is a public image and needs no key. See the [Quick start](#quick-start) above for how to get one.
 
-**Supported Regions:** any Region with Amazon EKS and `g5`-family (or G7e) instances, including `us-east-1` (default), `us-west-2`, `eu-west-1`, `eu-central-1`, `ap-northeast-1`, and `ap-southeast-2`.
+**Docker:** not required. Images build on AWS CodeBuild by default. Docker (with buildx) is needed only for `--local-build`, and in Phase 5, where the two closed-loop agent images are built locally for arm64 when a Docker daemon is available and on CodeBuild otherwise.
+
+**Supported Regions:** any Region with Amazon EKS and `g5`-family instances, including `us-east-1` (default), `us-west-2`, `eu-west-1`, `eu-central-1`, `ap-northeast-1`, and `ap-southeast-2`. Part 2 and the MCP runtime additionally need Amazon Bedrock AgentCore in the same Region. Set the Region with `AWS_REGION`.
 
 ### Customizing your deployment
 
+Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys Part 1, the MCP runtime and Part 2 with remote CodeBuild image builds, in `us-east-1`, and does not deploy Prebid Server.
+
 ```bash
-./deploy.sh --prefix dv1                   # REQUIRED on every run: 3 chars, letter then letters/digits (dv1-*)
-./deploy.sh --prefix dv1 --profile prof    # AWS CLI profile; remembered per prefix (default: $AWS_PROFILE, else "default")
-./deploy.sh --prefix dv1 --skip-images     # reuse existing images
-./deploy.sh --prefix dv1 --skip-cluster    # reuse an existing EKS cluster
-./deploy.sh --prefix dv1 --local-build     # build images locally with Docker instead of CodeBuild
-./deploy.sh --prefix dv1 --no-retraining   # Part 1 only — skip the closed-loop stack (see below)
+./deploy.sh --prefix dv1                   # REQUIRED on every run: exactly 3 chars, a letter then letters/digits (names resources dv1-nvidia-artf-*)
+./deploy.sh --prefix dv1 --profile prof    # AWS CLI profile (default: $AWS_PROFILE if set, else the profile remembered for this prefix, else "default")
+./deploy.sh --prefix dv1 --with-retraining # deploy Part 2 closed-loop learning (DEFAULT)
+./deploy.sh --prefix dv1 --no-retraining   # Part 1 only: skip the closed-loop stack and the NGC key requirement
+./deploy.sh --prefix dv1 --ngc-key KEY     # NGC API key for the NeMo-RL training image (needed once per prefix when Part 2 is on)
 ./deploy.sh --prefix dv1 --ngc-secret my-secret-name  # reuse an NGC key already stored in Secrets Manager
-./deploy.sh --prefix dv1 --maxGPUs 5       # raise the GPU node group's max size (default 3)
-./deploy.sh --prefix dv1 --artf-node-role inference   # co-locate the model containers on the GPU node
-./deploy.sh --prefix dv1 --start-at 3      # resume from Phase 3 (see the breaking-change note below)
-./deploy.sh --prefix dv1 --verbose         # print every underlying command, not just step summaries
+./deploy.sh --prefix dv1 --skip-agentcore  # do not register the MCP runtime (default: registered)
+./deploy.sh --prefix dv1 --with-prebid     # also deploy Prebid Server as a second ARTF host (default: off; --no-prebid turns a remembered value back off)
+./deploy.sh --prefix dv1 --remote-build    # build images on AWS CodeBuild (DEFAULT)
+./deploy.sh --prefix dv1 --local-build     # build images locally with Docker buildx instead
+./deploy.sh --prefix dv1 --skip-images     # reuse the images already in ECR
+./deploy.sh --prefix dv1 --skip-cluster    # reuse the existing EKS cluster
+./deploy.sh --prefix dv1 --maxGPUs 5       # GPU node group maximum size (default 3; the group starts at 1 node)
+./deploy.sh --prefix dv1 --artf-node-role inference   # schedule the ARTF containers on the GPU node (default: services, the CPU node group); --artf-on-gpu is the same thing
+./deploy.sh --prefix dv1 --model-id ID     # Bedrock model or inference profile for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --start-at 3      # force a starting phase, 1-5 (default: probe AWS and run whatever is missing)
+./deploy.sh --prefix dv1 --export-only     # only export the ONNX/XGBoost models and upload them to S3
+./deploy.sh --prefix dv1 --ui-only         # only rebuild and redeploy the frontend
+./deploy.sh --prefix dv1 --status          # read-only: print the live phase table and exit
+./deploy.sh --prefix dv1 --destroy         # tear the prefix down (interactive confirmation)
+./deploy.sh --prefix dv1 --verbose         # stream every underlying command instead of one line per step
 DEPLOY_NO_SPINNER=1 ./deploy.sh --prefix dv1   # hold the progress line still (no animation)
-AWS_REGION=us-west-2 ./deploy.sh --prefix dv1  # deploy to a different Region
+AWS_REGION=us-west-2 ./deploy.sh --prefix dv1  # deploy to a different Region (default: us-east-1)
+ADAPTIVE_BIDDING_MODEL_ID=... GOVERNANCE_MODEL_ID=... ./deploy.sh --prefix dv1   # per-agent model override (default: the --model-id value)
+CAPTION_INFERENCE_PROFILE_ID=... ./deploy.sh --prefix dv1   # model the frontend uses for captions (default: global.anthropic.claude-haiku-4-5-20251001-v1:0)
+DEMO_USER_EMAIL=you@example.com ./deploy.sh --prefix dv1    # demo Cognito user (default: admin@example.com)
 ```
 
-Re-deploying or resuming by hand is not a supported path: always go back through `deploy.sh --prefix <p>` (with `--start-at N` to resume from a phase). It is the one place the profile, region and remembered inputs are resolved, and every child script and helper receives them from it.
+`--resume` is accepted and does nothing; a plain re-run already probes AWS and continues from whatever is missing. Re-deploying or resuming by hand is not a supported path: always go back through `deploy.sh --prefix <p>` (with `--start-at N` to force a phase). It is the one place the profile, region and remembered inputs are resolved, and every child script and helper receives them from it.
 
 By default, images build remotely on **AWS CodeBuild** — no local Docker required, and ARM64 images (AgentCore) build natively on Graviton. The first deploy provisions a CodeBuild stack automatically; later runs skip rebuilding images whose source hasn't changed. Pass `--local-build` if you'd rather build with Docker on your own machine (needs ~30 GB free disk, plus buildx for the ARM64 cross-compile).
 
@@ -449,6 +508,27 @@ Three things worth knowing about the record:
 - It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password — only the *name* of the Secrets Manager secret.
 - It records **no progress**. That was tried and removed: a file describing what the script had done disagreed with what the account actually contained, and reported a phase complete for a workload that had never started. Progress comes from `--status`.
 
+**What the terminal shows, and where the rest went.** The terminal prints phases and steps only. Everything a step runs — the ONNX export, S3 copies, `eksctl`, every `kubectl apply`, CodeBuild polling, the AgentCore SDK's logging, and the `deploy_prebid.sh` and `deploy_closed_loop.sh` children — goes to one file per run, `deployment/.deploy-<prefix>.log` (the previous run is kept as `.deploy-<prefix>.prev.log`). The path is printed at the start of every run and again by every failure, and a failure also prints the last 15 lines of it inline. Pass `--verbose` to stream everything to the terminal instead.
+
+**A flag the script does not recognise stops the run.** Nothing is created first. This includes a flag whose leading dashes were turned into an em dash by a chat client or word processor (`—with-prebid`); the message says so, because that mistake is invisible on screen and used to be silently dropped — a run that was meant to include Prebid Server ran without it.
+
+### Network layout: nothing in the VPC is internet-facing
+
+Both EKS node groups are placed in **private subnets** behind one NAT gateway per Availability Zone (`deployment/eks/cluster-config.yaml`: `privateNetworking: true`, `vpc.nat.gateway: HighlyAvailable`). Nothing in the deployment reaches a node by its IP address: the Prebid Server hook calls the orchestrator at its in-cluster Service DNS name, the orchestrator calls Prebid Server and the ARTF containers the same way, the Triton load balancer is internal to the VPC, and both Lambdas (the demand-endpoint `vpc-proxy` and the `ui-api-proxy` below) run inside the VPC.
+
+The **orchestrator has no public address.** In-cluster callers use its `ClusterIP` Service; the UI path uses a second Service, `orchestrator-internal`, an internal Network Load Balancer (`deployment/eks/orchestrator-internal-nlb.yaml`) that has an address inside the VPC and none outside it. The React UI, served as static files from CloudFront + S3, reaches it like this:
+
+1. The browser signs in with Cognito and exchanges the ID token for temporary SigV4 credentials through the Cognito Identity Pool (the same mechanism it already uses to invoke the closed-loop agents directly).
+2. Every `/api/...` call is packaged as a JSON event and sent with `lambda:InvokeFunction` to the **`<prefix>-ui-api-proxy`** Lambda (`deployment/ui_api_proxy_cfn.yaml`). The Identity Pool's authenticated role is granted that one action on that one function and nothing else.
+3. The Lambda, attached to the cluster's private subnets with the cluster security group, forwards the request to the orchestrator's internal NLB (`http://<name>.elb.<region>.amazonaws.com`, read from the Service by `deploy.sh` and passed to the Lambda stack) and returns the response. A Lambda cannot use the in-cluster name `orchestrator.default.svc.cluster.local`: that zone exists only in CoreDNS, and a ClusterIP has no route from an ENI, so the NLB is the only address outside the nodes that reaches the pods. `deploy.sh` proves the path by sending one `GET /api/health/ready` through the function before it builds the UI. It only forwards `/api/*` paths and only the `Authorization`, `Content-Type`, `Accept` and `Mcp-Session-Id` headers.
+4. The user's Cognito bearer token travels unchanged, so the orchestrator's own JWT and scope checks (`source/orchestrator/auth.py`) are still what authorise the call. The Lambda moves bytes; it does not authenticate.
+
+The load-test panel's live stream is the one feature this changes: a synchronous invoke cannot carry server-sent events, so the proxy answers `406 streaming_not_supported` immediately and the panel uses its existing 500 ms polling path instead.
+
+Why this shape: an account running [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) in `block-ingress` mode drops inbound traffic at the internet gateway for every VPC in the account — commonly as an organisation-level control the operator cannot change. Private nodes behind NAT are unaffected, because `block-ingress` permits NAT-gateway egress; an internet-facing load balancer (and a CloudFront VPC origin) would be created and then accept no traffic. A VPC-attached Lambda ENI is not an internet path, so the stack deploys and the UI works in such an account with no exclusion, no override, and no change to the bidstream hot path (Prebid Server → orchestrator → containers → Triton never leaves the cluster). Earlier releases created a public load balancer and stopped the deploy with a "create an exclusion" instruction; that gate no longer exists because nothing needs public ingress.
+
+To reach the orchestrator from your own machine for debugging: `kubectl port-forward svc/orchestrator 8080:80`, then `curl http://localhost:8080/health/ready`.
+
 ### Building your own ARTF container
 
 The deployment includes a seventh container, **ARTF Template**, as the starting point for your own. It is built, deployed and wired to the orchestrator like the six shipped ones, but starts **inactive** and returns no mutations, so it changes nothing until you switch it on.
@@ -500,9 +580,9 @@ The six shipped containers stay defined in the orchestrator's code and cannot be
 
 ### Attaching a container built outside this guidance
 
-The registry table accepts containers this repository did not build. A container prepared elsewhere — for example the Contextual Yield Agent from [Guidance for Containerized Advertising Context on AWS](https://github.com/aws-solutions-library-samples/guidance-for-containerized-semantic-context-on-aws) — attaches with **no orchestrator code change and no Java change**, because the Prebid ARTF hook calls the orchestrator rather than the containers and inherits whatever the registry resolves.
+The registry table accepts containers this repository did not build. A container prepared elsewhere attaches with **no orchestrator code change and no Java change**, because the Prebid ARTF hook calls the orchestrator rather than the containers and inherits whatever the registry resolves.
 
-That producer emits an `artf-registry-record.json` describing the container and a Kubernetes example manifest. `deployment/attach_artf_container.sh` consumes both.
+The producer supplies two files: an `artf-registry-record.json` describing the container (name, image, endpoint, intents, serving modes) and a Kubernetes example manifest. `deployment/attach_artf_container.sh` consumes both. The examples below use a producer named `my-producer` and a container named `floor-agent`; substitute your own.
 
 **Everything in one block:**
 
@@ -512,25 +592,25 @@ cd deployment
 # 1. Attach: validate, copy the image into this account's ECR, render the manifest,
 #    probe POST /mutate, and write the registry record (inactive).
 ./attach_artf_container.sh \
-  --record   /path/to/guidance-for-containerized-semantic-context-on-aws/deployment/artf-registration/artf-registry-record.json \
-  --template /path/to/guidance-for-containerized-semantic-context-on-aws/deployment/k8s/artf-container.example.yaml \
+  --record   /path/to/my-producer/artf-registry-record.json \
+  --template /path/to/my-producer/artf-container.example.yaml \
   --stack    "${STACK_NAME}" \
   --region   us-east-1 \
   --priority 0
 
 # 2. Review the rendered manifest, then apply it.
-cat eks/external-contextual-yield-agent.yaml
-kubectl apply -f eks/external-contextual-yield-agent.yaml
+cat eks/external-floor-agent.yaml
+kubectl apply -f eks/external-floor-agent.yaml
 
 # 3. Activate it — in the Container Health panel, or here.
 aws dynamodb update-item \
   --table-name "${STACK_NAME}-container-registry" --region us-east-1 \
-  --key '{"registry":{"S":"artf-containers"},"name":{"S":"contextual-yield-agent"}}' \
+  --key '{"registry":{"S":"artf-containers"},"name":{"S":"floor-agent"}}' \
   --update-expression 'SET active = :a' \
   --expression-attribute-values '{":a":{"BOOL":true}}'
 
 # 4. Teardown — record first, then workload. The script enforces that order.
-./attach_artf_container.sh --detach contextual-yield-agent --stack "${STACK_NAME}"
+./attach_artf_container.sh --detach floor-agent --stack "${STACK_NAME}"
 ```
 
 **What the script refuses, and why:**
@@ -553,7 +633,7 @@ Both containers are called. For any given `(path, intent)` only one mutation is 
 
 Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent — and the built-in's mutation is computed and then discarded. That is not new behaviour: it is what a consumer applying an unresolved mutation list already did, since the last write to a path is the one that sticks. What is new is that it is now decided in one place, reported, and controllable.
 
-`contextual-yield-agent` claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer** also claims. So attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
+If an attached container claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer** also claims, attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
 
 ```bash
 ./attach_artf_container.sh --record ... --stack "${STACK_NAME}" --priority -1
@@ -575,7 +655,7 @@ The losing mutation is not hidden. `metadata.conflicts` names the path, the inte
 | Namespace | `--namespace`, else the record's | the record's (`default`) |
 | Registry table | `--table`, else `${STACK_NAME}-container-registry` | derived from the stack |
 
-**Not verified.** The GPU variant is implemented and guarded but **untested**: only the CPU image is published today (`serving_modes: ["cpu"]`), so there is nothing to pull and nothing to run. The guard refuses it rather than rendering a manifest for an image that does not exist. This cluster's GPU nodes *would* be compatible — `g5.*` is A10G, `sm_86`, which the container builds for — but that is a static compatibility check, not a run.
+**Not verified.** The GPU variant is implemented and guarded but **untested**: no producer image advertising a GPU serving mode has been attached to this cluster yet. The guard refuses `--variant gpu` for an image whose `serving_modes` does not include `gpu`, rather than rendering a manifest for a shape the image cannot serve. An image built for `sm_86` would match this cluster's `g5` (A10G) nodes, but that is a static compatibility check, not a run.
 
 ### Part 2: closed-loop learning
 
@@ -703,7 +783,7 @@ cd deployment
 
 The upstream [Guidance for Deploying a Prebid Server on AWS](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) deploys Prebid Server to **ECS Fargate in its own VPC**. This variant deploys the same pinned upstream release into **the EKS cluster you already have**, beside the orchestrator and the ARTF containers.
 
-That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the orchestrator answers the Prebid pod in **8 ms**. Co-location is also closer to how a real bidding stack is laid out.
+That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the hook's measured round trip to the orchestrator is **34–37 ms** at steady state (hook analytics `latency_ms`); a cross-VPC hop would come out of the same budget. Co-location is also closer to how a real bidding stack is laid out.
 
 **Nothing upstream is forked.** The pinned `prebid-server-java` release is fetched at deploy time and our sources are *added* to the checkout through the one extension point the upstream Dockerfile provides. The deploy proves it rather than asserting it — `diff -rq` against the pristine release reports **0 modified files, 0 removals, 5 additions**, and the deploy script prints `Upstream files modified by this step: 0 (additions only)` as it runs.
 
@@ -738,10 +818,10 @@ The module is the sell side: it mutates the request every bidder then sees. The 
      v                                        |
 +------------------------------------------------------------+
 |  Orchestrator (EKS)  -- the SAME one the UI calls          |
-|  fans out to the ARTF containers, merges, replies (8 ms)   |
+|  runs stages 1-3 in order, applying between, replies       |
 +------------------------------------------------------------+
      |
-     |  parallel
+     |  stage by stage (parallel within a stage)
      v
 +------------------------------------------------------------+
 |  6 ARTF containers -> NVIDIA Triton (GPU)                  |
@@ -781,7 +861,7 @@ What actually happens, in order, when a browser loads a page carrying prebid.js.
 
 3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance and a reserve held back for bidder fan-out and auction resolution, and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget` — *not* an error, because nothing decided and nothing broke; the orchestrator was simply never asked.
 
-4. **The module calls the orchestrator.** `POST /v1/mutations` with a bearer token it already holds — a Cognito `client_credentials` token, refreshed on a timer, never fetched on the auction path. The orchestrator fans out to the six ARTF containers, four of which call Triton on the GPU, merges the results and replies in about **8 ms**, carrying per-container status:
+4. **The module calls the orchestrator.** `POST /v1/mutations` with a bearer token it already holds — a Cognito `client_credentials` token, refreshed on a timer, never fetched on the auction path. The orchestrator runs the ARTF containers through stages 1 to 3 (enrich, deals, yield; see [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)), four of the six call Triton on the GPU, and it replies with the stage-ordered list; the hook measured the earlier single-stage round trip at **34–37 ms** steady state (the `latency 36 ms` line below), and the reply carries per-container status with each container's own in-orchestrator latency:
 
    ```
    dlrm-bid-shader            skipped        (BID_SHADE is response-side; see below)
@@ -826,6 +906,32 @@ The response body is Prebid's own — no bid added, no price altered. Timing, th
 The Auction Theater uses this. If a live auction is available the offers column shows it; if not, it shows the captured fixture with a notice saying so. A fixture is never presented as live, and the check for "live" is a positive one — the orchestrator marks a real auction, rather than the UI assuming anything that is not the fixture must be real.
 
 The switch is `PREBID_AUCTION_URL`, set on the orchestrator by `deploy_prebid.sh` and removed by its `--destroy`. It is deployment state rather than a probe: probing the Service per request would make a transient failure read as "Prebid was never deployed".
+
+#### Walkthrough: the Auction Theater
+
+Every scenario card carries a **Step through in Auction Theater** button next to **Send**. It runs the same bid request through Prebid Server twice and steps you through both auctions frame by frame, so the effect of the ARTF containers is a before-and-after you can watch rather than a number you have to take on trust. The three columns stay fixed throughout: publisher yield decisions on the left, the bid request in the middle, and the candidate campaigns (the offers) on the right.
+
+The first pass sends the request to Prebid exactly as the publisher sent it. No container is consulted.
+
+<img src="assets/images/auction-theater-first-pass.png" alt="Auction Theater, first pass: the request goes to Prebid unmodified" width="100%">
+
+The seats bid against the request as-is. The outside buyer at `amazon.com` wins at $3.25; the publisher's remnant deal loses on price. This is the baseline the containers have to beat.
+
+<img src="assets/images/auction-theater-baseline-outcome.png" alt="First-pass outcome: amazon.com wins at $3.25, remnant deal lost on price" width="100%">
+
+The second pass sends the identical request through the ARTF containers first.
+
+<img src="assets/images/auction-theater-second-pass.png" alt="Auction Theater, second pass: the same request, routed through the ARTF containers" width="100%">
+
+The containers enrich the request in place: audience segments and premium-inventory signals, the premium home deal activated onto the impression by the Deal Scorer, and viewability and brand-safety metrics. Everything added shows under **Added by ARTF containers**, separate from what the exchange sent.
+
+<img src="assets/images/auction-theater-mutations.png" alt="The ARTF containers add audience segments, an activated deal, and quality metrics to the request" width="100%">
+
+Now a deal buyer can bid. `cedarandco.example` bids $6.35 on the activated `deal-home-premium` and wins; the same `amazon.com` bid that won the first pass now loses on price. The left column tallies the difference for this impression: $6.35 cleared versus $3.25, a +$3.10 delta that exists only because the containers ran. Without them, Amazon would have won at $3.25.
+
+<img src="assets/images/auction-theater-outcome.png" alt="Second-pass outcome: Cedar & Co wins at $6.35 on the activated deal, with a with-ARTF-vs-without comparison" width="100%">
+
+A note on honesty, consistent with the section above: the Theater shows a live auction when Prebid is deployed and reachable, and a captured fixture with a visible notice when it is not. A fixture is never presented as live. The prices in both seats' catalogs are authored, so the contest and the mechanism are real while the numbers going into them are yours.
 
 #### What is real here, and what is not
 
@@ -913,7 +1019,7 @@ If you want Prebid Server in its own isolated VPC on ECS Fargate — with the up
 
 - **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data — there's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
 - **Add or swap containers.** Use the containers under `source/containers/` as reference implementations for additional ARTF intents, then register them with the orchestrator fan-out.
-- **Scale for production traffic.** The included Horizontal Pod Autoscalers and Cluster Autoscaler scale with load; raise `--maxGPUs` or edit `deployment/eks/cluster-config.yaml` for higher ceilings. See [GUIDANCE.md](GUIDANCE.md#scaling-scenarios) for reference sizing at different QPS levels.
+- **Scale for production traffic.** The included Horizontal Pod Autoscalers add container and orchestrator replicas with load inside the node capacity you have provisioned; no Cluster Autoscaler is installed, so node counts are set by `deployment/eks/cluster-config.yaml` (`cpu-services` desired 3, min 2, max 8) and `--maxGPUs` (GPU maximum, default 3), and change only when you scale the node groups. See [GUIDANCE.md](GUIDANCE.md#scaling-scenarios) for reference sizing at different QPS levels.
 - **Connect to a live DSP.** Route real OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream. See [GUIDANCE.md](GUIDANCE.md#integration-with-a-dsp) for the integration steps.
 
 ## Cleanup
@@ -925,11 +1031,30 @@ cd deployment
 
 The script prompts for confirmation — type `destroy` to proceed. Include the same `--prefix` used at deploy time to tear down a specific namespaced stack.
 
-`--destroy` removes the Kubernetes workloads, the EKS cluster (both node groups), the S3 model bucket, the DynamoDB load-test table, the CloudFront distribution and frontend bucket, the AgentCore runtime, the Cognito user pool, and the IAM policies/roles this Guidance created.
+`--destroy` removes, in dependency order: the Kubernetes workloads; the `ui-api-proxy` and `vpc-optimizer-proxy` Lambda stacks (before the cluster, so their VPC ENIs do not block subnet deletion); the EKS cluster with both node groups, its VPC and NAT gateways, the internal Triton load balancer and the GPU scheduled action; the S3 model bucket; the `loadtest-history` and `container-registry` DynamoDB tables; the CloudFront distribution and frontend bucket; the MCP runtime and both closed-loop agent runtimes; the Part 2 stacks (`governance-eventbridge`, `closed-loop-core` after emptying its SageMaker Model Package Groups, `agentcore-security`, `glue-etl`, `feedback-pipeline`) with their DynamoDB tables and S3 buckets; the `<prefix>-prebid-artf` stack if it exists; the CodeBuild stack and its source bucket; the Cognito user pool, identity pool and authenticated role; the IAM policies and roles this Guidance created; every ECR repository named `<prefix>-nvidia-artf-recommenders-*` with its images; and the prefix's record in `deployment/.deploy-state.json`.
 
-**Deployed the [Prebid variant](#variant-prebid-server-as-a-second-artf-host-sell-side) too?** `--destroy` here covers most of it: the Kubernetes objects go with the cluster, and it deletes the `<prefix>-prebid-artf` stack explicitly if it exists. What it leaves behind is the **ECR repository and its images**, because this script retains ECR repositories by design. Run `./deploy_prebid.sh --prefix <prefix> --destroy` instead — or afterwards — to remove those too and to clear the orchestrator's `ARTF_MUTATIONS_REQUIRED_SCOPE`.
+**What `--destroy` does not remove.** Four things are outside its scope and stay in the account until you delete them:
 
-**Retained by design:** Amazon ECR repositories persist across deployments so cached images survive between runs. Delete them manually from the ECR console or CLI if you no longer need them.
+```bash
+P=<prefix>; S=${P}-nvidia-artf-recommenders; A=$(aws sts get-caller-identity --query Account --output text); R=us-east-1
+
+# The NGC API key secret (Part 2). Kept so a later deploy of the same prefix can reuse it with --ngc-secret.
+aws secretsmanager delete-secret --secret-id "${S}-ngc-api-key" --force-delete-without-recovery --region "$R"
+
+# The Glue ETL scripts bucket (Part 2).
+aws s3 rb "s3://${P}-artf-scripts-${A}" --force
+
+# The Prebid Server image repository (only if you deployed --with-prebid). deploy_prebid.sh --destroy removes it too.
+aws ecr delete-repository --repository-name "${P}-prebid-server" --force --region "$R"
+
+# The NeMo-RL training image repository. It is NOT prefixed and is shared by every deployment in the account;
+# delete it only when no other prefix still trains models.
+aws ecr delete-repository --repository-name artf-nemo-rl-training --force --region "$R"
+```
+
+CloudWatch log groups created by the Lambda functions, CodeBuild and the AgentCore runtimes also remain; at demo volumes they cost cents per month.
+
+**Deployed the [Prebid variant](#variant-prebid-server-as-a-second-artf-host-sell-side) too?** `--destroy` here covers most of it: the Kubernetes objects go with the cluster, and it deletes the `<prefix>-prebid-artf` stack explicitly if it exists. Run `./deploy_prebid.sh --prefix <prefix> --destroy` instead, or afterwards, to also remove the `<prefix>-prebid-server` ECR repository and clear the orchestrator's `ARTF_MUTATIONS_REQUIRED_SCOPE`.
 
 **Required permission for teardown:** disabling CloudFormation termination protection (which `eksctl` enables automatically) needs `cloudformation:UpdateTerminationProtection`. If your session denies that action, `--destroy` logs a warning and the EKS stacks won't delete — re-run it from a session that allows the action.
 
@@ -966,14 +1091,14 @@ aws codebuild list-builds-for-project --project-name "${STACK_NAME}-image-builde
 
 #### Option 1 — resume instead of stopping (usually right)
 
-The EKS cluster takes 15–20 minutes and an interrupted run does not lose it. Every phase is idempotent, so re-running picks up where it left off:
+The EKS cluster takes 15–20 minutes and an interrupted run does not lose it. Every phase is idempotent, so re-running the same command picks up where it left off:
 
 ```bash
 cd deployment
-./deploy.sh --prefix <your-prefix> --resume
+./deploy.sh --prefix <your-prefix>
 ```
 
-See [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings) for how `--resume`, `--start-at` and the remembered flags in `.deploy-state.json` interact. The short version: you do not need to tear down before redeploying, and `--destroy` is for when you want the resources *gone*, not as a precaution.
+See [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings) for how the live probe, `--start-at` and the remembered flags in `.deploy-state.json` interact. The short version: you do not need to tear down before redeploying, and `--destroy` is for when you want the resources *gone*, not as a precaution.
 
 #### Option 2 — stop the in-flight work, keep what exists
 
@@ -997,7 +1122,7 @@ Three things to know before you run it on an interrupted deployment:
 
 - **It needs an interactive terminal.** It prompts for the word `destroy` and fails outright if it cannot read a TTY — so it will not work backgrounded, piped, or from CI.
 - **Let the in-flight stacks settle first.** `--destroy` clears `eksctl`'s termination protection only on stacks in `CREATE_COMPLETE`, `UPDATE_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`. A stack still in `CREATE_IN_PROGRESS` — precisely what an interrupted deploy leaves — is not in that list, so its protection stays on and the delete can stall. Wait for the status to settle, then destroy.
-- **ECR repositories are retained by design**, including any created by `attach_artf_container.sh`. Delete them separately if you want them gone.
+- **It deletes every `<prefix>-nvidia-artf-recommenders-*` ECR repository**, including any created by `attach_artf_container.sh` under that name. The four resources listed under [Cleanup](#cleanup) as outside its scope stay behind.
 
 **If a stack is wedged**, deal with `eksctl`'s stacks through `eksctl` rather than CloudFormation, because it knows the dependency order between the cluster and its node groups:
 
@@ -1022,7 +1147,7 @@ Two local state files survive and are safe to delete, though deleting the first 
 
 | File | Holds |
 |---|---|
-| `deployment/.deploy-state.json` | The flags the last run was given — what `--resume` reads |
+| `deployment/.deploy-state.json` | The flags the last run of each prefix was given, which the next run of that prefix reuses for any flag you omit. It records no progress |
 | `deployment/.bootstrap-status.json` | Progress of the model-optimizer TensorRT build, which runs in the background and outlives the script by design |
 
 The optimizer bootstrap is deliberately fire-and-forget: `deploy.sh` does not block on it, so a Job may still be compiling engines after the script exits normally. That is expected, not a leftover.

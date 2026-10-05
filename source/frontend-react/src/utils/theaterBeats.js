@@ -20,14 +20,33 @@ export const BEAT_ORIGIN = "origin";
 export const BEAT_CONTAINER = "container";
 export const BEAT_BIDS = "bids";
 export const BEAT_RECAP = "recap";
+/**
+ * A pass banner: announces whether the auction about to run is the one WITHOUT
+ * ARTF mutations (pass 1) or the one WITH them (pass 2). A beat, not a transient
+ * overlay, so stepping back to it shows it again and the screen stays a pure
+ * function of (beats, index).
+ */
+export const BEAT_PASS = "pass";
+/**
+ * The baseline auction settling: the beat at which pass 1's winner is revealed.
+ * Pass 1 has no recap -- there were no mutations to recap -- so this is the beat
+ * that plays the recap's role of closing the pass.
+ */
+export const BEAT_BASELINE = "baseline";
+
+/** The two passes, by number. Pass 1 is the baseline; pass 2 is the one with ARTF. */
+export const PASS_BASELINE = 1;
+export const PASS_ARTF = 2;
 
 /** Where attention travels for each beat kind (BR-20). */
 const MOVEMENT_BY_KIND = Object.freeze({
+  [BEAT_PASS]: "none",
   [BEAT_ORIGIN]: "sell-to-request",
   [BEAT_CONTAINER]: "none",
   // Attention crosses to the buy side when the BIDS land, not at the recap: the
   // bids are the first thing the offers column shows, so that is the move.
   [BEAT_BIDS]: "request-to-buy",
+  [BEAT_BASELINE]: "none",
   [BEAT_RECAP]: "none",
 });
 
@@ -193,6 +212,9 @@ function makeBeat(index, kind, extra) {
     index,
     kind,
     movement: MOVEMENT_BY_KIND[kind],
+    // Which pass this beat belongs to. Defaults to the ARTF pass so a beat built
+    // without saying is the one that existed before passes did.
+    pass: PASS_ARTF,
     containerName: null,
     displayLabel: null,
     intent: null,
@@ -207,18 +229,36 @@ function makeBeat(index, kind, extra) {
 }
 
 /**
- * Derive the beat sequence: one origin beat, one beat per Mutation object in
- * stop order, one recap beat (BR-1 through BR-4).
+ * Derive the beat sequence (BR-1 through BR-4, extended to two passes).
  *
- * A stop with no mutations contributes no beats, so a container that was
- * invoked and deliberately recommended no change is absent from the
+ * Pass 1, the baseline: a pass banner, the request arriving, the seats bidding on
+ * it exactly as sent, and the auction settling. No container appears, because
+ * none was consulted -- the auction endpoint marks the request so the extension
+ * point proposes nothing.
+ *
+ * Pass 2, with ARTF: a pass banner, the request arriving again, one beat per
+ * Mutation object in stop order, the seats bidding on the enriched request, and
+ * the recap. A stop with no mutations contributes no beats, so a container that
+ * was invoked and deliberately recommended no change is absent from the
  * walkthrough (BR-4). The total is therefore only knowable after the response.
+ *
+ * Every beat carries `pass`, and every pass-1 beat precedes every pass-2 beat.
+ * Nothing in pass 1 carries values, so `visibleValues` is empty until the first
+ * container beat, which is in pass 2 by construction.
  */
 export function buildBeats(submittedPayload, normalizedResult) {
   const stops = Array.isArray(normalizedResult?.stops) ? normalizedResult.stops : [];
   const beats = [];
 
-  beats.push(makeBeat(0, BEAT_ORIGIN, {}));
+  // ---- pass 1: the baseline -------------------------------------------------
+  beats.push(makeBeat(beats.length, BEAT_PASS, { pass: PASS_BASELINE, artf: false }));
+  beats.push(makeBeat(beats.length, BEAT_ORIGIN, { pass: PASS_BASELINE }));
+  beats.push(makeBeat(beats.length, BEAT_BIDS, { pass: PASS_BASELINE }));
+  beats.push(makeBeat(beats.length, BEAT_BASELINE, { pass: PASS_BASELINE }));
+
+  // ---- pass 2: with ARTF ----------------------------------------------------
+  beats.push(makeBeat(beats.length, BEAT_PASS, { pass: PASS_ARTF, artf: true }));
+  beats.push(makeBeat(beats.length, BEAT_ORIGIN, { pass: PASS_ARTF }));
 
   for (const stop of stops) {
     // Only container stops carry a resolvable container name; the ssp and dsp
@@ -271,7 +311,7 @@ export function buildBeats(submittedPayload, normalizedResult) {
   // step total while the reader is partway through it. The beat is therefore always
   // present and the offers column states whatever is actually true when it is
   // reached: real bids, no bids, the fixture with its own notice, or a fault.
-  beats.push(makeBeat(beats.length, BEAT_BIDS, {}));
+  beats.push(makeBeat(beats.length, BEAT_BIDS, { pass: PASS_ARTF }));
 
   // The recap restates what actually changed. A container that produced nothing
   // is absent from it, consistent with having produced no beat (BR-9 of the
@@ -287,7 +327,7 @@ export function buildBeats(submittedPayload, normalizedResult) {
       beatIndexes: [beat.index],
     });
   }
-  beats.push(makeBeat(beats.length, BEAT_RECAP, { contributors }));
+  beats.push(makeBeat(beats.length, BEAT_RECAP, { pass: PASS_ARTF, contributors }));
 
   return beats;
 }
@@ -299,6 +339,22 @@ export function buildBeats(submittedPayload, normalizedResult) {
 export function visibleValues(beats, index) {
   if (!Array.isArray(beats)) return [];
   return beats.slice(0, index + 1).flatMap((b) => b.values ?? []);
+}
+
+/** The pass the beat at `index` belongs to, or null when there is no such beat. */
+export function passOf(beats, index) {
+  if (!Array.isArray(beats) || index < 0 || index >= beats.length) return null;
+  return beats[index]?.pass ?? null;
+}
+
+/**
+ * Whether a beat of `kind` in `pass` has been REACHED by `index` -- i.e. sits at or
+ * before it. Scoped to a pass because both passes have a bids beat: having reached
+ * pass 1's must not reveal pass 2's offers.
+ */
+export function sawKindInPass(beats, index, kind, pass) {
+  if (!Array.isArray(beats)) return false;
+  return beats.slice(0, index + 1).some((b) => b.kind === kind && b.pass === pass);
 }
 
 /** Card state as a function of how far the walkthrough has progressed (BR-25). */

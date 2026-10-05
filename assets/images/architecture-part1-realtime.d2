@@ -40,22 +40,22 @@ aws: "AWS Cloud" {
     style.stroke: "#ED7100"
     style.font-size: 24
     grid-columns: 2
-    dlrm: "DLRM Bid Shader\nBID_SHADE"
-    wd: "Wide & Deep Segment Activator\nACTIVATE_SEGMENTS"
-    ncf: "NCF Deal Manager\nACTIVATE_DEALS / SUPPRESS_DEALS"
-    metrics: "Metrics Enricher\nADD_METRICS (rule-based, CPU)"
-    yield_floor: "Yield Optimizer — Floor\nADJUST_DEAL_FLOOR"
-    yield_margin: "Yield Optimizer — Margin\nADJUST_DEAL_MARGIN"
+    dlrm: "Bid Pricer (DLRM, TensorRT)\nBID_SHADE"
+    wd: "Audience Activator\nACTIVATE_SEGMENTS (rule-based, CPU)"
+    ncf: "Deal Scorer (NCF, TensorRT)\nACTIVATE_DEALS / SUPPRESS_DEALS"
+    metrics: "Signals Enricher\nADD_METRICS (rule-based, CPU)"
+    yield_floor: "Yield Optimizer — Deal Floor (XGBoost, FIL)\nADJUST_DEAL_FLOOR"
+    yield_margin: "Yield Optimizer — Deal Margin (XGBoost, FIL)\nADJUST_DEAL_MARGIN"
   }
 
-  triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nONNX Runtime + FIL + CUDA EP · 4 models" {
+  triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nTensorRT plan (stable/canary router) + FIL · 4 models" {
     style.fill: "#76b900"
     style.stroke: "#5a8c00"
     style.font-color: "#000000"
     style.font-size: 22
   }
 
-  models: "Amazon S3\nModel Repository (ONNX + XGBoost)" {
+  models: "Amazon S3\nModel Repository (TensorRT .plan + xgboost.json)" {
     shape: cylinder
     style.fill: "#E4F2DD"
     style.stroke: "#3F8624"
@@ -80,7 +80,6 @@ aws.orch -> aws.containers.yield_floor
 aws.orch -> aws.containers.yield_margin
 
 aws.containers.dlrm -> aws.triton: "tritonclient"
-aws.containers.wd -> aws.triton
 aws.containers.ncf -> aws.triton
 aws.containers.yield_floor -> aws.triton
 aws.containers.yield_margin -> aws.triton

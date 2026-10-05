@@ -34,7 +34,7 @@ types.
 
 ```bash
 cd deployment
-./deploy.sh --start-at 2
+./deploy.sh --prefix <prefix> --start-at 2
 ```
 
 Or build it directly, from `source/`:

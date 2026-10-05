@@ -3,7 +3,7 @@ package org.prebid.server.hooks.modules.artf.core;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.iab.openrtb.request.BidRequest;
 import io.vertx.core.Future;
-import org.prebid.server.hooks.modules.artf.client.ArtfExtensionPointClient;
+import org.prebid.server.hooks.modules.artf.client.ExtensionPointClient;
 import org.prebid.server.hooks.modules.artf.model.ApplicationResult;
 import org.prebid.server.hooks.modules.artf.model.ArtfModuleProperties;
 import org.prebid.server.hooks.modules.artf.model.CallBudget;
@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class MutationApplicationService {
 
-    private final ArtfExtensionPointClient client;
+    private final ExtensionPointClient client;
     private final ArtfMutationApplier applier;
     private final ArtfModuleProperties properties;
     private final ObjectMapper mapper;
@@ -44,7 +44,7 @@ public class MutationApplicationService {
      */
     private final AtomicLong consecutiveFailures = new AtomicLong(0);
 
-    public MutationApplicationService(ArtfExtensionPointClient client,
+    public MutationApplicationService(ExtensionPointClient client,
                                      ArtfMutationApplier applier,
                                      ArtfModuleProperties properties,
                                      ObjectMapper mapper) {

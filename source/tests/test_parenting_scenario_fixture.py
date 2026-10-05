@@ -76,14 +76,29 @@ class TestFixtureShape:
         assert iab_taxonomy.is_special_category_data("192") is False
         assert iab_taxonomy.is_special_category_data("186") is True
 
-    def test_it_carries_real_deals_with_floors_and_auction_types(self, payload):
+    def test_the_publisher_offers_only_the_remnant_deal(self, payload):
+        # The premium and family-network deals are deliberately NOT on the request.
+        # They live in the Deal Scorer's publisher deal library and reach the
+        # auction only when the scorer activates them, which is what makes the
+        # Theater's with-ARTF pass differ from its baseline pass. Offering them
+        # here would hand the with-ARTF outcome to the baseline.
         deals = payload["bid_request"]["imp"][0]["pmp"]["deals"]
-        assert len(deals) == 3
-        for deal in deals:
-            assert isinstance(deal["bidfloor"], (int, float))
-            assert deal["at"] in (1, 2, 3)
-        # Floors descend across the deals, so a floor movement is visible.
-        assert [d["bidfloor"] for d in deals] == [3.40, 2.10, 0.85]
+        assert [(d["id"], d["bidfloor"], d["at"]) for d in deals] == [("deal-remnant-open", 0.85, 3)]
+
+    def test_the_deals_the_scorer_can_activate_come_from_its_library(self, payload):
+        import importlib.util
+        path = os.path.join(_ROOT, "containers", "ncf_deal_manager", "deal_library.py")
+        spec = importlib.util.spec_from_file_location("ncf_deal_library_for_fixture", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        library = module.deals_for(payload["bid_request"])
+        offered = payload["bid_request"]["imp"][0]["pmp"]["deals"]
+        activatable = module.not_on_request(library, offered)
+        assert [(d.id, d.bidfloor, d.at) for d in activatable] == [
+            ("deal-parenting-premium", 3.40, 1),
+            ("deal-family-network", 2.10, 2),
+        ]
 
     def test_the_declared_intents_match_the_containers_the_card_lists(self, payload):
         assert set(payload["applicable_intents"]) == {

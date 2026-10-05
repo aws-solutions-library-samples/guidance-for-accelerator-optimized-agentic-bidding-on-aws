@@ -17,7 +17,9 @@ import numpy as np
 import tritonclient.http as httpclient
 from tritonclient.utils import InferenceServerException
 
-TRITON_URL = os.environ.get("TRITON_URL", "localhost:8000")
+from shared import hop_timing, triton_client
+
+TRITON_URL = triton_client.TRITON_URL  # kept for log/health callers; see shared/triton_client.py
 MODEL_NAME = "ncf_deal_manager"
 
 # One client per thread. `mutate()` runs on a ThreadPoolExecutor of
@@ -31,13 +33,9 @@ _local = threading.local()
 def _get_client() -> httpclient.InferenceServerClient:
     client = getattr(_local, "client", None)
     if client is None:
-        client = httpclient.InferenceServerClient(
-            url=TRITON_URL,
-            verbose=False,
-            concurrency=4,
-            connection_timeout=5.0,
-            network_timeout=10.0,
-        )
+        # Protocol (HTTP :8000 or gRPC :8001) and endpoint come from
+        # shared/triton_client.py; this module only keeps the per-thread cache.
+        client = triton_client.new_client()
         _local.client = client
     return client
 
@@ -72,27 +70,28 @@ def predict_relevance(
     d = item_ids.reshape(-1, 1).astype(np.int64)
 
     inputs = [
-        httpclient.InferInput("user_ids", list(u.shape), "INT64"),
-        httpclient.InferInput("item_ids", list(d.shape), "INT64"),
+        triton_client.api().InferInput("user_ids", list(u.shape), "INT64"),
+        triton_client.api().InferInput("item_ids", list(d.shape), "INT64"),
     ]
     inputs[0].set_data_from_numpy(u)
     inputs[1].set_data_from_numpy(d)
 
     if target_variant in ("stable", "canary"):
-        variant_input = httpclient.InferInput("target_variant", [1], "BYTES")
+        variant_input = triton_client.api().InferInput("target_variant", [1], "BYTES")
         variant_input.set_data_from_numpy(
             np.array([target_variant.encode("utf-8")], dtype=object)
         )
         inputs.append(variant_input)
 
     outputs = [
-        httpclient.InferRequestedOutput("relevance_scores"),
-        httpclient.InferRequestedOutput("served_variant"),
-        httpclient.InferRequestedOutput("served_model_version"),
+        triton_client.api().InferRequestedOutput("relevance_scores"),
+        triton_client.api().InferRequestedOutput("served_variant"),
+        triton_client.api().InferRequestedOutput("served_model_version"),
     ]
 
     try:
-        result = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+        with hop_timing.triton_call():
+            result = triton_client.infer(client, model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
         scores = result.as_numpy("relevance_scores").flatten()
         served_variant = _decode_str_output(result, "served_variant")
         served_model_version = _decode_str_output(result, "served_model_version")

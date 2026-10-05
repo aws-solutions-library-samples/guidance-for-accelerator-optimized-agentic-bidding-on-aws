@@ -31,7 +31,7 @@ LABEL agent-manifest="{ \
 # Install tritonclient (the real NVIDIA dependency) + ARTF server deps
 # No torch needed — Triton handles inference
 RUN pip install --no-cache-dir \
-    tritonclient[http] \
+    tritonclient[http,grpc] \
     numpy \
     fastapi uvicorn[standard] starlette httpx pydantic \
     grpcio protobuf

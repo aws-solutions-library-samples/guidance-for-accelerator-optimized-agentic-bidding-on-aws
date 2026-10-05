@@ -299,8 +299,25 @@ async def audit_handler(request: Request) -> JSONResponse:
         )
 
 
+def _training_jobs_block(model_type: str) -> dict:
+    """``training_jobs`` for the models response: active SageMaker training jobs
+    for model_type plus the most recent failure from the last 24 hours (see
+    training_trigger.list_training_jobs_for_display). A failure of this lookup
+    is reported in ``training_jobs_error`` and never hides the registry versions,
+    which come from a different API and are useful on their own."""
+    from orchestrator.training_trigger import list_training_jobs_for_display
+
+    try:
+        return {"training_jobs": list_training_jobs_for_display(model_type)}
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
+        logger.warning("list training jobs failed: %s", exc)
+        return {"training_jobs": [], "training_jobs_error": f"{type(exc).__name__}: {exc}"}
+
+
 async def models_handler(request: Request) -> JSONResponse:
-    """GET — model registry versions and approval status (real SageMaker)."""
+    """GET — model registry versions and approval status (real SageMaker), plus
+    the model's active / recently failed training jobs so the registry view can
+    show a job that has not registered a version yet."""
     model_type = request.query_params.get("model_type", "dlrm_bid_shader")
     try:
         limit = int(request.query_params.get("limit", "20"))
@@ -311,7 +328,12 @@ async def models_handler(request: Request) -> JSONResponse:
         sm = _get_sagemaker()
         versions = readers.read_model_versions(sm, group, limit=limit)
         return JSONResponse(
-            {"model_type": model_type, "model_package_group": group, "versions": versions}
+            {
+                "model_type": model_type,
+                "model_package_group": group,
+                "versions": versions,
+                **_training_jobs_block(model_type),
+            }
         )
     except Exception as exc:
         logger.warning("read model versions failed: %s", exc)

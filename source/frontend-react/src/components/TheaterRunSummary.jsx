@@ -10,14 +10,19 @@
 // derived version read as a degraded one when it states the same facts.
 
 import { useEffect, useRef } from "react";
+import { TheaterComparisonPanel } from "./TheaterComparisonPanel.jsx";
+import { FULL_ROWS } from "../utils/outcomeComparison.js";
 
 /**
- * @param text     the summary prose
- * @param open     whether the surface is showing
- * @param onClose  called on outside click or Escape
- * @param subtitle short provenance line, e.g. the offers notice
+ * @param text        the summary prose
+ * @param open        whether the surface is showing
+ * @param onClose     called on outside click or Escape
+ * @param subtitle    short provenance line, e.g. the offers notice
+ * @param comparison  from compareOutcomes(); the full row set renders under the
+ *                    prose, so the sentence and the numbers it summarises are on
+ *                    the same surface
  */
-export function TheaterRunSummary({ text, open, onClose, subtitle }) {
+export function TheaterRunSummary({ text, open, onClose, subtitle, comparison = null }) {
   const panelRef = useRef(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -68,6 +73,11 @@ export function TheaterRunSummary({ text, open, onClose, subtitle }) {
         </div>
         <p className="th-summary-text" data-testid="theater-run-summary-text">{text}</p>
         {subtitle ? <p className="th-summary-sub">{subtitle}</p> : null}
+        {comparison ? (
+          <div className="th-summary-compare" data-testid="theater-run-summary-comparison">
+            <TheaterComparisonPanel comparison={comparison} rows={FULL_ROWS} />
+          </div>
+        ) : null}
       </div>
     </div>
   );

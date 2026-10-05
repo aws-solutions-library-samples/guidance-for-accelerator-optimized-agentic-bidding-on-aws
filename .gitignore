@@ -99,3 +99,12 @@ deployment/output.txt
 # image digest, endpoints, account-specific names). Local state, not source -- committing
 # it would put one operator's account details in every other operator's checkout.
 .prebid-deployment.json
+
+# Editor workspace files and the retired composability docs (kept locally as a backup).
+*.code-workspace
+composability-documentation
+_bk_composability-documentation
+
+# Scratch Playwright capture script and MCP browser snapshots (contain a live stack URL).
+.cap2x.js
+.playwright-mcp/

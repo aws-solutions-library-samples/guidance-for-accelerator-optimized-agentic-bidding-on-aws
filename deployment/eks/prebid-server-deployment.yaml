@@ -43,6 +43,8 @@
 #   __CREDENTIAL_SECRET__ ARN of the credential secret
 #   __DEMAND_ENDPOINT__   artfhouse demand endpoint URL
 #   __ORCHESTRATOR_URL__  in-cluster orchestrator extension point
+#   __ORCHESTRATOR_GRPC_TARGET__ host:port of the orchestrator's gRPC listener
+#   __ARTF_TRANSPORT__    http | grpc -- which of the two the hook uses
 #   __ORCHESTRATOR_SCOPE__ OAuth scope required by the orchestrator
 ---
 apiVersion: v1
@@ -113,6 +115,12 @@ spec:
             # ingress.
             - name: ARTF_EXTENSION_POINT_URL
               value: "__ORCHESTRATOR_URL__"
+            # gRPC alternative to the URL above (hooks.artf-orchestrator.grpc-target)
+            # and the switch between them (hooks.artf-orchestrator.transport).
+            - name: ARTF_GRPC_TARGET
+              value: "__ORCHESTRATOR_GRPC_TARGET__"
+            - name: ARTF_TRANSPORT
+              value: "__ARTF_TRANSPORT__"
             - name: ARTF_TOKEN_ENDPOINT
               value: "__TOKEN_ENDPOINT__"
             # BOTH scopes, space-delimited as OAuth2 requires. This pod talks to TWO

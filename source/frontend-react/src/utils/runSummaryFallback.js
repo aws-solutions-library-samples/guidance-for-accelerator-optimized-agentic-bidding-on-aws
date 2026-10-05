@@ -24,10 +24,12 @@ function assertedSegments(context) {
 /**
  * @param {object[]} beats
  * @param {object}   context   ScenarioContext
- * @param {object}   viewModel offers view model
+ * @param {object}   viewModel offers view model (the auction WITH ARTF)
+ * @param {object}  [baseline] from outcomeComparison.baselineFacts: the auction
+ *                             WITHOUT ARTF, or `{ unavailable }`, or null
  * @returns {string}
  */
-export function factualRunSummary(beats, context, viewModel) {
+export function factualRunSummary(beats, context, viewModel, baseline = null) {
   const sentences = [];
 
   // 1. Publisher and page.
@@ -80,6 +82,22 @@ export function factualRunSummary(beats, context, viewModel) {
     if (decision) sentences.push(`${decision.label}.`);
   } else {
     sentences.push("This response records no winner.");
+  }
+
+  // 5. The same auction without ARTF. One sentence, from the baseline response
+  // alone; the difference is the comparison panel's to show, not to restate.
+  if (baseline?.unavailable) {
+    sentences.push(`The auction without ARTF could not be compared: ${baseline.unavailable}.`);
+  } else if (baseline) {
+    if (!baseline.sold) {
+      sentences.push("Without ARTF, the same request went unsold.");
+    } else {
+      const campaign = baseline.campaign ?? "an unnamed campaign";
+      const price = typeof baseline.clearedPrice === "number"
+        ? ` at $${baseline.clearedPrice.toFixed(2)}`
+        : "";
+      sentences.push(`Without ARTF, the same request was won by ${campaign}${price}.`);
+    }
   }
 
   return sentences.join(" ");

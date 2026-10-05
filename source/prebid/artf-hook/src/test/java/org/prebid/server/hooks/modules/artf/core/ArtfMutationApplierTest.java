@@ -163,6 +163,45 @@ class ArtfMutationApplierTest {
         assertThat(result.bidRequest().getImp().get(0).getBidfloor()).isEqualByComparingTo("5.00");
     }
 
+    /**
+     * A PERCENT margin's value is a fraction, the unit the margin container emits. 0.5 on a
+     * 1.00 floor is 1.50, not 1.005. Pinned here because the orchestrator's Python applier and
+     * the frontend's JS applier assert the same vector.
+     */
+    @Test
+    void aPercentMarginScalesTheDealFloorByTheFraction() {
+        final BidRequest request = requestWithDeal("imp-1", "deal-1", BigDecimal.valueOf(1.00));
+        final ArtfMutation margin = new ArtfMutation(
+                Intent.ADJUST_DEAL_MARGIN.wireValue(),
+                Operation.REPLACE.wireValue(),
+                "/imp/imp-1/deals/deal-1",
+                null,
+                new ArtfMutation.AdjustDealPayload(null, new ArtfMutation.Margin(0.5, 1)),
+                null,
+                null);
+        final ApplicationResult result = applier.apply(request, List.of(margin));
+        assertThat(result.dispositions().get(0).applied()).isTrue();
+        assertThat(result.bidRequest().getImp().get(0).getPmp().getDeals().get(0).getBidfloor())
+                .isEqualByComparingTo("1.5000");
+    }
+
+    /** A CPM margin adds to the deal floor. */
+    @Test
+    void aCpmMarginAddsToTheDealFloor() {
+        final BidRequest request = requestWithDeal("imp-1", "deal-1", BigDecimal.valueOf(1.00));
+        final ArtfMutation margin = new ArtfMutation(
+                Intent.ADJUST_DEAL_MARGIN.wireValue(),
+                Operation.REPLACE.wireValue(),
+                "/imp/imp-1/deals/deal-1",
+                null,
+                new ArtfMutation.AdjustDealPayload(null, new ArtfMutation.Margin(0.75, 0)),
+                null,
+                null);
+        final ApplicationResult result = applier.apply(request, List.of(margin));
+        assertThat(result.bidRequest().getImp().get(0).getPmp().getDeals().get(0).getBidfloor())
+                .isEqualByComparingTo("1.75");
+    }
+
     /** A floor of zero is ignored by Prebid, so it is rejected rather than written. */
     @Test
     void aNonPositiveFloorIsRejectedRatherThanWrittenAndIgnored() {

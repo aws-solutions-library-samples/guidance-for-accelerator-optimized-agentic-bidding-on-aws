@@ -321,6 +321,12 @@ public class ArtfMutationApplier {
      * CPM (absolute, added to the existing floor) or 1 for PERCENT (relative). An
      * unrecognised calculation type yields null, and therefore a rejection with a reason --
      * guessing which one was meant would silently pick a floor nobody asked for.
+     *
+     * <p>A PERCENT value is a FRACTION: 0.12 is twelve percent. That is the unit the
+     * emitting container uses ({@code yield_optimizer_margin}, bounded to [-0.5, 0.5] in
+     * {@code shared/yield_exploration.py}) and the unit the orchestrator's own applier
+     * ({@code shared/artf_applier.py}) and the frontend read. An earlier version divided
+     * by 100 here, which made every PERCENT margin a near no-op on this host.
      */
     private static BigDecimal resolveFloor(ArtfMutation mutation, Deal deal, Intent intent) {
         final ArtfMutation.AdjustDealPayload payload = mutation.adjustDeal();
@@ -342,7 +348,7 @@ public class ArtfMutationApplier {
 
         return switch (margin.calculationType()) {
             case 0 -> base.add(value);
-            case 1 -> base.add(base.multiply(value).divide(BigDecimal.valueOf(100), 4, RoundingMode.HALF_UP));
+            case 1 -> base.add(base.multiply(value).setScale(4, RoundingMode.HALF_UP));
             default -> null;
         };
     }

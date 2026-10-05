@@ -123,6 +123,16 @@ CORE_IMAGES = (
 )
 RETRAINING_IMAGES = ("adaptive-bidding-agent",)
 
+# The UI API proxy Lambda stack, created by deploy.sh Step 8.4 (Phase 3) after the
+# manifests. It is the browser's only route to the orchestrator, which is a
+# ClusterIP Service with no public address, so a missing or failed stack means a
+# UI that loads but cannot reach anything.
+UI_API_PROXY_STACK = "ui-api-proxy"
+# The Service whose internal NLB the UI API proxy forwards to
+# (deployment/eks/orchestrator-internal-nlb.yaml). Not prefixed: Kubernetes names
+# are scoped by cluster, and each prefix has its own cluster.
+ORCHESTRATOR_INTERNAL_SVC = "orchestrator-internal"
+
 # CloudFormation stacks created by deploy_closed_loop.sh, in the order it creates
 # them, so a partial Phase 5 reads as a prefix of this list.
 CLOSED_LOOP_STACKS = (
@@ -634,7 +644,38 @@ class Probe:
                 continue
             status, why = self._rollout_status(name, conds)
             checks.append(self._check(f"deployment {name}", status, f"{ready}/{spec} ready — {why}"))
-        return checks or [self._check("workloads", MISSING, "no deployments found")]
+        if not checks:
+            checks.append(self._check("workloads", MISSING, "no deployments found"))
+        checks.append(self._orchestrator_internal_nlb())
+        checks.append(self._stack_check(prefixed(self.prefix, UI_API_PROXY_STACK), label="UI API proxy"))
+        return checks
+
+    def _orchestrator_internal_nlb(self) -> Dict[str, Any]:
+        """The orchestrator-internal Service: the address the UI API proxy forwards to.
+
+        OK once the in-tree controller has given it a hostname, IN_PROGRESS while the
+        Service exists without one (NLB still provisioning), MISSING when not applied.
+        Without this line a probe could call Phase 3 complete while every UI call 502s.
+        """
+        title = f"service {ORCHESTRATOR_INTERNAL_SVC}"
+        proc = self._kubectl("get", "svc", ORCHESTRATOR_INTERNAL_SVC, "-o", "json")
+        if proc is None:
+            return self._check(title, UNKNOWN, "kubectl could not be run")
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            if "NotFound" in err or "not found" in err:
+                return self._check(title, MISSING, "not applied")
+            msg = err.splitlines()
+            return self._check(title, UNKNOWN, f"kubectl failed: {msg[-1] if msg else 'unknown error'}")
+        try:
+            svc = json.loads(proc.stdout)
+        except ValueError:
+            return self._check(title, UNKNOWN, "kubectl returned unparseable JSON")
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        host = (ingress[0].get("hostname") if ingress else None) or ""
+        if host:
+            return self._check(title, OK, f"internal NLB {host}")
+        return self._check(title, IN_PROGRESS, "no load balancer hostname yet (NLB provisioning)")
 
     # Container waiting-reasons that will not fix themselves. Waiting out the
     # progress deadline to state the obvious would be its own kind of unhelpful.
@@ -842,33 +883,30 @@ class Probe:
             return checks
         return self._closed_loop_stacks() + self._agent_runtimes()
 
-    def _closed_loop_stacks(self) -> List[Dict[str, Any]]:
+    def _stack_check(self, name: str, label: Optional[str] = None) -> Dict[str, Any]:
+        """One CloudFormation stack as a check line: OK / IN_PROGRESS / FAILED / MISSING."""
+        title = f"{label} (stack {name})" if label else f"stack {name}"
         cfn = self._client("cloudformation")
         if not cfn:
-            return [self._check("closed-loop stacks", UNKNOWN, "no cloudformation client")]
-        checks = []
-        for base in CLOSED_LOOP_STACKS:
-            name = prefixed(self.prefix, base)
-            try:
-                st = cfn.describe_stacks(StackName=name)["Stacks"][0]["StackStatus"]
-            except ClientError as exc:
-                msg = str(exc)
-                if "does not exist" in msg:
-                    checks.append(self._check(f"stack {name}", MISSING, "not created"))
-                else:
-                    checks.append(self._check(f"stack {name}", UNKNOWN, msg[:100]))
-                continue
-            except Exception as exc:
-                checks.append(self._check(f"stack {name}", UNKNOWN, str(exc)[:100]))
-                continue
-            if st.endswith("_IN_PROGRESS"):
-                checks.append(self._check(f"stack {name}", IN_PROGRESS, st))
-            elif st.endswith("_COMPLETE") and not st.startswith("ROLLBACK") \
-                    and not st.startswith("DELETE"):
-                checks.append(self._check(f"stack {name}", OK, st))
-            else:
-                checks.append(self._check(f"stack {name}", FAILED, st))
-        return checks
+            return self._check(title, UNKNOWN, "no cloudformation client")
+        try:
+            st = cfn.describe_stacks(StackName=name)["Stacks"][0]["StackStatus"]
+        except ClientError as exc:
+            msg = str(exc)
+            if "does not exist" in msg:
+                return self._check(title, MISSING, "not created")
+            return self._check(title, UNKNOWN, msg[:100])
+        except Exception as exc:
+            return self._check(title, UNKNOWN, str(exc)[:100])
+        if st.endswith("_IN_PROGRESS"):
+            return self._check(title, IN_PROGRESS, st)
+        if st.endswith("_COMPLETE") and not st.startswith("ROLLBACK") \
+                and not st.startswith("DELETE"):
+            return self._check(title, OK, st)
+        return self._check(title, FAILED, st)
+
+    def _closed_loop_stacks(self) -> List[Dict[str, Any]]:
+        return [self._stack_check(prefixed(self.prefix, base)) for base in CLOSED_LOOP_STACKS]
 
     def _agent_runtimes(self) -> List[Dict[str, Any]]:
         rp = runtime_prefix(self.prefix)

@@ -3,7 +3,7 @@
   "tmax": 100,
   "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
   "originator": {"type": "TYPE_SSP", "id": "ssp-yield-demo-001"},
-  "applicable_intents": ["ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+  "applicable_intents": ["ACTIVATE_DEALS", "ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
   "bid_request": {
     "id": "auction-yield-001",
     "imp": [
@@ -20,7 +20,6 @@
         "pmp": {
           "private_auction": 1,
           "deals": [
-            {"id": "deal-guaranteed-premium", "bidfloor": 12.00, "at": 1},
             {"id": "deal-open-midtier", "bidfloor": 3.25, "at": 2},
             {"id": "deal-open-remnant", "bidfloor": 0.75, "at": 2}
           ]

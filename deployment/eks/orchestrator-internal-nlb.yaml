@@ -1,0 +1,35 @@
+# Internal Network Load Balancer in front of the orchestrator, for callers that
+# live in the VPC but outside the cluster: the <prefix>-ui-api-proxy Lambda
+# (deployment/ui_api_proxy_cfn.yaml). A VPC Lambda resolves names through the
+# VPC's Route 53 Resolver, which has no cluster.local zone, and a ClusterIP is a
+# kube-proxy construct with no route from an ENI. The NLB gets an ENI in each
+# private subnet and a DNS name the VPC resolver answers. deploy.sh reads
+# status.loadBalancer.ingress[0].hostname and hands it to the proxy stack.
+#
+# Same shape as triton-internal-nlb.yaml. "internal" means no public address:
+# this works unchanged under VPC Block Public Access block-ingress.
+#
+# In-cluster callers (Prebid hook, ARTF containers) keep using the ClusterIP
+# Service `orchestrator` and the headless `orchestrator-grpc` in
+# orchestrator-deployment.yaml; this Service is for the UI path only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-internal
+  labels:
+    app: artf
+    component: orchestrator
+    artf.role: ui-api-ingress
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    app: artf
+    component: orchestrator

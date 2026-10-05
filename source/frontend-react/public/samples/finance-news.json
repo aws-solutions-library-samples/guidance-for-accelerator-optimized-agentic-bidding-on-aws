@@ -6,6 +6,7 @@
   "applicable_intents": [
     "ACTIVATE_SEGMENTS",
     "ADD_METRICS",
+    "ACTIVATE_DEALS",
     "ADJUST_DEAL_FLOOR",
     "ADJUST_DEAL_MARGIN"
   ],
@@ -25,8 +26,6 @@
         "pmp": {
           "private_auction": 0,
           "deals": [
-            {"id": "deal-finance-pmp", "bidfloor": 3.50, "at": 1},
-            {"id": "deal-home-premium", "bidfloor": 3.00, "at": 2},
             {"id": "deal-remnant-open", "bidfloor": 1.00, "at": 3}
           ]
         }

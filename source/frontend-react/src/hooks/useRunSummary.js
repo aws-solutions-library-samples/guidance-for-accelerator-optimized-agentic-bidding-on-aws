@@ -24,8 +24,10 @@ export const SUMMARY_DEADLINE_MS = 12000;
  * @param {object}    args
  * @param {object[]}  args.beats
  * @param {object}    args.context   ScenarioContext
- * @param {object}    args.viewModel offers view model
- * @param {boolean}   args.ready     the run has settled, including its auction
+ * @param {object}    args.viewModel offers view model (the auction with ARTF)
+ * @param {object}   [args.baseline] baselineFacts(): the auction without ARTF, or
+ *                                   `{ unavailable }`, or null
+ * @param {boolean}   args.ready     the run has settled, including both auctions
  * @param {Function} [args.generate] injected for tests
  * @param {number}   [args.deadlineMs]
  * @returns {{text: string, generated: boolean}}
@@ -34,6 +36,7 @@ export function useRunSummary({
   beats,
   context,
   viewModel,
+  baseline = null,
   ready,
   generate = generateRunSummary,
   deadlineMs = SUMMARY_DEADLINE_MS,
@@ -61,9 +64,9 @@ export function useRunSummary({
     setState((prev) => (
       prev.generated && askedForRef.current === beats
         ? prev
-        : { text: factualRunSummary(beats, context, viewModel), generated: false }
+        : { text: factualRunSummary(beats, context, viewModel, baseline), generated: false }
     ));
-  }, [beats, context, viewModel]);
+  }, [beats, context, viewModel, baseline]);
 
   useEffect(() => {
     if (!ready || !beats) return undefined;
@@ -78,7 +81,7 @@ export function useRunSummary({
 
     let pending;
     try {
-      pending = generate({ beats, context, viewModel, signal: controller.signal });
+      pending = generate({ beats, context, viewModel, baseline, signal: controller.signal });
     } catch {
       pending = Promise.resolve({ ok: false, kind: "unknown", detail: "generator threw" });
     }
@@ -104,7 +107,7 @@ export function useRunSummary({
       clearTimeout(deadline);
       controller.abort();
     };
-  }, [ready, beats, context, viewModel, generate, deadlineMs]);
+  }, [ready, beats, context, viewModel, baseline, generate, deadlineMs]);
 
   return state;
 }

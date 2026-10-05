@@ -18,6 +18,18 @@ public class ArtfModuleProperties {
     /** The orchestrator's mutations endpoint. In-cluster service DNS in this deployment. */
     private String extensionPointUrl;
 
+    /**
+     * Which transport reaches the extension point: {@code http} ({@code POST} to
+     * {@code extensionPointUrl}) or {@code grpc} ({@code RTBExtensionPoint/GetMutations} at
+     * {@code grpcTarget}). The default is {@code http} until a measured run shows gRPC
+     * beats it on this hop; the deployment sets it, so a measurement run flips it without
+     * rebuilding the image.
+     */
+    private String transport = "http";
+
+    /** {@code host:port} of the orchestrator's gRPC listener. Required when transport is grpc. */
+    private String grpcTarget;
+
     /** Cognito hosted token endpoint for the {@code client_credentials} grant. */
     private String tokenEndpoint;
 
@@ -128,6 +140,22 @@ public class ArtfModuleProperties {
 
     public String getExtensionPointUrl() {
         return extensionPointUrl;
+    }
+
+    public String getTransport() {
+        return transport;
+    }
+
+    public void setTransport(String transport) {
+        this.transport = transport;
+    }
+
+    public String getGrpcTarget() {
+        return grpcTarget;
+    }
+
+    public void setGrpcTarget(String grpcTarget) {
+        this.grpcTarget = grpcTarget;
     }
 
     public void setExtensionPointUrl(String extensionPointUrl) {

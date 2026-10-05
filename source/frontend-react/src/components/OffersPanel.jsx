@@ -26,20 +26,29 @@ import { AUCTION_FAILED } from "../hooks/useTheaterRun.js";
  * request failed look identical — which is how the missing bearer token went
  * unnoticed through a whole feature.
  */
-function AuctionFaultNotice({ fault }) {
+function AuctionFaultNotice({ fault, baseline }) {
   if (!fault) return null;
   const failed = fault.kind === AUCTION_FAILED;
+  // The baseline pass has no fixture to fall back to, so there is nothing "below"
+  // to describe: the sentence stops at the reason.
+  const trailer = baseline
+    ? ""
+    : failed
+      ? " The offers below are the captured fixture, not this scenario's auction."
+      : "";
   return (
     <p
       className={`th-offers-fault th-offers-fault-${fault.kind}`}
       data-testid="offers-panel-fault"
       data-fault-kind={fault.kind}
     >
-      <strong>{failed ? "The live auction could not be read." : "No live auction."}</strong>{" "}
+      <strong>
+        {baseline
+          ? "No baseline auction."
+          : failed ? "The live auction could not be read." : "No live auction."}
+      </strong>{" "}
       {fault.detail}
-      {failed
-        ? " The offers below are the captured fixture, not this scenario's auction."
-        : ""}
+      {trailer}
     </p>
   );
 }
@@ -54,7 +63,13 @@ function AuctionFaultNotice({ fault }) {
  * `revealed` so a caller that passes only the old prop gets the old behaviour
  * rather than a column that never names a winner.
  */
-export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault }) {
+/**
+ * @param baseline  true while the column shows pass 1, the auction run WITHOUT
+ *                  ARTF. Changes the copy only: the request was not enriched, and
+ *                  there is no fixture to fall back to, so a missing response is
+ *                  stated as missing rather than as a response with no offers.
+ */
+export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault, baseline = false }) {
   const offers = viewModel?.offers ?? [];
   const bidRows = viewModel?.bidRows ?? [];
   const groups = viewModel?.groups ?? [];
@@ -78,12 +93,13 @@ export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault 
       */}
       {!revealed ? (
         <div className="th-offers-pending" data-testid="offers-panel-pending">
-          Offers resolve against the enriched request. They appear once the
-          containers have finished mutating it.
+          {baseline
+            ? "Offers resolve against the request as the publisher sent it. They appear once the seats have bid."
+            : "Offers resolve against the enriched request. They appear once the containers have finished mutating it."}
         </div>
       ) : (
         <>
-          <AuctionFaultNotice fault={auctionFault} />
+          <AuctionFaultNotice fault={auctionFault} baseline={baseline} />
 
           {viewModel?.noticeText ? (
             <p
@@ -94,7 +110,14 @@ export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault 
             </p>
           ) : null}
 
-          {offers.length === 0 ? (
+          {viewModel == null ? (
+            /* No response at all -- distinct from a response with no offers. For
+               the baseline this is the state while pass 1's auction is still in
+               flight, or after it faulted (the notice above says which). */
+            <div className="th-empty" data-testid="offers-panel-no-response">
+              {auctionFault ? "No auction response to show" : "Waiting for the auction"}
+            </div>
+          ) : offers.length === 0 ? (
             <div className="th-empty">No offers in this response</div>
           ) : (
             <>
@@ -167,7 +190,7 @@ export function OffersPanel({ viewModel, revealed, winnerRevealed, auctionFault 
             A null winner is an explicit unsold state, distinct from an empty or
             missing one (BR-17) — an empty render looks like a failed lookup.
           */}
-          {!showWinner ? (
+          {viewModel == null ? null : !showWinner ? (
             /*
               Bids in, outcome not yet claimed. This states that the auction has
               not been called rather than rendering nothing in the winner's place,

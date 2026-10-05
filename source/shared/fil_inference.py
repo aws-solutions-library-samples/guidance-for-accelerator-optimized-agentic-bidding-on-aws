@@ -39,7 +39,9 @@ import numpy as np
 import tritonclient.http as httpclient
 from tritonclient.utils import InferenceServerException
 
-TRITON_URL = os.environ.get("TRITON_URL", "localhost:8000")
+from shared import hop_timing, triton_client
+
+TRITON_URL = triton_client.TRITON_URL  # kept for log/health callers; see shared/triton_client.py
 
 _local = threading.local()
 
@@ -58,13 +60,9 @@ def get_client() -> httpclient.InferenceServerClient:
     """
     client = getattr(_local, "client", None)
     if client is None:
-        client = httpclient.InferenceServerClient(
-            url=TRITON_URL,
-            verbose=False,
-            concurrency=4,
-            connection_timeout=5.0,
-            network_timeout=10.0,
-        )
+        # Protocol (HTTP :8000 or gRPC :8001) and endpoint come from
+        # shared/triton_client.py; this module only keeps the per-thread cache.
+        client = triton_client.new_client()
         _local.client = client
     return client
 
@@ -80,12 +78,13 @@ def infer_single_output(model_name: str, feature_vector: list[float]) -> float |
     client = get_client()
 
     features_np = np.array([feature_vector], dtype=np.float32)
-    inputs = [httpclient.InferInput("input__0", list(features_np.shape), "FP32")]
+    inputs = [triton_client.api().InferInput("input__0", list(features_np.shape), "FP32")]
     inputs[0].set_data_from_numpy(features_np)
-    outputs = [httpclient.InferRequestedOutput("output__0")]
+    outputs = [triton_client.api().InferRequestedOutput("output__0")]
 
     try:
-        result = client.infer(model_name=model_name, inputs=inputs, outputs=outputs)
+        with hop_timing.triton_call():
+            result = triton_client.infer(client, model_name=model_name, inputs=inputs, outputs=outputs)
         return float(result.as_numpy("output__0").flat[0])
     except InferenceServerException as e:
         print(f"[triton] {model_name} inference failed: {e.message()}")

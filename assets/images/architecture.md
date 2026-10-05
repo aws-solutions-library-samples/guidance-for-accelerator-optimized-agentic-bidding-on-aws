@@ -25,9 +25,10 @@ Triton serves **two deep-learning models** (DLRM for the bid pricer, NCF for the
 deal scorer) plus **two independent XGBoost tree models** for the yield optimizer
 (one for floor, one for margin, each served by its own container — Triton's Forest
 Inference Library backend doesn't support multi-output regression, so these were
-always two models) on a single NVIDIA **A10G GPU** (`g5.xlarge`) with
-the CUDA Execution Provider; for higher throughput, the more powerful Amazon EC2
-**G7e** instances are an alternative. The audience activator and signals enricher
+always two models) on a single NVIDIA **A10G GPU** (`g5.xlarge` by default;
+the node group also accepts `g5.2xlarge` and `g5.4xlarge`) with the CUDA
+Execution Provider. The TensorRT engines Part 2 compiles are specific to the
+A10G, so the node group is pinned to the `g5` family. The audience activator and signals enricher
 are rule-based and need no GPU model. The audience activator previously scored
 segments with a Wide & Deep neural network on Triton — that model's ONNX graph
 could not be compiled to a TensorRT engine (a `BatchNorm1d` fusion limitation), so
@@ -52,14 +53,16 @@ slated to be replaced by a partner ISV implementation. See
 > container.
 
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
-Amazon Cognito JWT, and **fans out in parallel** to the six containers over gRPC
-(primary ARTF protocol) with an MCP/REST path for AI-agent and tool interoperability.
+Amazon Cognito JWT, and **fans out in parallel** to the six containers over the ARTF
+extension point (gRPC or REST, selected per deployment) with an MCP path for AI-agent
+and tool interoperability.
 It merges the per-container mutations into a single `RTBResponse`.
 
 A **React frontend** is hosted on Amazon S3 and delivered through Amazon CloudFront;
 Amazon Cognito provides user-pool authentication (SRP, admin-created users, no
-self-signup). An optional **Amazon Bedrock AgentCore MCP runtime** exposes the same
-`extend_rtb` capability to Bedrock-hosted AI agents.
+self-signup). An **Amazon Bedrock AgentCore MCP runtime**, registered by default
+(`--skip-agentcore` omits it), exposes the same `extend_rtb` capability to
+Bedrock-hosted AI agents.
 
 ## Architecture diagram (Mermaid)
 
@@ -70,16 +73,18 @@ graph TB
     end
 
     subgraph Edge["AWS Edge & Frontend"]
-        CF["Amazon CloudFront<br/>HTTPS edge + /api/* proxy"]
+        CF["Amazon CloudFront<br/>HTTPS edge, static assets only"]
         S3F["Amazon S3<br/>React static frontend"]
-        COG["Amazon Cognito<br/>User Pool + SRP / JWT"]
+        COG["Amazon Cognito<br/>User Pool + Identity Pool<br/>SRP / JWT / SigV4 credentials"]
     end
 
-    subgraph EKS["Compute (Amazon EKS)"]
-        NLB["Network Load Balancer"]
-        ORCH["Orchestrator (Starlette)<br/>JWT verify + parallel fan-out<br/>gRPC primary · MCP/REST"]
+    subgraph VPC["Cluster VPC (private subnets, NAT egress; nothing internet-facing)"]
+        PROXY["UI API proxy<br/>AWS Lambda, VPC-attached<br/>forwards /api/* to the orchestrator"]
 
-        subgraph GPU["GPU node — g5.xlarge · NVIDIA A10G (or Amazon EC2 G7e)"]
+    subgraph EKS["Compute (Amazon EKS)"]
+        ORCH["Orchestrator (Starlette)<br/>ClusterIP in-cluster + internal NLB for the UI proxy<br/>no public address<br/>JWT verify + parallel fan-out<br/>gRPC / REST / MCP"]
+
+        subgraph GPU["GPU node: g5.xlarge, NVIDIA A10G"]
             TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + FIL + CUDA EP<br/>4 models on GPU"]
             DLRM_C["Bid Pricer<br/>BID_SHADE"]
             NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
@@ -90,21 +95,22 @@ graph TB
         WD_C["Audience Activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
         MET_C["Signals Enricher<br/>ADD_METRICS (rule-based)"]
     end
+    end
 
     subgraph Models["Model Storage"]
         S3M["Amazon S3 model repository<br/>dlrm_bid_shader · ncf_deal_manager<br/>deal_yield_manager_floor · deal_yield_manager_margin<br/>(model.onnx / xgboost.json)"]
     end
 
     subgraph Bedrock["Amazon Bedrock AgentCore"]
-        AC["MCP Runtime (optional)<br/>extend_rtb tool"]
+        AC["MCP Runtime (default; --skip-agentcore omits)<br/>extend_rtb tool"]
     end
 
-    Browser -->|"SRP auth"| COG
-    COG -->|"JWT tokens"| Browser
-    Browser -->|"HTTPS + Bearer token"| CF
-    CF -->|"GET /*"| S3F
-    CF -->|"POST /api/*"| NLB
-    NLB --> ORCH
+    Browser -->|"SRP auth, ID token -> SigV4 creds"| COG
+    COG -->|"JWT tokens + temporary credentials"| Browser
+    Browser -->|"HTTPS GET /*"| CF
+    CF --> S3F
+    Browser -->|"lambda:InvokeFunction (SigV4)<br/>event carries the Bearer token"| PROXY
+    PROXY -->|"HTTP to the internal NLB (orchestrator-internal)"| ORCH
     ORCH -->|"verify JWT via JWKS"| COG
     ORCH -->|"gRPC / MCP fan-out"| DLRM_C
     ORCH -->|"gRPC / MCP fan-out"| WD_C
@@ -128,6 +134,7 @@ graph TB
     style YIELD_M fill:#be185d,color:#fff
     style CF fill:#f59e0b,color:#000
     style S3F fill:#f59e0b,color:#000
+    style PROXY fill:#f59e0b,color:#000
     style COG fill:#dd6b20,color:#fff
     style AC fill:#f59e0b,color:#000
 ```
@@ -135,12 +142,24 @@ graph TB
 ## Request flow
 
 1. The user authenticates against **Amazon Cognito** (SRP, email + password) and
-   receives JWT access and ID tokens.
-2. The browser calls **CloudFront** over HTTPS with a `Bearer` token. CloudFront
-   serves the React app from **S3** for `GET /*` and proxies `POST /api/*` to the
-   **Network Load Balancer**.
-3. The **orchestrator** verifies the JWT (RS256, JWKS cached from Cognito) and rejects
-   unauthenticated requests.
+   receives JWT access and ID tokens. The browser exchanges the ID token for
+   temporary SigV4 credentials through the **Cognito Identity Pool**.
+2. **CloudFront** serves the React app from **S3** and nothing else. For every
+   `/api/*` call the browser packages the request as a JSON event (method, path,
+   query, the `Bearer` token and content headers, body) and sends it with
+   `lambda:InvokeFunction` to the **UI API proxy** Lambda. The Identity Pool's
+   authenticated role may invoke that one function and nothing else.
+3. The proxy, attached to the cluster's private subnets, forwards the request to
+   the orchestrator's internal Network Load Balancer (`orchestrator-internal`,
+   `deployment/eks/orchestrator-internal-nlb.yaml`) and returns the HTTP response.
+   The in-cluster name `orchestrator.default.svc.cluster.local` is not usable here:
+   a Lambda ENI resolves through the VPC resolver, which has no `cluster.local` zone,
+   and a ClusterIP has no route from outside the nodes. The **orchestrator** keeps
+   its ClusterIP Service for in-cluster callers and has no public address; it verifies
+   the forwarded JWT (RS256, JWKS cached from Cognito) and rejects unauthenticated
+   requests exactly as before. This path works in accounts running VPC Block Public
+   Access in block-ingress mode, where an internet-facing load balancer would be
+   dropped at the internet gateway.
 4. The orchestrator **fans out the OpenRTB request in parallel** to the six
    containers, respecting the OpenRTB `tmax` timeout.
 5. The bid pricer, deal scorer, and both yield optimizers call **Triton** via
@@ -148,18 +167,32 @@ graph TB
    return rule-based mutations.
 6. **Triton** loads the DLRM/NCF ONNX models and the two yield optimizer XGBoost
    models from the **S3 model repository** at startup and runs inference on the
-   A10G GPU (or the more powerful Amazon EC2 G7e).
+   A10G GPU.
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
-   it through the NLB and CloudFront to the caller.
+   it through the proxy Lambda to the browser.
 
 The same fan-out is reachable as an MCP tool (`extend_rtb`) — either through the
-orchestrator's `/api/mcp` endpoint or through the optional **Bedrock AgentCore** MCP
-runtime.
+orchestrator's `/api/mcp` endpoint or through the **Bedrock AgentCore** MCP runtime,
+which `deploy.sh` registers by default (`--skip-agentcore` omits it).
 
 ## Deployment path
 
-- **Amazon EKS** via `deployment/deploy.sh`: provisions ECR repositories,
-  exports and uploads ONNX models to S3, builds and pushes images, creates/reuses the
-  EKS cluster (GPU `g5.xlarge` — or the more powerful Amazon EC2 G7e — + CPU `c5.xlarge` node groups), installs the NVIDIA
-  device plugin, applies the manifests under `deployment/eks/`, and deploys the
-  frontend (S3 + CloudFront + Cognito).
+- **Amazon EKS** via `deployment/deploy.sh --prefix <p>` (the prefix is required;
+  every resource is named `<p>-nvidia-artf-recommenders-*`). In five phases it
+  provisions the ECR repositories and two DynamoDB tables, exports and uploads the
+  ONNX and XGBoost models to S3, builds and pushes the images on AWS CodeBuild
+  (default) or with local Docker (`--local-build`) while it creates or reuses the
+  EKS cluster (Kubernetes 1.31, three AZs, private nodes behind one NAT gateway per
+  AZ; `gpu-inference` node group of 1 `g5.xlarge`, min 1, max `--maxGPUs` default 3;
+  `cpu-services` node group of 3 `c5.2xlarge`, min 2, max 8), installs the NVIDIA
+  device plugin and IRSA roles, creates the Cognito pools, applies the manifests
+  under `deployment/eks/` (Triton behind an internal NLB, six ARTF containers, the
+  orchestrator with its own internal NLB for the UI API proxy, HPAs, the TensorRT
+  bootstrap Job), deploys the UI API proxy Lambda
+  stack (`deployment/ui_api_proxy_cfn.yaml`) and grants the Identity Pool role
+  invoke on it, installs the nightly GPU scheduled shutdown (8:00 PM
+  America/New_York), deploys the frontend (S3 + CloudFront), registers the AgentCore
+  MCP runtime (default; `--skip-agentcore` omits it) and, unless `--no-retraining`,
+  runs `deploy_closed_loop.sh` for Part 2. `--with-prebid` (off by default) adds
+  Prebid Server to the same cluster as a second ARTF host via `deploy_prebid.sh`.
+  Region defaults to `us-east-1` (`AWS_REGION`).

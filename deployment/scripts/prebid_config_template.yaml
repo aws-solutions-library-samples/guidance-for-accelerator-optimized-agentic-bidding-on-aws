@@ -312,6 +312,12 @@ hooks:
     # BR-18) -- that is what makes this a general ARTF host rather than a bespoke
     # client for one repository's containers.
     extension-point-url: ${ARTF_EXTENSION_POINT_URL}
+    # Which transport reaches it: http (POST extension-point-url) or grpc
+    # (RTBExtensionPoint/GetMutations at grpc-target, the orchestrator's headless
+    # orchestrator-grpc Service). http until a measured run shows gRPC beats it
+    # on this hop; flip with ARTF_TRANSPORT on the pod for a measurement run.
+    transport: ${ARTF_TRANSPORT:http}
+    grpc-target: ${ARTF_GRPC_TARGET:}
     token-endpoint: ${ARTF_TOKEN_ENDPOINT}
     scope: ${ARTF_SCOPE}
 

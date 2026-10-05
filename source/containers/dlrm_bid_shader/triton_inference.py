@@ -20,9 +20,9 @@ import numpy as np
 import tritonclient.http as httpclient
 from tritonclient.utils import InferenceServerException
 
-from shared import dlrm_features
+from shared import dlrm_features, hop_timing, triton_client
 
-TRITON_URL = os.environ.get("TRITON_URL", "localhost:8000")
+TRITON_URL = triton_client.TRITON_URL  # kept for log/health callers; see shared/triton_client.py
 MODEL_NAME = "dlrm_bid_shader"
 
 # One client per thread. `mutate()` runs on a ThreadPoolExecutor of
@@ -41,13 +41,9 @@ class InferenceUnavailable(RuntimeError):
 def _get_client() -> httpclient.InferenceServerClient:
     client = getattr(_local, "client", None)
     if client is None:
-        client = httpclient.InferenceServerClient(
-            url=TRITON_URL,
-            verbose=False,
-            concurrency=4,
-            connection_timeout=5.0,
-            network_timeout=10.0,
-        )
+        # Protocol (HTTP :8000 or gRPC :8001) and endpoint come from
+        # shared/triton_client.py; this module only keeps the per-thread cache.
+        client = triton_client.new_client()
         _local.client = client
     return client
 
@@ -111,32 +107,33 @@ def predict_ctr(
             f"arrays for {dlrm_features.CATEGORICAL_COLUMNS}, got {len(categorical)}"
         )
 
-    dense_input = httpclient.InferInput(
+    dense_input = triton_client.api().InferInput(
         dlrm_features.TRITON_DENSE_INPUT, list(dense.shape), "FP32"
     )
     dense_input.set_data_from_numpy(dense.astype(np.float32))
     inputs = [dense_input]
 
     for name, array in zip(dlrm_features.TRITON_CATEGORICAL_INPUTS, categorical):
-        tensor = httpclient.InferInput(name, list(array.shape), "INT64")
+        tensor = triton_client.api().InferInput(name, list(array.shape), "INT64")
         tensor.set_data_from_numpy(array.astype(np.int64))
         inputs.append(tensor)
 
     if target_variant in ("stable", "canary"):
-        variant_input = httpclient.InferInput("target_variant", [1], "BYTES")
+        variant_input = triton_client.api().InferInput("target_variant", [1], "BYTES")
         variant_input.set_data_from_numpy(
             np.array([target_variant.encode("utf-8")], dtype=object)
         )
         inputs.append(variant_input)
 
     outputs = [
-        httpclient.InferRequestedOutput("ctr_prediction"),
-        httpclient.InferRequestedOutput("served_variant"),
-        httpclient.InferRequestedOutput("served_model_version"),
+        triton_client.api().InferRequestedOutput("ctr_prediction"),
+        triton_client.api().InferRequestedOutput("served_variant"),
+        triton_client.api().InferRequestedOutput("served_model_version"),
     ]
 
     try:
-        result = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+        with hop_timing.triton_call():
+            result = triton_client.infer(client, model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
         ctr = float(result.as_numpy("ctr_prediction").flat[0])
         served_variant = _decode_str_output(result, "served_variant")
         served_model_version = _decode_str_output(result, "served_model_version")

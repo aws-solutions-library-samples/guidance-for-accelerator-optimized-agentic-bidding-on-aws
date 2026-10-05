@@ -323,11 +323,15 @@ class TestTheReasonReachesTheConsumer:
         )
 
     def test_both_transports_read_it_from_the_response(self) -> None:
-        """REST /mutate is the primary path and MCP the fallback; a reason dropped on
-        either is a reason lost for whichever transport answered."""
+        """gRPC, REST /mutate and MCP all build their outcome through one helper
+        (``_outcome_from_rtb_response``), so the reason is read once and reaches the
+        consumer whichever transport answered. Pinned as: the helper reads it, and
+        every transport branch returns through the helper."""
         text = (SOURCE_DIR / "orchestrator" / "app.py").read_text()
 
-        assert text.count('metadata.get("abstained_reason") or None') == 2
+        assert text.count('metadata.get("abstained_reason") or None') == 1
+        # One call per transport: gRPC reply, REST 200 body, MCP content text.
+        assert text.count("return _outcome_from_rtb_response(") == 3
 
     def test_the_timer_wrapper_passes_it_to_the_per_container_record(self) -> None:
         text = (SOURCE_DIR / "orchestrator" / "app.py").read_text()

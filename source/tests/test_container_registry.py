@@ -174,7 +174,10 @@ class TestMergeRegistry:
 
     def test_grpc_target_is_derived_from_the_endpoint_when_absent(self):
         entries, _ = merge_registry([], [_record("c")])
-        assert entries[0].grpc == "c:8081", "scheme stripped, matching the code half"
+        # Host from the endpoint, port = the ARTF gRPC port (50051), matching
+        # app.py _grpc_from_url. The endpoint's own port is the HTTP listener
+        # and was never a gRPC one.
+        assert entries[0].grpc == "c:50051"
 
     def test_as_container_dict_matches_the_legacy_transport_shape(self):
         entries, _ = merge_registry([], [_record("c", intents=["ADD_CIDS"])])
@@ -764,7 +767,14 @@ class TestFanOut:
         assert by_name["mine"].latency_ms == 0
         assert by_name["mine"].mutations == []
 
-    def test_every_registry_entry_appears_in_registry_order(self, monkeypatch):
+    def test_every_registry_entry_appears_in_stage_then_registry_order(self, monkeypatch):
+        """Stage order first (shared/artf_stages.py), registry order within a stage,
+        then the entries that were not called, in registry order.
+
+        CODE_TWO puts the shader (stage 4) before the enricher (stage 1); the two
+        store records carry ADD_CIDS (stage 1) and merge in name order. So the
+        called order is enricher, aa, zz, shader, and the disabled record comes last.
+        """
         pytest.importorskip("grpc")
         from orchestrator import app as oapp
         from shared.artf_types import ContainerInvocationModel
@@ -782,7 +792,8 @@ class TestFanOut:
         monkeypatch.setattr(oapp, "_call_container_timed", fake_call)
 
         invocations = asyncio.run(oapp._fan_out({"id": "r"}, b"{}", None, timeout_s=1.0))
-        assert [i.name for i in invocations] == [e.name for e in entries]
+        assert [i.name for i in invocations] == ["metrics-enricher", "aa", "zz", "dlrm-bid-shader", "off"]
+        assert {i.name for i in invocations} == {e.name for e in entries}
 
     def test_a_disabled_container_does_not_suppress_other_mutations(self, monkeypatch):
         pytest.importorskip("grpc")

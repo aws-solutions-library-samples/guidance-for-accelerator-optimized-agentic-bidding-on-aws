@@ -1,8 +1,8 @@
 # Part 2 — Closed-Loop Learning
 # Simplifies the Part 1 real-time path into a single block and adds the two
 # feedback loops: a batch retraining loop and an agentic parameter-tuning loop,
-# plus governed zero-downtime deployment. SageMaker is intentionally not shown;
-# the training step is represented as generic GPU retraining.
+# plus governed zero-downtime deployment;
+# the training step runs on Amazon SageMaker.
 
 direction: down
 
@@ -26,17 +26,17 @@ aws: "AWS Cloud" {
   style.bold: true
   grid-columns: 2
 
-  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 5 ARTF containers" {
+  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 6 ARTF containers" {
     style.fill: "#FDEBD0"
     style.stroke: "#ED7100"
-    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n3 ONNX models + 2 XGBoost (FIL)" {
+    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n2 TensorRT engines (stable/canary router) + 2 XGBoost (FIL)" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
   }
 
-  params: "Parameter Store (DynamoDB)\nshade_factor · conversion_value" {
+  params: "Parameter Store (DynamoDB)\nshading policy slope (shade_factor) · conversion_value" {
     shape: cylinder
     style.fill: "#F7D9F9"
     style.stroke: "#C925D1"
@@ -94,12 +94,12 @@ aws: "AWS Cloud" {
     style.stroke: "#76b900"
     direction: down
     style.font-size: 20
-    nemo: "NVIDIA NeMo-RL\nRL policy optimization" {
+    nemo: "Amazon SageMaker training\nNVIDIA NeMo-RL (supervised head + RL policy search)" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
-    registry: "Model Registry\nVersioned artifacts + lineage" {
+    registry: "SageMaker Model Registry\nDLRM + NCF package groups" {
       shape: cylinder
     }
     nemo -> registry: "register new version"
@@ -114,7 +114,7 @@ aws: "AWS Cloud" {
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
-    registry: "Model Registry\nFloor + margin package groups" {
+    registry: "SageMaker Model Registry\nFloor + margin package groups" {
       shape: cylinder
     }
     xgb -> registry: "register new version"
@@ -122,19 +122,19 @@ aws: "AWS Cloud" {
 
   agents: "Amazon Bedrock AgentCore Runtimes" {
     style.stroke: "#ED7100"
-    gov: "Model Governance Agent\nA/B test + approval gate"
-    bsa: "Adaptive Bidding Strategy Agent\ntunes pricing parameters"
+    gov: "Model Promotion Governance Agent\nWelch t-test + SPRT, guardrails, audit trail (DynamoDB)"
+    bsa: "Adaptive Bidding Strategy Agent\nevery 5 min, bounded parameter updates"
   }
 
   deploy: "Zero-Downtime Deployment" {
     style.stroke: "#76b900"
     direction: down
-    optimizer: "Model Optimizer (in-cluster)\nlocal TensorRT engine build — NIM-like, no external dependency" {
+    optimizer: "Model Optimizer (one-shot EKS Job)\nTensorRT trtexec ONNX → .plan (FP16) — not a NIM" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
-    canary: "Canary Deployer\nProgressive rollout"
+    canary: "Canary Deployer\nTriton-side router: 5% → promote / reject / rollback"
     optimizer -> canary: "optimized model"
   }
 

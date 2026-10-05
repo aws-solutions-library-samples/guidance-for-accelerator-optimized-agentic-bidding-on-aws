@@ -12,7 +12,12 @@ import LoadTestSweepStatus from "./LoadTestSweepStatus.jsx";
 import GovernanceStepper, { GOVERNANCE_STEPS } from "./GovernanceStepper.jsx";
 import LoadTestPanel, { LoadTestResults } from "./LoadTestPanel.jsx";
 import BidBubbleOverlay from "./BidBubbleOverlay.jsx";
-import { COMPARABLE_MODEL_TYPES, isFilModel } from "../utils/comparableModels.js";
+import { COMPARABLE_MODEL_TYPES, isFilModel, comparableModelLabel } from "../utils/comparableModels.js";
+
+// How often the registry view re-reads SageMaker while a training job for the
+// selected model is active. Not polled at all
+// when no job is running; the Refresh button covers that case.
+export const REGISTRY_POLL_MS = 60000;
 
 // Default pipeline stages shown (all "done"/grey) before any scenario has run,
 // matching the prototype's always-visible pipeline bar at the top of the page.
@@ -91,7 +96,14 @@ export default function GovernancePanel() {
   const [revealed, setRevealed] = useState(0);
   const [runError, setRunError] = useState(null);
 
+  // Model registry view. It has its OWN model selector (registryModelType):
+  // the card sits outside the stepper as a reference view, so binding it to
+  // the test-versions or training selector made it read as "the" model with
+  // no way to tell which. `models` and `trainingJobs` are always for
+  // registryModelType and nothing else reads them.
+  const [registryModelType, setRegistryModelType] = useState("dlrm_bid_shader");
   const [models, setModels] = useState(null);
+  const [trainingJobs, setTrainingJobs] = useState([]);
   const [stateError, setStateError] = useState({});
   const [samplesScenario, setSamplesScenario] = useState(null);
   const revealTimer = useRef(null);
@@ -197,15 +209,36 @@ export default function GovernancePanel() {
   const refreshState = useCallback(async () => {
     const errs = {};
     try {
-      const r = await authFetch(`/api/v1/closed-loop/models?model_type=${modelType}`);
+      const r = await authFetch(`/api/v1/closed-loop/models?model_type=${registryModelType}`);
       const d = await r.json();
-      if (r.ok) setModels(d.versions || []);
-      else { setModels(null); errs.models = d.error || `HTTP ${r.status}`; }
-    } catch (e) { setModels(null); errs.models = String(e); }
+      if (r.ok) {
+        setModels(d.versions || []);
+        setTrainingJobs(d.training_jobs || []);
+        if (d.training_jobs_error) errs.trainingJobs = d.training_jobs_error;
+      } else {
+        setModels(null);
+        setTrainingJobs([]);
+        errs.models = d.error || `HTTP ${r.status}`;
+      }
+    } catch (e) { setModels(null); setTrainingJobs([]); errs.models = String(e); }
     setStateError(errs);
-  }, [modelType]);
+  }, [registryModelType]);
 
+  // Runs on mount (tab open, browser refresh) and whenever the registry's own
+  // model selector changes. The Refresh button calls the same function.
   useEffect(() => { refreshState(); }, [refreshState]);
+
+  // While a training job for the selected model is active, re-read once a
+  // minute so the row turns into a registered version (or a failure) without a
+  // click. No interval when nothing is running.
+  const hasActiveTrainingJob = trainingJobs.some(
+    (j) => j.status === "InProgress" || j.status === "Stopping"
+  );
+  useEffect(() => {
+    if (!hasActiveTrainingJob) return undefined;
+    const timer = setInterval(refreshState, REGISTRY_POLL_MS);
+    return () => clearInterval(timer);
+  }, [hasActiveTrainingJob, refreshState]);
 
   // Fetch the real cost/duration estimate whenever the selected training
   // model type changes, and reset any prior training-in-progress/result
@@ -293,6 +326,11 @@ export default function GovernancePanel() {
       if (resp.ok) {
         setTrainingResult(data);
         setConfirmingTraining(false);
+        // Show the new job in the registry view immediately: point the registry
+        // at the model just trained and re-read. When the selector already
+        // matches, the state setter is a no-op, so refresh explicitly.
+        setRegistryModelType(trainingModelType);
+        if (registryModelType === trainingModelType) refreshState();
       } else if (data.reason === "already_in_progress") {
         setTrainingInProgress(true);
         setConfirmingTraining(false);
@@ -307,7 +345,7 @@ export default function GovernancePanel() {
     } finally {
       setTrainingSubmitting(false);
     }
-  }, [trainingModelType]);
+  }, [trainingModelType, selectedTrainingRun, registryModelType, refreshState]);
 
   // Fetch eligible load-test runs whenever the model type changes, auto-
   // selecting the most recent per role (FR-7). Clears any prior
@@ -442,7 +480,13 @@ export default function GovernancePanel() {
       //    version directly (no TensorRT compile). DLRM is already staged by the
       //    governance agent on its load-test-triggered training completion.
       if (isFilModel(modelType)) {
-        const latest = (models || [])[0];
+        // Read the latest version for THIS model directly. The registry card's
+        // `models` state follows its own selector and may hold another model's
+        // versions, so it is not a safe source for the ARN to stage.
+        setRetrainStep("Looking up the latest registered version…");
+        const verResp = await authFetch(`/api/v1/closed-loop/models?model_type=${modelType}`);
+        const verData = await verResp.json().catch(() => ({}));
+        const latest = verResp.ok ? (verData.versions || [])[0] : null;
         if (!latest || !latest.model_package_arn) {
           setRetrainError("No registered version is available to stage as the challenger.");
           return;
@@ -530,7 +574,7 @@ export default function GovernancePanel() {
       setRetrainStep("");
       setRetraining(false);
     }
-  }, [modelType, selectedCurrentRun, currentRuns, models]);
+  }, [modelType, selectedCurrentRun, currentRuns]);
 
   useEffect(() => {
     if (revealTimer.current) clearInterval(revealTimer.current);
@@ -1022,9 +1066,34 @@ export default function GovernancePanel() {
       <div className="cl-section-title">Model registry</div>
       <div className="info-bar" style={{ margin: "0 0 12px" }}>
         <span>Model registry versions</span>
-        <button className="btn-secondary sg-interactive" onClick={refreshState} style={{ padding: "5px 12px" }}>Refresh</button>
+        <div className="cl-control-group" style={{ marginLeft: "auto", gap: "8px" }}>
+          <label htmlFor="cl-registry-model">Model:</label>
+          <select
+            id="cl-registry-model"
+            className="cl-select sg-interactive"
+            data-testid="registry-model-select"
+            value={registryModelType}
+            onChange={(e) => setRegistryModelType(e.target.value)}
+          >
+            {MODEL_TYPES.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+          </select>
+          <button
+            className="btn-secondary sg-interactive"
+            onClick={refreshState}
+            style={{ padding: "5px 12px" }}
+            data-testid="registry-refresh-button"
+          >
+            Refresh
+          </button>
+        </div>
       </div>
-      <ModelsView versions={models} error={stateError.models} />
+      <ModelsView
+        versions={models}
+        error={stateError.models}
+        modelLabel={comparableModelLabel(registryModelType)}
+        trainingJobs={trainingJobs}
+        trainingJobsError={stateError.trainingJobs}
+      />
 
       {/* Governance Agent Testing — the synthetic A/B scenario harness. Demoted
           below the operational cards above and collapsed by default: this runs

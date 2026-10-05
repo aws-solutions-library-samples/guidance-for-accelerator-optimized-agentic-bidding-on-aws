@@ -87,13 +87,12 @@ const AGENT_NODES = [
   },
 ];
 
-// Map stop IDs from the orchestrator response to our node IDs.
+// Map CONTAINER names from the orchestrator response to our node IDs.
 //
-// Vestigial: this table is keyed by CONTAINER name but is applied to `s.id`,
-// which normalizer.js already emits as a stop id -- so every lookup misses and
-// the `|| s.id` fallback below is what actually resolves the node. Kept (with
-// the container names corrected) rather than silently deleted, since removing
-// it is a behavior-neutral cleanup that belongs in its own change.
+// Used for `metadata.stages[].containers`, which the orchestrator reports by
+// container name. The stop lookups below also pass it `s.id`, which normalizer.js
+// already emits as a stop id; those lookups miss and the `|| s.id` fallback
+// resolves the node, which is harmless.
 const STOP_ID_MAP = {
   "dlrm-bid-shader": "dlrm",
   "widedeep-segment-activator": "widedeep",
@@ -133,6 +132,21 @@ export default function FlowPipeline({ result, loading, error }) {
   const [hoveredNode, setHoveredNode] = useState(null);
 
   const timeData = useMemo(() => computeTimeLayout(result), [result]);
+
+  // Which sequential stage each agent ran in, from the orchestrator's own
+  // account (metadata.stages, container names). Empty on the bypassed baseline
+  // pass and on an orchestrator that predates staging; the rows then carry no
+  // stage badge, which is the truthful rendering of "no stages were reported".
+  const stageByAgent = useMemo(() => {
+    const map = {};
+    for (const stage of result?.stages ?? []) {
+      for (const name of stage.containers ?? []) {
+        const nodeId = STOP_ID_MAP[name] || name;
+        if (!(nodeId in map)) map[nodeId] = { stage: stage.stage, name: stage.name };
+      }
+    }
+    return map;
+  }, [result]);
 
   // Mutations grouped by source agent
   const mutationsByAgent = useMemo(() => {
@@ -236,6 +250,7 @@ export default function FlowPipeline({ result, loading, error }) {
               // the bid path did not use, which is neither "contributed" nor
               // "did not run" and has to be visible as its own thing.
               const superseded = stop?.superseded ?? 0;
+              const stageInfo = node.type === "agent" ? stageByAgent[node.id] : undefined;
 
               return (
                 <div
@@ -254,6 +269,15 @@ export default function FlowPipeline({ result, loading, error }) {
 
                   {/* Agent name */}
                   <div className="agent-row-name" style={{ color: node.color }}>
+                    {stageInfo && (
+                      <span
+                        className="agent-stage-badge"
+                        data-testid={`flow-stage-${node.id}`}
+                        title={`Ran in stage ${stageInfo.stage} (${stageInfo.name}); its mutations were applied before stage ${stageInfo.stage + 1} ran`}
+                      >
+                        {stageInfo.stage}
+                      </span>
+                    )}
                     {node.label}
                     {/* Tooltip */}
                     {node.type === "agent" && (
@@ -334,7 +358,7 @@ export default function FlowPipeline({ result, loading, error }) {
             <span>{timeData.maxLatency.toFixed(0)}ms</span>
           </div>
 
-          <TotalLatency latencyMs={result?.totalLatencyMs} stops={result?.stops} />
+          <TotalLatency latencyMs={result?.totalLatencyMs} stops={result?.stops} stages={result?.stages} />
         </div>
       )}
     </div>

@@ -15,15 +15,24 @@
 // appears here, because no data source for one exists (see sellSideKpis.js).
 
 import { TheaterSellSidePanel } from "./TheaterPanels.jsx";
+import { TheaterComparisonPanel } from "./TheaterComparisonPanel.jsx";
+import { SHORT_ROWS } from "../utils/outcomeComparison.js";
 
 /**
- * @param values    existing sell-side values, passed through untouched
- * @param kpis      from deriveSellSideKpis; null before the auction settles
- * @param revealed  existing reveal convention
+ * @param values      existing sell-side values, passed through untouched
+ * @param kpis        from deriveSellSideKpis; null before the auction settles
+ * @param comparison  from compareOutcomes; null until the recap. Rendered at the
+ *                    TOP of the column with the headline rows, above the yield
+ *                    decisions that caused the difference and the KPI block that
+ *                    details the with-ARTF result. Both are kept.
+ * @param revealed    existing reveal convention
  */
-export function SellSideDecisionsPanel({ values, kpis, revealed }) {
+export function SellSideDecisionsPanel({ values, kpis, comparison = null, revealed }) {
   return (
     <div className="th-col-sell-wrap" data-testid="sell-side-decisions-panel">
+      {comparison ? (
+        <TheaterComparisonPanel comparison={comparison} rows={SHORT_ROWS} compact />
+      ) : null}
       <TheaterSellSidePanel values={values} revealed={revealed} />
 
       {kpis ? (

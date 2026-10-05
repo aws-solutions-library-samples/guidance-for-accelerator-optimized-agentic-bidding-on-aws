@@ -17,6 +17,7 @@ import { act } from 'react-dom/test-utils';
 let fetchHandler;
 vi.mock('../authFetch.js', () => ({
   authFetch: (...args) => fetchHandler(...args),
+  isProxyTransport: () => false,
 }));
 
 import LoadTestPanel from './LoadTestPanel.jsx';

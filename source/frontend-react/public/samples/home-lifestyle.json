@@ -25,9 +25,6 @@
         "pmp": {
           "private_auction": 0,
           "deals": [
-            {"id": "deal-home-premium", "bidfloor": 3.00, "at": 2},
-            {"id": "deal-retail-run", "bidfloor": 2.60, "at": 2},
-            {"id": "deal-auto-brand", "bidfloor": 1.50, "at": 2},
             {"id": "deal-remnant-open", "bidfloor": 1.00, "at": 3}
           ]
         }

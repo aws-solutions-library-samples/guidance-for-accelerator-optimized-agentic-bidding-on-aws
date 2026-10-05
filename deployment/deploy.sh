@@ -31,12 +31,36 @@ fi
 # a long wait reads as a wait, not a hang; set DEPLOY_NO_SPINNER=1 to hold it still
 # (it is skipped automatically when output is redirected).
 #
-# Noisy commands -- arm64 image builds, the AgentCore SDK's INFO logging -- write to
-# deployment/.deploy-*.log rather than the terminal. A FAILURE is never quiet: the
-# last 15 lines of the log are printed inline and the file is named.
+# The terminal shows phases and steps only. Everything a step runs -- the ONNX
+# export, pip, S3 copies, eksctl, every kubectl apply, CodeBuild polling, the
+# AgentCore SDK's INFO logging, deploy_prebid.sh and deploy_closed_loop.sh -- writes
+# to ONE file per run, deployment/.deploy-<prefix>.log (the previous run is kept as
+# .deploy-<prefix>.prev.log). Its path is printed at the start of the run and again
+# by every failure. A FAILURE is never quiet: the last 15 lines of the log are
+# printed inline and the file is named.
 #
-# Pass --verbose for the full detailed log stream. On failure, the phase and
+# Pass --verbose to stream it all to the terminal instead. On failure, the phase and
 # step that failed are reported with the real error plus a remediation hint.
+#
+# A flag the script does not recognise STOPS the run before anything is touched --
+# including a flag typed with an em dash (—with-prebid), which a chat client or word
+# processor substitutes for two hyphens and which used to be silently dropped.
+#
+# NETWORK LAYOUT. Both EKS node groups sit in PRIVATE subnets behind one NAT gateway
+# per AZ (eks/cluster-config.yaml: privateNetworking: true, nat.gateway:
+# HighlyAvailable). Nothing in the deployment reaches a node by its IP: Prebid Server
+# and the ARTF containers talk to the orchestrator through in-cluster Service DNS,
+# the Triton load balancer is internal, and both Lambdas (vpc-proxy, ui-api-proxy)
+# are attached to the VPC. NOTHING IN THE VPC IS INTERNET-FACING. The orchestrator has
+# no public address; the React UI reaches it by invoking the <prefix>-ui-api-proxy
+# Lambda (deployment/ui_api_proxy_cfn.yaml) with SigV4 credentials from the Cognito
+# Identity Pool, and that Lambda forwards to the orchestrator's INTERNAL NLB
+# (eks/orchestrator-internal-nlb.yaml). Not to orchestrator.<ns>.svc.cluster.local:
+# that name lives only in CoreDNS, and a ClusterIP has no route from a Lambda ENI.
+# This is what lets the stack deploy unchanged in an account running VPC Block
+# Public Access in block-ingress mode: a VPC Lambda ENI is not an internet path,
+# whereas an internet-facing load balancer (and a CloudFront VPC origin) is dropped
+# at the internet gateway there.
 #
 # Model-optimizer bootstrap is fire-and-forget: it runs in the background and
 # does not block Phase 3+. Triton auto-loads the compiled TensorRT engines
@@ -306,6 +330,18 @@ for arg in "$@"; do
         NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
         DEPLOY_PROFILE="${arg}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1
+      else
+        # Anything else is a mistake, and a mistake that used to be silent: the token
+        # fell through every branch above and the run proceeded without it. For example,
+        # as "—with-prebid" pasted with an em dash, which deployed with
+        # Prebid OFF and said nothing. The em/en dash case gets its own hint because
+        # the two glyphs are indistinguishable from "--" in most terminal fonts.
+        _dash_hint=""
+        case "${arg}" in
+          $'\xe2\x80\x94'*|$'\xe2\x80\x93'*) _dash_hint=" (that first character is an em/en dash, not two hyphens)" ;;
+        esac
+        printf '\033[0;31m[fail]\033[0m %s\n' "unknown argument '${arg}'${_dash_hint} -- see ./deploy.sh --help" >&2
+        exit 1
       fi
       ;;
   esac
@@ -432,6 +468,265 @@ phase() { _emit '\n\033[1;36mPhase %s/5: %s\033[0m' "$1" "$2"; }
 # fabricated "done" markers).
 ok() { _emit '  \033[0;32m[OK]\033[0m %s' "$*"; }
 
+# ---- The detail log --------------------------------------------------------
+#
+# One file per run: deployment/.deploy-<prefix>.log. Everything that is not a phase
+# header, a step, a completion mark, a warning, a failure or the summary goes there
+# -- model export, every S3 copy, image builds, kubectl apply/rollout, the Cognito
+# and frontend helpers, the AgentCore SDK, the closed-loop and Prebid children. The
+# terminal reads as the sequence of steps; the log reads as what each step did.
+# Under --verbose nothing is redirected and the log receives only the headers.
+#
+# Set by _deploy_log_init() once the prefix is validated; empty until then, and the
+# helpers below fall back to the terminal while it is empty so nothing is lost.
+DEPLOY_LOG=""
+
+_deploy_log_init() {
+  DEPLOY_LOG="${SCRIPT_DIR}/.deploy-${STACK_PREFIX}.log"
+  # Keep exactly one previous run. A log that only ever appended would carry every
+  # run since the prefix was created, which makes the one you want hard to find.
+  if [[ -s "${DEPLOY_LOG}" ]]; then
+    mv -f "${DEPLOY_LOG}" "${DEPLOY_LOG%.log}.prev.log" 2>/dev/null || true
+  fi
+  if ! : > "${DEPLOY_LOG}" 2>/dev/null; then
+    DEPLOY_LOG="/tmp/deploy-${STACK_PREFIX}-$$.log"
+    : > "${DEPLOY_LOG}"
+  fi
+  {
+    printf '===== deploy.sh =====\n'
+    printf '===== %s =====\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'argv: %s\n' "${_DEPLOY_ARGV[*]+"${_DEPLOY_ARGV[*]}"}"
+  } >> "${DEPLOY_LOG}" 2>/dev/null || true
+  return 0
+}
+
+# _log_section <label>: a dated header in the detail log, so a reader can find the
+# step that produced the lines after it.
+_log_section() {
+  [[ -n "${DEPLOY_LOG}" ]] || return 0
+  {
+    printf '\n===== %s =====\n' "$1"
+    printf '===== %s =====\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >> "${DEPLOY_LOG}" 2>/dev/null || true
+  return 0
+}
+
+# quiet <label> <command...>: run a command with its output in the detail log.
+#
+# For the short, chatty commands whose only interesting output is a failure: an S3
+# copy, a kubectl apply, an IAM policy version. Under --verbose, or before the log
+# exists, the command runs unchanged. On failure the last lines of the log are
+# printed, because the failing command's own message is still the real error and
+# this is where it went. The return code is the command's, so `|| warn` and
+# `|| true` at the call sites keep their meaning.
+quiet() {
+  local label="$1"; shift
+  if [[ "${VERBOSE}" -eq 1 || -z "${DEPLOY_LOG}" ]]; then
+    "$@"
+    return $?
+  fi
+  _log_section "${label}"
+  local rc=0
+  local _ee=0; case "$-" in *e*) _ee=1 ;; esac
+  set +e
+  "$@" >> "${DEPLOY_LOG}" 2>&1
+  rc=$?
+  if [[ "${_ee}" -eq 1 ]]; then set -e; fi
+  if [[ "${rc}" -ne 0 ]]; then
+    printf '\033[0;31m[fail]\033[0m %s (exit %s) -- last 15 lines of %s:\n' "${label}" "${rc}" "${DEPLOY_LOG}" >&2
+    tail -15 "${DEPLOY_LOG}" 2>/dev/null | sed 's/^/      /' >&2
+  fi
+  return "${rc}"
+}
+
+# run_step <label> <command...>: quiet(), plus a visible wait.
+#
+# For the commands a human waits on -- model export, a CodeBuild run, a rollout, the
+# frontend build. The label is shown while the command runs (a spinner on a
+# terminal, one static line otherwise) and marked done when it finishes; the output
+# goes to the detail log. Under --verbose the label is printed once and the command
+# streams. Wraps lib/deploy_progress.sh's run_logged, which is sourced later than
+# this definition but earlier than any call.
+run_step() {
+  local label="$1"; shift
+  if [[ "${VERBOSE}" -eq 1 || -z "${DEPLOY_LOG}" ]]; then
+    step "${label}"
+    "$@"
+    return $?
+  fi
+  run_logged "${DEPLOY_LOG}" "${label}" "$@"
+}
+
+# _ecr_docker_login: a pipeline, so it is a function (quiet/run_step take a command,
+# not a shell string). Used by Phase 1 (--local-build daemon check) and Phase 2.
+_ecr_docker_login() {
+  aws ecr get-login-password --region "${AWS_REGION}" | \
+    docker login --username AWS --password-stdin "${REGISTRY}"
+}
+
+# ---- UI API proxy Lambda (the orchestrator's only way in) ---------------------
+#
+# The orchestrator has no public address; the React UI reaches it by invoking the
+# <prefix>-ui-api-proxy Lambda (deployment/ui_api_proxy_cfn.yaml), which runs on the
+# cluster's private subnets with the cluster security group and forwards each call
+# to the orchestrator's internal NLB (eks/orchestrator-internal-nlb.yaml). A VPC
+# Lambda ENI is not an internet path and an internal NLB has no public address, so
+# this works in an account running VPC Block Public Access in block-ingress mode,
+# where an internet-facing load balancer would be dropped at the internet gateway.
+# Earlier releases gated on that mode and stopped; nothing here reads it any more,
+# because nothing here needs public ingress.
+#
+# Why an NLB and not the ClusterIP Service: the Lambda resolves names through the
+# VPC's Route 53 Resolver, which has no cluster.local zone, and a ClusterIP is a
+# kube-proxy rewrite rule on the nodes with no route from an ENI. The first live
+# use of the cluster.local URL failed every call in 2 ms with
+# "[Errno 16] Device or resource busy" (a failed getaddrinfo), returned as
+# 502 orchestrator_unreachable.
+#
+# The stack is (re)deployed on every run that applies the manifests: it is cheap,
+# idempotent (update-stack / "No updates"), and the only way the Lambda's subnets
+# and target URL follow a recreated cluster. The function ARN is then granted to
+# the Identity Pool authenticated role (deploy_cognito.py grant-ui-api-invoke) and
+# baked into the UI build as VITE_UI_API_PROXY_ARN.
+
+UI_API_PROXY_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}ui-api-proxy"
+ORCHESTRATOR_INTERNAL_SVC="orchestrator-internal"
+ORCHESTRATOR_INTERNAL_URL=""
+
+# resolve_orchestrator_internal_url <phase>: wait for the in-tree cloud controller
+# to provision the internal NLB behind the orchestrator-internal Service and
+# export ORCHESTRATOR_INTERNAL_URL=http://<hostname>. Provisioning normally takes
+# one to three minutes after the Service is applied; five is the ceiling before this
+# is a failure, not a wait.
+resolve_orchestrator_internal_url() {
+  local _phase="$1" deadline host
+  deadline=$(( $(date +%s) + 300 ))
+  while :; do
+    host="$(kubectl get svc "${ORCHESTRATOR_INTERNAL_SVC}" \
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
+    if [[ -n "${host}" ]]; then
+      ORCHESTRATOR_INTERNAL_URL="http://${host}"
+      ok "Orchestrator internal NLB: ${host}"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      fail "${_phase}" "Service ${ORCHESTRATOR_INTERNAL_SVC} has no load balancer hostname after 5 minutes. The UI API proxy has nothing to forward to. Check: kubectl describe svc ${ORCHESTRATOR_INTERNAL_SVC} (Events show why the NLB was not created; the node role needs elasticloadbalancing:* and the private subnets the kubernetes.io/role/internal-elb=1 tag)."
+    fi
+    sleep 10
+  done
+}
+
+# _ui_api_proxy_probe <function-arn>: invoke the proxy once with GET /api/health/ready
+# through boto3 and print the proxy's reply (or the SDK error) on stdout. Exit 0 only
+# when the proxy reports status 200 from the orchestrator. boto3 rather than
+# `aws lambda invoke`: the binary-payload flag that call needs exists only in
+# AWS CLI v2, and the first live run of this check hit a shell whose `aws` was v1,
+# so every invoke failed locally and the deploy blamed the network. boto3 is already
+# a hard requirement of this script and behaves the same everywhere.
+_ui_api_proxy_probe() {
+  ${PYTHON} - "$1" "${AWS_REGION}" <<'PY'
+import json, sys
+import boto3
+fn, region = sys.argv[1], sys.argv[2]
+event = {"method": "GET", "path": "/api/health/ready", "query": {}, "headers": {}, "body": None}
+try:
+    resp = boto3.client("lambda", region_name=region).invoke(
+        FunctionName=fn, Payload=json.dumps(event).encode("utf-8"))
+    raw = resp["Payload"].read().decode("utf-8", "replace")
+except Exception as exc:  # the SDK call itself failed; say so, do not fake a reply
+    print(f"invoke failed: {type(exc).__name__}: {exc}")
+    sys.exit(1)
+print(raw[:300])
+if resp.get("FunctionError"):
+    sys.exit(1)
+try:
+    status = json.loads(raw).get("status")
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if status == 200 else 1)
+PY
+}
+
+# verify_ui_api_proxy <phase>: drive one request through the proxy and keep trying
+# for up to three minutes, because a freshly created NLB registers its targets
+# after it has a hostname. The deploy does not report a UI path it has not driven
+# end to end. A persistent failure is a Phase failure, with the last reply (or SDK
+# error) in the message.
+verify_ui_api_proxy() {
+  local _phase="$1" deadline last
+  deadline=$(( $(date +%s) + 180 ))
+  while :; do
+    if last="$(_ui_api_proxy_probe "${UI_API_PROXY_ARN}" 2>&1)"; then
+      ok "UI API proxy reaches the orchestrator (GET /api/health/ready -> 200)"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      fail "${_phase}" "The UI API proxy could not reach the orchestrator through ${ORCHESTRATOR_INTERNAL_URL:-<unset>} after 3 minutes. Last reply: ${last:-<none>}. Check: kubectl get svc ${ORCHESTRATOR_INTERNAL_SVC}; aws logs tail /aws/lambda/${UI_API_PROXY_STACK}."
+    fi
+    sleep 10
+  done
+}
+
+# _cfn_output <stack> <output-key>: one output value, or empty.
+_cfn_output() {
+  aws cloudformation describe-stacks --stack-name "$1" --region "${AWS_REGION}" \
+    --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null \
+    | grep -v '^None$' | head -n 1
+}
+
+# deploy_ui_api_proxy <phase> <nlb-url>: discover the cluster's private
+# subnets and security group, create or update the proxy stack pointed at the
+# orchestrator's internal NLB, and export UI_API_PROXY_ARN.
+deploy_ui_api_proxy() {
+  local _phase="$1" orch_url="${2:-}" vpc_id subnets sg status action cfn_log
+  [[ "${orch_url}" == http://*.amazonaws.com* ]] \
+    || fail "${_phase}" "deploy_ui_api_proxy needs the orchestrator's internal NLB URL (got '${orch_url:-<empty>}'). A cluster.local name cannot be resolved from a Lambda ENI."
+  vpc_id="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+    --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null || echo '')"
+  sg="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
+    --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text 2>/dev/null || echo '')"
+  [[ -n "${vpc_id}" && "${vpc_id}" != "None" && -n "${sg}" && "${sg}" != "None" ]] \
+    || fail "${_phase}" "Could not resolve the VPC and cluster security group of ${CLUSTER_NAME}; the UI API proxy Lambda needs both."
+  # The same private subnets eksctl tags for internal load balancers; they route
+  # through the NAT gateways, never the internet gateway.
+  subnets="$(aws ec2 describe-subnets --region "${AWS_REGION}" \
+    --filters "Name=vpc-id,Values=${vpc_id}" "Name=tag:kubernetes.io/role/internal-elb,Values=1" \
+    --query 'Subnets[].SubnetId' --output text 2>/dev/null | tr '\t' ',' | tr ' ' ',')"
+  [[ -n "${subnets}" && "${subnets}" != "None" ]] \
+    || fail "${_phase}" "No private subnets (tag kubernetes.io/role/internal-elb=1) found in ${vpc_id} for the UI API proxy Lambda."
+
+  status="$(aws cloudformation describe-stacks --stack-name "${UI_API_PROXY_STACK}" --region "${AWS_REGION}" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
+  if [[ "${status}" == "ROLLBACK_COMPLETE" || "${status}" == "DELETE_FAILED" ]]; then
+    log "  ${UI_API_PROXY_STACK} is ${status}; deleting before recreate"
+    aws cloudformation delete-stack --stack-name "${UI_API_PROXY_STACK}" --region "${AWS_REGION}"
+    aws cloudformation wait stack-delete-complete --stack-name "${UI_API_PROXY_STACK}" --region "${AWS_REGION}"
+    status=""
+  fi
+  action="create-stack"
+  [[ -n "${status}" && "${status}" != "None" ]] && action="update-stack"
+  cfn_log="/tmp/cfn-deploy-${UI_API_PROXY_STACK}-$(date +%s).log"
+  log "  ${action} ${UI_API_PROXY_STACK} (subnets ${subnets}, sg ${sg})"
+  if aws cloudformation "${action}" --stack-name "${UI_API_PROXY_STACK}" \
+      --template-body "file://${SCRIPT_DIR}/ui_api_proxy_cfn.yaml" \
+      --capabilities CAPABILITY_NAMED_IAM --region "${AWS_REGION}" \
+      --parameters "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
+                   "ParameterKey=SubnetIds,ParameterValue=\"${subnets}\"" \
+                   "ParameterKey=SecurityGroupIds,ParameterValue=${sg}" \
+                   "ParameterKey=OrchestratorBaseUrl,ParameterValue=${orch_url}" \
+      >"${cfn_log}" 2>&1; then
+    local wait_action="stack-create-complete"
+    [[ "${action}" == "update-stack" ]] && wait_action="stack-update-complete"
+    aws cloudformation wait "${wait_action}" --stack-name "${UI_API_PROXY_STACK}" --region "${AWS_REGION}" \
+      || fail "${_phase}" "UI API proxy stack ${UI_API_PROXY_STACK} did not reach ${wait_action}; see: aws cloudformation describe-stack-events --stack-name ${UI_API_PROXY_STACK}"
+  elif ! grep -q "No updates are to be performed" "${cfn_log}"; then
+    fail "${_phase}" "UI API proxy stack ${UI_API_PROXY_STACK} ${action} failed: $(cat "${cfn_log}")"
+  fi
+  UI_API_PROXY_ARN="$(_cfn_output "${UI_API_PROXY_STACK}" ProxyFunctionArn)"
+  [[ -n "${UI_API_PROXY_ARN}" ]] || fail "${_phase}" "${UI_API_PROXY_STACK} has no ProxyFunctionArn output."
+  ok "UI API proxy: ${UI_API_PROXY_ARN}"
+}
+
 # phase_hint(): a short remediation hint per phase, printed by fail() as
 # additional context above the real captured error — never a replacement
 # for it (FR-11). A case statement (not an associative array) for bash 3.2
@@ -440,8 +735,8 @@ ok() { _emit '  \033[0;32m[OK]\033[0m %s' "$*"; }
 phase_hint() {
   case "$1" in
     1) echo "Check AWS credentials (aws sts get-caller-identity) and that boto3/torch/onnx/onnxscript are installed." ;;
-    2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild, and your EC2 g5 GPU service quota for cluster creation." ;;
-    3) echo "Check GPU node availability: kubectl get nodes -l nvidia.com/gpu=present ; kubectl get pods" ;;
+    2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild and your EC2 g5 GPU service quota for cluster creation. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)." ;;
+    3) echo "Check GPU node availability: kubectl get nodes -l nvidia.com/gpu=present ; kubectl get pods ; and the UI API proxy stack: aws cloudformation describe-stack-events --stack-name ${UI_API_PROXY_STACK:-<prefix>-ui-api-proxy}" ;;
     4) echo "Check the CloudFront/S3 frontend deploy output above and Cognito user pool creation." ;;
     5) echo "Check Bedrock model access (--model-id) and the AgentCore runtime IAM roles." ;;
     *) echo "" ;;
@@ -487,6 +782,9 @@ fail() {
       "${STACK_PREFIX:-}" >&2
   else
     printf '\033[0;31m[fail]\033[0m %s\n' "$*" >&2
+  fi
+  if [[ -n "${DEPLOY_LOG:-}" ]]; then
+    printf '\033[0;33m[hint]\033[0m Full output of every step this run: %s\n' "${DEPLOY_LOG}" >&2
   fi
   exit 1
 }
@@ -681,6 +979,13 @@ ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 # readable at the top of the output rather than from a stack-name collision later.
 say "  AWS account: ${ACCOUNT_ID}  region: ${AWS_REGION}  prefix: ${STACK_PREFIX}"
 
+# The detail log exists from here on. Named now, before the first thing worth
+# logging, and named in every fail() after this point.
+_deploy_log_init
+if [[ "${VERBOSE}" -eq 0 ]]; then
+  say "  Detail log:  ${DEPLOY_LOG}   (tail -f to watch a step; --verbose streams it here instead)"
+fi
+
 # =========================================================================
 # Local deployment state — remembered inputs and the resume decision
 # =========================================================================
@@ -830,11 +1135,39 @@ fi
 # `unknown` runs the phase. Every phase is idempotent, so re-running one we could
 # not verify costs minutes; skipping one we could not verify ships a deployment
 # that claims to be complete and is not.
+#
+# One exception to "AWS already satisfied: skip". The probe reads what is RUNNING,
+# and a Deployment whose pods run an image that Step 4 has just rebuilt under the
+# same tag is "ok" by every check the probe has, so Phase 3 (which carries the
+# rollout restart) would be skipped and the new image would never ship. That is
+# exactly what happened once: nine images rebuilt, every phase skipped, the old
+# orchestrator kept serving. So build_images records that it rebuilt something,
+# and Phase 3 runs whenever it did; Phase 5 likewise when the AgentCore image is
+# among the rebuilt ones, since the runtime only picks a new image up through
+# update-agent-runtime.
+_IMAGES_REBUILT=0
+_AGENTCORE_IMAGE_REBUILT=0
 _run_phase() {
   local n="$1" st
   [[ "${START_AT}" -le "${n}" ]] || return 1
   gate_wait "${n}" "${STACK_PREFIX}" || true
   if gate_should_run "${n}"; then
+    return 0
+  fi
+  # --start-at N names the phase the operator wants run; that is the documented
+  # override of the probe (header: "for when you know something the probe cannot").
+  # Only the named phase is forced; the ones after it still consult AWS. Without
+  # this, `--start-at 3` on a healthy cluster did nothing, and the header was wrong.
+  if [[ "${_GIVEN_START_AT}" -eq 1 && "${n}" -eq "${START_AT}" ]]; then
+    say "  Phase ${n}/5 reads as complete in AWS; running it anyway because --start-at ${n} names it."
+    return 0
+  fi
+  if [[ "${n}" -eq 3 && "${_IMAGES_REBUILT}" -eq 1 ]]; then
+    say "  Phase 3/5 reads as complete in AWS, but Step 4 rebuilt images under the same tag; running it so the new images roll out."
+    return 0
+  fi
+  if [[ "${n}" -eq 5 && "${_AGENTCORE_IMAGE_REBUILT}" -eq 1 ]]; then
+    say "  Phase 5/5 reads as complete in AWS, but Step 4 rebuilt the AgentCore image; running it so the runtime is updated."
     return 0
   fi
   st="$(gate_status "${n}")"
@@ -984,6 +1317,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   warn "ECR repos, the Prebid ARTF host stack (${PREBID_STACK}) with its Cognito"
   warn "domain, resource servers, M2M client and credential secret, and all"
   warn "Kubernetes resources. NOTHING is retained — this is not reversible."
+  warn "Also deleted: the UI API proxy Lambda stack (${UI_API_PROXY_STACK})."
   # Teardown genuinely needs a human, so unlike the resume prompt this does not
   # fall back to a default -- it fails. But it must fail with a reason: an
   # unguarded read here returns empty on EOF (or stops the process with SIGTTIN
@@ -1041,11 +1375,15 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # behind and block subnet deletion (eksctl-*-cluster stack
   # gets stuck DELETE_FAILED on "subnet has dependencies and cannot be
   # deleted"). Wait for completion so the ENIs are gone before eksctl runs.
-  if aws cloudformation describe-stacks --stack-name "${VPC_PROXY_STACK}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    say "Deleting VPC proxy Lambda stack (${VPC_PROXY_STACK}) before the EKS cluster..."
-    aws cloudformation delete-stack --stack-name "${VPC_PROXY_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
-    aws cloudformation wait stack-delete-complete --stack-name "${VPC_PROXY_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
-  fi
+  # The UI API proxy Lambda (Part 1) has the same VPC-attached ENIs, so it goes
+  # at the same point for the same reason.
+  for _vpc_lambda_stack in "${UI_API_PROXY_STACK}" "${VPC_PROXY_STACK}"; do
+    if aws cloudformation describe-stacks --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+      say "Deleting VPC-attached Lambda stack (${_vpc_lambda_stack}) before the EKS cluster..."
+      aws cloudformation delete-stack --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" 2>/dev/null || true
+      aws cloudformation wait stack-delete-complete --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" 2>/dev/null || true
+    fi
+  done
 
   say "Deleting EKS cluster ${CLUSTER_NAME}..."
   # Disable termination protection on eksctl-managed stacks first, in case
@@ -1319,13 +1657,12 @@ fi
 if [[ "${UI_ONLY}" -eq 1 ]]; then
   log "UI-only deploy"
 
-  # Get the NLB endpoint from the EKS cluster
-  aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" 2>/dev/null || true
-  NLB_DNS="$(kubectl get svc orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
-  if [[ -z "${NLB_DNS}" ]]; then
-    warn "Could not read NLB endpoint from EKS. Using placeholder."
-    NLB_DNS="localhost"
-  fi
+  # The UI reaches the orchestrator through the ui-api-proxy Lambda; its ARN is a
+  # build-time input (VITE_UI_API_PROXY_ARN). Read it from the proxy stack. A UI
+  # built without it falls back to plain fetch against /api, which nothing serves
+  # from CloudFront, so a missing stack is a hard stop here.
+  UI_API_PROXY_ARN="$(_cfn_output "${UI_API_PROXY_STACK}" ProxyFunctionArn)"
+  [[ -n "${UI_API_PROXY_ARN}" ]] || fail "UI API proxy stack ${UI_API_PROXY_STACK} not found. Run the full deploy (it is created in Phase 3) before --ui-only."
 
   # Regenerate the frontend build config so a standalone UI redeploy bakes in the
   # CURRENT Cognito + agent runtime ARNs. The UI must be (re)built AFTER the agents
@@ -1366,16 +1703,16 @@ VITE_BEDROCK_REGION=${AWS_REGION}
 VITE_CAPTION_INFERENCE_PROFILE_ID=${CAPTION_INFERENCE_PROFILE_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}
 VITE_GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}
+VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}
 EOF
-  log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}"
+  log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}  ui-api-proxy=${UI_API_PROXY_ARN}"
 
   # Primary distribution: React UI (fresh build embeds the env above)
   ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
-    --profile "${AWS_PROFILE}" \
-    --orchestrator-url "http://${NLB_DNS}"
+    --profile "${AWS_PROFILE}"
 
   PRIMARY_OUTPUTS="${SCRIPT_DIR}/.frontend-outputs.json"
   CF_DOMAIN="$(jq -r '.CloudFrontDomain // empty' "${PRIMARY_OUTPUTS}" 2>/dev/null || echo '')"
@@ -1457,8 +1794,7 @@ if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
   source "${SCRIPT_DIR}/lib/deploy_docker.sh"
   docker_ensure_running "build the container images locally (--local-build)"
   docker_ensure_buildx
-  aws ecr get-login-password --region "${AWS_REGION}" | \
-    docker login --username AWS --password-stdin "${REGISTRY}"
+  quiet "ECR login (${REGISTRY})" _ecr_docker_login
 fi
 
 for repo in "${REPOS[@]}"; do
@@ -1540,8 +1876,9 @@ step "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
 # with the router/engine configs committed under triton/model_repository/.
 ONNX_STAGING="${SCRIPT_DIR}/../source/triton/onnx_export"
 rm -rf "${ONNX_STAGING}"
-${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
-  --output-dir "${ONNX_STAGING}"
+run_step "Exporting DLRM and NCF to ONNX" \
+  ${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
+    --output-dir "${ONNX_STAGING}"
 
 # Step 2.5: Genesis XGBoost export for the Yield Optimizer (floor/margin).
 # Best-effort, non-blocking (per explicit user instruction: train the
@@ -1585,7 +1922,7 @@ fi
 step "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
 if [[ "${XGBOOST_OK}" -ne 1 ]]; then
   log "  Installing ${XGBOOST_PIN}/onnxmltools (best-effort, non-blocking)..."
-  ${PYTHON} -m pip install --quiet "${XGBOOST_PIN}" onnxmltools 2>/dev/null || true
+  quiet "pip install ${XGBOOST_PIN} onnxmltools" ${PYTHON} -m pip install --quiet "${XGBOOST_PIN}" onnxmltools || true
   if ${PYTHON} -c "
 import sys
 try:
@@ -1599,8 +1936,9 @@ sys.exit(0 if xgboost.__version__ == '1.7.6' else 1)
 fi
 
 if [[ "${XGBOOST_OK}" -eq 1 ]]; then
-  ${PYTHON} "${SCRIPT_DIR}/../source/training/export_xgboost_genesis.py" \
-    --output-dir "${ONNX_STAGING}" \
+  run_step "Exporting genesis XGBoost floor/margin models" \
+    ${PYTHON} "${SCRIPT_DIR}/../source/training/export_xgboost_genesis.py" \
+      --output-dir "${ONNX_STAGING}" \
     && log "  Genesis XGBoost artifacts exported to ${ONNX_STAGING}/" \
     || warn "  Genesis XGBoost export failed - deal_yield_manager_floor/margin genesis registration will be skipped honestly until this is re-run (see Step 3's register_genesis_models.py)."
 else
@@ -1617,7 +1955,7 @@ fi
 # =========================================================================
 step "Step 3: Ensuring S3 model bucket ${MODEL_BUCKET}"
 if ! aws s3api head-bucket --bucket "${MODEL_BUCKET}" 2>/dev/null; then
-  aws s3 mb "s3://${MODEL_BUCKET}" --region "${AWS_REGION}"
+  quiet "s3 mb ${MODEL_BUCKET}" aws s3 mb "s3://${MODEL_BUCKET}" --region "${AWS_REGION}"
 fi
 
 # widedeep_segment_activator is intentionally absent — segment activation is
@@ -1634,15 +1972,17 @@ YIELD_MODELS=(deal_yield_manager_floor deal_yield_manager_margin)
 # 3a. Upload exported ONNX to onnx-source/ — the Model Optimizer reads these to
 #     build TensorRT engines. NOT served directly by Triton.
 for m in "${RECOMMENDER_MODELS[@]}"; do
-  aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
-    "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
+  quiet "s3 cp ${m}/model.onnx -> onnx-source/" \
+    aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
+      "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
   # manifest.json goes NEXT TO the ONNX, which is where the optimizer looks for it.
   # Only the exporters that write one produce this file; a model without one is
   # uploaded without one, and the optimizer then refuses it if its bootstrap entry
   # declares an expected version.
   if [[ -f "${ONNX_STAGING}/${m}/1/manifest.json" ]]; then
-    aws s3 cp "${ONNX_STAGING}/${m}/1/manifest.json" \
-      "s3://${MODEL_BUCKET}/onnx-source/${m}/manifest.json" --region "${AWS_REGION}"
+    quiet "s3 cp ${m}/manifest.json -> onnx-source/" \
+      aws s3 cp "${ONNX_STAGING}/${m}/1/manifest.json" \
+        "s3://${MODEL_BUCKET}/onnx-source/${m}/manifest.json" --region "${AWS_REGION}"
   fi
 done
 log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
@@ -1656,10 +1996,12 @@ log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
 # 2.5 did not produce that model's artifacts.
 for m in "${YIELD_MODELS[@]}"; do
   if [[ -f "${ONNX_STAGING}/${m}/1/model.onnx" && -f "${ONNX_STAGING}/${m}/1/xgboost.json" ]]; then
-    aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
-      "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
-    aws s3 cp "${ONNX_STAGING}/${m}/1/xgboost.json" \
-      "s3://${MODEL_BUCKET}/triton-models/${m}/1/xgboost.json" --region "${AWS_REGION}"
+    quiet "s3 cp ${m}/model.onnx -> onnx-source/" \
+      aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
+        "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
+    quiet "s3 cp ${m}/xgboost.json -> triton-models/" \
+      aws s3 cp "${ONNX_STAGING}/${m}/1/xgboost.json" \
+        "s3://${MODEL_BUCKET}/triton-models/${m}/1/xgboost.json" --region "${AWS_REGION}"
     log "  ${m}: genesis ONNX + native XGBoost JSON uploaded"
   else
     warn "  ${m}: no genesis artifact from Step 2.5 - skipping upload (Model Registry genesis and Triton FIL load for this model will start empty until Step 2.5 succeeds)."
@@ -1677,8 +2019,9 @@ for m in "${RECOMMENDER_MODELS[@]}"; do
   mkdir -p "${SERVED_STAGING}/${m}/1"
   cp "${SCRIPT_DIR}/../source/triton/router/model.py" "${SERVED_STAGING}/${m}/1/model.py"
 done
-aws s3 sync "${SERVED_STAGING}/" "s3://${MODEL_BUCKET}/triton-models/" \
-  --exclude "*.onnx" --region "${AWS_REGION}"
+quiet "s3 sync served Triton repo -> triton-models/" \
+  aws s3 sync "${SERVED_STAGING}/" "s3://${MODEL_BUCKET}/triton-models/" \
+    --exclude "*.onnx" --region "${AWS_REGION}"
 rm -rf "${SERVED_STAGING}"
 log "  Triton served repo (routers + engine configs) uploaded; engines built at Step 8b"
 
@@ -1703,8 +2046,9 @@ sed -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
   "${SCRIPT_DIR}/optimizer-bootstrap.json" > "${BOOTSTRAP_TMP}"
 grep -q '__FEATURE_SPEC_VERSION__' "${BOOTSTRAP_TMP}" \
   && fail "optimizer-bootstrap.json still has an unsubstituted __FEATURE_SPEC_VERSION__"
-aws s3 cp "${BOOTSTRAP_TMP}" \
-  "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
+quiet "s3 cp optimizer bootstrap spec" \
+  aws s3 cp "${BOOTSTRAP_TMP}" \
+    "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
 rm -f "${BOOTSTRAP_TMP}"
 log "  Model Optimizer bootstrap spec uploaded"
 ok "Models exported and uploaded"
@@ -1718,12 +2062,11 @@ phase 2 "Building containers & provisioning infrastructure"
 log "  This typically takes 15-20 minutes (bounded by EKS cluster creation)."
 fi
 _PHASE2_START=$(date +%s)
-# Per-run log for the two long, chatty commands whose output is captured by
-# default (eksctl create cluster, and the Phase-3 kubectl apply loop). Named per
-# cluster and per run so a later run cannot overwrite the log of the one being
-# debugged. Never deleted.
-_EKSCTL_LOG="/tmp/${CLUSTER_NAME}-eksctl-$(date +%s).log"
-_KUBECTL_LOG="/tmp/${CLUSTER_NAME}-kubectl-$(date +%s).log"
+# eksctl create cluster and the Phase-3 kubectl apply loop write to the run's detail
+# log like every other step. They used to have per-run files under /tmp; one log per
+# run, rotated by _deploy_log_init, is easier to find and to hand to someone.
+_EKSCTL_LOG="${DEPLOY_LOG}"
+_KUBECTL_LOG="${DEPLOY_LOG}"
 IMAGE_OUTPUTS="${SCRIPT_DIR}/.image-outputs.json"
 
 # Always read the outputs file if it exists (needed for --start-at to use the correct tag)
@@ -1873,10 +2216,10 @@ build_image_local() {
       --image-scanning-configuration scanOnPush=true >/dev/null
   case "${key}" in
     dlrm-bid-shader|ncf-deal-manager|yield-optimizer-floor|yield-optimizer-margin)
-      log "  Building ${repo} (amd64, tritonclient)"
-      docker buildx build --platform linux/amd64 --build-arg CONTAINER="containers/${key//-/_}" \
-        -f "${src}/triton/Dockerfile.triton-artf" -t "${image}" --load "${src}"
-      docker push "${image}" ;;
+      run_step "Building ${repo} (amd64, tritonclient)" \
+        docker buildx build --platform linux/amd64 --build-arg CONTAINER="containers/${key//-/_}" \
+          -f "${src}/triton/Dockerfile.triton-artf" -t "${image}" --load "${src}"
+      quiet "docker push ${repo}" docker push "${image}" ;;
     widedeep-segment-activator|metrics-enricher|artf-template)
       # No Triton dependency, so the plain ARTF Dockerfile rather than
       # Dockerfile.triton-artf. Segment activation was switched from the Wide &
@@ -1885,26 +2228,26 @@ build_image_local() {
       # was always rules; and artf-template ships as a pass-through with no
       # model at all. A user who adds a Triton model to the template should move
       # its key to the tritonclient case above.
-      log "  Building ${repo} (amd64)"
-      docker buildx build --platform linux/amd64 \
-        --build-arg CONTAINER="containers/${key//-/_}" --build-arg AGENT_NAME="${key}" \
-        -f "${src}/Dockerfile" -t "${image}" --load "${src}"
-      docker push "${image}" ;;
+      run_step "Building ${repo} (amd64)" \
+        docker buildx build --platform linux/amd64 \
+          --build-arg CONTAINER="containers/${key//-/_}" --build-arg AGENT_NAME="${key}" \
+          -f "${src}/Dockerfile" -t "${image}" --load "${src}"
+      quiet "docker push ${repo}" docker push "${image}" ;;
     orchestrator)
-      log "  Building ${repo} (amd64)"
-      docker buildx build --platform linux/amd64 --build-arg AGENT_NAME="artf-orchestrator" \
-        -f "${src}/Dockerfile.orchestrator" -t "${image}" --load "${src}"
-      docker push "${image}" ;;
+      run_step "Building ${repo} (amd64)" \
+        docker buildx build --platform linux/amd64 --build-arg AGENT_NAME="artf-orchestrator" \
+          -f "${src}/Dockerfile.orchestrator" -t "${image}" --load "${src}"
+      quiet "docker push ${repo}" docker push "${image}" ;;
     agentcore)
-      log "  Building ${repo} (arm64)"
-      docker buildx build --platform linux/arm64 \
-        -f "${src}/Dockerfile.agentcore" -t "${image}" --load "${src}"
-      docker push "${image}" ;;
+      run_step "Building ${repo} (arm64)" \
+        docker buildx build --platform linux/arm64 \
+          -f "${src}/Dockerfile.agentcore" -t "${image}" --load "${src}"
+      quiet "docker push ${repo}" docker push "${image}" ;;
     model-optimizer)
-      log "  Building ${repo} (amd64)"
-      docker buildx build --platform linux/amd64 \
-        -f "${src}/Dockerfile.optimizer" -t "${image}" --load "${src}"
-      docker push "${image}" ;;
+      run_step "Building ${repo} (amd64)" \
+        docker buildx build --platform linux/amd64 \
+          -f "${src}/Dockerfile.optimizer" -t "${image}" --load "${src}"
+      quiet "docker push ${repo}" docker push "${image}" ;;
     *)
       warn "  Unknown image key '${key}' — skipping" ;;
   esac
@@ -1961,6 +2304,14 @@ build_images() {
     fi
   done
 
+  if [[ ${#MISSING_KEYS[@]} -gt 0 ]]; then
+    # Read by _run_phase: a rebuilt image must be rolled out even when the probe
+    # says the phase that rolls it is already complete.
+    _IMAGES_REBUILT=1
+    for key in "${MISSING_KEYS[@]}"; do
+      [[ "${key}" == "agentcore" ]] && _AGENTCORE_IMAGE_REBUILT=1
+    done
+  fi
   if [[ ${#MISSING_KEYS[@]} -eq 0 ]]; then
     step "Step 4: All required images content-matched. Nothing to build."
   elif [[ "${LOCAL_BUILD}" -eq 0 ]]; then
@@ -1968,17 +2319,21 @@ build_images() {
     NGC_FLAG=()
     if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
     elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
-    bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
-      --stack-name "${STACK_NAME}" \
-      --only "${MISSING_KEYS[*]}" \
-      --tag "${IMAGE_TAG}" \
-      --region "${AWS_REGION}" \
-      --profile "${AWS_PROFILE}" \
-      "${NGC_FLAG[@]}"
+    # remote_build.sh narrates on stderr and polls CodeBuild every 15 s; all of that is
+    # in the detail log. The terminal shows this one label until the build finishes.
+    run_step "CodeBuild: ${#MISSING_KEYS[@]} image(s), tag ${IMAGE_TAG}" \
+      bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
+        --stack-name "${STACK_NAME}" \
+        --only "${MISSING_KEYS[*]}" \
+        --tag "${IMAGE_TAG}" \
+        --region "${AWS_REGION}" \
+        --profile "${AWS_PROFILE}" \
+        ${NGC_FLAG[@]+"${NGC_FLAG[@]}"}
+        # ^ bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`, so a
+        #   plain "${NGC_FLAG[@]}" aborts the run when no NGC flag was given.
   else
     step "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
-    aws ecr get-login-password --region "${AWS_REGION}" | \
-      docker login --username AWS --password-stdin "${REGISTRY}"
+    quiet "ECR login (${REGISTRY})" _ecr_docker_login
     for key in "${MISSING_KEYS[@]}"; do
       build_image_local "${key}"
     done
@@ -2032,8 +2387,7 @@ create_eks_cluster() {
   if [[ "${VERBOSE}" -eq 1 ]]; then
     eksctl create cluster -f "${CLUSTER_CONFIG}"
   else
-    say "  Creating the EKS cluster (15-20 min). Full eksctl output: ${_EKSCTL_LOG}"
-    say "    Follow it with: tail -f ${_EKSCTL_LOG}"
+    _log_section "eksctl create cluster ${CLUSTER_NAME}"
     eksctl create cluster -f "${CLUSTER_CONFIG}" >>"${_EKSCTL_LOG}" 2>&1
   fi
 }
@@ -2080,7 +2434,8 @@ ensure_eks_cluster() {
         warn "  Stack is in a failed state; deleting the orphaned cluster before recreating"
         # Prefer eksctl (cleans up all associated stacks); fall back to a raw
         # CFN delete if eksctl can't (the cluster resource may never have existed).
-        eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null \
+        quiet "eksctl delete cluster ${CLUSTER_NAME} (orphaned stack)" \
+          eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait \
           || aws cloudformation delete-stack --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}"
         aws cloudformation wait stack-delete-complete \
           --stack-name "${CLUSTER_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
@@ -2117,7 +2472,7 @@ if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
       while kill -0 "${_cluster_pid}" 2>/dev/null; do
         sleep 60
         kill -0 "${_cluster_pid}" 2>/dev/null || break
-        printf '  … still creating the EKS cluster (%dm elapsed) — tail %s\n' \
+        printf '  … still creating the EKS cluster (%dm elapsed; eksctl output in %s)\n' \
           "$(( ( $(date +%s) - _PHASE2_START ) / 60 ))" "${_EKSCTL_LOG}"
       done
     ) &
@@ -2126,7 +2481,7 @@ if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
   build_images
   if ! wait "${_cluster_pid}"; then
     stop_bg "${_heartbeat_pid}"
-    fail 2 "EKS cluster creation failed. Full eksctl output: ${_EKSCTL_LOG}. Check: eksctl get cluster --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+    fail 2 "EKS cluster creation failed. eksctl output is in ${_EKSCTL_LOG}; the resource-level reason is in CloudFormation: aws cloudformation describe-stack-events --stack-name <the eksctl-${CLUSTER_NAME}-* stack that failed> --region ${AWS_REGION} --query \"StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]\""
   fi
   stop_bg "${_heartbeat_pid}"
 elif [[ "${SKIP_IMAGES}" -eq 0 ]]; then
@@ -2175,21 +2530,26 @@ fi
 
 # --profile is written into the kubeconfig's exec block, so a kubectl run later from
 # a shell with a different AWS_PROFILE still authenticates as this deployment did.
-aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}"
+quiet "eks update-kubeconfig ${CLUSTER_NAME}" \
+  aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}"
+
 
 # =========================================================================
 # Step 6: Install NVIDIA Kubernetes Device Plugin + Prometheus Operator CRDs
 # =========================================================================
 step "Step 6: Ensuring NVIDIA Kubernetes Device Plugin"
-kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml 2>/dev/null || true
+quiet "kubectl apply nvidia-device-plugin" \
+  kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml || true
 
 log "  Ensuring Prometheus Operator CRDs (for Triton metrics)"
 if ! kubectl get crd podmonitors.monitoring.coreos.com >/dev/null 2>&1; then
-  kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.75.0/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml 2>/dev/null || \
+  quiet "kubectl apply PodMonitor CRD" \
+    kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.75.0/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml || \
     warn "Could not install PodMonitor CRD"
 fi
 if ! kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null 2>&1; then
-  kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.75.0/example/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml 2>/dev/null || \
+  quiet "kubectl apply PrometheusRule CRD" \
+    kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.75.0/example/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml || \
     warn "Could not install PrometheusRule CRD"
 fi
 
@@ -2205,21 +2565,22 @@ if aws iam get-policy --policy-arn "${TRITON_POLICY_ARN}" >/dev/null 2>&1; then
   aws iam create-policy-version \
     --policy-arn "${TRITON_POLICY_ARN}" \
     --policy-document "${POLICY_DOC}" \
-    --set-as-default 2>/dev/null || true
+    --set-as-default >>"${DEPLOY_LOG:-/dev/null}" 2>&1 || true
 else
   aws iam create-policy \
     --policy-name "${TRITON_POLICY_NAME}" \
     --policy-document "${POLICY_DOC}" >/dev/null
 fi
 
-eksctl create iamserviceaccount \
-  --name triton-sa \
-  --namespace default \
-  --cluster "${CLUSTER_NAME}" \
-  --region "${AWS_REGION}" \
-  --attach-policy-arn "${TRITON_POLICY_ARN}" \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+quiet "eksctl create iamserviceaccount triton-sa" \
+  eksctl create iamserviceaccount \
+    --name triton-sa \
+    --namespace default \
+    --cluster "${CLUSTER_NAME}" \
+    --region "${AWS_REGION}" \
+    --attach-policy-arn "${TRITON_POLICY_ARN}" \
+    --approve \
+    --override-existing-serviceaccounts || true
 
 # eksctl returns before the ServiceAccount's IRSA annotation is guaranteed to
 # be readable back from the API server. Reading it immediately after create
@@ -2260,21 +2621,22 @@ if aws iam get-policy --policy-arn "${OPTIMIZER_POLICY_ARN}" >/dev/null 2>&1; th
   aws iam create-policy-version \
     --policy-arn "${OPTIMIZER_POLICY_ARN}" \
     --policy-document "${OPTIMIZER_POLICY_DOC}" \
-    --set-as-default 2>/dev/null || true
+    --set-as-default >>"${DEPLOY_LOG:-/dev/null}" 2>&1 || true
 else
   aws iam create-policy \
     --policy-name "${OPTIMIZER_POLICY_NAME}" \
     --policy-document "${OPTIMIZER_POLICY_DOC}" >/dev/null
 fi
 
-eksctl create iamserviceaccount \
-  --name model-optimizer-sa \
-  --namespace default \
-  --cluster "${CLUSTER_NAME}" \
-  --region "${AWS_REGION}" \
-  --attach-policy-arn "${OPTIMIZER_POLICY_ARN}" \
-  --approve \
-  --override-existing-serviceaccounts 2>/dev/null || true
+quiet "eksctl create iamserviceaccount model-optimizer-sa" \
+  eksctl create iamserviceaccount \
+    --name model-optimizer-sa \
+    --namespace default \
+    --cluster "${CLUSTER_NAME}" \
+    --region "${AWS_REGION}" \
+    --attach-policy-arn "${OPTIMIZER_POLICY_ARN}" \
+    --approve \
+    --override-existing-serviceaccounts || true
 
 # Same eksctl/kubectl propagation race as triton-sa above -- poll instead of
 # reading the annotation once.
@@ -2313,7 +2675,7 @@ if aws iam get-policy --policy-arn "${DYNAMO_POLICY_ARN}" >/dev/null 2>&1; then
   aws iam create-policy-version \
     --policy-arn "${DYNAMO_POLICY_ARN}" \
     --policy-document "${DYNAMO_POLICY_DOC}" \
-    --set-as-default 2>/dev/null || true
+    --set-as-default >>"${DEPLOY_LOG:-/dev/null}" 2>&1 || true
 else
   aws iam create-policy \
     --policy-name "${DYNAMO_POLICY_NAME}" \
@@ -2337,7 +2699,7 @@ if aws iam get-policy --policy-arn "${EKS_SCALE_POLICY_ARN}" >/dev/null 2>&1; th
   aws iam create-policy-version \
     --policy-arn "${EKS_SCALE_POLICY_ARN}" \
     --policy-document "${EKS_SCALE_POLICY_DOC}" \
-    --set-as-default 2>/dev/null || true
+    --set-as-default >>"${DEPLOY_LOG:-/dev/null}" 2>&1 || true
 else
   aws iam create-policy \
     --policy-name "${EKS_SCALE_POLICY_NAME}" \
@@ -2430,13 +2792,13 @@ phase 3 "Deploying workloads"
 step "Step 8: Applying Kubernetes manifests"
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
-log "  Provisioning Cognito User Pool (needed for orchestrator auth)..."
-${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
-  --action deploy \
-  --stack-name "${STACK_NAME}" \
-  --region "${AWS_REGION}" \
-  --profile "${AWS_PROFILE}" \
-  --cloudfront-domain "${CF_DOMAIN:-localhost}"
+run_step "Provisioning the Cognito user pool (orchestrator auth)" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+    --action deploy \
+    --stack-name "${STACK_NAME}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
+    --cloudfront-domain "${CF_DOMAIN:-localhost}"
 
 # Bedrock grant for the Auction Theater captions. Applied HERE, in the base
 # deploy, and not alongside the closed-loop agent grant: that one needs AgentCore
@@ -2444,12 +2806,12 @@ ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
 # nothing but the role that was just created. Gating it the same way would ship a
 # theater whose captions never generate, with no error anywhere but the browser
 # console -- the fallback caption is correct, so nothing would look broken.
-log "  Granting Bedrock invoke for Auction Theater captions..."
-${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
-  --action grant-caption-invoke \
-  --stack-name "${STACK_NAME}" \
-  --region "${AWS_REGION}" \
-  --profile "${AWS_PROFILE}" \
+quiet "deploy_cognito.py grant-caption-invoke" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+    --action grant-caption-invoke \
+    --stack-name "${STACK_NAME}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
   || warn "Caption grant failed - theater captions will fall back to factual text."
 
 COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
@@ -2556,7 +2918,7 @@ sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
     "${SCRIPT_DIR}/eks/model-optimizer-bootstrap-job.yaml" > "${BOOTSTRAP_MANIFEST}"
 # Jobs are immutable — delete any prior run before re-applying (idempotent redeploy).
 kubectl delete job model-optimizer-bootstrap --ignore-not-found >/dev/null 2>&1 || true
-kubectl apply -f "${BOOTSTRAP_MANIFEST}"
+quiet "kubectl apply model-optimizer-bootstrap Job" kubectl apply -f "${BOOTSTRAP_MANIFEST}"
 
 # FR-9: do NOT block deploy.sh on the bootstrap Job's completion. Nothing
 # downstream (frontend, Cognito, AgentCore, closed-loop) depends on the
@@ -2596,7 +2958,7 @@ log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat 
 # NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
 # node group (role=services) since they call Triton over the network and hold no
 # GPU; --artf-node-role=inference co-locates them on the GPU node instead.
-_APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml triton-hpa.yaml)
+_APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml)
 for manifest in "${_APPLIED_MANIFESTS[@]}"; do
   PROCESSED="/tmp/${CLUSTER_NAME}-${manifest}"
   sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
@@ -2631,15 +2993,9 @@ for manifest in "${_APPLIED_MANIFESTS[@]}"; do
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
-  if [[ "${VERBOSE}" -eq 1 ]]; then
-    kubectl apply -f "${PROCESSED}"
-  else
-    kubectl apply -f "${PROCESSED}" >>"${_KUBECTL_LOG}" 2>&1
-  fi
+  quiet "kubectl apply ${manifest}" kubectl apply -f "${PROCESSED}"
 done
-if [[ "${VERBOSE}" -eq 0 ]]; then
-  say "  Applied ${#_APPLIED_MANIFESTS[@]} manifests — full kubectl output: ${_KUBECTL_LOG}"
-fi
+log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"
 
 # --- Prune pre-split Yield Optimizer objects.
 # `kubectl apply` only creates and updates; it NEVER deletes objects that were
@@ -2684,39 +3040,41 @@ for DEPLOY in bid-pricer audience-activator deal-scorer signals-enricher \
   fi
 done
 
-log "  Waiting for Triton Inference Server..."
-kubectl rollout status deployment/triton-inference-server --timeout=300s || \
+run_step "Waiting for Triton Inference Server to roll out" \
+  kubectl rollout status deployment/triton-inference-server --timeout=300s || \
   warn "Triton not ready yet — check GPU node availability with: kubectl get nodes -l nvidia.com/gpu=present"
 
-log "  Waiting for orchestrator..."
-kubectl rollout status deployment/orchestrator --timeout=120s || true
+run_step "Waiting for the orchestrator to roll out" \
+  kubectl rollout status deployment/orchestrator --timeout=120s || true
 
 # NOTE: the orchestrator is intentionally NOT patched with any agent runtime ARN.
 # It must never invoke the closed-loop agents (FR-6) — the browser invokes them
 # directly via SigV4. Agent ARNs are wired into the frontend build in Step 11.
 
-# Wait for the LoadBalancer to get an external hostname
-log "  Waiting for orchestrator LoadBalancer endpoint..."
-LB_WAIT_TIMEOUT=120
-LB_WAIT_INTERVAL=10
-LB_ELAPSED=0
-NLB_DNS=""
-while [[ -z "${NLB_DNS}" || "${NLB_DNS}" == "pending" ]]; do
-  NLB_DNS="$(kubectl get svc orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
-  if [[ -n "${NLB_DNS}" && "${NLB_DNS}" != "pending" ]]; then
-    log "  LoadBalancer ready: ${NLB_DNS}"
-    state_set "${STACK_PREFIX}" resolved "orchestratorNlbDns=${NLB_DNS}"
-    break
-  fi
-  if [[ "${LB_ELAPSED}" -ge "${LB_WAIT_TIMEOUT}" ]]; then
-    warn "LoadBalancer not ready after ${LB_WAIT_TIMEOUT}s — frontend will use placeholder URL."
-    NLB_DNS="localhost"
-    break
-  fi
-  log "  Waiting for LoadBalancer... (${LB_ELAPSED}s / ${LB_WAIT_TIMEOUT}s)"
-  sleep "${LB_WAIT_INTERVAL}"
-  LB_ELAPSED=$((LB_ELAPSED + LB_WAIT_INTERVAL))
-done
+# =========================================================================
+# Step 8.4: UI API proxy Lambda -- the orchestrator's only way in
+# =========================================================================
+# The browser reaches the orchestrator through this Lambda, which forwards from
+# inside the VPC to the orchestrator's internal NLB (eks/orchestrator-internal-nlb.yaml,
+# applied with the other manifests above). The NLB hostname is waited for here, passed
+# to the stack, and recorded; then the function is invoked once to prove the path
+# works before the UI build in Step 9 bakes the function ARN into the bundle. The
+# Identity Pool authenticated role is granted lambda:InvokeFunction on exactly this
+# function.
+step "Step 8.4: Deploying the UI API proxy Lambda (${UI_API_PROXY_STACK})"
+resolve_orchestrator_internal_url 3
+state_set "${STACK_PREFIX}" resolved "orchestratorInternalUrl=${ORCHESTRATOR_INTERNAL_URL}"
+deploy_ui_api_proxy 3 "${ORCHESTRATOR_INTERNAL_URL}"
+state_set "${STACK_PREFIX}" resolved "uiApiProxyArn=${UI_API_PROXY_ARN}"
+verify_ui_api_proxy 3
+quiet "deploy_cognito.py grant-ui-api-invoke" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+    --action grant-ui-api-invoke \
+    --stack-name "${STACK_NAME}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}" \
+    --ui-api-proxy-arn "${UI_API_PROXY_ARN}" \
+  || fail 3 "Could not grant the Identity Pool authenticated role lambda:InvokeFunction on ${UI_API_PROXY_ARN}; the UI would have no route to the orchestrator."
 
 # =========================================================================
 # Step 8.5: Schedule GPU node group shutdown at 8pm ET daily
@@ -2782,15 +3140,16 @@ VITE_BEDROCK_REGION=${AWS_REGION}
 VITE_CAPTION_INFERENCE_PROFILE_ID=${CAPTION_INFERENCE_PROFILE_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=
 VITE_GOVERNANCE_RUNTIME_ARN=
+VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}
 EOF
 
-# React UI distribution
-${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
-  --action deploy \
-  --stack-name "${STACK_NAME}" \
-  --region "${AWS_REGION}" \
-  --profile "${AWS_PROFILE}" \
-  --orchestrator-url "http://${NLB_DNS}"
+# React UI distribution (static-only CloudFront; API calls go browser -> ui-api-proxy)
+run_step "Building and publishing the frontend (S3 + CloudFront)" \
+  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+    --action deploy \
+    --stack-name "${STACK_NAME}" \
+    --region "${AWS_REGION}" \
+    --profile "${AWS_PROFILE}"
 
 PRIMARY_OUTPUTS="${SCRIPT_DIR}/.frontend-outputs.json"
 CF_DOMAIN="$(jq -r '.CloudFrontDomain // empty' "${PRIMARY_OUTPUTS}" 2>/dev/null || echo '')"
@@ -2798,12 +3157,13 @@ state_set "${STACK_PREFIX}" resolved "cloudFrontDomain=${CF_DOMAIN}"
 
 # Update Cognito callback URLs now that we know the CF domain
 if [[ -n "${CF_DOMAIN}" && -n "${COGNITO_USER_POOL_ID}" ]]; then
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
-    --action deploy \
-    --stack-name "${STACK_NAME}" \
-    --region "${AWS_REGION}" \
-    --profile "${AWS_PROFILE}" \
-    --cloudfront-domain "${CF_DOMAIN}"
+  quiet "deploy_cognito.py: callback URLs for ${CF_DOMAIN}" \
+    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+      --action deploy \
+      --stack-name "${STACK_NAME}" \
+      --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
+      --cloudfront-domain "${CF_DOMAIN}"
 fi
 
 # --- Step 9d: Ensure a default admin user exists ---
@@ -2868,10 +3228,9 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   step "Step 10: Deploying AgentCore MCP runtime"
 
   # The AgentCore SDK logs progress at INFO, which put dozens of lines into the
-  # middle of an otherwise quiet deployment. It goes to a file like every other
-  # phase's detail; run_logged still tails it inline if the deploy fails.
-  _AC_LOG="${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-agentcore.log"
-  : > "${_AC_LOG}" 2>/dev/null || _AC_LOG="/tmp/deploy-agentcore-$$.log"
+  # middle of an otherwise quiet deployment. It goes to the run's detail log like
+  # every other step; run_logged still tails it inline if the deploy fails.
+  _AC_LOG="${DEPLOY_LOG}"
 
   ROLE_NAME="${STACK_NAME}-agentcore-role-${STACK_UID}"
   ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
@@ -2953,9 +3312,11 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   # stdout only, so when it failed for real the error existed nowhere but the
   # terminal scrollback -- and "check the output above" is useless to anyone who
   # detached, closed the tab, or came back the next morning. It now lands in a file
-  # named by the failure message, and in the journal so a follower sees it too.
-  _CL_LOG="${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-closed-loop.log"
-  : > "${_CL_LOG}" 2>/dev/null || _CL_LOG="/tmp/deploy-closed-loop-$$.log"
+  # named by the failure message. It is the run's detail log: the child's own quiet
+  # mode (same contract as this script) sends its chatty children there directly,
+  # and its step lines reach both the terminal and the log through this tee.
+  _CL_LOG="${DEPLOY_LOG}"
+  _log_section "deploy_closed_loop.sh"
   _CL_TEE=("${_CL_LOG}")
 
   # PIPESTATUS[0], not $?: a pipeline reports its LAST element, so `... | tee`
@@ -3054,13 +3415,30 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
   # property of the checkout, not of the code, and losing it turned a working deploy
   # into "Permission denied" at Step 12 with Phases 1-4 already applied. Nothing here
   # needs the mode bit to be right.
+  #
+  # PREBID_DETAIL_LOG switches the child into the same quiet contract as this script:
+  # its step lines come to the terminal, its narration and its chatty children go to
+  # the detail log. Run standalone (no PREBID_DETAIL_LOG) it streams everything, as it
+  # always did. --verbose is passed through so one flag governs both.
+  if [[ "${VERBOSE}" -eq 1 ]]; then PREBID_ARGS="${PREBID_ARGS} --verbose"; fi
+  _log_section "deploy_prebid.sh"
+  set +e
+  PREBID_DETAIL_LOG="${DEPLOY_LOG}" \
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
-  bash "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} || {
+  bash "${SCRIPT_DIR}/deploy_prebid.sh" ${PREBID_ARGS} 2>&1 \
+    | tee -a "${DEPLOY_LOG}"
+  _PB_RC=${PIPESTATUS[0]}
+  set -e
+  if [[ "${_PB_RC}" -ne 0 ]]; then
     _DEPLOY_DEGRADED=1
-    _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the Prebid ARTF host (deploy_prebid.sh exited non-zero)"
-    warn "Prebid deployment returned non-zero. Check the output above for the real error."
+    _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the Prebid ARTF host (deploy_prebid.sh exited ${_PB_RC})"
+    warn "Prebid deployment exited ${_PB_RC}. Last 15 lines of its output:"
+    tail -15 "${DEPLOY_LOG}" 2>/dev/null | while IFS= read -r _pb_line; do
+      printf '         %s\n' "${_pb_line}"
+    done
+    warn "Full output: ${DEPLOY_LOG}"
     warn "Re-run on its own: ${SCRIPT_DIR}/deploy_prebid.sh ${PREBID_ARGS}"
-  }
+  fi
 else
   log ""
   log "  Skipping the Prebid ARTF host (pass --with-prebid to enable)."
@@ -3081,7 +3459,7 @@ fi # _run_phase 5 (Phase 5)
 # frontend URL and endpoint even though both already existed -- the phase that
 # assigns those variables simply had not run this time.
 CF_DOMAIN="${CF_DOMAIN:-$(state_read "${STACK_PREFIX}" resolved.cloudFrontDomain)}"
-NLB_DNS="${NLB_DNS:-$(state_read "${STACK_PREFIX}" resolved.orchestratorNlbDns)}"
+UI_API_PROXY_ARN="${UI_API_PROXY_ARN:-$(state_read "${STACK_PREFIX}" resolved.uiApiProxyArn)}"
 COGNITO_USER_POOL_ID="${COGNITO_USER_POOL_ID:-$(state_read "${STACK_PREFIX}" resolved.cognitoUserPoolId)}"
 
 # print_demo_credentials(): the login block, called from BOTH the success and the
@@ -3144,7 +3522,7 @@ if [[ "${_DEPLOY_DEGRADED}" -ne 0 ]]; then
   say ""
   say "  What already works:"
   say "    Frontend:  https://${CF_DOMAIN:-'(not deployed)'}"
-  say "    Endpoint:  http://${NLB_DNS:-'(not deployed)'}/v1/mutations"
+  say "    UI API:    ${UI_API_PROXY_ARN:-'(not deployed)'}  (Lambda; the orchestrator has no public address)"
   say ""
   print_demo_credentials
   say ""
@@ -3166,8 +3544,13 @@ say "  Accelerator-optimized Agentic Bidding — Deployed (EKS + Triton)"
 say "========================================================="
 say ""
 say "  Frontend:    https://${CF_DOMAIN:-'(pending)'}"
-say "  Endpoint:    http://${NLB_DNS:-'(pending)'}/v1/mutations"
-say "  Health:      http://${NLB_DNS:-'(pending)'}/health/ready"
+say "  UI API:      ${UI_API_PROXY_ARN:-'(pending)'}"
+say "               (Lambda invoked by the browser; forwards to the orchestrator's"
+say "               internal NLB. The orchestrator has no public address.)"
+say "  Orchestrator internal NLB: ${ORCHESTRATOR_INTERNAL_URL:-'(pending)'}/health/ready"
+say "               (reachable only from inside the VPC)"
+say "  Orchestrator in-cluster:  http://orchestrator.default.svc.cluster.local/health/ready"
+say "               (kubectl port-forward svc/orchestrator 8080:80 to reach it from here)"
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
 say "  AgentCore:   See runtime ARN above"
 fi

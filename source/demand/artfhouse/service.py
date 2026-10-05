@@ -3,10 +3,11 @@
 Sequences the pure modules and assembles the response. Holds no decision logic of
 its own:
 
-  1. read ``imp.pmp.deals``
+  1. read ``imp.pmp.deals`` and the user's audience segments
   2. evaluate eligibility against the catalog
   3. resolve the binding floor per candidate
-  4. build bids; below-floor candidates become exclusions
+  4. build bids (catalogued CPM plus any audience uplift); below-floor candidates
+     become exclusions
   5. assemble a single seatbid plus ``ext.artf.excluded``
 
 This endpoint computes NO winner and NO clearing price. Prebid resolves the auction;
@@ -53,6 +54,26 @@ def validate(bid_request: Optional[dict]) -> list[str]:
     return errors
 
 
+def user_segment_ids(bid_request: dict) -> tuple[str, ...]:
+    """Every segment id on ``user.data[].segment[]``, as strings, in request order.
+
+    One flat tuple across providers: the publisher's DMP and the ARTF Audience
+    Activator both write here, under different ``data[].name`` values, and a buyer
+    pricing on an audience does not care which provider asserted it.
+    """
+    user = bid_request.get("user")
+    if not isinstance(user, dict):
+        return ()
+    out: list[str] = []
+    for provider in user.get("data") or []:
+        if not isinstance(provider, dict):
+            continue
+        for segment in provider.get("segment") or []:
+            if isinstance(segment, dict) and segment.get("id") is not None:
+                out.append(str(segment["id"]))
+    return tuple(out)
+
+
 class DemandDecisionService:
     """One pass over a bid request."""
 
@@ -74,6 +95,7 @@ class DemandDecisionService:
 
         all_bids: list[bid_builder.Bid] = []
         all_exclusions: list[bid_builder.Exclusion] = []
+        segment_ids = user_segment_ids(bid_request)
 
         for imp in bid_request["imp"]:
             candidates = evaluate(imp, self._catalog)
@@ -83,7 +105,7 @@ class DemandDecisionService:
                 for c in candidates
             }
 
-            result = bid_builder.build(imp["id"], candidates, resolved)
+            result = bid_builder.build(imp["id"], candidates, resolved, segment_ids)
             all_bids.extend(result.bids)
             all_exclusions.extend(result.exclusions)
 

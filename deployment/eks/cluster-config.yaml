@@ -26,6 +26,17 @@ metadata:
 # capacity resilience; see the note on instanceTypes below for what does not.
 availabilityZones: ["__REGION__a", "__REGION__b", "__REGION__c"]
 
+# Nodes are PRIVATE (privateNetworking: true on every nodegroup below), so all node
+# egress -- ECR pulls, S3 model traffic, STS, nvcr.io, the GitHub-hosted device-plugin
+# and CRD manifests -- leaves through NAT gateways. One per AZ rather than eksctl's
+# default of one in total: with a single gateway, that AZ's loss takes every node's
+# outbound path with it, and the three-AZ spread above exists precisely so one AZ is
+# not load-bearing. Cost: three NAT gateway hours plus per-GB processing instead of
+# one; see the README cost table.
+vpc:
+  nat:
+    gateway: HighlyAvailable
+
 managedNodeGroups:
   # GPU node group for Triton Inference Server.
   #
@@ -46,8 +57,21 @@ managedNodeGroups:
   # tensorrt_plan) compiled by the Model Optimizer for A10G; a plan built for one
   # GPU arch will NOT load on another. Do NOT add g4dn (T4, sm_75) or g6 (L4,
   # sm_89) here — it would silently break Triton engine loading.
+  #
+  # privateNetworking: true -- nodes launch in the private subnets with no public IP.
+  # eksctl's default places managed nodes in the PUBLIC subnets, and that is what
+  # fails in an account with VPC Block Public Access in block-ingress
+  # mode, under which only NAT-gateway traffic is allowed, so nodes routing via the
+  # internet gateway could not reach the EKS endpoint or ECR and never joined
+  # ("NodeCreationFailure: Instances failed to join the kubernetes cluster", on the
+  # CPU nodes as well as the GPU node). Nothing reaches a node directly, and
+  # nothing in the cluster is internet-facing: the orchestrator is a ClusterIP
+  # Service reached by the ui-api-proxy Lambda inside the VPC, Triton is behind
+  # an internal NLB, Prebid Server is in-cluster over service DNS, and the VPC
+  # proxy Lambda sits inside the VPC.
   - name: gpu-inference
     instanceTypes: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+    privateNetworking: true
     desiredCapacity: 1
     minSize: 1
     maxSize: __MAX_GPUS__
@@ -73,6 +97,7 @@ managedNodeGroups:
   # gives real headroom for those HPAs to scale into.
   - name: cpu-services
     instanceType: c5.2xlarge
+    privateNetworking: true   # see gpu-inference above
     desiredCapacity: 3
     minSize: 2
     maxSize: 8

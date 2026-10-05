@@ -103,11 +103,25 @@ for arg in "$@"; do
         NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
         DEPLOY_PROFILE="${arg}"
+      else
+        # An unrecognised token used to fall through silently. The em/en dash case is
+        # called out because a pasted "—prefix" looks like "--prefix" in most fonts.
+        _dash_hint=""
+        case "${arg}" in
+          $'\xe2\x80\x94'*|$'\xe2\x80\x93'*) _dash_hint=" (that first character is an em/en dash, not two hyphens)" ;;
+        esac
+        printf '\033[0;31m[closed-loop][fail]\033[0m %s\n' "unknown argument '${arg}'${_dash_hint} -- see deploy_closed_loop.sh --help" >&2
+        exit 1
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
+case "${_PREV_ARG:-}" in
+  --prefix|--start-at|--ngc-secret|--ngc-key|--profile)
+    printf '\033[0;31m[closed-loop][fail]\033[0m %s\n' "${_PREV_ARG} needs a value (it was the last argument)" >&2
+    exit 1 ;;
+esac
 unset _PREV_ARG
 # Exported before the first aws call so every aws/kubectl/docker-login/python3
 # call below, and every child this script starts, uses the same credentials.
@@ -141,6 +155,43 @@ ok() { done_ok "$*"; }
 # Where the noisy commands' output goes. deploy.sh passes its Phase 5 log so there
 # is ONE file to read after a failure; standalone runs get their own.
 CL_DETAIL_LOG="${CL_DETAIL_LOG:-${SCRIPT_DIR}/.deploy${STACK_PREFIX:+-${STACK_PREFIX}}-closed-loop-detail.log}"
+
+# quiet <label> <command...> / run_step <label> <command...>: the same two helpers
+# deploy.sh has. quiet() sends a short command's output to CL_DETAIL_LOG and prints
+# the log's tail if it fails; run_step() does the same for a command a human waits
+# on, with a visible label while it runs. Under --verbose both run the command
+# unchanged. The return code is always the command's.
+quiet() {
+  local label="$1"; shift
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    "$@"
+    return $?
+  fi
+  {
+    printf '\n===== %s =====\n' "${label}"
+    printf '===== %s =====\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >> "${CL_DETAIL_LOG}" 2>/dev/null || true
+  local rc=0
+  local _ee=0; case "$-" in *e*) _ee=1 ;; esac
+  set +e
+  "$@" >> "${CL_DETAIL_LOG}" 2>&1
+  rc=$?
+  if [[ "${_ee}" -eq 1 ]]; then set -e; fi
+  if [[ "${rc}" -ne 0 ]]; then
+    printf '\033[0;31m[closed-loop][fail]\033[0m %s (exit %s) -- last 15 lines of %s:\n' "${label}" "${rc}" "${CL_DETAIL_LOG}" >&2
+    tail -15 "${CL_DETAIL_LOG}" 2>/dev/null | sed 's/^/      /' >&2
+  fi
+  return "${rc}"
+}
+run_step() {
+  local label="$1"; shift
+  if [[ "${VERBOSE}" -eq 1 ]]; then
+    step "${label}"
+    "$@"
+    return $?
+  fi
+  run_logged "${CL_DETAIL_LOG}" "${label}" "$@"
+}
 
 # AgentCore VPC-supported Availability Zone IDs per region. Subnets outside these
 # AZs fail AgentCore runtime creation. Extend as AgentCore adds regions.
@@ -528,8 +579,8 @@ log "  SageMaker Training Execution Role: ${SAGEMAKER_TRAINING_ROLE_ARN:-<not cr
 # fine-tune from. Skips honestly (non-fatal) if MODEL_BUCKET is not set - that
 # only happens when deploy_closed_loop.sh is run standalone without deploy.sh.
 if [[ -n "${MODEL_BUCKET:-}" ]]; then
-  log "  Registering genesis models (idempotent) from s3://${MODEL_BUCKET}/onnx-source/..."
-  python3 "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
+  run_step "Registering genesis models in the Model Registry" \
+    python3 "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
     --model-bucket "${MODEL_BUCKET}" \
     --region "${AWS_REGION}" \
     --profile "${AWS_PROFILE}" \
@@ -576,8 +627,8 @@ log "  PARAM_TABLE_NAME=${PARAM_TABLE_NAME}  AUDIT_TABLE_NAME=${AUDIT_TABLE_NAME
 # Idempotently seed the bidding parameters so the Adaptive Bidding agent has values
 # to read on the scheduled EventBridge path (which never calls the orchestrator's
 # /generate seeder). Safe to re-run — existing parameters are left untouched.
-log "  Seeding parameter store (idempotent) so the agent works on the EventBridge path..."
-python3 "${SCRIPT_DIR}/scripts/init_parameter_store.py" \
+quiet "init_parameter_store.py (seed ${PARAM_TABLE_NAME})" \
+  python3 "${SCRIPT_DIR}/scripts/init_parameter_store.py" \
   --table-name "${PARAM_TABLE_NAME}" \
   --region "${AWS_REGION}" \
   --profile "${AWS_PROFILE}" \
@@ -712,15 +763,19 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
     # shellcheck source=lib/deploy_docker.sh
     source "${SCRIPT_DIR}/lib/deploy_docker.sh"
     docker_ensure_running "build the NeMo-RL training image locally"
-    aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${TRAINING_REGISTRY}" 2>/dev/null
-    docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SCRIPT_DIR}/../source/training/container/"
+    _training_ecr_login() {
+      aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${TRAINING_REGISTRY}"
+    }
+    quiet "ECR login (${TRAINING_REGISTRY})" _training_ecr_login
+    run_step "Building the NeMo-RL training image (amd64)" \
+      docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SCRIPT_DIR}/../source/training/container/"
     # src-<hash> is pushed alongside dlrm/ncf so the next run can tell this
     # image was built from the current source (see the hash note above).
     NEMO_PUSH_TAGS=(dlrm ncf)
     [[ -n "${NEMO_SRC_TAG}" ]] && NEMO_PUSH_TAGS+=("${NEMO_SRC_TAG}")
     for tag in "${NEMO_PUSH_TAGS[@]}"; do
       docker tag "${TRAINING_REPO}:latest" "${TRAINING_REGISTRY}/${TRAINING_REPO}:${tag}"
-      docker push "${TRAINING_REGISTRY}/${TRAINING_REPO}:${tag}"
+      quiet "docker push ${TRAINING_REPO}:${tag}" docker push "${TRAINING_REGISTRY}/${TRAINING_REPO}:${tag}"
     done
     cat > "${NEMO_OUTPUTS}" <<EOF
 {
@@ -1152,19 +1207,18 @@ except Exception:
   # are live, grant the Cognito Identity-Pool auth role scoped InvokeAgentRuntime and
   # rebuild+redeploy the UI so the browser can call the agents directly via SigV4 (FR-6).
   #
-  # Guard: a frontend re-deploy REPLACES the CloudFront origins. deploy_frontend.py
-  # only keeps the /api (ALB) origin when it is given a real orchestrator URL — a
-  # localhost fallback would DROP that origin and break the live UI. So if the
-  # orchestrator NLB can't be resolved we skip the rebuild and say so, rather than
-  # ship a broken distribution.
+  # The rebuilt bundle must also carry VITE_UI_API_PROXY_ARN: the UI reaches the
+  # orchestrator by invoking the <prefix>-ui-api-proxy Lambda (deploy.sh Step 8.4),
+  # not through CloudFront. A rebuild without it would ship a UI with no route to
+  # the orchestrator, so a missing proxy stack skips the rebuild and says so.
   # -----------------------------------------------------------------------
   if [[ -n "${ADAPTIVE_BIDDING_RUNTIME_ARN}" || -n "${GOVERNANCE_RUNTIME_ARN}" ]]; then
     step "Step 7: Rewiring the UI with the closed-loop agent runtime ARNs"
 
     # Grant the Identity Pool authenticated role least-privilege InvokeAgentRuntime,
     # scoped to exactly these two runtimes (+ their DEFAULT endpoint sub-resources).
-    log "  Granting scoped InvokeAgentRuntime to the Cognito Identity Pool auth role..."
-    python3 "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+    quiet "deploy_cognito.py grant-agent-invoke" \
+      python3 "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
       --action grant-agent-invoke \
       --stack-name "${STACK_NAME}" \
       --region "${AWS_REGION}" \
@@ -1173,21 +1227,13 @@ except Exception:
       --governance-runtime-arn "${GOVERNANCE_RUNTIME_ARN}" \
       || warn "  Could not attach scoped InvokeAgentRuntime policy to the auth role"
 
-    # Resolve the orchestrator NLB so the CloudFront /api origin (ALB) is preserved
-    # on re-deploy. Requires cluster access (CLUSTER_NAME is passed by deploy.sh).
-    if [[ -n "${CLUSTER_NAME}" ]]; then
-      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" >/dev/null 2>&1 || true
-    fi
-    UI_NLB_DNS=""
-    if command -v kubectl >/dev/null 2>&1; then
-      UI_NLB_DNS="$(kubectl get svc orchestrator -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
-    fi
+    UI_API_PROXY_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}ui-api-proxy"
+    UI_API_PROXY_ARN="$(get_stack_output "${UI_API_PROXY_STACK}" "ProxyFunctionArn" | grep -v '^None$' | head -n 1)"
 
-    if [[ -z "${UI_NLB_DNS}" ]]; then
-      warn "  Could not resolve the orchestrator NLB endpoint (cluster unreachable?)."
-      warn "  Skipping the UI rebuild: re-deploying with a placeholder URL would drop the"
-      warn "  CloudFront /api origin and break the live UI. Re-run with CLUSTER_NAME set,"
-      warn "  or run  ./deploy.sh --ui-only  to rebuild the UI with the current agent ARNs."
+    if [[ -z "${UI_API_PROXY_ARN}" ]]; then
+      warn "  UI API proxy stack ${UI_API_PROXY_STACK} not found (deploy.sh Step 8.4 creates it)."
+      warn "  Skipping the UI rebuild: a bundle without VITE_UI_API_PROXY_ARN has no route to"
+      warn "  the orchestrator. Run  ./deploy.sh --ui-only  once the proxy stack exists."
     else
       # Read the existing Cognito auth config so the rebuilt bundle keeps working logins.
       COGNITO_OUTPUTS="${SCRIPT_DIR}/.cognito-outputs.json"
@@ -1204,16 +1250,16 @@ VITE_COGNITO_REGION=${AWS_REGION}
 VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}
 VITE_GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}
+VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}
 EOF
-      log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}"
+      log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}  ui-api-proxy=${UI_API_PROXY_ARN}"
 
-      log "  Rebuilding + redeploying the React UI..."
-      python3 "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+      run_step "Rebuilding the frontend with the agent runtime ARNs" \
+        python3 "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
         --action deploy \
         --stack-name "${STACK_NAME}" \
         --region "${AWS_REGION}" \
         --profile "${AWS_PROFILE}" \
-        --orchestrator-url "http://${UI_NLB_DNS}" \
         || warn "  Frontend re-deploy failed — UI still shows the previous (empty-ARN) build."
       log "  UI rebuilt with agent runtime ARNs."
     fi

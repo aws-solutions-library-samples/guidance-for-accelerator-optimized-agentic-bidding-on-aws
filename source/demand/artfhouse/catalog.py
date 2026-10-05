@@ -58,16 +58,53 @@ class Campaign:
     #: Creative duration in seconds. Video only; ignored for banner. Video slots
     #: state minduration/maxduration, and a creative outside that range cannot run.
     duration: Optional[int] = None
+    #: What this buyer pays extra when the user carries one of its target audience
+    #: segments. None means the campaign prices on content only.
+    audience_uplift: Optional["AudienceUplift"] = None
+
+    def price_for(self, segment_ids: tuple[str, ...]) -> float:
+        """The CPM this campaign offers to a user carrying ``segment_ids``.
+
+        The declared CPM, plus the uplift when any target segment is present. The
+        catalog is still the single source of the price: both numbers are authored
+        here, and which applies is decided by the request's own audience data.
+        """
+        if self.audience_uplift and self.audience_uplift.matches(segment_ids):
+            return round(self.declared_cpm + self.audience_uplift.cpm, 4)
+        return self.declared_cpm
+
+    @property
+    def ceiling_cpm(self) -> float:
+        """The most this campaign can ever offer."""
+        return round(self.declared_cpm + (self.audience_uplift.cpm if self.audience_uplift else 0.0), 4)
 
 
-#: The highest CPM any campaign declares. The adapter's bid ceiling MUST exceed
-#: this, or an eligible bid is emitted here and then silently discarded by Prebid's
-#: price-range filter -- a failure whose symptom is a missing campaign and whose
-#: cause is a configuration number (BR-19). Exposed so the ceiling can be derived
-#: from it rather than guessed.
+@dataclass(frozen=True)
+class AudienceUplift:
+    """A CPM premium a buyer pays for a matched audience.
+
+    Segment ids are compared as strings against ``user.data[].segment[].id``, which
+    is where both the publisher's DMP and the ARTF Audience Activator place them.
+    The ids below are IAB Audience Taxonomy 1.1 identifiers, since that is what the
+    Audience Activator emits; a publisher's proprietary segment ids never collide
+    with them.
+    """
+
+    segment_ids: tuple[str, ...]
+    cpm: float
+
+    def matches(self, segment_ids: tuple[str, ...]) -> bool:
+        return any(s in self.segment_ids for s in segment_ids)
+
+
+#: The highest CPM any campaign can offer, uplift included. The adapter's bid
+#: ceiling MUST exceed this, or an eligible bid is emitted here and then silently
+#: discarded by Prebid's price-range filter -- a failure whose symptom is a missing
+#: campaign and whose cause is a configuration number (BR-19). Exposed so the
+#: ceiling can be derived from it rather than guessed.
 def highest_declared_cpm(catalog: "CampaignCatalog") -> float:
-    """The maximum declared CPM in the catalog."""
-    prices = [c.declared_cpm for c in catalog.all()]
+    """The maximum CPM any campaign in the catalog can offer."""
+    prices = [c.ceiling_cpm for c in catalog.all()]
     return max(prices) if prices else 0.0
 
 
@@ -183,6 +220,9 @@ _CAMPAIGNS: tuple[Campaign, ...] = (
         declared_cpm=4.10,          # deal floor 3.40 binds
         deal_ids=("deal-parenting-premium",),
         target_categories=("parenting", "family"),
+        # Pays more for a user the Audience Activator places in Parenting (350) or
+        # Parenting > Babies and Toddlers (354). 4.50 when matched.
+        audience_uplift=AudienceUplift(segment_ids=("350", "354"), cpm=0.40),
     ),
     Campaign(
         campaign_id="camp-familynet",
@@ -194,6 +234,8 @@ _CAMPAIGNS: tuple[Campaign, ...] = (
         declared_cpm=3.05,          # imp floor 2.60 binds, above the 2.10 deal floor
         deal_ids=("deal-family-network",),
         target_categories=("parenting", "family"),
+        # Pays more for Parents with Children (98). 3.30 when matched.
+        audience_uplift=AudienceUplift(segment_ids=("98",), cpm=0.25),
     ),
     Campaign(
         campaign_id="camp-remnant-open",

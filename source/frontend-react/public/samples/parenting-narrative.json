@@ -22,8 +22,6 @@
         "pmp": {
           "private_auction": 0,
           "deals": [
-            {"id": "deal-parenting-premium", "bidfloor": 3.40, "at": 1},
-            {"id": "deal-family-network", "bidfloor": 2.10, "at": 2},
             {"id": "deal-remnant-open", "bidfloor": 0.85, "at": 3}
           ]
         }

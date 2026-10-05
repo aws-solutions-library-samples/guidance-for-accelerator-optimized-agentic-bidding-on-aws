@@ -58,20 +58,35 @@ export const SCENARIOS = [
   // it is a threshold sitting inside the noise.
   //
   // So a demand line states only what the code and the catalog fix:
-  //   - which deals are on the impression, and which campaign holds each
+  //   - which deals the publisher offers on the request (only its open/remnant
+  //     deals -- see below) and which campaign holds each
+  //   - which deals the Deal Scorer can ACTIVATE from its publisher deal library
+  //     (containers/ncf_deal_manager/deal_library.py, keyed by site.domain) and
+  //     the floor each arrives with
   //   - each campaign's declared CPM (constants in catalog.py)
   //   - who targeting turns away (deterministic from imp.ext.artf.categories)
   //   - who the impression floor turns away (deterministic arithmetic)
   //   - the bidder simulator's fixed prices ($3.25 banner, $12.50 video)
   // and it names the Deal Scorer as the run-time variable rather than pretending
   // the outcome is fixed. The walkthrough shows the decision that was actually made.
+  //
+  // WHY THE FIXTURES OFFER ONLY OPEN/REMNANT DEALS.
+  //
+  // The Theater runs every request scenario twice, with and without ARTF, and
+  // compares the outcomes. When a fixture pre-declared the premium deal the Deal
+  // Scorer would have activated, both passes carried the same deals and both
+  // passes produced the same winner at the same price. So each request fixture now
+  // offers only the deal(s) whose id contains "open" or "remnant"; the premium and
+  // mid-tier deals live in the Deal Scorer's library and reach the auction only
+  // when it activates them, floor included. The baseline pass therefore sees the
+  // thin book, and the with-ARTF pass sees whatever the scorer added to it.
   {
     id: "home-lifestyle",
     surface: SURFACE_REQUEST,
     name: "Home & Lifestyle — Four-Way Deal Contest",
     page: "A small-space living room guide, declaring Content Taxonomy 3.1 category 283 Interior Decorating. 300x250, and the impression carries home and lifestyle targeting categories.",
     audience: "Interior Decorating and Home Improvement, plus First Time Homeowner — a household life stage, so it is reachable only from the data the exchange asserted, never from the page.",
-    demand: "Four deals on the impression: Cedar & Co at $6.35 on the premium home deal, Northlake at $3.10, Vantage Motorsport on an auto deal, and the remnant pool at $2.75. An outside buyer bids $3.25. Two are settled before the auction: Vantage is turned away by TARGETING, not price — its deal is here but a home page is not automotive — and the open-market campaign at $2.05 falls under the $2.50 floor. Which of the rest transacts is the Deal Scorer's call at run time, so watch whether it leaves the $6.35 deal live.",
+    demand: "The publisher offers one deal on the request: the remnant pool at $2.75 on its open remnant deal. An outside buyer bids $3.25, and the $2.05 open-market campaign falls under the $2.50 floor — so without ARTF the outside buyer takes it. Three more deals sit in the Deal Scorer's library for this publisher: the premium home deal at a $3.00 floor, which Cedar & Co holds at $6.35; a retail deal at $2.60, Northlake at $3.10; and an auto deal at $1.50, Vantage Motorsport at $1.80. Vantage is turned away by TARGETING either way — a home page is not automotive. Whether the Deal Scorer activates the $6.35 deal onto the impression is its call at run time, and it is the whole difference between the two passes.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
@@ -93,15 +108,17 @@ export const SCENARIOS = [
     name: "Finance Vertical — One Endemic Buyer",
     page: "A rate-decision analysis declaring Content Taxonomy 3.1 category 410 Personal Investing. 300x250, and the impression carries finance targeting.",
     audience: "Personal Investing and Retirement Planning, a reader in the 50-54 bracket in Illinois.",
-    demand: "The scenario where page context, not price, decides who competes. Cedar & Co holds a deal on this impression at $6.35 — the highest declared CPM in the whole catalog — and TARGETING is the only thing that stops it, because a finance page is not home or lifestyle. That leaves Harbour Financial at $4.20 on its PMP deal, the remnant pool at $2.75 and an outside buyer at $3.25, with the $2.05 open-market campaign under the $2.20 floor. Retarget the impression and the $6.35 comes back.",
+    demand: "The scenario where page context, not price, decides who competes. The publisher offers only its open remnant deal, where the remnant pool bids $2.75; an outside buyer bids $3.25 and the $2.05 open-market campaign is under the $2.20 floor — so the baseline goes to the outside buyer. The Deal Scorer's library for this publisher holds two more: a finance PMP deal at a $3.50 floor, which Harbour Financial holds at $4.20, and the premium home deal at $3.00, which Cedar & Co holds at $6.35 — the highest declared CPM in the whole catalog. Activate both and TARGETING still stops Cedar, because a finance page is not home or lifestyle; Harbour is the one activation that changes the price. The Yield Optimizer then adjusts floor and margin on whatever deals are live.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
       { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
       { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
       { key: "metrics_enricher", label: "Signals Enricher", rulesBased: true },
     ],
     tags: [
       { cls: "seg", label: "ACTIVATE_SEGMENTS" },
+      { cls: "deal", label: "ACTIVATE_DEALS" },
       { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
       { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
       { cls: "metric", label: "ADD_METRICS" },
@@ -116,7 +133,7 @@ export const SCENARIOS = [
     name: "Parenting Article — Full Sell-Side",
     page: "A first-year sleep guide on a parenting title declaring Content Taxonomy 3.1 category 192, 300x250.",
     audience: "Parents with Children and Parenting Babies and Toddlers. Both are reachable only from the data the exchange asserted, never inferred from what the reader was reading.",
-    demand: "Three household deals: Brightstart Family at $4.10 on the premium parenting deal, the family network at $3.05 and the remnant pool at $2.75, against an outside buyer at $3.25. The $2.05 open-market campaign falls under the $2.60 floor. The deepest sell-side chain of any scenario — segments, deal activation and suppression, and a floor and margin adjustment per deal — so the most places for a live model to change the result.",
+    demand: "The publisher offers one deal: the remnant pool at $2.75 on its open remnant deal, against an outside buyer at $3.25, with the $2.05 open-market campaign under the $2.60 floor — so the baseline goes to the outside buyer. Two household deals wait in the Deal Scorer's library: the premium parenting deal at a $3.40 floor, held by Brightstart Family at $4.10, and the family network deal at $2.10, held at $3.05. Both of those campaigns also pay for the audience ARTF activates — Brightstart adds $0.40 when the parenting segments are on the request, the family network $0.25 for parents with children — so the with-ARTF pass can move the price twice: once by putting the deal on the impression, once by the segments the buyer is paying for. The deepest sell-side chain of any scenario.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
@@ -140,14 +157,16 @@ export const SCENARIOS = [
     id: "yield-optimizer",
     surface: SURFACE_REQUEST,
     name: "CTV Guaranteed — PMP Yield Optimizer",
-    page: "A 1280x720 connected-TV slot on a sports property, sold through three private marketplace deals.",
+    page: "A 1280x720 connected-TV slot on a sports property. The publisher offers its two open private marketplace deals on the request; the guaranteed tier is the Deal Scorer's to add.",
     audience: "A household segment on a large-format living-room device.",
-    demand: "Three tiers on one slot: Meridian Guaranteed at $13.40, open mid-tier at $6.80 and open remnant at $6.20, with an outside buyer at $12.50 — so the guaranteed deal and the outside buyer are the only two above the $6.00 floor by a real margin. The Yield Optimizer predicts a floor multiplier and a margin adjustment per deal on Triton's FIL backend, and those predictions are what move the boundary.",
+    demand: "Two open tiers on the request: Meridian mid-tier at $6.80 on a $3.25 deal floor and Meridian remnant at $6.20 on a $0.75 floor, both clearing the $6.00 impression floor, against an outside buyer at $12.50 — so without ARTF the outside buyer wins by a wide margin. The guaranteed tier is not offered: it sits in the Deal Scorer's library at a $12.00 floor, and Meridian Guaranteed holds it at $13.40. If the scorer activates it, the publisher's own demand tops the outside buyer; if not, the outside buyer keeps the slot. The Yield Optimizer then predicts a floor multiplier and a margin adjustment per live deal on Triton's FIL backend.",
     models: [
+      { key: "ncf_deal_manager", label: "NCF Deal Manager" },
       { key: "deal_yield_manager_floor", label: "Yield Optimizer — Floor" },
       { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin" },
     ],
     tags: [
+      { cls: "deal", label: "ACTIVATE_DEALS" },
       { cls: "yield", label: "ADJUST_DEAL_FLOOR" },
       { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
     ],
@@ -159,9 +178,9 @@ export const SCENARIOS = [
     id: "video-deals",
     surface: SURFACE_REQUEST,
     name: "Mid-roll Video — Outside Bidder Wins",
-    page: "A 640x480 mid-roll on a streaming property, offered through three private marketplace deals at premium, standard and remnant tiers.",
+    page: "A 640x480 mid-roll on a streaming property. The publisher offers only its remnant private marketplace deal on the request; the premium and standard tiers are in the Deal Scorer's library.",
     audience: "A viewer segment resolved from the request, then scored against each deal in turn by the deal scorer. All three video campaigns take any category, so here the audience colours the story rather than deciding it.",
-    demand: "The scenario an SSP least wants to see. Three house deals at $11.50, $8.75 and $8.10 — every one of them above the $8.00 floor, so none is priced out — and an outside buyer at $12.50, over the top of all three. The publisher's own demand is healthy and still loses, which is the case a yield team actually has to answer for.",
+    demand: "The scenario an SSP least wants to see. On the request: one house deal, the video remnant at $8.10 on a $0.50 deal floor, clearing the $8.00 impression floor, and an outside buyer at $12.50. The Deal Scorer can add two more from its library — the premium video deal at a $10.00 floor, held by Skyline at $11.50, and the standard deal at $5.00, Skyline Standard at $8.75. Even with both activated, the outside buyer at $12.50 is over the top of all three. The publisher's own demand is healthy and still loses, which is the case a yield team actually has to answer for — and the comparison shows how much the activations closed the gap.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
@@ -178,7 +197,10 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "video-deals.json",
-    controls: ["bidFloor", "ageRange", "numDeals", "segThreshold", "explore"],
+    // numDeals was dropped from this card: it sliced the pre-declared deal list,
+    // and the fixture now offers a single remnant deal (the rest come from the
+    // Deal Scorer's library at run time, which a request-side slider cannot reach).
+    controls: ["bidFloor", "ageRange", "segThreshold", "explore"],
     defaults: { bidFloor: 8.0 },
   },
   {
@@ -208,7 +230,7 @@ export const SCENARIOS = [
     name: "Two Impressions — SSP Enrichment Fan-out",
     page: "An automotive review page offering two slots at once: a 970x250 leaderboard and a 300x600 rail.",
     audience: "An in-market automotive segment, resolved once and applied to both impressions.",
-    demand: "Two impressions, and only one of them has demand. The leaderboard is deal-only: Autoline Premium at $7.20 and Autoline Standard at $4.60, both over its $4.00 floor. The 300x600 rail returns NOTHING, and for two separate reasons — it carries no deals at all, so every deal-holding campaign is ineligible there, and the one open-market campaign bids $2.05 against its $3.00 floor. An enrichment fan-out across two impressions where one of them was never going to fill.",
+    demand: "Two impressions, and the publisher offers no deals on either. The house seat's only deal-free campaign bids $2.05 open-market — under the leaderboard's $4.00 floor and the rail's $3.00 — so without ARTF neither slot fills from this seat. The leaderboard's demand is deal-only and lives in the Deal Scorer's library: Autoline Premium at $7.20 on a $6.00 deal floor and Autoline Standard at $4.60 on $3.50. If the scorer activates them, the leaderboard fills; the 300x600 rail has no deal in the library at all, so it returns NOTHING either way. An enrichment fan-out across two impressions where one of them was never going to fill.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },

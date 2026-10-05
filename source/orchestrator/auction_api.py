@@ -61,6 +61,73 @@ _BIDDERS = ("artfhouse", "amt")
 #: unbounded. Matches the ceiling the repo's own diagnostic fixture uses.
 _MAX_BIDS_PER_BIDDER = 3
 
+#: The `artf` query parameter: whether the ARTF extension point is asked to mutate
+#: this auction. `on` is the default and the only behaviour when the parameter is
+#: absent. `off` is per request and opt-in -- the Theater's baseline pass sends it,
+#: nothing else does, and there is deliberately no environment variable or config
+#: flag that turns it on for the whole stack. An allowlist, not a truthiness check
+#: (SECURITY-05): anything other than these two values is a 400.
+ARTF_MODE_PARAM = "artf"
+ARTF_MODE_ON = "on"
+ARTF_MODE_OFF = "off"
+_ARTF_MODES = frozenset({ARTF_MODE_ON, ARTF_MODE_OFF})
+
+#: Where the bypass marker travels: the request's TOP-LEVEL `ext.artf`, which Prebid
+#: Server carries through as an opaque extension. It must not go under `ext.prebid`:
+#: that object is parsed into a typed model and unknown keys are dropped before the
+#: hook builds its envelope, so a marker there is silently lost and the auction runs
+#: WITH every container while claiming otherwise. The
+#: orchestrator's `/v1/mutations` reads the same key via `is_artf_bypass`.
+ARTF_BYPASS_KEY = "bypass"
+
+
+#: The `intents` query parameter: the scenario's ARTF `applicable_intents`, comma
+#: separated. Carried onto the request's top-level `ext.artf.applicable_intents`
+#: so the request Prebid receives STATES which intents the scenario called for.
+#:
+#: It does not narrow anything today, and that is deliberate. The hook asks the
+#: extension point for its configured intent set regardless of the request (its
+#: reader looks under `ext.prebid.artf`, which Prebid drops, and the set was opened
+#: to the full list on purpose). This parameter is for the record, and for a
+#: future hook that chooses to read it; the auction's mutations are decided by the
+#: hook's configuration and the containers, not by this value.
+#:
+#: An allowlist of intent names (SECURITY-05): anything else is a 400.
+INTENTS_PARAM = "intents"
+INTENTS_KEY = "applicable_intents"
+_INTENT_NAMES = frozenset(
+    name for name in (
+        "ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "SUPPRESS_DEALS", "ADJUST_DEAL_FLOOR",
+        "ADJUST_DEAL_MARGIN", "BID_SHADE", "ADD_METRICS", "ADD_CIDS",
+    )
+)
+
+
+def intents_of(request: Request) -> tuple[Optional[list[str]], Optional[str]]:
+    """The validated `intents` list, or (None, None) when absent.
+
+    Returns (None, reason) when a value is not on the allowlist, so the handler can
+    name the bad entry rather than silently dropping it.
+    """
+    raw = request.query_params.get(INTENTS_PARAM)
+    if raw is None or raw.strip() == "":
+        return None, None
+    names = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    bad = [n for n in names if n not in _INTENT_NAMES]
+    if bad:
+        return None, f"unknown intent(s): {', '.join(sorted(set(bad)))}"
+    # De-duplicated, order kept.
+    return list(dict.fromkeys(names)), None
+
+
+def artf_mode_of(request: Request) -> Optional[str]:
+    """The validated `artf` mode, or None when the value is not on the allowlist."""
+    raw = request.query_params.get(ARTF_MODE_PARAM)
+    if raw is None or raw == "":
+        return ARTF_MODE_ON
+    value = raw.strip().lower()
+    return value if value in _ARTF_MODES else None
+
 
 def prebid_auction_url() -> Optional[str]:
     value = (os.environ.get(PREBID_AUCTION_URL_ENV) or "").strip()
@@ -110,6 +177,19 @@ async def run_auction_handler(request: Request) -> JSONResponse:
             status_code=501,
         )
 
+    artf_mode = artf_mode_of(request)
+    if artf_mode is None:
+        return JSONResponse(
+            {
+                "error": "invalid_artf_mode",
+                "detail": (
+                    f"'{ARTF_MODE_PARAM}' must be '{ARTF_MODE_ON}' or "
+                    f"'{ARTF_MODE_OFF}'"
+                ),
+            },
+            status_code=400,
+        )
+
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError) as exc:
@@ -126,7 +206,19 @@ async def run_auction_handler(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    intents, intents_error = intents_of(request)
+    if intents_error:
+        return JSONResponse(
+            {"error": "invalid_intents", "detail": intents_error}, status_code=400
+        )
+
     body, prepared = _prepare_for_auction(body)
+    if artf_mode == ARTF_MODE_OFF:
+        body, note = _with_artf_bypass(body)
+        prepared.append(note)
+    if intents:
+        body, note = _with_applicable_intents(body, intents)
+        prepared.append(note)
     body = _with_debug_enabled(body)
 
     started = time.monotonic()
@@ -200,6 +292,13 @@ async def run_auction_handler(request: Request) -> JSONResponse:
             "source": "prebid",
             "endpoint": url,
             "hop_ms": elapsed_ms,
+            # Whether the ARTF extension point was asked to mutate this auction.
+            # "bypassed" means the request carried the marker and the orchestrator
+            # answered the hook with zero mutations before reaching any container;
+            # "requested" is every other auction. A consumer comparing two auctions
+            # needs this on the response itself, not inferred from which call it
+            # made.
+            "artf_mutations": "bypassed" if artf_mode == ARTF_MODE_OFF else "requested",
             "seats": sorted(
                 {
                     seat.get("seat")
@@ -334,6 +433,55 @@ def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
     out["ext"] = ext
 
     return out, prepared
+
+
+def _with_artf_bypass(body: dict) -> tuple[dict, str]:
+    """Mark the request so the ARTF extension point proposes nothing.
+
+    The marker is `ext.artf.bypass: true` on the request's top-level ext. Prebid's
+    hook serialises the parsed bid request -- top-level ext included -- into the
+    envelope it POSTs to the orchestrator's `/v1/mutations`, which reads the marker
+    and returns an empty mutation set WITHOUT fanning out to any container. The
+    seats then bid on the request exactly as the publisher sent it.
+
+    This is how the Theater's "without ARTF mutations" pass is a real auction and
+    not a derivation: the same Prebid Server, the same seats, the same request --
+    minus the one step being demonstrated.
+
+    Copied shallowly, with ext and ext.artf copied too, so the caller's dict is not
+    mutated. Anything the caller already put under `ext.artf` is kept.
+    """
+    out = dict(body)
+    ext = dict(out.get("ext") or {})
+    artf = dict(ext.get("artf") or {})
+    artf[ARTF_BYPASS_KEY] = True
+    ext["artf"] = artf
+    out["ext"] = ext
+    return out, (
+        f"ext.artf.{ARTF_BYPASS_KEY} (baseline pass: the ARTF extension point "
+        "proposes nothing, so no container is consulted)"
+    )
+
+
+def _with_applicable_intents(body: dict, intents: list[str]) -> tuple[dict, str]:
+    """Record the scenario's applicable intents on the request's top-level ext.
+
+    Same location as the bypass marker, for the same reason: top-level `ext.artf`
+    survives Prebid, `ext.prebid.artf` does not. See INTENTS_PARAM for why this is a
+    statement on the request and not a control: the hook does not read it, and the
+    mutations it asks for are not narrowed by it. Anything the caller already put
+    under `ext.artf` is kept.
+    """
+    out = dict(body)
+    ext = dict(out.get("ext") or {})
+    artf = dict(ext.get("artf") or {})
+    artf[INTENTS_KEY] = list(intents)
+    ext["artf"] = artf
+    out["ext"] = ext
+    return out, (
+        f"ext.artf.{INTENTS_KEY} (the scenario's intents, stated on the request; "
+        "the hook's configured set still decides what is asked for)"
+    )
 
 
 def _with_debug_enabled(body: dict) -> dict:

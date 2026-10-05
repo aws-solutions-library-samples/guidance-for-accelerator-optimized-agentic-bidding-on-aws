@@ -92,7 +92,9 @@ describe("BR3-31 over derived beats", () => {
       ],
     };
     const beats = buildBeats(submitted, normalised);
-    expect(beats.length).toBe(7); // origin + 4 mutations + bids + recap
+    // pass 1 (banner, origin, bids, baseline) + pass 2 (banner, origin, 4
+    // mutations, bids, recap)
+    expect(beats.length).toBe(4 + 2 + 4 + 2);
 
     for (const beat of beats) {
       const text = factualCaption(beat, {});

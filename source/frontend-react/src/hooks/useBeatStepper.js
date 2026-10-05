@@ -7,11 +7,16 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
+/** Autoplay dwell on a pass banner: long enough to read two lines, then move on. */
+export const PASS_BANNER_DWELL_MS = 2800;
+
 /**
  * Autoplay dwell. Longer when attention crosses between columns, because there
- * is travel to watch (BR-19).
+ * is travel to watch (BR-19). A pass banner has its own dwell: it is read, not
+ * watched.
  */
 export function paceFor(beat) {
+  if (beat && beat.kind === "pass") return PASS_BANNER_DWELL_MS;
   return beat && beat.movement && beat.movement !== "none" ? 3200 : 2600;
 }
 

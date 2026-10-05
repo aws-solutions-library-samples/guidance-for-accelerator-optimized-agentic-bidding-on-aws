@@ -30,8 +30,8 @@ Parameters:
 
   AdaptiveBiddingScheduleRate:
     Type: String
-    Default: 'rate(5 minutes)'
-    Description: EventBridge Scheduler rate expression for the Adaptive Bidding Agent
+    Default: 'rate(24 hours)'
+    Description: EventBridge Scheduler rate expression for the Adaptive Bidding Agent. Every invocation is a Bedrock call; shorten with care.
 
   GovernanceAgentMaxLifetimeHours:
     Type: Number
@@ -246,7 +246,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub '${StackPrefix}-adaptive-bidding-scheduler'
-      Description: Invokes the Adaptive Bidding Strategy Agent every 5 minutes via Lambda.
+      Description: Invokes the Adaptive Bidding Strategy Agent on the AdaptiveBiddingScheduleRate cadence (default every 24 hours) via Lambda.
       ScheduleExpression: !Ref AdaptiveBiddingScheduleRate
       ScheduleExpressionTimezone: UTC
       FlexibleTimeWindow:

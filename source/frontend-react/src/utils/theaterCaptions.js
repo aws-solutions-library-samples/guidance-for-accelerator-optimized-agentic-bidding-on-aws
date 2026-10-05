@@ -12,7 +12,42 @@
 // degrades to it, and importing it from the component that consumes the caption
 // service would be circular. AuctionTheater.jsx re-exports it.
 
-import { BEAT_BIDS, BEAT_RECAP } from "./theaterBeats.js";
+import {
+  BEAT_BIDS,
+  BEAT_RECAP,
+  BEAT_PASS,
+  BEAT_BASELINE,
+  PASS_BASELINE,
+  PASS_ARTF,
+} from "./theaterBeats.js";
+
+/**
+ * The words on a pass banner. One definition: the banner component renders
+ * these, and `mutationNarration` reads the same ones out as a sentence, so the
+ * visual and the spoken form cannot disagree.
+ *
+ * Pass 1 is the baseline -- the request as the publisher sent it, no container
+ * consulted. Pass 2 is the same request with the ARTF containers mutating it
+ * before the seats bid.
+ *
+ * Written as "First pass" / "Second pass" rather than "1 of 2": the caption
+ * validator refuses any numeral that does not trace to a beat value (BR3-13),
+ * and these words go through the same fallback path as every other caption.
+ */
+export function passBannerCopy(beat) {
+  if (beat?.pass === PASS_BASELINE || beat?.artf === false) {
+    return {
+      title: "First pass",
+      headline: "Without ARTF mutations",
+      body: "The bid request goes to Prebid Server as the publisher sent it. No container is consulted.",
+    };
+  }
+  return {
+    title: "Second pass",
+    headline: "With ARTF mutations",
+    body: "The same request, mutated by the ARTF containers before the seats bid.",
+  };
+}
 
 /**
  * Human wording for an ARTF intent, for the pill beside the container name.
@@ -82,6 +117,13 @@ export function mutationNarration(beat, context) {
   };
   if (!beat) return base;
 
+  if (beat.kind === BEAT_PASS) {
+    // The banner's own copy, as a sentence. This is what a screen reader gets and
+    // what the fallback path shows; the banner component renders the same words.
+    const copy = passBannerCopy(beat);
+    return { ...base, text: `${copy.title}. ${copy.headline}. ${copy.body}` };
+  }
+
   if (beat.kind === "origin") {
     const parts = [];
     if (context?.publisher) parts.push(context.publisher);
@@ -89,11 +131,16 @@ export function mutationNarration(beat, context) {
       parts.push(`${context.impressionFormat} impression`);
     }
     if (context?.bidFloor != null) parts.push(`floor $${context.bidFloor.toFixed(2)}`);
+    const arrives = parts.length
+      ? `The bid request arrives from ${parts.join(", ")}.`
+      : "The bid request arrives from the exchange.";
+    // The second arrival is the same request. Saying so is what tells the reader
+    // the two passes are a controlled comparison and not two different requests.
     return {
       ...base,
-      text: parts.length
-        ? `The bid request arrives from ${parts.join(", ")}.`
-        : "The bid request arrives from the exchange.",
+      text: beat.pass === PASS_ARTF
+        ? `${arrives} The same request, this time through the ARTF containers.`
+        : arrives,
     };
   }
 
@@ -104,7 +151,17 @@ export function mutationNarration(beat, context) {
     // wrong or require the beat to wait on the auction.
     return {
       ...base,
-      text: "The seats bid against the enriched request. No winner yet.",
+      text: beat.pass === PASS_BASELINE
+        ? "The seats bid against the request as the publisher sent it. No winner yet."
+        : "The seats bid against the enriched request. No winner yet.",
+    };
+  }
+
+  if (beat.kind === BEAT_BASELINE) {
+    // No winner named here either: the offers column states it, from the response.
+    return {
+      ...base,
+      text: "Prebid resolved the baseline auction. No ARTF container took part.",
     };
   }
 

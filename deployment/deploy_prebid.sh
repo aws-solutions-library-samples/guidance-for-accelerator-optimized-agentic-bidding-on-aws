@@ -58,6 +58,10 @@ fi
 #   --tag TAG            Image tag (default: pinned version + source hash)
 #   --start-at N         Resume from step N
 #   --skip-build         Reuse the image already in ECR
+#   --verbose            Stream every line to the terminal. Standalone this is already
+#                        the behaviour; it matters when deploy.sh invokes this script,
+#                        which otherwise shows only the eight step lines and sends the
+#                        narration to the run's detail log (PREBID_DETAIL_LOG).
 #   --inject-plugin DIR  Add a third-party bidder to this image. DIR must contain an
 #                        inject.sh; it is copied into the build context's injection slot
 #                        and sourced by copy-bidder-files.sh before Maven runs. Repeatable.
@@ -160,9 +164,18 @@ PLUGIN_ADAPTERS=()
 ADDITIONAL_NODE_MONTHLY_USD=""
 # Resolved after the arg loop: --profile, then AWS_PROFILE, then "default".
 DEPLOY_PROFILE="${AWS_PROFILE:-}"
+# Output contract. Run on its own this script streams everything, as it always has.
+# When deploy.sh invokes it, deploy.sh sets PREBID_DETAIL_LOG to the run's detail log
+# and this script switches to the parent's shape of output: the eight step lines and
+# any warning or failure reach the terminal, the narration and the chatty children
+# (the CodeBuild poll, the rollout wait) go to that file. --verbose streams in either
+# case. VERBOSE is also read from the environment so the parent's flag carries.
+VERBOSE="${VERBOSE:-0}"
+PREBID_DETAIL_LOG="${PREBID_DETAIL_LOG:-}"
 
 for arg in "$@"; do
   case "${arg}" in
+    --verbose)         VERBOSE=1 ;;
     --prefix=*)        STACK_PREFIX="${arg#--prefix=}" ;;
     --prefix)          ;; # value in next arg
     --cluster=*)       CLUSTER_NAME="${arg#--cluster=}" ;;
@@ -191,7 +204,10 @@ for arg in "$@"; do
     --no-simulator)    WITH_SIMULATOR=0 ;;
     --yes|--non-interactive) ASSUME_YES=1 ;;
     --destroy)         DESTROY=1 ;;
-    -h|--help)         sed -n '7,67p' "$0"; exit 0 ;;
+    # The whole header block between the first two `# =====` banners, derived the
+    # same way deploy.sh does it. The previous fixed `sed -n '7,67p'` stopped
+    # mid-option as soon as the header grew.
+    -h|--help)         awk '/^# ={10,}/{n++; next} n==1' "$0"; exit 0 ;;
     *)
       if   [[ "${_PREV_ARG:-}" == "--prefix" ]];       then STACK_PREFIX="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--cluster" ]];      then CLUSTER_NAME="${arg}"
@@ -205,20 +221,64 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--plugin-env" ]]; then PLUGIN_ENV+=("${arg}")
       elif [[ "${_PREV_ARG:-}" == "--plugin-secret-env" ]]; then PLUGIN_SECRET_ENV+=("${arg}")
       elif [[ "${_PREV_ARG:-}" == "--plugin-adapter" ]]; then PLUGIN_ADAPTERS+=("${arg}")
+      else
+        # An unrecognised token used to fall through silently and the run went on
+        # without it. The em/en dash case is called out because a pasted "—prefix"
+        # is indistinguishable from "--prefix" in most terminal fonts.
+        _dash_hint=""
+        case "${arg}" in
+          $'\xe2\x80\x94'*|$'\xe2\x80\x93'*) _dash_hint=" (that first character is an em/en dash, not two hyphens)" ;;
+        esac
+        printf '\033[0;31m[prebid][fail]\033[0m %s\n' "unknown argument '${arg}'${_dash_hint} -- see deploy_prebid.sh --help" >&2
+        exit 1
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
+# A value-taking flag as the LAST argument was swallowed: nothing followed it, so
+# the run proceeded with the default. Stop instead.
+case "${_PREV_ARG:-}" in
+  --prefix|--cluster|--user-pool-id|--namespace|--region|--profile|--tag|--start-at|--inject-plugin|--plugin-env|--plugin-secret-env|--plugin-adapter)
+    printf '\033[0;31m[prebid][fail]\033[0m %s\n' "${_PREV_ARG} needs a value (it was the last argument)" >&2
+    exit 1 ;;
+esac
 unset _PREV_ARG
 # Exported before the first aws/kubectl call. kubectl authenticates through the
 # kubeconfig's `aws eks get-token` exec plugin, which reads AWS_PROFILE from the
 # environment, so the export covers both paths at once.
 export AWS_PROFILE="${DEPLOY_PROFILE:-default}"
 
-log()  { printf '\033[0;32m[prebid]\033[0m %s\n' "$*"; }
+# _quiet: true when narration and child output belong in PREBID_DETAIL_LOG rather
+# than on the terminal (invoked by deploy.sh, and not --verbose).
+_quiet() { [[ -n "${PREBID_DETAIL_LOG}" && "${VERBOSE}" -eq 0 ]]; }
+
+# log(): narration. To the terminal standalone; to the detail log under deploy.sh.
+log() {
+  if _quiet; then
+    printf '[prebid] %s\n' "$*" >> "${PREBID_DETAIL_LOG}" 2>/dev/null || true
+  else
+    printf '\033[0;32m[prebid]\033[0m %s\n' "$*"
+  fi
+}
+# step(): the "Step N/8" lines. Always on the terminal, in deploy.sh's own step
+# shape so Prebid's steps read as part of the same run; also in the log when quiet.
+step() {
+  printf '  \033[0;90m->\033[0m %s\n' "$*"
+  if _quiet; then printf '[prebid] %s\n' "$*" >> "${PREBID_DETAIL_LOG}" 2>/dev/null || true; fi
+}
+# warn()/fail() always reach the terminal; a warning or a failure is never quiet.
 warn() { printf '\033[0;33m[prebid][warn]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[prebid][fail]\033[0m %s\n' "$*" >&2; exit 1; }
+# _run <command...>: a command whose output is narration -- to the log when quiet,
+# the terminal otherwise. The return code is the command's.
+_run() {
+  if _quiet; then
+    "$@" >> "${PREBID_DETAIL_LOG}" 2>&1
+  else
+    "$@"
+  fi
+}
 
 # Exported because the inline python below reads it to find prebid_release.py.
 # Exported HERE rather than at first use, so no step can run before it is set.
@@ -240,6 +300,14 @@ CONFIG_KEY="prebid-server/current/prebid-config.yaml"
 # The orchestrator's in-cluster address. Its Cognito JWT middleware is enforced in the
 # application, so reaching it over service DNS does not bypass authentication.
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://orchestrator.${NAMESPACE}.svc.cluster.local/v1/mutations}"
+# The orchestrator's gRPC listener (headless orchestrator-grpc Service in
+# orchestrator-deployment.yaml) and which transport the hook uses to reach the
+# extension point. "http" is the measured baseline; "grpc" becomes the default
+# here once a measured run shows it beats http on this hop. Override either with
+# the env var for a measurement run.
+ORCHESTRATOR_GRPC_TARGET="${ORCHESTRATOR_GRPC_TARGET:-orchestrator-grpc.${NAMESPACE}.svc.cluster.local:50051}"
+ARTF_TRANSPORT="${ARTF_TRANSPORT:-http}"
+case "${ARTF_TRANSPORT}" in http|grpc) ;; *) echo "ARTF_TRANSPORT must be http or grpc, got '${ARTF_TRANSPORT}'" >&2; exit 1 ;; esac
 K8S_MANIFEST="${SCRIPT_DIR}/eks/prebid-server-deployment.yaml"
 CFN_TEMPLATE="${SCRIPT_DIR}/prebid_cfn.yaml"
 CONFIG_TEMPLATE="${SCRIPT_DIR}/scripts/prebid_config_template.yaml"
@@ -797,7 +865,7 @@ fi
 # first one turns a five-minute fix into five sequential five-minute fixes.
 # =============================================================================
 if [[ "${START_AT}" -le 1 ]]; then
-  log "Step 1/8: Preflight"
+  step "Step 1/8: Preflight"
   MISSING=()
 
   for tool in aws kubectl python3 curl tar; do
@@ -921,9 +989,12 @@ REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 # the stack exists is not a disclosure.
 # =============================================================================
 if [[ "${START_AT}" -le 2 ]]; then
-  log "Step 2/8: Idle cost"
-  echo
-  python3 - "${ADDITIONAL_NODE_MONTHLY_USD}" <<'PY'
+  step "Step 2/8: Idle cost"
+  # The disclosure is for the person deciding; standalone it is on the terminal above
+  # the prompt. Under deploy.sh the decision was made by passing --with-prebid, so it
+  # goes to the detail log with the rest of this script's narration.
+  _quiet || echo
+  _run python3 - "${ADDITIONAL_NODE_MONTHLY_USD}" <<'PY'
 import sys, os
 sys.path.insert(0, os.path.join(os.environ["SCRIPT_DIR"], "scripts"))
 import prebid_release as p
@@ -932,7 +1003,7 @@ raw = sys.argv[1] if len(sys.argv) > 1 else ""
 node = float(raw) if raw not in ("", "None") else None
 print(p.format_cost_disclosure(p.build_cost_disclosure(node)))
 PY
-  echo
+  _quiet || echo
 
   if [[ "${ASSUME_YES}" -ne 1 ]]; then
     # Gated on stdin being a TERMINAL, not on /dev/tty existing.
@@ -965,7 +1036,7 @@ fi
 # that points at the wrong thing.
 # =============================================================================
 if [[ "${START_AT}" -le 3 ]]; then
-  log "Step 3/8: Acquire upstream release ${PINNED_VERSION}"
+  step "Step 3/8: Acquire upstream release ${PINNED_VERSION}"
   rm -rf "${WORK_DIR}"
   mkdir -p "${WORK_DIR}"
   TARBALL="${WORK_DIR}/upstream.tar.gz"
@@ -1022,7 +1093,7 @@ BUILD_CONTEXT="${UPSTREAM_DIR}/deployment/ecr/prebid-server"
 # like success.
 # =============================================================================
 if [[ "${START_AT}" -le 4 ]]; then
-  log "Step 4/8: Place the ARTF hook module and artfhouse adapter"
+  step "Step 4/8: Place the ARTF hook module and artfhouse adapter"
 
   [[ -d "${BUILD_CONTEXT}" ]] \
     || fail "Upstream build context not found at ${BUILD_CONTEXT}. The release layout has changed; re-check it before deploying."
@@ -1215,7 +1286,7 @@ fi
 # What the build DOES need from the environment is nothing beyond ECR credentials.
 # =============================================================================
 if [[ "${START_AT}" -le 5 && "${SKIP_BUILD}" -ne 1 ]]; then
-  log "Step 5/8: Build the image on CodeBuild"
+  step "Step 5/8: Build the image on CodeBuild"
 
   if [[ -z "${IMAGE_TAG}" ]]; then
     SRC_HASH="$(find "${BUILD_CONTEXT}" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -c1-12)"
@@ -1404,12 +1475,12 @@ SPEC
       SUCCEEDED) log "  Build SUCCEEDED after $((ELAPSED / 60))m$((ELAPSED % 60))s"; break ;;
       FAILED|FAULT|TIMED_OUT|STOPPED)
         fail "Build ${BUILD_STATUS}. Logs: https://${AWS_REGION}.console.aws.amazon.com/codesuite/codebuild/projects/${CB_PROJECT}/build/${BUILD_ID}?region=${AWS_REGION}" ;;
-      *) printf '\033[0;32m[prebid]\033[0m   %s  phase=%-18s elapsed=%dm%02ds\n' "${BUILD_STATUS}" "${PHASE}" "$((ELAPSED / 60))" "$((ELAPSED % 60))"; sleep 15 ;;
+      *) log "  $(printf '%s  phase=%-18s elapsed=%dm%02ds' "${BUILD_STATUS}" "${PHASE}" "$((ELAPSED / 60))" "$((ELAPSED % 60))")"; sleep 15 ;;
     esac
   done
   echo "${IMAGE_TAG}" >"${WORK_DIR}/image_tag.txt"
 elif [[ "${SKIP_BUILD}" -eq 1 ]]; then
-  log "Step 5/8: --skip-build; reusing the image already in ECR"
+  step "Step 5/8: --skip-build; reusing the image already in ECR"
 fi
 
 if [[ -z "${IMAGE_TAG}" ]]; then
@@ -1428,7 +1499,7 @@ fi
 # which is a defect this repository has hit before.
 # =============================================================================
 if [[ "${START_AT}" -le 6 ]]; then
-  log "Step 6/8: Deploy"
+  step "Step 6/8: Deploy"
 
   OIDC_ISSUER="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
     --query 'cluster.identity.oidc.issuer' --output text)"
@@ -1525,6 +1596,8 @@ if [[ "${START_AT}" -le 6 ]]; then
       -e "s|__CREDENTIAL_SECRET__|${CREDENTIAL_SECRET}|g" \
       -e "s|__DEMAND_ENDPOINT__|${DEMAND_ENDPOINT}|g" \
       -e "s|__ORCHESTRATOR_URL__|${ORCHESTRATOR_URL}|g" \
+      -e "s|__ORCHESTRATOR_GRPC_TARGET__|${ORCHESTRATOR_GRPC_TARGET}|g" \
+      -e "s|__ARTF_TRANSPORT__|${ARTF_TRANSPORT}|g" \
       -e "s|__ORCHESTRATOR_SCOPE__|${ORCHESTRATOR_SCOPE}|g" \
       -e "s|__ARTF_TOKEN_SCOPES__|${ARTF_TOKEN_SCOPES}|g" \
       -e "s|__AMT_SIMULATOR_ENDPOINT__|${AMT_SIMULATOR_ENDPOINT:-http://amt-simulator.not-deployed.invalid/}|g" \
@@ -1761,8 +1834,8 @@ PY
   "${KUBECTL[@]}" apply -f "${PROCESSED}" || fail "kubectl apply failed for the Prebid manifest"
 
   log "  Forcing a pod rollout (apply alone does not restart pods when only the image CONTENT changed)"
-  "${KUBECTL[@]}" rollout restart deployment/prebid-server -n "${NAMESPACE}" || true
-  "${KUBECTL[@]}" rollout status deployment/prebid-server -n "${NAMESPACE}" --timeout=300s \
+  _run "${KUBECTL[@]}" rollout restart deployment/prebid-server -n "${NAMESPACE}" || true
+  _run "${KUBECTL[@]}" rollout status deployment/prebid-server -n "${NAMESPACE}" --timeout=300s \
     || warn "The Prebid deployment did not become ready within 300s. Check: kubectl describe pod -l app=prebid-server -n ${NAMESPACE}"
 
   # ---------------------------------------------------------------------------
@@ -1822,7 +1895,7 @@ fi
 # this object is the way to reconfigure.
 # =============================================================================
 if [[ "${START_AT}" -le 7 ]]; then
-  log "Step 7/8: Configuration overlay"
+  step "Step 7/8: Configuration overlay"
   CONFIG_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
   DEMAND_ENDPOINT="${DEMAND_ENDPOINT:-$(stack_output "${PREBID_STACK}" DemandEndpointUrl)}"
 
@@ -1843,7 +1916,7 @@ fi
 # which image are live without inferring it from tags.
 # =============================================================================
 if [[ "${START_AT}" -le 8 ]]; then
-  log "Step 8/8: Record"
+  step "Step 8/8: Record"
   IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
     --image-ids "imageTag=${IMAGE_TAG}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
   [[ "${IMAGE_DIGEST}" == "None" ]] && IMAGE_DIGEST=""

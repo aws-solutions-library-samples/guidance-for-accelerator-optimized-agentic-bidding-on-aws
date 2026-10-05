@@ -260,6 +260,54 @@ function buildInferredContainerStops(mutations) {
   }));
 }
 
+/** A stable identity for one raw mutation, for matching the flattened list to a container's list. */
+function mutationKey(raw) {
+  return JSON.stringify([raw?.intent, raw?.op, raw?.path, raw?.ids, raw?.adjust_deal, raw?.adjust_bid, raw?.add_metrics, raw?.metrics]);
+}
+
+/**
+ * The orchestrator's flattened mutation list, in its order, each stamped with the
+ * stop that produced it.
+ *
+ * `raw.mutations` is already conflict-resolved and in application order; the
+ * per-container lists on the stops say who produced what. A mutation that two
+ * containers both produced byte-for-byte is attributed to the first in stop order,
+ * which is the orchestrator's own tie-break. One that no stop lists (an inferred
+ * attribution, or an older server) is attributed by intent.
+ */
+export function attributeOrderedMutations(raw, containerStops) {
+  const list = Array.isArray(raw?.mutations) ? raw.mutations : [];
+  const byKey = new Map();
+  for (const stop of containerStops ?? []) {
+    for (const m of stop.mutations ?? []) {
+      const key = mutationKey(m.raw);
+      if (!byKey.has(key)) byKey.set(key, stop.id);
+    }
+  }
+  return list.map((m) => {
+    const model = toMutationModel(m);
+    const intentCode = m?.intent;
+    const fallback = (typeof intentCode === "number" && INTENT_TO_STOP[intentCode]) || "metrics";
+    return { ...model, sourceAgent: byKey.get(mutationKey(m)) ?? fallback };
+  });
+}
+
+/** metadata.stages as the UI reads it. [] when absent. */
+export function normalizeStages(rawStages) {
+  if (!Array.isArray(rawStages)) return [];
+  return rawStages
+    .filter((s) => s && typeof s === "object")
+    .map((s) => ({
+      stage: isFiniteNumber(s.stage) ? s.stage : 0,
+      name: typeof s.name === "string" ? s.name : "",
+      containers: Array.isArray(s.containers) ? s.containers.filter((c) => typeof c === "string") : [],
+      latencyMs: isFiniteNumber(s.latency_ms) ? s.latency_ms : null,
+      budgetMs: isFiniteNumber(s.budget_ms) ? s.budget_ms : null,
+      applied: isFiniteNumber(s.applied) ? s.applied : 0,
+      rejected: Array.isArray(s.rejected) ? s.rejected : [],
+    }));
+}
+
 /**
  * Normalize a raw Orchestrator response into the NormalizedFlowResult shape.
  */
@@ -281,6 +329,8 @@ export function normalize(raw, transport, submittedPayload) {
         makeDspStop(),
       ],
       packet: summarizePacket(safePayload, raw),
+      mutations: [],
+      stages: [],
       attribution: "inferred",
       lifecycle,
       isResponseLifecycle,
@@ -302,6 +352,16 @@ export function normalize(raw, transport, submittedPayload) {
     transport,
     totalLatencyMs: extractTotalLatency(raw),
     stops,
+    // The orchestrator's returned list: stage-ordered and conflict-resolved, which
+    // is the order the host applies. Each entry carries the stop id of the
+    // container that produced it (resolved by matching the mutation against the
+    // per-container lists; by intent when no container claims it). Stops above are
+    // in display order and must not be used as an application order.
+    mutations: attributeOrderedMutations(raw, containerStops),
+    // The sequenced fan-out's own account: which containers ran in which stage
+    // and how long each stage took. [] when the server did not report stages
+    // (bypassed pass, or an orchestrator predating staging).
+    stages: normalizeStages(raw?.metadata?.stages),
     packet: summarizePacket(safePayload, raw),
     attribution: hasExplicitContainers ? "explicit" : "inferred",
     // Contests for a (path, intent) claimed by more than one container. Always an

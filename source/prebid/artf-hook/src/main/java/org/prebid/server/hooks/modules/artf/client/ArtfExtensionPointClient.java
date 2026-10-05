@@ -15,7 +15,9 @@ import java.time.Clock;
 import java.util.Objects;
 
 /**
- * Calls the orchestrator's {@code POST /v1/mutations}. Transport only.
+ * Calls the orchestrator's {@code POST /v1/mutations}. Transport only. The HTTP
+ * implementation of {@link ExtensionPointClient}; {@link ArtfExtensionPointGrpcClient} is the
+ * other, selected by {@code hooks.artf-orchestrator.transport}.
  *
  * <p><b>Uses Prebid Server's own async client</b> ({@link HttpClient}), for two reasons and
  * in this order of seriousness:
@@ -39,7 +41,7 @@ import java.util.Objects;
  * already spent. A breaker would make the Theater's rendering depend on hidden state, so two
  * identical scenarios could differ because of an earlier unrelated failure.
  */
-public class ArtfExtensionPointClient {
+public class ArtfExtensionPointClient implements ExtensionPointClient {
 
     private static final long MAX_RESPONSE_BYTES = 1_048_576L;
 
@@ -71,6 +73,7 @@ public class ArtfExtensionPointClient {
      *
      * @return a Future that always SUCCEEDS, carrying one of the five outcomes
      */
+    @Override
     public Future<ExtensionPointOutcome> fetchMutations(RtbRequest request, CallBudget budget) {
         final long startedAt = clock.millis();
 
@@ -162,7 +165,8 @@ public class ArtfExtensionPointClient {
         return new ExtensionPointOutcome.TransportFailure(message, latency);
     }
 
-    private static boolean isTimeout(Throwable error) {
+    /** Shared with the gRPC client: the same Vert.x timeout surfaces on both transports. */
+    static boolean isTimeout(Throwable error) {
         for (Throwable t = error; t != null; t = t.getCause()) {
             if (t instanceof java.util.concurrent.TimeoutException) {
                 return true;

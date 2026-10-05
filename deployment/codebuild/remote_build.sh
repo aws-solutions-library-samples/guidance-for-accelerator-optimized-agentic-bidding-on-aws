@@ -73,6 +73,7 @@ NEMO_SRC_TAG=""
 NGC_SECRET=""
 NGC_KEY=""
 NO_WAIT=0
+DEPLOY_PROFILE=""
 
 for arg in "$@"; do
   case "${arg}" in
@@ -105,12 +106,39 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--region" ]]; then AWS_REGION="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then DEPLOY_PROFILE="${arg}"
+      else
+        # Anything else is a typo. Silently ignoring it used to turn a mistyped
+        # flag into a run with the wrong target or tag.
+        printf '\033[0;31m[fail]\033[0m unknown argument '"'"'%s'"'"'\n' "${arg}" >&2
+        case "${arg}" in
+          $'\xe2\x80\x94'*|$'\xe2\x80\x93'*)
+            printf '       That starts with an em/en dash. Flags take two ASCII hyphens: --%s\n' \
+              "${arg#?}" >&2 ;;
+        esac
+        exit 1
       fi
       ;;
   esac
   _PREV_ARG="${arg}"
 done
+# A flag that takes a value must not be the last argument.
+case "${_PREV_ARG:-}" in
+  --stack-name|--target|--only|--tag|--nemo-src-tag|--ngc-secret|--ngc-key|--region|--profile)
+    printf '\033[0;31m[fail]\033[0m %s requires a value\n' "${_PREV_ARG}" >&2; exit 1 ;;
+esac
 unset _PREV_ARG
+
+# Resolve the profile exactly as the header promises: --profile, else the
+# AWS_PROFILE already in the environment, else "default" -- and EXPORT it before
+# the first aws call. Until this was exported, --profile was parsed and then
+# ignored, so a stale AWS_ACCESS_KEY_ID/AWS_SESSION_TOKEN pair in the caller's
+# shell (which the CLI prefers over any profile) failed the very first
+# get-caller-identity with InvalidClientTokenId even though the named profile
+# was valid. Clearing those variables here makes the named profile the one
+# credential source for this process and its children.
+DEPLOY_PROFILE="${DEPLOY_PROFILE:-${AWS_PROFILE:-default}}"
+export AWS_PROFILE="${DEPLOY_PROFILE}"
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 log()  { printf '\033[0;32m[remote-build]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[0;33m[warn]\033[0m %s\n' "$*" >&2; }

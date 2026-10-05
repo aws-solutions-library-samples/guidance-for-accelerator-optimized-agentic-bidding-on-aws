@@ -259,3 +259,105 @@ class TestRunLoadTestDealYieldWiring:
         status = loadtest._active_tests["test-dy-3"]
         # preset "100" == 100 requests, each contributing 2 samples.
         assert status.outcome_sample_count == 200
+
+
+
+class TestGetLoadtestLiveProgress:
+    """GET /v1/loadtest/{id} is the UI's transport behind the UI API proxy Lambda,
+    which cannot carry the SSE stream. While a test runs, the stored
+    LoadTestStatus is the start-time snapshot (all zeros), so the endpoint must
+    merge the live counters from the _progress_* dicts; otherwise the panel
+    shows zeros for the whole run and the bid-bubble animation (driven by
+    `completed` increasing) never fires."""
+
+    def _seed_running(self, test_id, total=1000):
+        loadtest._active_tests[test_id] = loadtest.LoadTestStatus(
+            id=test_id, state="running", preset="1k", total_requests=total,
+            completed=0, errors=0, elapsed_ms=0.0, rps=0.0,
+            latency_p50=0.0, latency_p95=0.0, latency_p99=0.0,
+            latency_min=0.0, latency_avg=0.0, latency_max=0.0,
+            histogram={"lt_10ms": 0, "10_30ms": 0, "30_50ms": 0, "gt_50ms": 0},
+            per_container=[],
+        )
+        loadtest._progress_latencies[test_id] = [4.0, 12.0, 35.0, 80.0]
+        loadtest._progress_completed[test_id] = 4
+        loadtest._progress_errors[test_id] = 1
+        # Started two seconds ago, so rps is a real positive number.
+        loadtest._progress_start_time[test_id] = __import__("time").monotonic() - 2.0
+        loadtest._expiry_times.pop(test_id, None)
+
+    def _request(self, test_id):
+        return MagicMock(path_params={"id": test_id})
+
+    def _body(self, response):
+        import json
+        return json.loads(response.body)
+
+    def test_running_test_returns_live_counters(self):
+        tid = "lt-live-1"
+        self._seed_running(tid)
+        body = self._body(asyncio.run(loadtest.get_loadtest(self._request(tid))))
+        assert body["state"] == "running"
+        assert body["total_requests"] == 1000
+        assert body["completed"] == 4
+        assert body["errors"] == 1
+        assert body["elapsed_ms"] >= 2000.0
+        assert body["rps"] > 0
+        assert body["latency_min"] == 4.0
+        assert body["latency_max"] == 80.0
+        assert body["latency_p50"] == 35.0
+        assert body["histogram"] == {"lt_10ms": 1, "10_30ms": 1, "30_50ms": 1, "gt_50ms": 1}
+
+    def test_running_test_keeps_stored_identity_fields(self):
+        tid = "lt-live-2"
+        self._seed_running(tid)
+        loadtest._active_tests[tid].target_model_type = "deal_yield_manager_margin"
+        loadtest._active_tests[tid].scenario = "late_night"
+        body = self._body(asyncio.run(loadtest.get_loadtest(self._request(tid))))
+        assert body["id"] == tid
+        assert body["preset"] == "1k"
+        assert body["target_model_type"] == "deal_yield_manager_margin"
+        assert body["scenario"] == "late_night"
+
+    def test_completed_test_returns_stored_status_untouched(self):
+        tid = "lt-done-1"
+        self._seed_running(tid)
+        final = loadtest._active_tests[tid].model_copy(update={
+            "state": "complete", "completed": 1000, "errors": 3, "elapsed_ms": 20893.97,
+            "rps": 47.86, "latency_p50": 9.1, "latency_p95": 21.4, "latency_p99": 38.0,
+            "latency_min": 2.0, "latency_avg": 10.2, "latency_max": 90.0,
+            "histogram": {"lt_10ms": 600, "10_30ms": 350, "30_50ms": 40, "gt_50ms": 10},
+            "total_mutations": 1953,
+        })
+        loadtest._active_tests[tid] = final
+        # Stale live dicts must not leak into a finished test's body.
+        loadtest._progress_completed[tid] = 999
+        body = self._body(asyncio.run(loadtest.get_loadtest(self._request(tid))))
+        assert body == final.model_dump()
+
+    def test_poll_body_matches_sse_progress_event(self):
+        """Both transports read _live_progress, so the numbers cannot drift."""
+        import json
+        tid = "lt-sse-1"
+        self._seed_running(tid)
+
+        async def first_event():
+            gen = loadtest._sse_event_generator(tid)
+            try:
+                return await gen.__anext__()
+            finally:
+                await gen.aclose()
+
+        event = asyncio.run(first_event())
+        assert event.startswith("event: progress\n")
+        sse = json.loads(event.split("data: ", 1)[1].strip())
+        poll = self._body(asyncio.run(loadtest.get_loadtest(self._request(tid))))
+        for key in ("completed", "errors", "latency_p50", "latency_p95", "latency_p99", "histogram"):
+            assert sse[key] == poll[key], key
+        assert sse["total"] == poll["total_requests"]
+        # elapsed_ms/rps are clock-derived; the two reads are milliseconds apart.
+        assert abs(sse["elapsed_ms"] - poll["elapsed_ms"]) < 500
+
+    def test_unknown_test_is_404(self):
+        response = asyncio.run(loadtest.get_loadtest(self._request("lt-missing")))
+        assert response.status_code == 404

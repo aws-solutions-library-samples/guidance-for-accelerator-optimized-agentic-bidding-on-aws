@@ -13,7 +13,7 @@ Part 2 closes the loop. It observes the outcome of every bid, uses that feedback
 
 1. **A batch retraining loop.** Bid outcomes (wins, losses, prices, CTR) are captured, transformed into labeled training data by AWS Glue, and used by NVIDIA NeMo-RL to retrain the bid pricer's and deal scorer's models (DLRM and NCF, respectively) on Amazon SageMaker. The yield optimizer's two XGBoost models (floor, margin) go through the same batch retraining loop via a separate Glue ETL job and SageMaker's built-in XGBoost training container, rather than NeMo-RL — a tree model has no reinforcement-learning loss to compute. Each retrained version is registered in the SageMaker Model Registry with full lineage.
 2. **A governance loop.** Every new model version is compiled from ONNX to a TensorRT engine, deployed as a live canary behind the same model name the ARTF containers already call, and evaluated with a statistically rigorous A/B test (Welch's t-test + SPRT). A promotion, rejection, or automatic guardrail rollback follows — every decision is written to an append-only audit trail.
-3. **An agentic parameter-tuning loop.** A Bedrock reasoning agent reads real CloudWatch bid-outcome metrics every five minutes and decides whether to adjust bidding parameters (`shade_factor`, `conversion_value`), subject to hard safety bounds enforced by the parameter store, not the agent.
+3. **An agentic parameter-tuning loop.** A Bedrock reasoning agent reads real CloudWatch bid-outcome metrics on a schedule (once every 24 hours by default) and decides whether to adjust bidding parameters (`shade_factor`, `conversion_value`), subject to hard safety bounds enforced by the parameter store, not the agent.
 
 > **Note for the reader:** This document covers Part 2 only. See [GUIDANCE.md](GUIDANCE.md) for Part 1 — the ARTF containers, orchestrator, and Triton serving layer that Part 2 builds on. Part 2 is a progression of Part 1, not a separate stack: deploying it upgrades Part 1's Triton serving path from ONNX Runtime to compiled TensorRT engines and adds the infrastructure described here alongside the existing real-time bidding path, which is never modified. For the practical how-to — deploying, trying it out, and disabling scheduled components — see [CLOSED_LOOP.md](CLOSED_LOOP.md).
 
@@ -31,7 +31,7 @@ Part 2 closes the loop. It observes the outcome of every bid, uses that feedback
 |---------|-------------|
 | Models improve over time | Bidding accuracy compounds as real outcomes retrain the models, instead of degrading as market conditions drift away from a static model |
 | Reduced operational risk | Every model promotion goes through an automated statistical gate and guardrail monitoring before it can affect live spend |
-| Faster response to market shifts | An agent re-tunes bid pricing every five minutes from live signals, instead of waiting for a manual review cycle |
+| Faster response to market shifts | An agent re-tunes bid pricing on a schedule from live signals (daily by default, adjustable down to minutes), instead of waiting for a manual review cycle |
 | Full auditability | Every parameter change and model promotion/rejection decision is permanently recorded with its rationale, supporting compliance and post-incident review |
 
 ## Technical Benefits
@@ -123,7 +123,7 @@ While a canary is serving live traffic, a guardrail monitor independently polls 
 | Amazon Bedrock | Provides the foundation model (default: a Claude Opus 4.8 cross-region inference profile) used by both agents' reasoning layers |
 | Amazon SageMaker | Runs NeMo-RL training jobs for DLRM/NCF and built-in XGBoost training jobs for the yield optimizer's floor/margin models; hosts the versioned Model Registry with an approval workflow for all four model types |
 | AWS Glue | Two scheduled ETL jobs: one de-duplicates bid outcomes by request ID and engineers features (ROI, shade ratio, bucketed win rate) for DLRM/NCF; a second de-duplicates deal-yield outcomes by (request ID, deal ID, intent) and writes two independently labeled datasets (floor, margin) for the yield optimizer's XGBoost models |
-| Amazon EventBridge (Scheduler + Rules) | Drives the five-minute agentic tuning cadence, the six-hour retraining cadence, and event-driven governance review on model registration and training completion |
+| Amazon EventBridge (Scheduler + Rules) | Drives the agentic tuning cadence (every 24 hours by default), the six-hour ETL cadence, the daily retraining trigger, and event-driven governance review on model registration and training completion |
 | AWS Lambda | Invocation shims between EventBridge and AgentCore, and a VPC-attached proxy bridging the public Governance runtime to cluster-internal endpoints |
 | Amazon DynamoDB | Stores the bidding parameter store, the append-only audit trail, and per-user feature vectors, all encrypted at rest with AWS KMS |
 | AWS KMS | Encrypts all DynamoDB tables, the SNS alerts topic, and the S3 training-data bucket at rest |
@@ -170,7 +170,7 @@ While a canary is serving live traffic, a guardrail monitor independently polls 
 
 - **On-demand GPU use for optimization:** TensorRT compilation runs as one-shot Jobs rather than an always-on service, so the GPU node group's steady-state footprint is unchanged from Part 1
 - **In-process canary routing:** The Triton router performs traffic splitting inside the GPU node's process space, adding no measurable latency to the real-time bidding path
-- **Sub-5ms parameter reads:** The bidding parameter store is designed for low-latency reads at inference time, optionally fronted by DynamoDB Accelerator (DAX) for high request volumes
+- **Sub-5ms parameter reads:** The bidding parameter store is read through an in-process cache with a 60-second TTL in front of DynamoDB. The deployment creates no DynamoDB Accelerator (DAX) cluster; the cache client switches to DAX if a `DAX_ENDPOINT` environment variable is set, for deployments whose parameter-read rate warrants one
 
 ### Cost Optimization
 
@@ -194,44 +194,46 @@ While a canary is serving live traffic, a guardrail monitor independently polls 
 
 ### Supported Regions
 
-Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G/G7e instances). Confirm AgentCore regional availability before choosing a region, since AgentCore has a smaller regional footprint than the other services used here.
+Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G `g5` instances). Confirm AgentCore regional availability before choosing a region, since AgentCore has a smaller regional footprint than the other services used here. The default Bedrock model is the `global.anthropic.claude-opus-4-8` cross-region inference profile; `--model-id` (or `BEDROCK_MODEL_ID`, and per agent `ADAPTIVE_BIDDING_MODEL_ID` / `GOVERNANCE_MODEL_ID`) overrides it.
 
 ### Deployment Steps
 
-Deploy Part 2 together with Part 1 in a single command:
+Part 2 is part of the default `deploy.sh` run; `--with-retraining` is the default and `--no-retraining` turns it off. The NGC API key (`--ngc-key`, needed once per prefix) authenticates the pull of the gated NeMo-RL base image:
 
 ```bash
 cd deployment
-./deploy.sh --prefix dv --with-retraining
+./deploy.sh --prefix dv1 --ngc-key YOUR_NGC_API_KEY
 ```
 
 Or deploy Part 2 separately against an existing Part 1 stack:
 
 ```bash
 cd deployment
-./deploy_closed_loop.sh --prefix dv
+./deploy_closed_loop.sh --prefix dv1
 ```
 
-`deploy_closed_loop.sh` provisions the closed-loop stack in dependency order:
+`deploy_closed_loop.sh` provisions the closed-loop stack in dependency order. Every resource name below starts with the prefix:
 
-| Step | Action |
-|------|--------|
-| 1 | Deploy the feedback pipeline (Kinesis, Firehose, S3, KMS) — includes the yield optimizer's dedicated stream/table alongside the bid-outcome one |
-| 2 | Deploy the Glue ETL feature-engineering jobs (bid outcomes, and the yield optimizer's floor/margin outcomes) and the training-data bucket |
-| 3 | Deploy DynamoDB tables (parameter store, audit trail, user features), the SageMaker Model Registry package groups (DLRM, NCF, and the yield optimizer's floor/margin groups), and register genesis model versions for all of them |
-| 4 | Deploy AgentCore execution roles, seed the parameter store, and build the NeMo-RL training container |
-| 5 | Deploy both AgentCore runtimes (Adaptive Bidding Strategy Agent, Model Promotion Governance Agent) |
-| 6 | Deploy the EventBridge invocation paths (scheduled agent invocation, model-registration triggers, scheduled retraining) |
-| 7 | Rewire and rebuild the frontend with the deployed agent runtime ARNs |
+| Step | Action | Resources created (defaults) |
+|------|--------|-------------------------------|
+| 1 | Deploy the feedback pipeline | Stack `<p>-feedback-pipeline`: KMS customer-managed key; Kinesis Data Streams `<p>-bid-outcome-stream` and `<p>-deal-yield-outcome-stream` (provisioned, 2 shards each); two Firehose delivery streams; S3 bucket `<p>-raw-outcomes-<account>-<region>` |
+| 2 | Deploy the Glue ETL jobs | Stack `<p>-glue-etl`: S3 bucket `<p>-training-data-<account>-<region>`; jobs `<p>-feature-engineering-etl` and `<p>-deal-yield-feature-engineering-etl`, 10 G.1X workers each, both on `cron(0 */6 * * ? *)` (every 6 hours); scripts bucket `<p>-artf-scripts-<account>` |
+| 3 | Deploy the core tables and registry | Stack `<p>-closed-loop-core`: DynamoDB `<p>-parameter-store`, `<p>-audit-trail`, `<p>-user-features` (on-demand); SageMaker Model Package Groups `<p>-artf-dlrm-bid-shader`, `<p>-artf-ncf-deal-manager`, `<p>-artf-deal-yield-manager-floor`, `<p>-artf-deal-yield-manager-margin`, each seeded with a genesis version; SNS topic `<p>-training-alerts` |
+| 4 | Deploy agent security and build the training image | Stack `<p>-agentcore-security` (execution roles); parameter store seeded; NeMo-RL training image built asynchronously into the shared, unprefixed ECR repository `artf-nemo-rl-training` |
+| 5 | Deploy both AgentCore runtimes | `<p>_AdaptiveBiddingStrategyAgent` and `<p>_ModelPromotionGovernanceAgent` (HTTP protocol, arm64 images built with local Docker when a daemon is available, otherwise on CodeBuild); stack `<p>-vpc-proxy` with Lambda `<p>-vpc-optimizer-proxy` (900 s timeout, 256 MB) so the governance agent can reach the in-VPC Model Optimizer |
+| 6 | Deploy the invocation paths | Stack `<p>-governance-eventbridge`: EventBridge Scheduler `<p>-adaptive-bidding-scheduler` at `rate(24 hours)` and `<p>-retraining-scheduler` at `rate(24 hours)` (each retraining trigger launches up to 4 SageMaker training jobs on `ml.g5.2xlarge`, 100 GB volume, 4-hour maximum runtime), plus EventBridge rules on model registration and training-job completion |
+| 7 | Rewire the frontend | Rebuild and redeploy the React app with the deployed agent runtime ARNs |
 
 Useful options:
 
 ```bash
-./deploy_closed_loop.sh --prefix dv --skip-agentcore   # infrastructure only, no agent runtimes
-./deploy_closed_loop.sh --prefix dv --stack-only        # CloudFormation stacks only
-./deploy_closed_loop.sh --prefix dv --local-build       # build the training container locally
-AWS_REGION=us-west-2 ./deploy_closed_loop.sh --prefix dv
+./deploy_closed_loop.sh --prefix dv1 --skip-agentcore   # infrastructure only, no agent runtimes
+./deploy_closed_loop.sh --prefix dv1 --stack-only        # CloudFormation stacks only
+./deploy_closed_loop.sh --prefix dv1 --local-build       # build the training container locally (default: --remote-build on CodeBuild)
+AWS_REGION=us-west-2 ./deploy_closed_loop.sh --prefix dv1
 ```
+
+The agent cadence and the retraining cadence are the `AdaptiveBiddingScheduleRate` and `RetrainingScheduleRate` parameters of `deployment/governance_eventbridge_cfn.yaml`; the Glue interval is `ScheduleIntervalHours` in `deployment/glue_etl_cfn.yaml` and the shard count is `KinesisShardCount` in `deployment/feedback_pipeline_cfn.yaml`.
 
 ### Disabling Scheduled Components
 
@@ -248,29 +250,39 @@ The frontend's Adaptive Bidding page also exposes this as a toggle.
 ## Cost Estimation
 
 The following costs are in addition to the Part 1 base cost (see
-[GUIDANCE.md](GUIDANCE.md#cost-estimation)). Two AWS Glue ETL jobs run in Part
-2, not one — the original bid-outcome (DLRM/NCF) job and a separate deal-yield
-outcome (Yield Optimizer floor/margin) job, each on its own schedule and Glue
-table:
+[GUIDANCE.md](GUIDANCE.md#cost-estimation)), for the default schedules in
+`us-east-1` at public on-demand rates current when this was written. Two AWS
+Glue ETL jobs run in Part 2, not one: the bid-outcome (DLRM/NCF) job and a
+separate deal-yield outcome (Yield Optimizer floor/margin) job, each on its
+own schedule and Glue table.
 
-| AWS Service | Dimensions | Cost [USD/month] |
-|-------------|-----------|--------------------|
+| AWS Service | Dimensions (defaults) | Cost [USD/month] |
+|-------------|-----------------------|--------------------|
+| Amazon Kinesis Data Streams | 2 provisioned streams × 2 shards, $0.015 per shard-hour | $44 |
+| Amazon Data Firehose, Amazon S3, AWS KMS | 2 delivery streams ($0.029/GB), raw-outcomes + training-data + scripts buckets, 1 customer-managed key ($1) | ~$3 |
+| AWS Glue | 2 jobs × 10 G.1X workers, each every 6 hours (4 runs/day), ~5 minutes per run at $0.44 per DPU-hour | ~$88 |
 | Amazon DynamoDB | 3 tables (parameter store, audit trail, user features), on-demand | ~$5 |
-| Amazon DynamoDB Accelerator (optional) | 1 × dax.t3.small cluster | ~$36 |
-| Amazon Bedrock AgentCore | Adaptive Bidding Agent, ~8,640 invocations/month at a 5-minute cadence | ~$15 |
-| Amazon Bedrock AgentCore | Governance Agent, triggered on model registration | ~$2 |
-| Amazon SageMaker Training | NeMo-RL (DLRM/NCF) + built-in XGBoost (floor/margin), ~4 retraining jobs/day combined at 15 min each, 1 × ml.g5.xlarge | ~$60 |
-| AWS Glue | 2 scheduled ETL jobs, ~10 DPU-hours/day each | ~$88 |
-| Amazon EventBridge Scheduler | 2 schedules, negligible | <$1 |
-| **Estimated Total** | | **~$170–200/month** |
+| Amazon SageMaker Training | up to 4 jobs per daily trigger on `ml.g5.2xlarge` ($1.515/h), ~30 minutes each; NeMo-RL for DLRM/NCF, built-in XGBoost for floor/margin | ~$91 |
+| Amazon Bedrock (Adaptive Bidding Agent) | `global.anthropic.claude-opus-4-8`, 30 invocations/month at `rate(24 hours)`, ~10K input and ~1K output tokens per invocation ($5.50 / $25 per million) | ~$3 |
+| Amazon Bedrock (Governance Agent) | Same model; invoked on model-registration and training-completion events only | ~$10 |
+| Amazon Bedrock AgentCore | Runtime consumption for both agents, $0.0895 per vCPU-hour and $0.00945 per GB-hour, ~30 s per invocation | ~$1 |
+| AWS Secrets Manager, Amazon EventBridge Scheduler, AWS Lambda, Amazon SNS | NGC key secret ($0.40), 2 schedules, `vpc-optimizer-proxy` function, alerts topic | ~$2 |
+| **Estimated Total** | | **~$245/month** |
 
-Disabling the scheduled components (see above) reduces Part 2's ongoing cost to near zero, leaving only DynamoDB storage. DAX is optional and only needed for very high parameter-read request rates.
+What moves the total:
+
+- **Agent cadence.** The Bedrock line scales linearly with `AdaptiveBiddingScheduleRate` (`deployment/governance_eventbridge_cfn.yaml`, default `rate(24 hours)`): about $8 at `rate(6 hours)`, $58 at `rate(1 hour)`, and $700 at `rate(5 minutes)`. Change the template default and re-run `deploy.sh --prefix <p> --start-at 5`, or pass the parameter in the governance-eventbridge `deploy_cfn_stack` call in `deployment/deploy_closed_loop.sh`. Pausing the schedule from the Adaptive Bidding page or the `/api/v1/closed-loop/schedule` endpoint (see above) takes this line and the SageMaker line to zero while the infrastructure stays up.
+- **Model choice.** `--model-id` selects the model for both agents; a smaller model lowers the per-token rate.
+- **Training only happens with data.** SageMaker jobs launch only when an ETL run has produced a dataset that passes the trainer's gate. A fresh deployment with no bid traffic launches none, so that line starts at $0.
+- **Always-on floor.** With both schedules paused, the Kinesis shards ($44), the KMS key, the Glue schedule (its runs become short no-op scans) and DynamoDB storage remain, roughly $60 to $90 per month.
+- **No DAX cluster is deployed.** The parameter cache reads DynamoDB directly through an in-process cache; a DAX cluster is only added if you set `DAX_ENDPOINT` and provision one yourself.
 
 ### Combined Total (Part 1 + Part 2)
 
 The default `deploy.sh` run deploys both parts together. Combined with Part
-1's ~$592–1,080/month (see [GUIDANCE.md](GUIDANCE.md#cost-estimation),
-depending on the GPU schedule), expect roughly **$762–1,250/month** total. See
+1's ~$1,225/month on the nightly GPU schedule (~$1,700 with the GPU on 24/7;
+see [GUIDANCE.md](GUIDANCE.md#cost-estimation)), expect roughly
+**$1,470/month** (**$1,945** with the GPU on 24/7). See
 [README.md](README.md#cost) for the full combined line-item table.
 
 ## Related Content

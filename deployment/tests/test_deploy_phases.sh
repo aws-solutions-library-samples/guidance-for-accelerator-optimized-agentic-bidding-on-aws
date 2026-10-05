@@ -478,7 +478,7 @@ STUB
 
   _gate_env() {
     AWS_REGION=us-east-1; WITH_RETRAINING=1; WITH_PREBID=0; SKIP_AGENTCORE=0
-    STACK_PREFIX=t; START_AT=1
+    STACK_PREFIX=t; START_AT=1; _GIVEN_START_AT=0
     say()  { printf '%s\n' "$*"; }
     warn() { printf '[warn] %s\n' "$*"; }
     ok()   { printf '  [OK] %s\n' "$*"; }
@@ -487,11 +487,25 @@ STUB
     # shellcheck source=/dev/null
     source "${tmp}/lib/deploy_gate.sh"
     # _run_phase, lifted from deploy.sh so the real precedence is what is tested.
+    _IMAGES_REBUILT=0
+    _AGENTCORE_IMAGE_REBUILT=0
     _run_phase() {
       local n="$1" st
       [[ "${START_AT}" -le "${n}" ]] || return 1
       gate_wait "${n}" "${STACK_PREFIX}" || true
       if gate_should_run "${n}"; then return 0; fi
+      if [[ "${_GIVEN_START_AT}" -eq 1 && "${n}" -eq "${START_AT}" ]]; then
+        say "  Phase ${n}/5 reads as complete in AWS; running it anyway because --start-at ${n} names it."
+        return 0
+      fi
+      if [[ "${n}" -eq 3 && "${_IMAGES_REBUILT}" -eq 1 ]]; then
+        say "  Phase 3/5 reads as complete in AWS, but Step 4 rebuilt images under the same tag; running it so the new images roll out."
+        return 0
+      fi
+      if [[ "${n}" -eq 5 && "${_AGENTCORE_IMAGE_REBUILT}" -eq 1 ]]; then
+        say "  Phase 5/5 reads as complete in AWS, but Step 4 rebuilt the AgentCore image; running it so the runtime is updated."
+        return 0
+      fi
       st="$(gate_status "${n}")"
       ok "Phase ${n}/5 already complete in AWS (${st}) — skipping"
       return 1
@@ -521,13 +535,41 @@ STUB
   for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
   assert_eq "${ran}" "12345" "an unknown phase is run, not skipped"
 
-  # --- --start-at still overrides a completed phase -----------------------
+  # --- --start-at forces exactly the phase it names -----------------------
+  # The header documents --start-at as the override "for when you know something
+  # the probe cannot". A healthy cluster used to make it a no-op. The named phase
+  # runs; the later ones still consult AWS, so a forced Phase 3 does not drag the
+  # frontend and agents along with it.
   STUB_STATUSES="ok,ok,ok,ok,ok" gate_refresh t
-  START_AT=3
+  START_AT=3; _GIVEN_START_AT=1
   ran=""
   for n in 1 2 3 4 5; do if _run_phase "$n" >/dev/null 2>&1; then ran="${ran}${n}"; fi; done
-  assert_eq "${ran}" "" "--start-at does not force a phase AWS says is complete"
-  START_AT=1
+  assert_eq "${ran}" "3" "--start-at 3 forces Phase 3 and only Phase 3 on a complete stack"
+  _run_phase 3 > "${tmp}/startat.out" 2>&1 || true
+  assert_contains "$(cat "${tmp}/startat.out")" "because --start-at 3 names it" "the forced phase says why it is running"
+  # The default START_AT=1 with no flag given is not a force: a complete stack still skips.
+  START_AT=1; _GIVEN_START_AT=0
+  ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "" "the implicit START_AT=1 forces nothing"
+
+  # --- a rebuilt image forces the rollout phase -----------------------------
+  # The probe reads what is RUNNING; pods on an image rebuilt under the same tag
+  # read as ok. Nine images were once rebuilt and every phase skipped, so the old
+  # orchestrator kept serving. Phase 3 carries the rollout restart and must run.
+  STUB_STATUSES="ok,ok,ok,ok,ok" gate_refresh t
+  _IMAGES_REBUILT=1
+  ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "3" "a rebuilt image forces Phase 3 (rollout) and nothing else"
+  _run_phase 3 > "${tmp}/rebuilt.out" 2>&1 || true
+  assert_contains "$(cat "${tmp}/rebuilt.out")" "rebuilt images under the same tag" "the forced rollout says why it is running"
+  _AGENTCORE_IMAGE_REBUILT=1
+  ran=""
+  for n in 1 2 3 4 5; do if _gate_run_quiet "$n"; then ran="${ran}${n}"; fi; done
+  assert_eq "${ran}" "35" "a rebuilt AgentCore image also forces Phase 5 (runtime update)"
+  _IMAGES_REBUILT=0
+  _AGENTCORE_IMAGE_REBUILT=0
 
   # --- a probe that cannot run -> everything runs -------------------------
   rm -f "${tmp}/scripts/deploy_status.py"
@@ -791,8 +833,286 @@ test_progress_output() {
 }
 
 # =========================================================================
+# Test: nodes land in private subnets behind NAT
+# =========================================================================
+# An account with VPC Block Public Access in block-ingress mode drops the
+# kubelet's traffic to the cluster endpoint when the node sits in a public
+# subnet, so the node never joins and eksctl's CloudFormation waiter times out
+# after 25 minutes with no useful message. Private nodes behind NAT are the fix,
+# and this pins both halves of it in the RENDERED config -- the same sed deploy.sh
+# runs -- so a stray edit to the template cannot quietly undo it.
+test_cluster_config_private_nodes() {
+  local tmp rendered
+  tmp="$(mktemp -d)"
+  rendered="${tmp}/config.yaml"
+  sed -e "s/__STACK_NAME__/t-stack/g" -e "s/__REGION__/us-east-1/g" -e "s/__MAX_GPUS__/1/g" \
+      "${SCRIPT_DIR}/../eks/cluster-config.yaml" > "${rendered}"
+
+  local n_private n_groups
+  n_private="$(grep -c '^[[:space:]]*privateNetworking: true' "${rendered}")"
+  # Nodegroups only: `- name:` also appears under addons:, which have no subnets.
+  n_groups="$(awk '/^managedNodeGroups:/{g=1; next} /^[^[:space:]]/{g=0} g && /^[[:space:]]*- name: /{c++} END{print c+0}' "${rendered}")"
+  assert_eq "${n_private}" "${n_groups}" "every managed nodegroup sets privateNetworking: true (${n_groups} groups)"
+  assert_eq "${n_private}" "2" "both nodegroups (gpu-inference, cpu-services) are private"
+  assert_contains "$(cat "${rendered}")" "gateway: HighlyAvailable" "NAT is HighlyAvailable (one gateway per AZ), the option chosen in the Express"
+  assert_not_contains "$(cat "${rendered}")" "__" "no template placeholder survives rendering"
+
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
+# Test: a mistyped flag stops the run instead of being dropped
+# =========================================================================
+# The run that motivated this was started with `—with-prebid` (an em dash, the
+# kind a chat client or word processor substitutes for two hyphens). The old loop
+# ignored it, so the deploy ran without Prebid and nobody knew until the end. Every
+# script a human invokes now rejects anything it does not recognise, and names the
+# dash when that is what happened.
+test_unknown_args_rejected() {
+  local D="${SCRIPT_DIR}/.." out rc
+  local em=$'\xe2\x80\x94'
+
+  # Fake credentials so nothing here can reach AWS even if parsing let it through.
+  _arg_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE bash "$@" 2>&1; }
+
+  out="$(_arg_run "${D}/deploy.sh" --prefix abc --bogus-flag)"; rc=$?
+  assert_eq "${rc}" "1" "deploy.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--bogus-flag'" "deploy.sh names the unknown flag"
+
+  out="$(_arg_run "${D}/deploy.sh" --prefix abc "${em}with-prebid")"; rc=$?
+  assert_eq "${rc}" "1" "deploy.sh exits 1 on an em-dash flag"
+  assert_contains "${out}" "em/en dash" "deploy.sh says the first character is a dash, not two hyphens"
+
+  out="$(_arg_run "${D}/deploy_prebid.sh" --nope)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_prebid.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--nope'" "deploy_prebid.sh names the unknown flag"
+
+  out="$(_arg_run "${D}/deploy_closed_loop.sh" --nope)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_closed_loop.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--nope'" "deploy_closed_loop.sh names the unknown flag"
+
+  out="$(_arg_run "${D}/codebuild/remote_build.sh" --nope)"; rc=$?
+  assert_eq "${rc}" "1" "remote_build.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--nope'" "remote_build.sh names the unknown flag"
+
+  out="$(_arg_run "${D}/codebuild/remote_build.sh" --tag)"; rc=$?
+  assert_eq "${rc}" "1" "remote_build.sh exits 1 when a value-taking flag is last"
+  assert_contains "${out}" "--tag requires a value" "remote_build.sh names the flag missing its value"
+
+  out="$(_arg_run "${D}/codebuild/remote_build.sh" "${em}tag" x)"; rc=$?
+  assert_eq "${rc}" "1" "remote_build.sh exits 1 on an em-dash flag"
+  assert_contains "${out}" "two ASCII hyphens: --tag" "remote_build.sh shows the corrected flag"
+}
+
+# =========================================================================
+# Test: the UI API path is private (no public ingress anywhere)
+# =========================================================================
+# The orchestrator used to sit behind an internet-facing load balancer, and an
+# account running VPC Block Public Access in block-ingress mode dropped every
+# packet to it at the internet gateway, so the
+# deploy stopped. The design now has NO internet-facing resource
+# in the VPC: the orchestrator is a ClusterIP Service and the browser reaches it by
+# invoking the <prefix>-ui-api-proxy Lambda, attached to the cluster's private
+# subnets. These assertions pin that shape in the manifest, in deploy.sh, and in
+# the proxy stack helper, and pin the ABSENCE of the old gate (it must not come
+# back: it stopped deploys that now work, and it asked a person to override an
+# account security control).
+test_private_ui_api_path() {
+  local tmp fn_src out rc manifest
+  tmp="$(mktemp -d)"
+  manifest="${SCRIPT_DIR}/../eks/orchestrator-deployment.yaml"
+
+  # --- the manifest: ClusterIP, never LoadBalancer -------------------------
+  local svc
+  svc="$(awk '/^kind: Service$/{s=1} s && /^  name: orchestrator$/{n=1} s && n && /^  type: /{print $2; exit}' "${manifest}")"
+  assert_eq "${svc}" "ClusterIP" "the orchestrator Service is ClusterIP"
+  assert_not_contains "$(cat "${manifest}")" "type: LoadBalancer" "no Service in the orchestrator manifest asks for a load balancer"
+
+  # --- the internal NLB the proxy forwards to -------------------------------
+  # A VPC Lambda cannot resolve cluster.local and has no route to a ClusterIP; the
+  # first live use of that URL 502'd every UI call. The orchestrator therefore gets
+  # an INTERNAL NLB, same shape as triton-internal, and nothing internet-facing.
+  local nlb; nlb="${SCRIPT_DIR}/../eks/orchestrator-internal-nlb.yaml"
+  [[ -f "${nlb}" ]]; assert_eq "$?" "0" "eks/orchestrator-internal-nlb.yaml exists"
+  local nlb_src; nlb_src="$(cat "${nlb}")"
+  assert_contains "${nlb_src}" "name: orchestrator-internal" "the Service is named orchestrator-internal"
+  assert_contains "${nlb_src}" "type: LoadBalancer" "it is a LoadBalancer Service"
+  assert_contains "${nlb_src}" 'service.beta.kubernetes.io/aws-load-balancer-type: "nlb"' "it asks for an NLB"
+  assert_contains "${nlb_src}" 'service.beta.kubernetes.io/aws-load-balancer-internal: "true"' "the NLB is internal"
+  assert_not_contains "${nlb_src}" "internet-facing" "nothing in it is internet-facing"
+  assert_contains "${nlb_src}" "targetPort: 8000" "it targets the orchestrator's HTTP port"
+  assert_contains "${nlb_src}" "component: orchestrator" "it selects the orchestrator pods"
+  assert_contains "$(cat "${DEPLOY_SH}")" "orchestrator-deployment.yaml orchestrator-internal-nlb.yaml" "the manifest is applied right after the orchestrator"
+
+  # --- deploy.sh: the gate and the ELB wait are gone, the proxy is wired in --
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_not_contains "${src}" "ensure_public_ingress_allowed" "the public-ingress gate is removed"
+  assert_not_contains "${src}" "create-vpc-block-public-access-exclusion" "deploy.sh never asks for a BPA exclusion"
+  assert_not_contains "${src}" "describe-vpc-block-public-access" "deploy.sh does not read the account's BPA mode"
+  # The only load-balancer hostname deploy.sh waits on is the orchestrator's INTERNAL
+  # NLB, in resolve_orchestrator_internal_url; the old public ELB wait must not return.
+  assert_eq "$(grep -c 'loadBalancer.ingress' "${DEPLOY_SH}")" "1" "exactly one load balancer hostname wait, the internal NLB"
+  assert_contains "${src}" 'kubectl get svc "${ORCHESTRATOR_INTERNAL_SVC}"' "that wait reads the orchestrator-internal Service"
+  assert_contains "${src}" "resolve_orchestrator_internal_url 3" "Phase 3 resolves the internal NLB hostname"
+  assert_contains "${src}" 'deploy_ui_api_proxy 3 "${ORCHESTRATOR_INTERNAL_URL}"' "the proxy stack is given the internal NLB URL"
+  assert_contains "${src}" "verify_ui_api_proxy 3" "Phase 3 drives one request through the proxy before building the UI"
+  # The probe goes through boto3. `aws lambda invoke --cli-binary-format` is CLI v2
+  # only; on a shell whose `aws` is v1 every invoke failed locally and the first live
+  # run reported a network fault that did not exist.
+  assert_contains "${src}" 'boto3.client("lambda", region_name=region).invoke(' "the readiness probe invokes the function through boto3"
+  assert_not_contains "${src}" "cli-binary-format" "deploy.sh uses no AWS CLI v2-only flag"
+  assert_contains "${src}" 'resolved "orchestratorInternalUrl=${ORCHESTRATOR_INTERNAL_URL}"' "the NLB URL is recorded in the prefix state"
+  assert_not_contains "${src}" "ParameterValue=http://orchestrator.default.svc.cluster.local" "the proxy is never pointed at a cluster.local name"
+  assert_not_contains "${src}" "orchestrator-url" "deploy_frontend.py is no longer given an orchestrator URL"
+  assert_contains "${src}" 'UI_API_PROXY_STACK="${STACK_PREFIX:+${STACK_PREFIX}-}ui-api-proxy"' "the proxy stack follows the prefix convention"
+  assert_contains "${src}" "deploy_ui_api_proxy 3" "Phase 3 deploys the UI API proxy"
+  assert_contains "${src}" "--action grant-ui-api-invoke" "the Identity Pool role is granted invoke on the proxy"
+  assert_contains "${src}" 'VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}' "the proxy ARN is baked into the UI build"
+  # Both .env.production writers (Step 9 and --ui-only) carry it.
+  assert_eq "$(grep -c 'VITE_UI_API_PROXY_ARN=' "${DEPLOY_SH}")" "2" "both UI env writers set VITE_UI_API_PROXY_ARN"
+  # --destroy removes the proxy's VPC ENIs before eksctl deletes the subnets.
+  assert_contains "${src}" 'for _vpc_lambda_stack in "${UI_API_PROXY_STACK}" "${VPC_PROXY_STACK}"' "--destroy deletes the proxy stack before the cluster"
+
+  # --- deploy_closed_loop.sh: the UI rebuild keeps the proxy ARN ------------
+  local cl; cl="$(cat "${SCRIPT_DIR}/../deploy_closed_loop.sh")"
+  assert_not_contains "${cl}" "orchestrator-url" "deploy_closed_loop.sh is no longer given an orchestrator URL"
+  assert_not_contains "${cl}" "get svc orchestrator" "deploy_closed_loop.sh does not look for an orchestrator load balancer (Triton's internal NLB lookup is unrelated)"
+  assert_contains "${cl}" 'VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}' "the Step 7 rebuild carries the proxy ARN"
+
+  # --- deploy_frontend.py: CloudFront is static-only ------------------------
+  local fe; fe="$(cat "${SCRIPT_DIR}/../scripts/deploy_frontend.py")"
+  assert_not_contains "${fe}" "alb-api" "no load-balancer origin in the distribution"
+  assert_not_contains "${fe}" '"PathPattern"' "no cache behaviour of any kind in the distribution"
+  assert_not_contains "${fe}" "--orchestrator-url" "deploy_frontend.py has no orchestrator URL argument"
+
+  # --- deploy_ui_api_proxy: subnet + SG discovery and the stack call ---------
+  # The real function, lifted from deploy.sh, run against a mocked aws that records
+  # every call. The stack must land on the private (internal-elb tagged) subnets
+  # with the cluster security group, and nothing public may be created.
+  fn_src="$(sed -n '/^_cfn_output() {/,/^}/p; /^deploy_ui_api_proxy() {/,/^}/p' "${DEPLOY_SH}")"
+  out="$(CALLS="${tmp}/calls" bash -c '
+    set -uo pipefail
+    AWS_REGION=us-east-1; AWS_PROFILE=t-profile; CLUSTER_NAME=t-cluster; STACK_PREFIX=t
+    SCRIPT_DIR=/deploy; UI_API_PROXY_STACK=t-ui-api-proxy
+    ORCH_URL=http://t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com
+    log()  { printf "%s\n" "$*"; }
+    ok()   { printf "[OK] %s\n" "$*"; }
+    fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+    aws() {
+      printf "%s\n" "$*" >> "$CALLS"
+      case "$*" in
+        *eks\ describe-cluster*vpcId*) printf "vpc-0abc\n" ;;
+        *eks\ describe-cluster*clusterSecurityGroupId*) printf "sg-0cafe\n" ;;
+        *ec2\ describe-subnets*) printf "subnet-aaa\tsubnet-bbb\n" ;;
+        *cloudformation\ describe-stacks*StackStatus*) printf "\n"; return 1 ;;
+        *cloudformation\ create-stack*) printf "{\"StackId\":\"arn:x\"}\n" ;;
+        *cloudformation\ wait*) ;;
+        *cloudformation\ describe-stacks*ProxyFunctionArn*) printf "arn:aws:lambda:us-east-1:123456789012:function:t-ui-api-proxy\n" ;;
+        *) printf "UNEXPECTED aws %s\n" "$*" >&2; return 1 ;;
+      esac
+      return 0
+    }
+    '"${fn_src}"'
+    deploy_ui_api_proxy 3 "${ORCH_URL}"
+    echo "ARN=${UI_API_PROXY_ARN}"
+  ' 2>&1)"; rc=$?
+  assert_eq "${rc}" "0" "deploy_ui_api_proxy succeeds against a healthy mocked account (output: ${out})"
+  assert_contains "${out}" "ARN=arn:aws:lambda:us-east-1:123456789012:function:t-ui-api-proxy" "the function ARN is read from the stack output"
+  local calls; calls="$(cat "${tmp}/calls")"
+  assert_contains "${calls}" "tag:kubernetes.io/role/internal-elb,Values=1" "subnets are the private ones eksctl tags for internal load balancers"
+  assert_contains "${calls}" 'ParameterKey=SubnetIds,ParameterValue="subnet-aaa,subnet-bbb"' "both private subnets are passed to the stack"
+  assert_contains "${calls}" "ParameterKey=SecurityGroupIds,ParameterValue=sg-0cafe" "the cluster security group is passed to the stack"
+  assert_contains "${calls}" "ParameterKey=OrchestratorBaseUrl,ParameterValue=http://t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com" "the Lambda targets the orchestrator's internal NLB hostname"
+  assert_contains "${calls}" "create-stack --stack-name t-ui-api-proxy" "a missing stack is created"
+  assert_not_contains "${calls}" "elbv2" "nothing creates a load balancer"
+  assert_not_contains "${calls}" "block-public-access" "nothing reads or changes the account's BPA settings"
+
+  # --- no private subnets: a clear Phase-3 failure, no stack call -----------
+  : > "${tmp}/calls"
+  out="$(CALLS="${tmp}/calls" bash -c '
+    set -uo pipefail
+    AWS_REGION=us-east-1; CLUSTER_NAME=t-cluster; STACK_PREFIX=t; SCRIPT_DIR=/deploy; UI_API_PROXY_STACK=t-ui-api-proxy
+    log() { :; }; ok() { :; }
+    fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+    aws() {
+      printf "%s\n" "$*" >> "$CALLS"
+      case "$*" in
+        *vpcId*) printf "vpc-0abc\n" ;;
+        *clusterSecurityGroupId*) printf "sg-0cafe\n" ;;
+        *describe-subnets*) printf "\n" ;;
+        *) printf "UNEXPECTED aws %s\n" "$*" >&2; return 1 ;;
+      esac
+    }
+    '"${fn_src}"'
+    deploy_ui_api_proxy 3 http://t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com
+  ' 2>&1)"; rc=$?
+  assert_eq "${rc}" "1" "no private subnets stops the deploy"
+  assert_contains "${out}" "Phase 3/5" "the failure is attributed to Phase 3"
+  assert_contains "${out}" "internal-elb" "the failure names the subnet tag it looked for"
+  assert_not_contains "$(cat "${tmp}/calls")" "cloudformation" "no stack call is made without subnets"
+
+  # --- a cluster.local URL, or none, is refused before any AWS call -----------
+  for bad in "" "http://orchestrator.default.svc.cluster.local"; do
+    : > "${tmp}/calls"
+    out="$(CALLS="${tmp}/calls" bash -c '
+      set -uo pipefail
+      AWS_REGION=us-east-1; CLUSTER_NAME=t-cluster; STACK_PREFIX=t; SCRIPT_DIR=/deploy; UI_API_PROXY_STACK=t-ui-api-proxy
+      log() { :; }; ok() { :; }
+      fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+      aws() { printf "%s\n" "$*" >> "$CALLS"; }
+      '"${fn_src}"'
+      deploy_ui_api_proxy 3 "$1"
+    ' _ "${bad}" 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "deploy_ui_api_proxy refuses the URL '${bad:-<empty>}'"
+    assert_contains "${out}" "internal NLB URL" "the refusal names what it wanted"
+    assert_eq "$(cat "${tmp}/calls" | wc -l | tr -d ' ')" "0" "no AWS call is made for a refused URL"
+  done
+
+  # --- resolve_orchestrator_internal_url: hostname appears -> URL exported ----
+  local wait_src; wait_src="$(sed -n '/^resolve_orchestrator_internal_url() {/,/^}/p' "${DEPLOY_SH}")"
+  out="$(bash -c '
+    set -uo pipefail
+    ORCHESTRATOR_INTERNAL_SVC=orchestrator-internal; ORCHESTRATOR_INTERNAL_URL=""
+    ok() { printf "[OK] %s\n" "$*"; }
+    fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+    kubectl() { printf "t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com"; }
+    '"${wait_src}"'
+    resolve_orchestrator_internal_url 3
+    echo "URL=${ORCHESTRATOR_INTERNAL_URL}"
+  ' 2>&1)"; rc=$?
+  assert_eq "${rc}" "0" "resolve_orchestrator_internal_url succeeds when the Service has a hostname"
+  assert_contains "${out}" "URL=http://t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com" "it exports http://<hostname>"
+
+  # --- resolve_orchestrator_internal_url: never a hostname -> Phase 3 failure --
+  # The deadline is forced to the past so the test does not wait five minutes.
+  out="$(bash -c '
+    set -uo pipefail
+    ORCHESTRATOR_INTERNAL_SVC=orchestrator-internal; ORCHESTRATOR_INTERNAL_URL=""
+    ok() { :; }
+    fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+    kubectl() { printf ""; }
+    '"${wait_src/+ 300/- 1}"'
+    resolve_orchestrator_internal_url 3
+  ' 2>&1)"; rc=$?
+  assert_eq "${rc}" "1" "no hostname within the deadline stops the deploy"
+  assert_contains "${out}" "Phase 3/5" "the failure is attributed to Phase 3"
+  assert_contains "${out}" "kubectl describe svc orchestrator-internal" "the failure names the command that explains why"
+
+  # --- the CFN parameter has no default and rejects cluster.local --------------
+  local cfn; cfn="$(cat "${SCRIPT_DIR}/../ui_api_proxy_cfn.yaml")"
+  assert_not_contains "${cfn}" "Default: http://orchestrator.default.svc.cluster.local" "OrchestratorBaseUrl has no cluster.local default"
+  assert_contains "${cfn}" "AllowedPattern: '^http://[A-Za-z0-9.-]+\\.amazonaws\\.com" "OrchestratorBaseUrl only accepts an amazonaws.com hostname"
+  assert_contains "${cfn}" 'BASE_URL = os.environ["ORCHESTRATOR_BASE_URL"]' "the handler has no fallback URL"
+
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
 # Run all tests
 # =========================================================================
+test_cluster_config_private_nodes
+test_unknown_args_rejected
+test_private_ui_api_path
 test_gate_decisions
 test_docker_autostart
 test_progress_output

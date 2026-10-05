@@ -16,19 +16,7 @@ import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
-// Imported from the specific provider package, not the `@aws-sdk/credential-providers`
-// umbrella. That umbrella re-exports Node-only providers -- `fromTokenFile` does
-// `import { readFileSync } from "node:fs"` -- which a browser target cannot resolve, so
-// Vite's dependency pre-bundling fails with `"fromTokenFile" is not exported`. `vite build`
-// tolerates it but `vite dev` does not, which made `npm run dev` unusable while production
-// builds still succeeded.
-import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-identity";
-import { getIdToken } from "./auth";
-
-// Configuration from Vite env vars (generated at deploy time by deploy_frontend.py).
-const REGION = import.meta.env.VITE_COGNITO_REGION || "us-east-1";
-const IDENTITY_POOL_ID = import.meta.env.VITE_IDENTITY_POOL_ID || "";
-const USER_POOL_ID = import.meta.env.VITE_COGNITO_USER_POOL_ID || "";
+import { COGNITO_REGION as REGION, getSigV4Credentials, isIdentityConfigured } from "./awsCredentials";
 
 // Runtime ARNs. Accept the legacy VITE_BID_SHADING_RUNTIME_ARN name as a
 // fallback for the adaptive runtime so older deploys keep working.
@@ -37,9 +25,6 @@ const ADAPTIVE_BIDDING_RUNTIME_ARN =
   import.meta.env.VITE_BID_SHADING_RUNTIME_ARN ||
   "";
 const GOVERNANCE_RUNTIME_ARN = import.meta.env.VITE_GOVERNANCE_RUNTIME_ARN || "";
-
-// Cognito Identity provider key: "cognito-idp.REGION.amazonaws.com/USER_POOL_ID"
-const COGNITO_PROVIDER = `cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`;
 
 /**
  * Error thrown when an agent is not deployed/configured or is unreachable.
@@ -59,27 +44,11 @@ export class AgentInvokeError extends Error {
  * The user's ID token is exchanged for temporary SigV4 credentials.
  */
 async function getClient() {
-  const idToken = await getIdToken();
-  if (!idToken) {
-    throw new AgentInvokeError(
-      "not_authenticated",
-      "Not signed in — no Cognito ID token available."
-    );
+  const { credentials, error } = await getSigV4Credentials();
+  if (error) {
+    throw new AgentInvokeError(error.kind, error.detail);
   }
-  if (!IDENTITY_POOL_ID) {
-    throw new AgentInvokeError(
-      "not_configured",
-      "Identity Pool not configured (VITE_IDENTITY_POOL_ID missing). Re-deploy with deploy.sh."
-    );
-  }
-  return new BedrockAgentCoreClient({
-    region: REGION,
-    credentials: fromCognitoIdentityPool({
-      clientConfig: { region: REGION },
-      identityPoolId: IDENTITY_POOL_ID,
-      logins: { [COGNITO_PROVIDER]: idToken },
-    }),
-  });
+  return new BedrockAgentCoreClient({ region: REGION, credentials });
 }
 
 function _mapError(err) {
@@ -157,9 +126,7 @@ export function invokeGovernance(payload) {
 }
 
 /** True when the shared prerequisites (identity pool + user pool) are present. */
-function _identityConfigured() {
-  return !!(IDENTITY_POOL_ID && USER_POOL_ID);
-}
+const _identityConfigured = isIdentityConfigured;
 
 export function isAdaptiveConfigured() {
   return _identityConfigured() && !!ADAPTIVE_BIDDING_RUNTIME_ARN;

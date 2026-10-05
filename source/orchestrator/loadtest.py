@@ -157,7 +157,13 @@ class LoadTestStatus(BaseModel):
     latency_avg: float
     latency_max: float
     histogram: dict  # {"lt_10ms": int, "10_30ms": int, "30_50ms": int, "gt_50ms": int}
-    per_container: list[dict]  # [{name, avg_latency_ms, total_mutations}]
+    # [{name, avg_latency_ms, total_mutations, p50_latency_ms, p95_latency_ms,
+    #   timing_p50: {segment: ms}, transport_p50_ms}] -- the last three come from
+    # the container's own metadata.timing (shared/hop_timing.py) and are 0/{} when
+    # a container reported none. transport_p50_ms is the p50 of
+    # (orchestrator-measured latency_ms - container-reported total), i.e. the
+    # network + client-stack share a protocol change can move.
+    per_container: list[dict]
     # Additional stats
     warmup_avg_ms: float = 0.0  # avg latency of first 10% of requests
     steady_state_avg_ms: float = 0.0  # avg latency of last 50% of requests
@@ -238,6 +244,9 @@ _progress_completed: dict[str, int] = {}  # test_id -> completed count
 _progress_start_time: dict[str, float] = {}  # test_id -> monotonic start time
 _progress_per_container_latencies: dict[str, dict[str, list[float]]] = {}  # test_id -> {name: [latencies]}
 _progress_per_container_mutations: dict[str, dict[str, int]] = {}  # test_id -> {name: mutation_count}
+# test_id -> {name: {segment: [ms]}} from each container's metadata.timing, plus
+# the derived "transport" segment (latency_ms - timing.total) per request.
+_progress_per_container_timing: dict[str, dict[str, dict[str, list[float]]]] = {}
 
 
 def _cleanup_expired() -> None:
@@ -254,6 +263,7 @@ def _cleanup_expired() -> None:
         _progress_start_time.pop(tid, None)
         _progress_per_container_latencies.pop(tid, None)
         _progress_per_container_mutations.pop(tid, None)
+        _progress_per_container_timing.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +739,47 @@ def compute_histogram(latencies: list[float]) -> dict:
 # Async load test runner
 # ---------------------------------------------------------------------------
 
+def _record_container_timing(store: dict[str, list[float]] | None, inv) -> None:
+    """Append one invocation's container-reported timing segments to ``store``.
+
+    Adds a derived ``transport`` segment: the orchestrator's wall clock for the
+    call minus the container's own ``total``. That difference is the network hop
+    plus both client/server HTTP stacks -- the share a transport change can
+    move -- and is the number Phase 1/2 of the gRPC plan are judged on. Nothing
+    is recorded for a container that reported no timing.
+    """
+    if store is None:
+        return
+    timing = getattr(inv, "timing", None)
+    if not timing:
+        return
+    for seg, val in timing.items():
+        if isinstance(val, (int, float)):
+            store.setdefault(seg, []).append(float(val))
+    total = timing.get("total")
+    if isinstance(total, (int, float)):
+        store.setdefault("transport", []).append(max(0.0, float(inv.latency_ms) - float(total)))
+
+
+def summarize_container_timing(store: dict[str, list[float]]) -> dict:
+    """p50 per segment plus the transport p50, for one container's per_container entry."""
+    timing_p50: dict[str, float] = {}
+    timing_p95: dict[str, float] = {}
+    for seg, vals in store.items():
+        if seg == "transport" or not vals:
+            continue
+        st = compute_latency_stats(vals)
+        timing_p50[seg] = st["latency_p50"]
+        timing_p95[seg] = st["latency_p95"]
+    transport = compute_latency_stats(store.get("transport", []))
+    return {
+        "timing_p50": timing_p50,
+        "timing_p95": timing_p95,
+        "transport_p50_ms": transport["latency_p50"],
+        "transport_p95_ms": transport["latency_p95"],
+    }
+
+
 async def _scale_containers(replicas: int) -> None:
     """Scale all ARTF container deployments via Kubernetes API.
     
@@ -804,6 +855,7 @@ async def _run_load_test(
     _progress_start_time[test_id] = time.monotonic()
     _progress_per_container_latencies[test_id] = {c["name"]: [] for c in CONTAINERS}
     _progress_per_container_mutations[test_id] = {c["name"]: 0 for c in CONTAINERS}
+    _progress_per_container_timing[test_id] = {c["name"]: {} for c in CONTAINERS}
 
     start_time = _progress_start_time[test_id]
     deadline = start_time + duration_s  # absolute monotonic deadline
@@ -874,6 +926,7 @@ async def _run_load_test(
             for inv in invocations:
                 _progress_per_container_latencies[test_id][inv.name].append(inv.latency_ms)
                 _progress_per_container_mutations[test_id][inv.name] += len(inv.mutations)
+                _record_container_timing(_progress_per_container_timing[test_id].get(inv.name), inv)
                 # ERROR_STATUSES, not a literal pair. The orchestrator's status
                 # vocabulary now distinguishes "unreachable" and "error" from a
                 # timeout; both used to be reported as "ok" (the connect error
@@ -985,11 +1038,18 @@ async def _run_load_test(
         name = c["name"]
         c_lats = _progress_per_container_latencies.get(test_id, {}).get(name, [])
         avg_lat = round(sum(c_lats) / len(c_lats), 3) if c_lats else 0.0
-        per_container.append({
+        c_stats = compute_latency_stats(c_lats)
+        entry = {
             "name": name,
             "avg_latency_ms": avg_lat,
             "total_mutations": _progress_per_container_mutations.get(test_id, {}).get(name, 0),
-        })
+            "p50_latency_ms": c_stats["latency_p50"],
+            "p95_latency_ms": c_stats["latency_p95"],
+        }
+        entry.update(summarize_container_timing(
+            _progress_per_container_timing.get(test_id, {}).get(name, {})
+        ))
+        per_container.append(entry)
 
     # Determine final state
     if _cancel_flags.get(test_id, False):
@@ -1251,7 +1311,15 @@ async def start_loadtest(request: Request) -> JSONResponse:
 
 
 async def get_loadtest(request: Request) -> JSONResponse:
-    """GET /v1/loadtest/{id} — Poll final results."""
+    """GET /v1/loadtest/{id} — Poll a test's status.
+
+    While the test is running, the stored ``LoadTestStatus`` is the start-time
+    snapshot (all counters zero), so the live counters from ``_live_progress`` are
+    merged over it. This is the transport the UI uses behind the UI API proxy
+    Lambda, which cannot carry the SSE stream, and it must show the same numbers
+    the stream would. Once the test is complete, cancelled or errored, the stored
+    object is final and is returned as is.
+    """
     _cleanup_expired()
 
     test_id = request.path_params["id"]
@@ -1259,7 +1327,10 @@ async def get_loadtest(request: Request) -> JSONResponse:
     if status is None:
         return JSONResponse({"error": "Load test not found"}, status_code=404)
 
-    return JSONResponse(status.model_dump())
+    body = status.model_dump()
+    if status.state == "running":
+        body.update(_live_progress(test_id))
+    return JSONResponse(body)
 
 
 async def get_loadtest_history(request: Request) -> JSONResponse:
@@ -1313,6 +1384,38 @@ async def cancel_loadtest(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Live progress (shared by the SSE stream and the poll endpoint)
+# ---------------------------------------------------------------------------
+
+def _live_progress(test_id: str) -> dict:
+    """Current stats for a running test, computed from the ``_progress_*`` dicts.
+
+    ``_active_tests[test_id]`` is written only at start and at completion; while the
+    test runs, these dicts are the only place the counters live. Both transports the
+    UI can use (SSE through CloudFront or a port-forward, polling through the UI API
+    proxy Lambda, which cannot stream) read from here so they report the same
+    numbers. Keys match ``LoadTestStatus`` so the poll body can be built from them.
+    """
+    latencies = _progress_latencies.get(test_id, [])
+    completed = _progress_completed.get(test_id, 0)
+    errors = _progress_errors.get(test_id, 0)
+    start_time = _progress_start_time.get(test_id)
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000.0 if start_time else 0.0
+    rps = round((completed / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0, 2)
+
+    stats = compute_latency_stats(latencies)
+    return {
+        "completed": completed,
+        "errors": errors,
+        "elapsed_ms": round(elapsed_ms, 2),
+        "rps": rps,
+        **stats,
+        "histogram": compute_histogram(latencies),
+    }
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming handler
 # ---------------------------------------------------------------------------
 
@@ -1342,29 +1445,17 @@ async def _sse_event_generator(test_id: str) -> AsyncGenerator[str, None]:
             yield f"event: complete\ndata: {json.dumps(current_status.model_dump())}\n\n"
             return
 
-        # Compute current progress stats from shared data
-        latencies = _progress_latencies.get(test_id, [])
-        completed = _progress_completed.get(test_id, 0)
-        errors = _progress_errors.get(test_id, 0)
-        start_time = _progress_start_time.get(test_id)
-
-        elapsed_ms = (time.monotonic() - start_time) * 1000.0 if start_time else 0.0
-        rps = round((completed / (elapsed_ms / 1000.0)) if elapsed_ms > 0 else 0.0, 2)
-
-        # Compute latency percentiles from accumulated data
-        stats = compute_latency_stats(latencies)
-        histogram = compute_histogram(latencies)
-
+        live = _live_progress(test_id)
         progress_data = {
-            "completed": completed,
+            "completed": live["completed"],
             "total": total,
-            "rps": rps,
-            "elapsed_ms": round(elapsed_ms, 2),
-            "latency_p50": stats["latency_p50"],
-            "latency_p95": stats["latency_p95"],
-            "latency_p99": stats["latency_p99"],
-            "errors": errors,
-            "histogram": histogram,
+            "rps": live["rps"],
+            "elapsed_ms": live["elapsed_ms"],
+            "latency_p50": live["latency_p50"],
+            "latency_p95": live["latency_p95"],
+            "latency_p99": live["latency_p99"],
+            "errors": live["errors"],
+            "histogram": live["histogram"],
         }
 
         yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"

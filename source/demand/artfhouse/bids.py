@@ -4,8 +4,10 @@ One bid per eligible campaign that clears its floor, all within a SINGLE seatbid
 with no seat aliases. Every offer arrives under one seat, which is why the frontend
 column is labelled offers rather than bidders.
 
-A bid's price is the campaign's CATALOGUED CPM. It is not the floor, and it is not a
-computed clearing price -- this endpoint does not resolve the auction. Prebid does.
+A bid's price is the campaign's CATALOGUED CPM, plus the campaign's catalogued
+audience uplift when the user carries a segment the campaign pays extra for. It is
+not the floor, and it is not a computed clearing price -- this endpoint does not
+resolve the auction. Prebid does.
 
 Candidates that do not clear their floor become ``below_floor`` exclusions rather
 than disappearing, so bids and exclusions PARTITION the candidate set: every
@@ -41,6 +43,13 @@ class Bid:
     #: Which floor the price had to clear, for the response's supporting detail.
     binding_floor: float
     floor_bound_by: str
+    #: The campaign's catalogued CPM before any audience uplift, and the uplift
+    #: that applied (None when none did). Reported so a consumer can see WHY this
+    #: price is what it is: the same campaign offers `declared_cpm` to a user
+    #: without the segment and `price` to one with it.
+    declared_cpm: float = 0.0
+    uplift_cpm: Optional[float] = None
+    uplift_segments: tuple[str, ...] = ()
     #: "banner" or "video", carried from the campaign. Emitted as OpenRTB `mtype`.
     media_type: str = "banner"
     #: Creative duration in seconds. Video only.
@@ -81,11 +90,18 @@ def build(
     imp_id: str,
     candidates: tuple[Candidate, ...],
     floors: dict[str, BindingFloor],
+    segment_ids: tuple[str, ...] = (),
 ) -> BuildResult:
     """Emit a bid per clearing candidate; everything else becomes an exclusion.
 
     ``floors`` is keyed by campaign id, so each candidate is compared against the
     floor resolved for its own deal rather than a single request-wide value.
+
+    ``segment_ids`` are the user's audience segments from the request. A campaign
+    with an audience uplift offers its uplifted price when one of its target
+    segments is present, and that uplifted price is what is compared against the
+    floor: a buyer who pays more for this audience clears a floor its base price
+    would not.
     """
     bids: list[Bid] = []
     exclusions: list[Exclusion] = []
@@ -105,8 +121,10 @@ def build(
             )
             continue
 
+        price = campaign.price_for(segment_ids)
+        uplifted = price != campaign.declared_cpm
         floor = floors.get(campaign.campaign_id)
-        if floor is not None and not floor.clears(campaign.declared_cpm):
+        if floor is not None and not floor.clears(price):
             exclusions.append(
                 Exclusion(
                     campaign_id=campaign.campaign_id,
@@ -125,7 +143,7 @@ def build(
                 campaign_id=campaign.campaign_id,
                 campaign_name=campaign.campaign_name,
                 deal_id=candidate.deal_id,
-                price=campaign.declared_cpm,
+                price=price,
                 adomain=campaign.adomain,
                 creative_id=campaign.creative_id,
                 width=campaign.width,
@@ -134,6 +152,12 @@ def build(
                 floor_bound_by=floor.bound_by.value if floor else "impression",
                 media_type=campaign.media_type,
                 duration=campaign.duration,
+                declared_cpm=campaign.declared_cpm,
+                uplift_cpm=campaign.audience_uplift.cpm if uplifted else None,
+                uplift_segments=(
+                    tuple(s for s in segment_ids if s in campaign.audience_uplift.segment_ids)
+                    if uplifted else ()
+                ),
             )
         )
 
@@ -237,6 +261,14 @@ def to_seatbid(bids: tuple[Bid, ...]) -> dict:
                             "dealId": b.deal_id,
                             "bindingFloor": b.binding_floor,
                             "floorBoundBy": b.floor_bound_by,
+                            "declaredCpm": b.declared_cpm,
+                            # Present only when an uplift applied, so a consumer
+                            # can tell "no uplift" from "uplift of zero".
+                            **(
+                                {"audienceUplift": {"cpm": b.uplift_cpm, "segments": list(b.uplift_segments)}}
+                                if b.uplift_cpm is not None
+                                else {}
+                            ),
                         }
                     }
                 },

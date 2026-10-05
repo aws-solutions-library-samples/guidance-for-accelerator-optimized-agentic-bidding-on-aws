@@ -20,7 +20,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -70,65 +69,28 @@ def _ensure_oac(cf, oac_name: str) -> str:
         return next(o["Id"] for o in oacs if o["Name"] == oac_name)
 
 
-def _ensure_strip_api_function(cf, function_name: str) -> str:
-    """Get or create+publish the CloudFront Function that strips the /api prefix."""
-    code = """function handler(event) {
-  var request = event.request;
-  request.uri = request.uri.replace(/^\\/api/, '');
-  if (request.uri === '') request.uri = '/';
-  return request;
-}"""
+# Name of the CloudFront Function earlier releases attached to a "/api/*" cache
+# behaviour in front of the orchestrator load balancer. The orchestrator now has
+# no public address (the UI invokes the ui-api-proxy Lambda instead), so the
+# behaviour is gone and a leftover function is deleted on update.
+def _legacy_strip_api_function_name(stack_name: str) -> str:
+    return f"{stack_name}-strip-api-prefix"
+
+
+def _delete_function_if_present(cf, function_name: str) -> None:
     try:
-        existing = cf.describe_function(Name=function_name)
-        return existing["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        desc = cf.describe_function(Name=function_name)
     except ClientError as e:
-        if "NoSuchFunctionExists" not in str(e):
-            raise
-        resp = cf.create_function(
-            Name=function_name,
-            FunctionConfig={"Comment": "Strip /api prefix for ALB origin", "Runtime": "cloudfront-js-2.0"},
-            FunctionCode=code.encode(),
-        )
-        cf.publish_function(Name=function_name, IfMatch=resp["ETag"])
-        return resp["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
-
-
-def _api_cache_behavior(fn_arn: str) -> dict:
-    return {
-        "PathPattern": "/api/*",
-        "TargetOriginId": "alb-api",
-        "ViewerProtocolPolicy": "redirect-to-https",
-        "AllowedMethods": {
-            "Quantity": 7,
-            "Items": ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"],
-            "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
-        },
-        "Compress": False,
-        "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",         # AWS managed: CachingDisabled
-        "OriginRequestPolicyId": "216adef6-5c7f-47e4-b989-5492eafa07d3", # AWS managed: AllViewer
-        "SmoothStreaming": False,
-        "FieldLevelEncryptionId": "",
-        "LambdaFunctionAssociations": {"Quantity": 0},
-        "FunctionAssociations": {"Quantity": 1, "Items": [{
-            "FunctionARN": fn_arn,
-            "EventType": "viewer-request",
-        }]},
-    }
-
-
-def _alb_origin(alb_host: str) -> dict:
-    return {
-        "Id": "alb-api",
-        "DomainName": alb_host,
-        "OriginPath": "",
-        "CustomHeaders": {"Quantity": 0},
-        "CustomOriginConfig": {
-            "HTTPPort": 80, "HTTPSPort": 443,
-            "OriginProtocolPolicy": "http-only",
-            "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
-            "OriginReadTimeout": 60, "OriginKeepaliveTimeout": 30,
-        },
-    }
+        if "NoSuchFunctionExists" in str(e):
+            return
+        raise
+    try:
+        cf.delete_function(Name=function_name, IfMatch=desc["ETag"])
+        _LOG.info("Deleted legacy CloudFront Function %s (no longer referenced)", function_name)
+    except ClientError as e:
+        # FunctionInUse means a distribution still references it; the update
+        # that removes the reference has to propagate first. Harmless to leave.
+        _LOG.warning("Could not delete CloudFront Function %s yet: %s", function_name, e)
 
 
 def _bucket_policy(bucket: str, dist_id: str, account_id: str) -> str:
@@ -262,13 +224,16 @@ def _ensure_distribution(
     oac_name: str,               # Origin Access Control name
     region: str,
     account_id: str,
-    orchestrator_url: str,
-    function_name: str,          # CloudFront Function name for /api stripping
 ) -> tuple[str, str]:
-    """Create or update a CloudFront distribution. Returns (distribution_id, domain)."""
+    """Create or update a static-only CloudFront distribution. Returns (distribution_id, domain).
 
-    alb_host = urlparse(orchestrator_url).hostname or "localhost"
-    has_alb = alb_host != "localhost"
+    The distribution has exactly one origin, the S3 bucket. API traffic never
+    touches CloudFront: the browser invokes the ui-api-proxy Lambda directly
+    (see source/frontend-react/src/authFetch.js), so there is no "/api/*"
+    behaviour and no second origin. On update the origins and cache behaviours
+    are replaced outright, which also strips the ALB origin earlier releases
+    configured.
+    """
     s3_origin_domain = f"{bucket_name}.s3.{region}.amazonaws.com"
 
     origins = [{
@@ -278,13 +243,7 @@ def _ensure_distribution(
         "CustomHeaders": {"Quantity": 0},
         "S3OriginConfig": {"OriginAccessIdentity": ""},
     }]
-    if has_alb:
-        origins.append(_alb_origin(alb_host))
-
-    fn_arn = _ensure_strip_api_function(cf, function_name) if has_alb else None
     cache_behaviors = {"Quantity": 0, "Items": []}
-    if has_alb:
-        cache_behaviors = {"Quantity": 1, "Items": [_api_cache_behavior(fn_arn)]}
 
     existing = _find_distribution(cf, primary_comment=canonical_comment, fallback_comments=fallback_comments)
 
@@ -356,7 +315,7 @@ def _ensure_distribution(
 # Public actions
 # =============================================================================
 
-def deploy(*, stack_name: str, region: str, orchestrator_url: str) -> dict:
+def deploy(*, stack_name: str, region: str) -> dict:
     """Deploy the React UI to the primary CloudFront distribution."""
     s3 = boto3.client("s3", region_name=region)
     cf = boto3.client("cloudfront", region_name=region)
@@ -378,89 +337,14 @@ def deploy(*, stack_name: str, region: str, orchestrator_url: str) -> dict:
         s3_origin_id="s3-frontend",
         oac_name=f"{stack_name}-oac-{uid}",
         region=region, account_id=account_id,
-        orchestrator_url=orchestrator_url,
-        function_name=f"{stack_name}-strip-api-prefix",
     )
+    _delete_function_if_present(cf, _legacy_strip_api_function_name(stack_name))
 
     outputs = {"CloudFrontDomain": cf_domain, "DistributionId": dist_id, "BucketName": bucket_name}
     outputs_path = os.path.join(os.path.dirname(__file__), "..", ".frontend-outputs.json")
     with open(outputs_path, "w", encoding="utf-8") as f:
         json.dump(outputs, f, indent=2)
     _LOG.info("React Frontend (primary): https://%s", cf_domain)
-    return outputs
-
-
-def deploy_vanilla(*, stack_name: str, region: str, orchestrator_url: str) -> dict:
-    """Deploy the vanilla UI to the secondary CloudFront distribution."""
-    s3 = boto3.client("s3", region_name=region)
-    cf = boto3.client("cloudfront", region_name=region)
-    sts = boto3.client("sts", region_name=region)
-    account_id = sts.get_caller_identity()["Account"]
-
-    uid = _uid(stack_name, account_id, region)
-    bucket_name = f"{stack_name}-vanilla-{uid}"
-    frontend_dir = Path(__file__).parent.parent / "frontend"
-
-    _ensure_bucket(s3, bucket_name, region)
-    _upload_vanilla(s3, bucket_name, frontend_dir)
-
-    canonical_comment = f"{stack_name}{SECONDARY_COMMENT_SUFFIX}"
-    fallback_comments = tuple(f"{stack_name}{s}" for s in SECONDARY_LEGACY_COMMENT_SUFFIXES)
-
-    dist_id, cf_domain = _ensure_distribution(
-        cf=cf, s3=s3,
-        canonical_comment=canonical_comment,
-        fallback_comments=fallback_comments,
-        bucket_name=bucket_name,
-        s3_origin_id="s3-vanilla",
-        oac_name=f"{stack_name}-vanilla-oac-{uid}",
-        region=region, account_id=account_id,
-        orchestrator_url=orchestrator_url,
-        function_name=f"{stack_name}-vanilla-strip-api",
-    )
-
-    outputs = {"CloudFrontDomain": cf_domain, "DistributionId": dist_id, "BucketName": bucket_name}
-    outputs_path = os.path.join(os.path.dirname(__file__), "..", ".frontend-vanilla-outputs.json")
-    with open(outputs_path, "w", encoding="utf-8") as f:
-        json.dump(outputs, f, indent=2)
-    _LOG.info("Vanilla Frontend (secondary): https://%s", cf_domain)
-    return outputs
-
-
-def deploy_vanilla(*, stack_name: str, region: str, orchestrator_url: str) -> dict:
-    """Deploy the vanilla UI to the secondary CloudFront distribution."""
-    s3 = boto3.client("s3", region_name=region)
-    cf = boto3.client("cloudfront", region_name=region)
-    sts = boto3.client("sts", region_name=region)
-    account_id = sts.get_caller_identity()["Account"]
-
-    uid = _uid(stack_name, account_id, region)
-    bucket_name = f"{stack_name}-vanilla-{uid}"
-    frontend_dir = Path(__file__).parent.parent / "frontend"
-
-    _ensure_bucket(s3, bucket_name, region)
-    _upload_vanilla(s3, bucket_name, frontend_dir)
-
-    canonical_comment = f"{stack_name}{SECONDARY_COMMENT_SUFFIX}"
-    fallback_comments = tuple(f"{stack_name}{s}" for s in SECONDARY_LEGACY_COMMENT_SUFFIXES)
-
-    dist_id, cf_domain = _ensure_distribution(
-        cf=cf, s3=s3,
-        canonical_comment=canonical_comment,
-        fallback_comments=fallback_comments,
-        bucket_name=bucket_name,
-        s3_origin_id="s3-vanilla",
-        oac_name=f"{stack_name}-vanilla-oac-{uid}",
-        region=region, account_id=account_id,
-        orchestrator_url=orchestrator_url,
-        function_name=f"{stack_name}-vanilla-strip-api",
-    )
-
-    outputs = {"CloudFrontDomain": cf_domain, "DistributionId": dist_id, "BucketName": bucket_name}
-    outputs_path = os.path.join(os.path.dirname(__file__), "..", ".frontend-vanilla-outputs.json")
-    with open(outputs_path, "w", encoding="utf-8") as f:
-        json.dump(outputs, f, indent=2)
-    _LOG.info("Vanilla Frontend (secondary): https://%s", cf_domain)
     return outputs
 
 
@@ -492,7 +376,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
                         help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
-    parser.add_argument("--orchestrator-url", default="http://localhost:8080")
     args = parser.parse_args(argv)
     if args.profile:
         # One place for both credential paths: boto3 clients created below, and any
@@ -502,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     if args.action == "deploy":
-        deploy(stack_name=args.stack_name, region=args.region, orchestrator_url=args.orchestrator_url)
+        deploy(stack_name=args.stack_name, region=args.region)
     else:
         destroy(stack_name=args.stack_name, region=args.region)
     return 0

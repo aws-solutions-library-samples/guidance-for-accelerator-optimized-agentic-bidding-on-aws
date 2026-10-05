@@ -9,7 +9,7 @@
 
 In programmatic advertising, the bidder that evaluates more signals and responds fastest wins. This guidance shows how NVIDIA GPU-accelerated compute and deep learning with NVIDIA Triton Inference Server can reduce bid-response latency while increasing the breadth of features evaluated per impression. This contributes to higher win rates and improved return on ad spend (ROAS).
 
-The solution provides five production-ready ARTF-compliant containers, each doing one job in the bidstream — pricing bids, activating audience segments, scoring private marketplace deals, enriching quality signals, and optimizing publisher yield. Three run GPU-accelerated inference on NVIDIA Triton Inference Server (two deep-learning models via ONNX/TensorRT, one tree model via Triton's Forest Inference Library backend); two use deterministic, rule-based logic on CPU. Future releases will include ISV (Independent Software Vendor) partner containers demonstrating the ecosystem extensibility — including a partner segment-activation model slated to replace the current rule-based audience activator. It also includes an orchestration layer for parallel fan-out using gRPC as the primary ARTF protocol for the production auction path. Optionally, Amazon Bedrock AgentCore with Model Context Protocol (MCP) support is available as a testing and simulation interface for AI agent integration.
+The solution provides five production-ready ARTF-compliant containers, each doing one job in the bidstream — pricing bids, activating audience segments, scoring private marketplace deals, enriching quality signals, and optimizing publisher yield. Three run GPU-accelerated inference on NVIDIA Triton Inference Server (two deep-learning models via ONNX/TensorRT, one tree model via Triton's Forest Inference Library backend); two use deterministic, rule-based logic on CPU. Future releases will include ISV (Independent Software Vendor) partner containers demonstrating the ecosystem extensibility — including a partner segment-activation model slated to replace the current rule-based audience activator. It also includes an orchestration layer for parallel fan-out over the ARTF extension point; each hop (Prebid hook to orchestrator, orchestrator to containers, containers to Triton) is switchable between HTTP and gRPC per deployment. Optionally, Amazon Bedrock AgentCore with Model Context Protocol (MCP) support is available as a testing and simulation interface for AI agent integration.
 
 > **Note for the reader:** This Guidance is published in two parts. Part 1 (this edition) demonstrates how to implement ARTF-compliant containers that act as agents in a bidstream, determining ARTF intents to apply to a bid request while adhering to response-time SLAs. The containers leverage GPU-accelerated inference via NVIDIA Triton to meet sub-millisecond latency requirements.
 >
@@ -53,7 +53,7 @@ The solution provides five production-ready ARTF-compliant containers, each doin
 
 ### Step-by-Step Flow
 
-1. **Bid request ingestion:** An OpenRTB bid request arrives via Amazon CloudFront and is routed through the load balancer to the orchestrator (CloudFront is for the front end testing tool).
+1. **Bid request ingestion:** An OpenRTB bid request reaches the orchestrator over in-cluster Service DNS. From the testing frontend (static files on CloudFront + S3), the browser invokes the UI API proxy Lambda with SigV4 credentials from the Cognito Identity Pool; the Lambda, attached to the cluster VPC, forwards the call to the orchestrator's internal Network Load Balancer (`orchestrator-internal`). From Prebid Server (optional second host) the hook calls the orchestrator directly in-cluster. The orchestrator has no public address.
 
 2. **Orchestration:** The orchestrator (Starlette/Python) receives the request and fans it out in parallel to all registered ARTF containers.
 
@@ -71,11 +71,11 @@ The solution provides five production-ready ARTF-compliant containers, each doin
 
 ### ARTF Container Protocol Stack
 
-Each ARTF container exposes three interfaces per the IAB Tech Lab ARTF v1.0 specification. The gRPC interface is the primary production protocol for real-time auction integration; the MCP interface is an optional testing and simulation endpoint for AI agent experimentation, and is not required for the core bidding stack:
+Each ARTF container exposes three interfaces per the IAB Tech Lab ARTF v1.0 specification. The gRPC interface is the ARTF-specified wire protocol for real-time auction integration and the orchestrator can fan out over it or over the REST equivalent (`ARTF_CONTAINER_TRANSPORT`); the MCP interface is an optional testing and simulation endpoint for AI agent experimentation, and is not required for the core bidding stack:
 
 | Port | Protocol | Endpoint | Description |
 |------|----------|----------|-------------|
-| 50051 | gRPC | RTBExtensionPoint.GetMutations | Primary ARTF protocol (protobuf) |
+| 50051 | gRPC | RTBExtensionPoint.GetMutations | ARTF extension point (JSON payload over gRPC; protobuf schema vendored under `source/proto/`) |
 | 8081 | MCP (JSON-RPC) | POST /mcp | extend_rtb tool for AI agents (Streamable HTTP transport) |
 | 8080 | HTTP | /health/live, /health/ready | Kubernetes liveness and readiness probes |
 
@@ -257,14 +257,20 @@ already-registered Triton models and SageMaker Model Package Groups.
 | AWS Service | Role in This Guidance |
 |-------------|----------------------|
 | Amazon Elastic Kubernetes Service (EKS) | Orchestrates GPU and CPU node groups; manages container lifecycle, scaling, and health |
-| Amazon EC2 (g5.xlarge) | Provides NVIDIA A10G GPU instances for Triton Inference Server |
-| Amazon EC2 (c5.xlarge) | Runs ARTF containers, orchestrator, and the signals enricher on CPU |
+| Amazon EC2 (g5.xlarge; g5.2xlarge and g5.4xlarge as capacity fallbacks) | Provides NVIDIA A10G GPU instances for Triton Inference Server (`gpu-inference` node group, 1 node by default) |
+| Amazon EC2 (c5.2xlarge) | Runs the ARTF containers, the orchestrator and the signals enricher on CPU (`cpu-services` node group, 3 nodes by default) |
+| Amazon VPC (NAT gateways) | One NAT gateway per Availability Zone (three); all nodes run in private subnets |
+| AWS CodeBuild | Builds the x86 and arm64 container images by default, so no local Docker is needed |
+| Elastic Load Balancing (internal NLBs) | In-VPC endpoints for Triton (`triton-internal`) and for the orchestrator (`orchestrator-internal`, the UI API proxy's target); neither is reachable from the internet |
 | Amazon S3 | Stores ONNX model repository (Triton) and static frontend assets |
-| Amazon CloudFront | HTTPS edge delivery for testing frontend; proxies API requests to the cluster |
+| Amazon CloudFront | HTTPS edge delivery of the testing frontend's static assets (S3 origin only) |
 | Amazon ECR | Stores container images for all ARTF containers, orchestrator, and AgentCore bundle |
-| Elastic Load Balancing (NLB) | TCP pass-through in front of the orchestrator |
+| AWS Lambda (UI API proxy) | VPC-attached function the browser invokes with SigV4; forwards UI API calls to the orchestrator's internal NLB so nothing in the VPC is internet-facing |
+| Amazon Cognito (User Pool + Identity Pool) | Signs users in; exchanges the ID token for temporary credentials scoped to invoking the UI API proxy and the closed-loop agents |
 | AWS IAM (IRSA) | IAM Roles for Service Accounts grants Triton S3 read access without long-lived credentials |
-| Amazon Bedrock AgentCore | Hosts the MCP runtime for AI agent integration via the extend_rtb tool |
+| Amazon Bedrock AgentCore | Hosts the MCP runtime for AI agent integration via the extend_rtb tool (deployed by default; `--skip-agentcore` omits it) |
+| Amazon DynamoDB | `loadtest-history` and `container-registry` tables (on-demand) |
+| AWS Secrets Manager | Stores the NVIDIA NGC API key used by the Part 2 training-image build |
 
 
 ### NVIDIA Acceleration and Integration Components
@@ -304,7 +310,7 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 - **Least privilege:** IAM Roles for Service Accounts (IRSA) grant only S3 read access to the Triton pod; no long-lived credentials in containers
 - **Non-root execution:** All ARTF containers run as appuser (non-root) per the ARTF specification
 - **Security hardening:** no-new-privileges security option and read-only filesystem in container runtime
-- **Network isolation:** ARTF containers communicate only within the cluster; external traffic enters exclusively through CloudFront → NLB
+- **Network isolation:** ARTF containers and the orchestrator communicate only within the cluster; the orchestrator has no public address (a ClusterIP Service in-cluster, an internal NLB for the UI API proxy). The only path in from the testing frontend is browser, then `lambda:InvokeFunction` (SigV4, Cognito Identity Pool), then the UI API proxy Lambda inside the VPC, then the orchestrator's internal NLB, with the user's Cognito bearer token forwarded for the orchestrator's own JWT check. This works unchanged in accounts running VPC Block Public Access in block-ingress mode
 - **Image provenance:** Base images sourced from NVIDIA NGC (authenticated registry) and Python official images; application containers stored in private ECR
 
 ### Reliability
@@ -323,7 +329,8 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 
 ### Cost Optimization
 
-- **Right-sized instances:** GPU nodes (g5.xlarge) run only Triton; lightweight ARTF containers run on cost-effective CPU nodes (c5.xlarge)
+- **Right-sized instances:** GPU nodes (g5.xlarge) run only Triton; the ARTF containers run on CPU nodes (c5.2xlarge) by default (`--artf-node-role services`)
+- **Scheduled GPU shutdown:** the deploy installs a scheduled action that scales the GPU node group to zero at 8:00 PM America/New_York every day; the UI's Start GPUs button brings it back on demand
 - **Horizontal Pod Autoscaler:** Kubernetes HPA scales pods based on actual request load, avoiding over-provisioning
 - **Deterministic naming:** Resource names include sha256(stack:account:region)[:8] suffix enabling multiple isolated stacks in one account without collision
 
@@ -337,13 +344,13 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 
 ### Prerequisites
 
-- An AWS account with permissions to create EKS clusters, EC2 instances (including g5 GPU instances), S3 buckets, ECR repositories, and IAM roles
+- An AWS account with permissions to create EKS clusters, EC2 instances (including g5 GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, CodeBuild projects, CloudFront distributions, Cognito pools, DynamoDB tables, Lambda functions, Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles (Part 2, on by default, adds Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager, SNS and Amazon Bedrock model access; see [GUIDANCE-part2.md](GUIDANCE-part2.md#prerequisites))
 - AWS CLI v2 with valid credentials
-- Docker with buildx (for ARM64 cross-compilation)
-- Python 3.11+ with boto3, torch, onnx, onnxscript
+- Python 3.11+ with boto3, torch, onnx, onnxscript (and sagemaker, which `deploy.sh` installs itself when Part 2 is enabled)
 - jq, eksctl, kubectl
-- Access to NVIDIA NGC registry for the Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`)
-- Service quota for at least one g5.xlarge instance in the target region
+- Docker with buildx only if you pass `--local-build`; images build on AWS CodeBuild by default
+- An NVIDIA NGC API key (`--ngc-key`) for the gated NeMo-RL training base image, unless you pass `--no-retraining`. The Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is public and needs no key
+- Service quota for at least one g5.xlarge instance in the target region (the node group also accepts g5.2xlarge and g5.4xlarge)
 
 ### Supported Regions
 
@@ -358,40 +365,47 @@ This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVI
 
 ### Deployment Steps
 
-Full deployment (EKS + Triton + Frontend + AgentCore):
+Full deployment (EKS + Triton + frontend + MCP runtime + Part 2 closed-loop learning, which is on by default):
 
 ```bash
-./deploy.sh
+cd deployment
+./deploy.sh --prefix dv1 --ngc-key YOUR_NGC_API_KEY
 ```
 
-This single command provisions all infrastructure:
+`--prefix` is required on every run: exactly three characters, a letter followed by letters or digits. It names every resource (`dv1-nvidia-artf-recommenders-*`) and keys the local record of remembered settings. The region defaults to `us-east-1` (`AWS_REGION` overrides it); the AWS profile resolves as `--profile`, then `AWS_PROFILE`, then the profile remembered for the prefix, then `default`.
 
-| Step | What | AWS Resources |
-|------|------|---------------|
-| 1 | ECR repositories | 9 repos (7 containers + orchestrator + agentcore) |
-| 2 | Export ONNX models | PyTorch → ONNX via triton/export_models.py |
-| 3 | Upload models to S3 | S3 model repository bucket |
-| 4 | Build & push images | AMD64 for EKS, ARM64 for AgentCore |
-| 5 | EKS cluster | g5.xlarge GPU nodes + c5.xlarge CPU nodes |
-| 6 | NVIDIA Device Plugin | GPU scheduling in Kubernetes |
-| 7 | IRSA configuration | IAM role for Triton S3 access |
-| 8 | Kubernetes manifests | Triton server, ARTF containers, orchestrator, HPA |
-| 9 | Frontend | S3 + CloudFront distribution |
-| 10 | AgentCore | MCP runtime registration |
+This single command runs five phases:
 
-Deploy options:
+| Phase | What | AWS resources created (defaults) |
+|-------|------|----------------------------------|
+| 1 | Prepare models | 9 ECR repositories (`<stack>-*`), DynamoDB tables `<stack>-loadtest-history` and `<stack>-container-registry` (on-demand), ONNX export of DLRM/NCF and the genesis XGBoost models, S3 model bucket `<stack>-triton-models-<id>` |
+| 2 | Build images and provision the cluster, in parallel | CodeBuild stack `<stack>-codebuild` (x86 and arm64 projects) and source bucket; EKS cluster `<stack>-triton` (Kubernetes 1.31, 3 AZs, private nodes, 3 NAT gateways) with node groups `gpu-inference` (1 × g5.xlarge, min 1, max `--maxGPUs`, default 3) and `cpu-services` (3 × c5.2xlarge, min 2, max 8); NVIDIA device plugin; IRSA roles for Triton and the Model Optimizer |
+| 3 | Deploy workloads | Cognito user pool, app client and identity pool; Triton with an internal NLB; the six ARTF containers, the orchestrator (ClusterIP plus the `orchestrator-internal` internal NLB) and HPAs; a one-shot TensorRT bootstrap Job; the `<prefix>-ui-api-proxy` Lambda stack pointed at that NLB and verified with one request; the GPU node group's nightly scheduled shutdown (desired and minimum 0 at 8:00 PM America/New_York) |
+| 4 | Set up access | Frontend bucket `<stack>-frontend-<id>`, CloudFront distribution (S3 origin only), demo Cognito user `admin@example.com` |
+| 5 | Register agents | Bedrock AgentCore MCP runtime `<stack>_mcp` (unless `--skip-agentcore`); then, unless `--no-retraining`, `deploy_closed_loop.sh` provisions Part 2 ([GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps)); then, only with `--with-prebid`, `deploy_prebid.sh` adds Prebid Server as a second ARTF host |
+
+Deploy options (each flag's default is in parentheses):
 
 ```bash
-./deploy.sh --prefix v1                    # namespaced resources (v1-nvidia-artf-*)
-./deploy.sh --prefix prod --skip-agentcore # EKS + frontend only
-./deploy.sh --skip-images                  # reuse existing images
-./deploy.sh --skip-cluster                 # reuse existing EKS cluster
-./deploy.sh --export-only                  # just export ONNX models
-./deploy.sh --ui-only                      # redeploy frontend only
-./deploy.sh --destroy                      # tear down everything
-./deploy.sh --destroy --prefix v1          # tear down a specific stack
-AWS_REGION=us-west-2 ./deploy.sh           # different region
+./deploy.sh --prefix dv1 --profile prof     # AWS CLI profile (AWS_PROFILE, else remembered, else "default")
+./deploy.sh --prefix dv1 --no-retraining    # Part 1 only (default: Part 2 on, --with-retraining)
+./deploy.sh --prefix dv1 --skip-agentcore   # no MCP runtime (default: registered)
+./deploy.sh --prefix dv1 --with-prebid      # add Prebid Server as a second host (default: off)
+./deploy.sh --prefix dv1 --local-build      # build images with local Docker (default: --remote-build on CodeBuild)
+./deploy.sh --prefix dv1 --skip-images      # reuse images already in ECR
+./deploy.sh --prefix dv1 --skip-cluster     # reuse the existing EKS cluster
+./deploy.sh --prefix dv1 --maxGPUs 5        # GPU node group maximum (default 3)
+./deploy.sh --prefix dv1 --artf-on-gpu      # run the ARTF containers on the GPU node (default: CPU node group)
+./deploy.sh --prefix dv1 --model-id ID      # Bedrock model for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --start-at 3       # force a starting phase, 1-5 (default: probe AWS, run what is missing)
+./deploy.sh --prefix dv1 --export-only      # only export and upload the models
+./deploy.sh --prefix dv1 --ui-only          # only redeploy the frontend
+./deploy.sh --prefix dv1 --status           # read-only live status table
+./deploy.sh --prefix dv1 --destroy          # tear the prefix down
+AWS_REGION=us-west-2 ./deploy.sh --prefix dv1   # different region (default: us-east-1)
 ```
+
+Re-running the same command is the way to resume: every phase is idempotent and the script probes AWS first and runs only what is missing. The full flag reference, including environment variables, is in [README.md](README.md#customizing-your-deployment).
 
 Local development:
 
@@ -411,38 +425,25 @@ docker compose up --build
 
 ## Scaling Scenarios
 
-The default deployment (1 GPU node) is designed for demos and development. Production DSPs handling real auction traffic need to scale horizontally. The solution includes built-in autoscaling at multiple layers.
+The default deployment (1 GPU node, 3 CPU nodes) is designed for demos and development. Production DSPs handling real auction traffic need to scale horizontally. The solution scales at three layers, two of them automatic.
 
 ### Scaling Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Scaling Layers                                                      │
-│                                                                      │
-│  Layer 1: Pod Autoscaling (HPA)                                      │
-│    Orchestrator:  2→10 pods  (CPU utilization > 70%)                 │
-│    Triton:        1→4 pods   (GPU utilization > 75% or CPU > 80%)    │
-│                                                                      │
-│  Layer 2: Node Autoscaling (Cluster Autoscaler)                      │
-│    GPU nodes:     1→3 g5.xlarge  (when Triton pods are pending)      │
-│    CPU nodes:     1→4 c5.xlarge  (when ARTF/orchestrator pods pend)  │
-│                                                                      │
-│  Layer 3: Triton Dynamic Batching                                    │
-│    Preferred batch sizes: [8, 16, 32], max batch: 64                 │
-│    Max queue delay: 500μs                                            │
-│    GPU instances per model: 2                                        │
-└─────────────────────────────────────────────────────────────────────┘
-```
+- **Pod autoscaling (automatic, Horizontal Pod Autoscalers).** The orchestrator runs 2 to 10 pods on CPU utilization above 70%. Each of the six ARTF containers runs 2 to 5 pods on CPU above 70% (the `artf-template` placeholder runs 1 to 5). Triton runs 1 to 4 pods on GPU utilization above 75% or CPU above 80%. HPAs place new pods only where node capacity already exists.
+- **Node scaling (manual).** No Cluster Autoscaler or Karpenter is installed. The `gpu-inference` node group is created with 1 node (minimum 1, maximum `--maxGPUs`, default 3) and the `cpu-services` node group with 3 `c5.2xlarge` nodes (minimum 2, maximum 8). To add capacity, scale the node group (`eksctl scale nodegroup` or the Auto Scaling console) or edit `deployment/eks/cluster-config.yaml` before deploying; a Triton pod that needs a GPU no node offers stays Pending until you do. The only automatic node-count change in the deployment is the nightly scheduled action that sets the GPU group to 0 at 8:00 PM America/New_York.
+- **Triton dynamic batching (automatic).** Preferred batch sizes 8, 16 and 32, maximum batch 64, maximum queue delay 500 microseconds, 2 GPU instances per model.
 
 ### Production Scaling Scenarios
 
-| Scenario | QPS | GPU Nodes | CPU Nodes | Triton Pods | Orchestrator Pods | Est. Monthly |
-|----------|-----|-----------|-----------|-------------|-------------------|--------------|
-| Demo / Dev | <100 | 1× g5.xlarge | 2× c5.xlarge | 1 | 2 | ~$1,080 |
-| Small DSP | 1K–10K | 2× g5.xlarge | 3× c5.xlarge | 2 | 4 | ~$2,000 |
-| Mid-market DSP | 10K–100K | 3× g5.xlarge | 4× c5.xlarge | 3–4 | 6–8 | ~$3,000 |
-| Large DSP | 100K–500K | 6× g5.2xlarge | 8× c5.2xlarge | 6 | 10+ | ~$8,500 |
-| Enterprise DSP | 500K–1M+ | 12× g5.4xlarge | 16× c5.4xlarge | 12 | 20+ | ~$22,000 |
+Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g5.xlarge $1.006/h, g5.2xlarge $1.212/h, g5.4xlarge $1.624/h, c5.2xlarge $0.34/h, c5.4xlarge $0.68/h, 730 h), with every node running 24/7 and three NAT gateways ($99). They exclude Part 2, data processing and storage.
+
+| Scenario | QPS | GPU nodes | CPU nodes | Triton pods | Orchestrator pods | Est. monthly compute |
+|----------|-----|-----------|-----------|-------------|-------------------|----------------------|
+| Demo / Dev (shipped default) | <100 | 1 × g5.xlarge | 3 × c5.2xlarge | 1 | 2 | ~$1,650 |
+| Small DSP | 1K to 10K | 2 × g5.xlarge | 4 × c5.2xlarge | 2 | 4 | ~$2,640 |
+| Mid-market DSP | 10K to 100K | 3 × g5.xlarge | 6 × c5.2xlarge | 3 to 4 | 6 to 8 | ~$3,870 |
+| Large DSP | 100K to 500K | 6 × g5.2xlarge | 8 × c5.2xlarge | 6 | 10+ | ~$7,470 |
+| Enterprise DSP | 500K to 1M+ | 12 × g5.4xlarge | 16 × c5.4xlarge | 12 | 20+ | ~$22,340 |
 
 ### Instance Type Selection Guide
 
@@ -460,32 +461,45 @@ The default deployment (1 GPU node) is designed for demos and development. Produ
 
 ### EKS Production Path (GPU) — Part 1 only
 
-All line items below are Part 1 (the real-time bidding path). This table
-assumes the GPU node runs 24/7; see [README.md](README.md#cost) for the
-lower-cost default (scheduled GPU shutdown) and the combined Part 1 + Part 2
-total, since `deploy.sh` deploys both parts by default.
+All line items below are Part 1 (the real-time bidding path) as the default
+`deploy.sh` run creates it in `us-east-1`, at public on-demand rates current
+when this was written (730 hours per month). The GPU line is shown both ways:
+on the included nightly shutdown schedule (about 260 GPU hours per month if
+the node is started each weekday morning) and running 24/7.
+`deploy.sh` deploys Part 2 by default as well; see [README.md](README.md#cost)
+for both parts in one table.
 
-| Resource | Configuration | Part | Est. Monthly Cost |
+| Resource | Configuration | Part | Est. monthly cost |
 |----------|---------------|------|-------------------|
-| EKS Cluster | 1 cluster | Part 1 | $73 |
-| GPU Node (g5.xlarge) | 1 instance (On-Demand) | Part 1 | ~$727 |
-| CPU Nodes (c5.xlarge) | 2 instances (On-Demand) | Part 1 | ~$245 |
-| NAT Gateway | 1 gateway + data transfer | Part 1 | ~$32 |
-| S3 (Models + Frontend) | ~50 MB storage | Part 1 | <$1 |
-| CloudFront | Low-traffic demo | Part 1 | <$1 |
-| ECR | Image storage | Part 1 | <$1 |
-| **Part 1 total (estimate)** | | | **~$1,080/month** |
+| EKS cluster | 1 control plane | Part 1 | $73 |
+| GPU node (g5.xlarge, $1.006/h) | 1 instance, ~260 h on the nightly shutdown schedule | Part 1 | $262 (24/7: $734) |
+| CPU nodes (c5.2xlarge, $0.34/h) | 3 instances, 24/7 (`cpu-services` desired 3, min 2, max 8) | Part 1 | $745 |
+| NAT gateways | 3 (one per AZ) at $0.045/h, plus $0.045 per GB processed | Part 1 | $99 + data |
+| Network Load Balancer (internal, Triton) | 1 at $0.0225/h, plus LCU usage | Part 1 | $16 + LCU |
+| EBS (gp3, $0.08/GB-mo) | 100 GB GPU node volume + 3 × 50 GB CPU node volumes | Part 1 | $20 |
+| S3 (models + frontend), CloudFront, Cognito | Low-traffic demo | Part 1 | <$2 |
+| DynamoDB (`loadtest-history`, `container-registry`) | On-demand | Part 1 | <$2 |
+| Lambda (UI API proxy), CloudWatch Logs, ECR storage | Per-invocation and per-GB; idle when the UI is closed | Part 1 | <$5 |
+| Bedrock AgentCore MCP runtime | Consumption-billed; idle unless an agent calls `extend_rtb` | Part 1 | <$2 |
+| **Part 1 total (estimate)** | | | **~$1,225/month (24/7 GPU: ~$1,700)** |
 
-GPU costs dominate. For demos: deploy, test, then `./deploy.sh --destroy` immediately. A 2-hour demo session costs approximately $3.
+The CPU node group, not the GPU, is the largest fixed line: the three
+`c5.2xlarge` nodes run around the clock. Scale `cpu-services` to its minimum
+of 2 to save about $248/month. For demos: deploy, test, then
+`./deploy.sh --prefix <p> --destroy` immediately. A 2-hour demo session with
+the default node groups costs approximately $5 of compute.
 
 Part 2 (closed-loop learning, deployed by default alongside Part 1) adds
-roughly $170–200/month on top of this — see
-[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for its line items, or
-[README.md](README.md#cost) for both parts combined in one table.
+roughly $245/month at its default schedules (the Adaptive Bidding Agent runs
+once every 24 hours by default; shortening that cadence is what moves the
+Bedrock line); see
+[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for its line items and
+the knobs that reduce it, or [README.md](README.md#cost) for both parts
+combined in one table.
 
 ## Amazon Bedrock AgentCore Integration
 
-The AgentCore deployment is an optional component for testing and AI agent simulation. It bundles all ARTF containers into a single ARM64 image that runs inside an AgentCore microVM, exposing the `extend_rtb` MCP tool on port 8000 at `/mcp`. AgentCore is not required for the core production bidding stack, which uses gRPC exclusively for real-time auction integration.
+The AgentCore MCP runtime is deployed by default in Phase 5 (omit it with `--skip-agentcore`) and is an interoperability surface for testing and AI agent simulation. It bundles all ARTF containers into a single ARM64 image that runs inside an AgentCore microVM (runtime name `<prefix>-nvidia-artf-recommenders_mcp`), exposing the `extend_rtb` MCP tool on port 8000 at `/mcp`. The real-time bidding path does not depend on it: the orchestrator reaches the ARTF containers directly inside the cluster over the ARTF extension point, and the containers' EKS and Triton deployment is unchanged whether or not the runtime exists.
 
 ### AgentCore Configuration
 
@@ -600,7 +614,7 @@ The complete source code for this Guidance is available at:
 ### Includes
 
 - ARTF container implementations: bid pricer, audience activator, deal scorer, signals enricher, yield optimizer
-- Orchestrator with parallel fan-out (gRPC primary, HTTP fallback)
+- Orchestrator with parallel fan-out (gRPC or REST per deployment, MCP fallback)
 - Model export scripts (PyTorch → ONNX via triton/export_models.py)
 - Triton model repository with config.pbtxt configurations
 - Kubernetes manifests with HPA (EKS deployment)

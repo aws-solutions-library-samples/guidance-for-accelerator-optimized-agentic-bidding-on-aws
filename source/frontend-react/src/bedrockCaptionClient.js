@@ -20,23 +20,14 @@
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-// From the specific provider package, not the `@aws-sdk/credential-providers`
-// umbrella. The umbrella re-exports Node-only providers -- `fromTokenFile` does
-// `import { readFileSync } from "node:fs"` -- which breaks Vite's dependency
-// pre-bundling and made `npm run dev` unusable while production builds still
-// succeeded. Same reason as in agentCoreClient.js.
-import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-identity";
-import { getIdToken } from "./auth";
+import { COGNITO_REGION, getSigV4Credentials, isIdentityConfigured } from "./awsCredentials";
 import { buildCaptionPrompt } from "./utils/captionPrompt.js";
 import { validateCaption } from "./utils/captionValidation.js";
 import { buildRunSummaryPrompt } from "./utils/runSummaryPrompt.js";
 import { validateRunSummary } from "./utils/runSummaryValidation.js";
 import { resolveSegmentLabel } from "./utils/segmentLabels.js";
 
-const COGNITO_REGION = import.meta.env.VITE_COGNITO_REGION || "us-east-1";
 const REGION = import.meta.env.VITE_BEDROCK_REGION || COGNITO_REGION;
-const IDENTITY_POOL_ID = import.meta.env.VITE_IDENTITY_POOL_ID || "";
-const USER_POOL_ID = import.meta.env.VITE_COGNITO_USER_POOL_ID || "";
 
 /**
  * The global inference profile, in every region. Haiku 4.5 reports
@@ -46,8 +37,6 @@ const USER_POOL_ID = import.meta.env.VITE_COGNITO_USER_POOL_ID || "";
  */
 const DEFAULT_PROFILE_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
 const PROFILE_ID = import.meta.env.VITE_CAPTION_INFERENCE_PROFILE_ID || DEFAULT_PROFILE_ID;
-
-const COGNITO_PROVIDER = `cognito-idp.${COGNITO_REGION}.amazonaws.com/${USER_POOL_ID}`;
 
 /** @type {{token: string, client: BedrockRuntimeClient} | null} */
 let _cached = null;
@@ -64,24 +53,14 @@ let _cached = null;
  * gating on it would proceed tokenless and fail at the credential exchange.
  */
 async function getClient() {
-  if (!IDENTITY_POOL_ID || !USER_POOL_ID) {
-    return { error: { kind: "not_configured", detail: "Identity Pool or User Pool not in this build." } };
-  }
-  const token = await getIdToken();
-  if (!token) {
-    return { error: { kind: "not_authenticated", detail: "No Cognito ID token." } };
+  const { token, credentials, error } = await getSigV4Credentials();
+  if (error) {
+    return { error };
   }
   if (_cached && _cached.token === token) {
     return { client: _cached.client };
   }
-  const client = new BedrockRuntimeClient({
-    region: REGION,
-    credentials: fromCognitoIdentityPool({
-      clientConfig: { region: COGNITO_REGION },
-      identityPoolId: IDENTITY_POOL_ID,
-      logins: { [COGNITO_PROVIDER]: token },
-    }),
-  });
+  const client = new BedrockRuntimeClient({ region: REGION, credentials });
   _cached = { token, client };
   return { client };
 }
@@ -229,7 +208,7 @@ export async function generateCaption({ beat, context, signal, deps = {} }) {
  * @param {object}      [args.deps]      injection seam for tests
  * @returns {Promise<{ok: true, text: string} | {ok: false, kind: string, detail: string, violations?: object[]}>}
  */
-export async function generateRunSummary({ beats, context, viewModel, signal, deps = {} }) {
+export async function generateRunSummary({ beats, context, viewModel, baseline = null, signal, deps = {} }) {
   const started = (globalThis.performance ?? Date).now();
   const buildPrompt = deps.buildRunSummaryPrompt ?? buildRunSummaryPrompt;
   const validate = deps.validateRunSummary ?? validateRunSummary;
@@ -250,6 +229,7 @@ export async function generateRunSummary({ beats, context, viewModel, signal, de
 
   const prompt = buildPrompt(beats, context, viewModel, {
     resolveSegmentLabel: deps.resolveSegmentLabel ?? resolveSegmentLabel,
+    baseline,
   });
 
   const { client, error } = await clientFactory();
@@ -299,7 +279,7 @@ export async function generateRunSummary({ beats, context, viewModel, signal, de
 
 /** True when the build carries what caption generation needs. */
 export function isCaptionConfigured() {
-  return !!(IDENTITY_POOL_ID && USER_POOL_ID && PROFILE_ID);
+  return isIdentityConfigured() && !!PROFILE_ID;
 }
 
 export { PROFILE_ID, DEFAULT_PROFILE_ID, REGION };

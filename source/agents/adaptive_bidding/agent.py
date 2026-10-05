@@ -446,7 +446,7 @@ class AdaptiveBiddingStrategyAgent:
         )
 
         prompt = (
-            "A new 5-minute market window has closed. Read the current market state and "
+            "A new market window has closed. Read the current market state and "
             "parameters, reason about whether shade_factor and/or conversion_value should "
             "change, apply any warranted adjustments, and summarize your reasoning."
         )

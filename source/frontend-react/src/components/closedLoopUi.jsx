@@ -783,17 +783,70 @@ export function SessionAuditTrail({ entries }) {
   );
 }
 
-export function ModelsView({ versions, error }) {
+// Badge for a SageMaker training job that has not produced a registry version
+// yet (or never will). Active jobs breathe with the processing halo so the row
+// reads as live work rather than a stuck record.
+export function TrainingJobBadge({ status }) {
+  const active = status === "InProgress" || status === "Stopping";
+  const map = { InProgress: "#4f46e5", Stopping: "#d97706", Failed: "#dc2626", Stopped: "#64748b" };
+  const label = {
+    InProgress: "Training in progress",
+    Stopping: "Stopping",
+    Failed: "Training failed",
+    Stopped: "Training stopped",
+  }[status] || status || "—";
   return (
-    <div className="cl-block sg-elevated">
-      <div className="cl-block-title">Model registry versions · SageMaker</div>
+    <span
+      className={`cl-approval-badge${active ? " state-processing" : ""}`}
+      style={{ background: map[status] || "var(--text-muted)" }}
+      data-testid="training-job-badge"
+    >
+      {label}
+    </span>
+  );
+}
+
+// Registry versions for ONE model type, named in the title so the table never
+// reads as "the" model. Training jobs (active, or the most recent failure) are
+// listed above the versions: a running job has no version yet, and a failed
+// one never gets one, so without these rows the registry is silent for the
+// whole training duration and after a failure.
+export function ModelsView({ versions, error, modelLabel, trainingJobs, trainingJobsError }) {
+  const jobs = trainingJobs || [];
+  const hasVersions = !error && versions && versions.length > 0;
+  const empty = !error && versions && versions.length === 0 && jobs.length === 0;
+  return (
+    <div className="cl-block sg-elevated" data-testid="models-view">
+      <div className="cl-block-title" data-testid="models-view-title">
+        Model registry versions · {modelLabel || "all models"} · SageMaker
+      </div>
       {error && <div className="cl-honest">Unavailable: {error}</div>}
-      {!error && versions && versions.length === 0 && <div style={SUBTLE}>No registered model versions yet.</div>}
-      {!error && versions && versions.length > 0 && (
+      {trainingJobsError && (
+        <div className="cl-honest" data-testid="models-view-jobs-error">
+          Training jobs unavailable: {trainingJobsError}
+        </div>
+      )}
+      {empty && <div style={SUBTLE}>No registered model versions yet.</div>}
+      {(hasVersions || jobs.length > 0) && (
         <table className="cl-table">
           <thead><tr><th>Version</th><th>Approval</th><th>Reason</th><th>Status</th><th>Created</th></tr></thead>
           <tbody>
-            {versions.map((v, i) => (
+            {jobs.map((j) => (
+              <tr key={`job-${j.job_name}`} data-testid="training-job-row">
+                <td style={{ ...SUBTLE, ...MONO }}>{j.job_name}</td>
+                <td><TrainingJobBadge status={j.status} /></td>
+                <td style={SUBTLE}>
+                  {j.failure_reason
+                    ? j.failure_reason
+                    : (j.status === "InProgress" || j.status === "Stopping")
+                      ? "Registers a new version when the job completes"
+                      : "No failure reason returned"}
+                </td>
+                <td style={SUBTLE}>{j.secondary_status || j.status}</td>
+                <td style={SUBTLE}>{j.created_at}</td>
+              </tr>
+            ))}
+            {(versions || []).map((v, i) => (
               <tr key={i}>
                 <td>{v.version}</td>
                 <td><ApprovalBadge status={v.approval_status} /></td>

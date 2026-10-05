@@ -155,8 +155,14 @@ describe("BR3-7: the prompt carries no other beat's values", () => {
   };
 
   const beats = buildBeats(submitted, normalised);
+  // The container beats follow pass 1's four beats and pass 2's banner and origin.
+  const firstContainerAt = beats.findIndex((b) => b.kind === BEAT_CONTAINER);
   // Values that belong to exactly one beat each.
-  const exclusive = { 1: ["0.61", "8"], 2: ["2.44", "19"], 3: ["2.99", "31"] };
+  const exclusive = {
+    [firstContainerAt]: ["0.61", "8"],
+    [firstContainerAt + 1]: ["2.44", "19"],
+    [firstContainerAt + 2]: ["2.99", "31"],
+  };
 
   for (const [indexStr, own] of Object.entries(exclusive)) {
     const index = Number(indexStr);

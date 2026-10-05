@@ -1,8 +1,10 @@
 """ARTF Orchestrator — fans out RTBRequests to intent containers.
 
-Calls each registered ARTF container via **gRPC** (the primary ARTF
-protocol) with a JSON-RPC/MCP fallback.  Merges returned mutations into
-a single RTBResponse.
+Calls each registered ARTF container over gRPC (``RTBExtensionPoint.GetMutations``,
+the ARTF protocol) when ``ARTF_CONTAINER_TRANSPORT=grpc``, falling back to REST
+``/mutate`` and then MCP JSON-RPC; with ``http`` (the default until a measured
+run shows gRPC beats it on this hop) the order is REST then MCP. Merges returned
+mutations into a single RTBResponse.
 
 Also exposes a REST endpoint for the frontend (``POST /v1/mutations``)
 and a container health dashboard (``GET /v1/containers``).
@@ -11,6 +13,7 @@ and a container health dashboard (``GET /v1/containers``).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -31,13 +34,17 @@ from starlette.routing import Route
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from shared import artf_applier, artf_stages, hop_timing  # noqa: E402
 from shared.artf_types import (  # noqa: E402
     ConflictModel,
     ContainerInvocationModel,
     Metadata,
     Mutation,
+    RejectedMutationModel,
     RTBRequest,
     RTBResponse,
+    StageModel,
+    is_artf_bypass,
 )
 from orchestrator.container_registry import (  # noqa: E402
     ERROR_STATUSES,
@@ -74,6 +81,25 @@ logger = logging.getLogger(__name__)
 
 _GRPC_METHOD = "/com.iabtechlab.bidstream.mutation.services.v1.RTBExtensionPoint/GetMutations"
 
+# Every ARTF container serves gRPC on this port (shared/server.py
+# run_artf_server's grpc_port default; the Services expose it by name "grpc").
+ARTF_GRPC_PORT = int(os.environ.get("ARTF_GRPC_PORT", "50051"))
+
+
+def _grpc_from_url(url: str) -> str:
+    """``host:ARTF_GRPC_PORT`` from an MCP/REST base URL.
+
+    The *_GRPC env vars name the headless gRPC Services directly; this is the
+    fallback when only *_URL is set. It used to strip the scheme and keep the
+    port, which pointed the gRPC channel at the container's uvicorn HTTP port
+    (8081) -- never a gRPC listener -- so every gRPC attempt would have failed
+    over to REST and the transport comparison would have measured nothing.
+    """
+    host = url.split("://", 1)[-1].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if ":" in host else host
+    return f"{host}:{ARTF_GRPC_PORT}"
+
+
 # ``display_name`` and ``description`` are served by GET /v1/containers so a
 # client does not have to carry a build-time label table. They matter because
 # store-defined containers (see orchestrator/container_registry.py) have names
@@ -86,7 +112,7 @@ CONTAINERS = [
         "display_name": "Bid Pricer",
         "description": "Prices the bid with the DLRM model on Triton.",
         "intents": {"BID_SHADE"},
-        "grpc": os.environ.get("DLRM_GRPC", os.environ.get("DLRM_URL", "http://localhost:50061")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("DLRM_GRPC") or _grpc_from_url(os.environ.get("DLRM_URL", "http://localhost:50061")),
         "mcp": os.environ.get("DLRM_MCP", os.environ.get("DLRM_URL", "http://localhost:8091")),
     },
     {
@@ -94,7 +120,7 @@ CONTAINERS = [
         "display_name": "Audience Activator",
         "description": "Activates IAB audience segments from bid-request signals (rule-based).",
         "intents": {"ACTIVATE_SEGMENTS"},
-        "grpc": os.environ.get("WIDEDEEP_GRPC", os.environ.get("WIDEDEEP_URL", "http://localhost:50062")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("WIDEDEEP_GRPC") or _grpc_from_url(os.environ.get("WIDEDEEP_URL", "http://localhost:50062")),
         "mcp": os.environ.get("WIDEDEEP_MCP", os.environ.get("WIDEDEEP_URL", "http://localhost:8092")),
     },
     {
@@ -102,7 +128,7 @@ CONTAINERS = [
         "display_name": "Deal Scorer",
         "description": "Activates and suppresses deals with the NCF model on Triton.",
         "intents": {"ACTIVATE_DEALS", "SUPPRESS_DEALS"},
-        "grpc": os.environ.get("NCF_GRPC", os.environ.get("NCF_URL", "http://localhost:50063")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("NCF_GRPC") or _grpc_from_url(os.environ.get("NCF_URL", "http://localhost:50063")),
         "mcp": os.environ.get("NCF_MCP", os.environ.get("NCF_URL", "http://localhost:8093")),
     },
     {
@@ -110,7 +136,7 @@ CONTAINERS = [
         "display_name": "Signals Enricher",
         "description": "Adds viewability and brand-safety metrics (rule-based).",
         "intents": {"ADD_METRICS"},
-        "grpc": os.environ.get("METRICS_GRPC", os.environ.get("METRICS_URL", "http://localhost:50064")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("METRICS_GRPC") or _grpc_from_url(os.environ.get("METRICS_URL", "http://localhost:50064")),
         "mcp": os.environ.get("METRICS_MCP", os.environ.get("METRICS_URL", "http://localhost:8094")),
     },
     # The Yield Optimizer is two containers, one per intent. Each is called
@@ -123,7 +149,7 @@ CONTAINERS = [
         "display_name": "Yield Optimizer — Floor",
         "description": "Sets the deal bid floor with an XGBoost/FIL model on Triton.",
         "intents": {"ADJUST_DEAL_FLOOR"},
-        "grpc": os.environ.get("YIELD_FLOOR_GRPC", os.environ.get("YIELD_FLOOR_URL", "http://localhost:50065")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("YIELD_FLOOR_GRPC") or _grpc_from_url(os.environ.get("YIELD_FLOOR_URL", "http://localhost:50065")),
         "mcp": os.environ.get("YIELD_FLOOR_MCP", os.environ.get("YIELD_FLOOR_URL", "http://localhost:8095")),
     },
     {
@@ -131,7 +157,7 @@ CONTAINERS = [
         "display_name": "Yield Optimizer — Margin",
         "description": "Sets the deal margin with an XGBoost/FIL model on Triton.",
         "intents": {"ADJUST_DEAL_MARGIN"},
-        "grpc": os.environ.get("YIELD_MARGIN_GRPC", os.environ.get("YIELD_MARGIN_URL", "http://localhost:50066")).replace("http://", "").rstrip("/"),
+        "grpc": os.environ.get("YIELD_MARGIN_GRPC") or _grpc_from_url(os.environ.get("YIELD_MARGIN_URL", "http://localhost:50066")),
         "mcp": os.environ.get("YIELD_MARGIN_MCP", os.environ.get("YIELD_MARGIN_URL", "http://localhost:8096")),
     },
 ]
@@ -235,24 +261,140 @@ def _filter_containers(applicable_intents: list[str] | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# gRPC caller (primary ARTF protocol)
+# gRPC caller (ARTF protocol; first transport when ARTF_CONTAINER_TRANSPORT=grpc)
 # ---------------------------------------------------------------------------
 
-async def _call_grpc(target: str, payload_bytes: bytes, timeout_s: float) -> list[Mutation]:
-    """Call a container's RTBExtensionPoint.GetMutations via gRPC."""
+# Which transport _call_container tries first: "grpc" (RTBExtensionPoint.GetMutations
+# on the container's gRPC port, then REST /mutate, then MCP) or "http" (REST /mutate,
+# then MCP -- the pre-Phase-2 order). Read once at import; tests override the module
+# attribute. The deployment manifest sets it, so a measurement run flips transports
+# with `kubectl set env` and no image rebuild.
+ARTF_CONTAINER_TRANSPORT = os.environ.get("ARTF_CONTAINER_TRANSPORT", "http").strip().lower()
+
+# Channel options. round_robin spreads calls over every address the target name
+# resolves to, which is only more than one when the Service is headless
+# (deployment/eks/artf-containers-deployment.yaml, the *-grpc Services). Keepalive
+# pings keep an idle channel from being dropped by a conntrack timeout between
+# bursts, so the first request after a quiet spell does not pay a reconnect.
+_GRPC_CHANNEL_OPTIONS = [
+    ("grpc.lb_policy_name", os.environ.get("ARTF_GRPC_LB_POLICY", "round_robin")),
+    ("grpc.keepalive_time_ms", 30_000),
+    ("grpc.keepalive_timeout_ms", 5_000),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.enable_retries", 0),
+]
+
+_GRPC_CHANNELS: dict[str, grpc.aio.Channel] = {}
+
+
+def _grpc_target(host_port: str) -> str:
+    """``dns:///host:port`` so the resolver returns every A record for a headless Service."""
+    if "://" in host_port or host_port.startswith("dns:"):
+        return host_port
+    return f"dns:///{host_port}"
+
+
+def _grpc_channel(host_port: str) -> grpc.aio.Channel:
+    """One channel per container target for the life of the process.
+
+    The previous _call_grpc opened and closed a channel per call, which costs a
+    TCP + HTTP/2 handshake on every bid request -- slower than the pooled HTTP
+    path it was meant to replace. A cached channel is the whole point of the
+    gRPC hop (plan §7, first trap).
+    """
+    channel = _GRPC_CHANNELS.get(host_port)
+    if channel is None:
+        channel = grpc.aio.insecure_channel(_grpc_target(host_port), options=_GRPC_CHANNEL_OPTIONS)
+        _GRPC_CHANNELS[host_port] = channel
+    return channel
+
+
+async def _close_grpc_channels() -> None:
+    channels = list(_GRPC_CHANNELS.values())
+    _GRPC_CHANNELS.clear()
+    for ch in channels:
+        try:
+            await ch.close()
+        except Exception:
+            pass
+
+
+# gRPC status codes that mean "no usable answer came back on the wire" -- the
+# same fact an httpx connect/read error reports on the REST path. Anything else
+# the container answered (INTERNAL with details from the servicer, for one) and
+# is an error from a reached container.
+_GRPC_UNREACHED = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.UNIMPLEMENTED,
+    grpc.StatusCode.CANCELLED,
+}
+
+
+def _outcome_from_rtb_response(data: dict) -> ContainerCallOutcome:
+    """Build the outcome from a parsed RTBResponse dict (any transport)."""
+    mutations = [Mutation(**m) for m in data.get("mutations", [])]
+    metadata = data.get("metadata") or {}
+    return ContainerCallOutcome(
+        reached=True,
+        mutations=mutations,
+        model_version=metadata.get("model_version", "") or "",
+        # Carried through rather than dropped: an empty mutation list with a
+        # reason attached is a different fact from an empty one without.
+        abstained_reason=metadata.get("abstained_reason") or None,
+        timing=metadata.get("timing") or None,
+    )
+
+
+def _grpc_metadata(headers: dict[str, str] | None) -> list[tuple[str, str]] | None:
+    """HTTP headers as gRPC metadata (keys must be lowercase ASCII)."""
+    if not headers:
+        return None
+    return [(k.lower(), str(v)) for k, v in headers.items()]
+
+
+async def _call_grpc(
+    target: str,
+    payload_bytes: bytes,
+    timeout_s: float,
+    *,
+    headers: dict[str, str] | None = None,
+) -> ContainerCallOutcome:
+    """Call a container's RTBExtensionPoint.GetMutations over gRPC.
+
+    JSON-over-gRPC: the request is the same RTBRequest JSON bytes the REST path
+    posts, and the reply is RTBResponse JSON bytes (shared/server.py's servicer
+    speaks exactly this). Encoding is unchanged by design -- plan Q2 = A -- so
+    the only variable between this and _call_container's REST branch is the
+    transport.
+
+    Returns a ``ContainerCallOutcome`` with the same reached/error/model_version/
+    abstained_reason/timing semantics as the REST branch, so ``derive_status`` labels
+    a gRPC call exactly as it labels an HTTP one.
+    """
     try:
-        channel = grpc.aio.insecure_channel(target)
+        channel = _grpc_channel(target)
         response_bytes = await channel.unary_unary(
             _GRPC_METHOD,
             request_serializer=lambda x: x,
             response_deserializer=lambda x: x,
-        )(payload_bytes, timeout=timeout_s)
-        await channel.close()
-        data = json.loads(response_bytes)
-        return [Mutation(**m) for m in data.get("mutations", [])]
+        )(payload_bytes, timeout=timeout_s, metadata=_grpc_metadata(headers))
+    except grpc.aio.AioRpcError as exc:
+        code = exc.code()
+        detail = f"grpc {code.name}"
+        print(f"[orchestrator] gRPC to {target} failed: {detail}: {exc.details()}")
+        return ContainerCallOutcome(reached=code not in _GRPC_UNREACHED, error=detail)
     except Exception as exc:
         print(f"[orchestrator] gRPC to {target} failed: {exc}")
-        return []
+        return ContainerCallOutcome(reached=False, error=type(exc).__name__)
+
+    try:
+        return _outcome_from_rtb_response(json.loads(response_bytes))
+    except Exception as exc:
+        print(f"[orchestrator] gRPC reply from {target} unparseable: {exc}")
+        return ContainerCallOutcome(
+            reached=True, error=f"unparseable gRPC reply ({type(exc).__name__})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -292,19 +434,7 @@ async def _call_mcp(
         # MCP returns a content array whose text holds the RTBResponse JSON.
         for content_item in result.get("content", []):
             if content_item.get("type") == "text":
-                rtb_resp = json.loads(content_item["text"])
-                mutations = [Mutation(**m) for m in rtb_resp.get("mutations", [])]
-                metadata = rtb_resp.get("metadata") or {}
-                model_version = metadata.get("model_version", "") or ""
-                return ContainerCallOutcome(
-                    reached=True,
-                    mutations=mutations,
-                    model_version=model_version,
-                    # Carried through rather than dropped here: an empty mutation
-                    # list with a reason attached is a different fact from an empty
-                    # one without, and only the container knows which it is.
-                    abstained_reason=metadata.get("abstained_reason") or None,
-                )
+                return _outcome_from_rtb_response(json.loads(content_item["text"]))
         # Some implementations put mutations directly on the result.
         if "mutations" in result:
             mutations = [Mutation(**m) for m in result.get("mutations", [])]
@@ -334,7 +464,7 @@ async def _call_http(client: httpx.AsyncClient, base_url: str, payload: dict, ti
 
 
 # ---------------------------------------------------------------------------
-# Dispatch to a single container (gRPC first, MCP fallback)
+# Dispatch to a single container (gRPC -> REST -> MCP, by ARTF_CONTAINER_TRANSPORT)
 # ---------------------------------------------------------------------------
 
 async def _call_container(
@@ -346,7 +476,7 @@ async def _call_container(
     *,
     headers: dict[str, str] | None = None,
 ) -> ContainerCallOutcome:
-    """Call a container's /mutate REST endpoint, falling back to MCP JSON-RPC.
+    """Call a container: gRPC (if selected) -> REST /mutate -> MCP JSON-RPC.
 
     ``headers``, when provided, are forwarded on the REST call only — used
     exclusively by the orchestrator's load-test invocation path to set the
@@ -368,6 +498,22 @@ async def _call_container(
     rest_error: str | None = None
     rest_reached = False
 
+    # gRPC first when selected (ARTF_CONTAINER_TRANSPORT=grpc). A parsed reply is
+    # definitive, mutations or not, for the same reason a parsed 200 is below.
+    # Anything else falls through to REST, then MCP, so a container whose gRPC
+    # port is unreachable is still served over HTTP and the error recorded here
+    # is reported only if the HTTP transports also fail.
+    grpc_error: str | None = None
+    grpc_reached = False
+    if ARTF_CONTAINER_TRANSPORT == "grpc" and container.get("grpc"):
+        grpc_outcome = await _call_grpc(
+            container["grpc"], payload_bytes, timeout_s, headers=headers
+        )
+        if grpc_outcome.error is None:
+            return grpc_outcome
+        grpc_error = grpc_outcome.error
+        grpc_reached = grpc_outcome.reached
+
     try:
         resp = await client.post(
             f"{container['mcp']}/mutate", json=payload, timeout=timeout_s, headers=headers
@@ -375,16 +521,7 @@ async def _call_container(
         rest_reached = True
         if resp.status_code == 200:
             try:
-                data = resp.json()
-                mutations = [Mutation(**m) for m in data.get("mutations", [])]
-                metadata = data.get("metadata") or {}
-                model_version = metadata.get("model_version", "") or ""
-                return ContainerCallOutcome(
-                    reached=True,
-                    mutations=mutations,
-                    model_version=model_version,
-                    abstained_reason=metadata.get("abstained_reason") or None,
-                )
+                return _outcome_from_rtb_response(resp.json())
             except Exception as exc:
                 rest_error = f"unparseable /mutate response ({type(exc).__name__})"
                 print(f"[orchestrator] /mutate response from {container['mcp']} unparseable: {exc}")
@@ -405,9 +542,10 @@ async def _call_container(
     # between "something answered badly" and "nothing answered at all", and
     # report the REST error in preference to the MCP one since /mutate is the
     # primary path.
+    # The first transport tried is the one whose error is reported, as before.
     return ContainerCallOutcome(
-        reached=rest_reached or mcp_outcome.reached,
-        error=rest_error or mcp_outcome.error or "no response",
+        reached=grpc_reached or rest_reached or mcp_outcome.reached,
+        error=grpc_error or rest_error or mcp_outcome.error or "no response",
     )
 
 
@@ -457,6 +595,7 @@ async def _call_container_timed(
             model_version=outcome.model_version,
             display_name=display_name,
             abstained_reason=outcome.abstained_reason,
+            timing=outcome.timing,
         )
     except asyncio.TimeoutError:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -480,8 +619,181 @@ async def _call_container_timed(
 
 
 # ---------------------------------------------------------------------------
+# Shared HTTP client for container calls (Phase 1 of the gRPC transport plan)
+# ---------------------------------------------------------------------------
+#
+# _fan_out used to construct an httpx.AsyncClient per request, so every bid
+# request opened a fresh TCP connection to every container it called and closed
+# them all afterwards. One process-wide client keeps those connections alive
+# across requests. Sized by env so a replica serving many concurrent bids is not
+# capped by the httpx default of 100 connections / 20 keep-alives.
+#
+# Created lazily (not at import) so importing this module needs no event loop,
+# and closed on Starlette shutdown.
+
+ARTF_HTTP_MAX_CONNECTIONS = int(os.environ.get("ARTF_HTTP_MAX_CONNECTIONS", "256"))
+ARTF_HTTP_MAX_KEEPALIVE = int(os.environ.get("ARTF_HTTP_MAX_KEEPALIVE", "128"))
+ARTF_HTTP_KEEPALIVE_EXPIRY_S = float(os.environ.get("ARTF_HTTP_KEEPALIVE_EXPIRY_S", "60"))
+
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=ARTF_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=ARTF_HTTP_MAX_KEEPALIVE,
+                keepalive_expiry=ARTF_HTTP_KEEPALIVE_EXPIRY_S,
+            ),
+        )
+    return _HTTP_CLIENT
+
+
+async def _close_shared_http_client() -> None:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:
+        await _HTTP_CLIENT.aclose()
+    _HTTP_CLIENT = None
+
+
+# ---------------------------------------------------------------------------
 # Fan-out — one implementation, used by both the REST and MCP entry points
 # ---------------------------------------------------------------------------
+
+# The least a stage is ever given, whatever is left of tmax. Matches the
+# orchestrator's own floor on tmax (``max(req.tmax, 10)``): below it a call is
+# a timeout before it starts, so the floor is what keeps a late stage from
+# being reported as "timed out in 0 ms" when the earlier stages used the budget.
+STAGE_MIN_TIMEOUT_S = 0.010
+
+
+@dataclass
+class FanOutResult:
+    """What the staged fan-out produced.
+
+    ``invocations`` lists every registry entry in stage-then-registry order,
+    which is also the mutation attribution order. ``stages`` is the per-stage
+    account. ``bid_request``/``bid_response`` are the working copies after the
+    last stage's mutations were applied, which is what the host's own applier
+    will reconstruct from the returned list.
+    """
+
+    invocations: list[ContainerInvocationModel]
+    stages: list[StageModel]
+    bid_request: dict
+    bid_response: dict | None
+
+
+async def _fan_out_staged(
+    payload: dict,
+    payload_bytes: bytes,
+    applicable_intents: list | None,
+    *,
+    timeout_s: float,
+    headers: dict[str, str] | None = None,
+) -> FanOutResult:
+    """Call the containers in stage order, applying each stage's mutations before the next.
+
+    Stages are defined in shared/artf_stages.py: enrichment, deals, yield,
+    pricing. Within a stage the containers run in parallel and all see the same
+    working request; between stages the orchestrator applies the mutations that
+    came back (shared/artf_applier.py) so stage N+1 is asked about the request
+    stage N produced. That is what lets the Deal Scorer score with the segments
+    the Audience Activator activated, and the Yield Optimizer price a deal the
+    Deal Scorer activated.
+
+    Budget: each stage is given whatever remains of ``timeout_s``, floored at
+    ``STAGE_MIN_TIMEOUT_S``. A stage that runs over is reported through its
+    containers' ``timeout`` status and the next stage still runs with what is
+    left; nothing is skipped pre-emptively.
+
+    Every registry entry appears in ``invocations`` whatever happened:
+    containers that were not called get ``disabled`` or ``skipped`` with
+    ``latency_ms=0``. Order is stage, then registry order within the stage, then
+    the not-called entries in registry order, so the mutation attribution order
+    is the application order.
+
+    One implementation, used by POST /v1/mutations, the gRPC servicer and the
+    MCP ``tools/call`` proxy, so the three cannot drift.
+    """
+    entries, _warnings = _effective_registry()
+    to_call, not_called = select_active(entries, applicable_intents)
+    grouped = artf_stages.group_by_stage(to_call, lambda e: e.intents)
+
+    client = _shared_http_client()
+    deadline = time.monotonic() + timeout_s
+
+    working_req = payload.get("bid_request") or {}
+    working_resp = payload.get("bid_response")
+    invocations: list[ContainerInvocationModel] = []
+    stages: list[StageModel] = []
+
+    for stage_no, stage_entries in grouped:
+        stage_start = time.monotonic()
+        remaining = deadline - stage_start
+        stage_timeout = max(remaining, STAGE_MIN_TIMEOUT_S)
+
+        # The envelope the stage sees: the caller's, with the working request
+        # and response substituted. Serialized once per stage, shared by every
+        # container in it.
+        stage_payload = dict(payload)
+        stage_payload["bid_request"] = working_req
+        if working_resp is not None:
+            stage_payload["bid_response"] = working_resp
+        stage_bytes = json.dumps(stage_payload).encode()
+
+        stage_invocations: list[ContainerInvocationModel] = await asyncio.gather(*[
+            _call_container_timed(
+                client, e.as_container_dict(), stage_payload, stage_bytes, stage_timeout,
+                headers=headers,
+            )
+            for e in stage_entries
+        ])
+        invocations.extend(stage_invocations)
+
+        # Apply this stage's mutations, in attribution order, to the working copy.
+        stage_mutations: list[tuple[str, Mutation]] = [
+            (inv.name, m) for inv in stage_invocations for m in inv.mutations
+        ]
+        applied = artf_applier.apply(
+            working_req, [m for _, m in stage_mutations], working_resp
+        )
+        working_req, working_resp = applied.bid_request, applied.bid_response
+
+        rejected = [
+            RejectedMutationModel(container=name, intent=d.intent, path=d.path, reason=d.reason or "")
+            for (name, _), d in zip(stage_mutations, applied.dispositions)
+            if not d.applied
+        ]
+        for r in rejected:
+            logger.warning(
+                "stage %d (%s): mutation from %s at %s not applied to the working request: %s",
+                stage_no, artf_stages.STAGE_NAMES[stage_no], r.container, r.path, r.reason,
+            )
+
+        stages.append(StageModel(
+            stage=stage_no,
+            name=artf_stages.STAGE_NAMES[stage_no],
+            containers=[e.name for e in stage_entries],
+            latency_ms=round((time.monotonic() - stage_start) * 1000.0, 2),
+            budget_ms=round(stage_timeout * 1000.0, 2),
+            applied=applied.applied_count,
+            rejected=rejected,
+        ))
+
+    for entry, reason in not_called:
+        invocations.append(ContainerInvocationModel(
+            name=entry.name,
+            status=reason,
+            latency_ms=0,
+            mutations=[],
+            display_name=entry.display_name,
+        ))
+
+    return FanOutResult(invocations, stages, working_req, working_resp)
+
 
 async def _fan_out(
     payload: dict,
@@ -491,43 +803,11 @@ async def _fan_out(
     timeout_s: float,
     headers: dict[str, str] | None = None,
 ) -> list[ContainerInvocationModel]:
-    """Call every active, intent-matching container and return one entry each.
-
-    Extracted because POST /v1/mutations and the MCP ``tools/call`` proxy each
-    carried their own copy of the filter + gather + backfill. Two copies is how
-    they drifted, and gating on activation state in only one of them would mean a
-    container the operator switched off still ran on the other path. One
-    implementation makes that impossible rather than merely unlikely.
-
-    Every registry entry appears in the result, in registry order, whatever
-    happened — containers that were not called get ``disabled`` or ``skipped``
-    with ``latency_ms=0``.
-    """
-    entries, _warnings = _effective_registry()
-    to_call, not_called = select_active(entries, applicable_intents)
-
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            _call_container_timed(
-                client, e.as_container_dict(), payload, payload_bytes, timeout_s, headers=headers
-            )
-            for e in to_call
-        ]
-        invocations: list[ContainerInvocationModel] = await asyncio.gather(*tasks)
-
-    by_name = {inv.name: inv for inv in invocations}
-    for entry, reason in not_called:
-        by_name[entry.name] = ContainerInvocationModel(
-            name=entry.name,
-            status=reason,
-            latency_ms=0,
-            mutations=[],
-            display_name=entry.display_name,
-        )
-
-    # Registry order is also the mutation attribution order, so it is preserved
-    # rather than following completion order.
-    return [by_name[e.name] for e in entries if e.name in by_name]
+    """The invocations of a staged fan-out. See ``_fan_out_staged``."""
+    result = await _fan_out_staged(
+        payload, payload_bytes, applicable_intents, timeout_s=timeout_s, headers=headers
+    )
+    return result.invocations
 
 
 # ---------------------------------------------------------------------------
@@ -535,12 +815,45 @@ async def _fan_out(
 # ---------------------------------------------------------------------------
 
 async def get_mutations(request: Request) -> JSONResponse:
+    """POST /v1/mutations over HTTP. The gRPC servicer calls the same body."""
+    handler_start = time.perf_counter()
     body = await request.json()
+    resp_dict = await _mutations_response(
+        body,
+        handler_start=handler_start,
+        auth_ms=getattr(request.state, "auth_ms", None),
+        # RTB Fabric adds identifying headers when traffic flows through its
+        # managed infrastructure.
+        fabric_link_id=request.headers.get("x-rtb-fabric-link-id"),
+    )
+    return JSONResponse(resp_dict)
+
+
+async def _mutations_response(
+    body: dict,
+    *,
+    handler_start: float,
+    auth_ms: float | None,
+    fabric_link_id: str | None,
+) -> dict:
+    """The extension point, transport-independent: parsed envelope in, response dict out.
+
+    Shared by the HTTP route and the gRPC ``RTBExtensionPoint/GetMutations``
+    servicer so the two differ in nothing but the wire -- the condition a
+    transport comparison needs (plan P3.2).
+    """
+    # Per-hop timing (shared/hop_timing.py ORCHESTRATOR_SEGMENTS). Reported on
+    # the response as metadata.timing and in one WARNING log line, so a reader
+    # can see where a request's time went without a profiler. WARNING because
+    # the image sets no log level and INFO is silent in the pod.
     req = RTBRequest(**body)
     tmax = max(req.tmax, 10)
     timeout_s = tmax / 1000.0
     payload = req.model_dump()
     payload_bytes = json.dumps(payload).encode()
+    timing: dict[str, float] = {"parse": hop_timing.ms(handler_start)}
+    if auth_ms is not None:
+        timing["auth"] = auth_ms
 
     # Only call containers that are active AND whose intents match
     # applicable_intents. An inactive container is reported "disabled" and never
@@ -548,42 +861,58 @@ async def get_mutations(request: Request) -> JSONResponse:
     # different labels.
     applicable = getattr(req, "applicable_intents", None) or body.get("applicable_intents")
 
+    # A request marked `ext.artf.bypass: true` is the Theater's baseline
+    # pass: the auction endpoint stamped it so that the Prebid hook's call here
+    # proposes nothing. No container is invoked -- not "skipped", not "disabled",
+    # simply never asked -- and the reply is an empty mutation set the hook applies
+    # as no change. The marker is per request; the browser's own call never sets
+    # it, so the beats path is untouched.
+    bypassed = is_artf_bypass(req.bid_request)
+
     start = time.monotonic()
-    all_invocations = await _fan_out(
-        payload, payload_bytes, applicable, timeout_s=timeout_s
-    )
+    fan_out_start = time.perf_counter()
+    stages: list[StageModel] | None
+    if bypassed:
+        all_invocations: list = []
+        stages = None
+    else:
+        fan_out = await _fan_out_staged(
+            payload, payload_bytes, applicable, timeout_s=timeout_s
+        )
+        all_invocations = fan_out.invocations
+        stages = fan_out.stages
+    timing["fan_out"] = hop_timing.ms(fan_out_start)
 
     # Preserve canonical registry order for both the flattened mutations list
     # and the per-container attribution surfaced via metadata. Competing claims
     # on the same (path, intent) are resolved here rather than left for the
     # consumer to overwrite, so both the Prebid hook and the frontend receive one
     # already-decided set.
+    merge_start = time.perf_counter()
     all_mutations, conflicts = _resolve_for_response(all_invocations)
 
     elapsed_ms = (time.monotonic() - start) * 1000
+    if bypassed:
+        logger.info("mutations bypassed for %s (baseline pass): 0 containers consulted", req.id)
 
-    # Detect network path — RTB Fabric adds identifying headers when traffic
+    # Detect network path -- RTB Fabric adds identifying headers when traffic
     # flows through its managed infrastructure.
-    fabric_link_id = request.headers.get("x-rtb-fabric-link-id")
     network_path = "rtb-fabric" if fabric_link_id else "direct"
 
-    metadata_dict = {
-        "api_version": "1.0",
-        "model_version": f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)",
-        "containers": all_invocations,
-        "network_path": network_path,
-        "total_latency_ms": round(elapsed_ms, 2),
-    }
-    if fabric_link_id:
-        metadata_dict["rtb_fabric_link_id"] = fabric_link_id
+    model_version = (
+        f"orchestrator-v1 (bypassed, 0 mutations, {elapsed_ms:.1f}ms)"
+        if bypassed
+        else f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)"
+    )
 
     resp = RTBResponse(
         id=req.id,
         mutations=all_mutations,
         metadata=Metadata(
             api_version="1.0",
-            model_version=f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)",
+            model_version=model_version,
             containers=all_invocations,
+            stages=stages,
             # None rather than [] so a reader can tell "nothing was contested"
             # from "this orchestrator does not report contests".
             conflicts=conflicts or None,
@@ -597,14 +926,121 @@ async def get_mutations(request: Request) -> JSONResponse:
     })
     if fabric_link_id:
         resp_dict["metadata"]["rtb_fabric_link_id"] = fabric_link_id
+    if bypassed:
+        # Stated on the response, so a reader of the hook's analytics or of this
+        # payload can tell "no container proposed anything" from "no container was
+        # asked". The key is absent on an ordinary call, not false.
+        resp_dict["metadata"]["bypassed"] = True
 
-    # Emit bid outcome event (fire-and-forget, non-blocking)
-    emit_bid_outcome(req, resp, start)
-    # Emit deal yield outcome event(s) for any adjust_deal mutations
-    # (fire-and-forget, non-blocking, independent of emit_bid_outcome above)
-    emit_deal_yield_outcome(req, resp)
+    timing["merge"] = hop_timing.ms(merge_start)
 
-    return JSONResponse(resp_dict)
+    emit_start = time.perf_counter()
+    if not bypassed:
+        # Emit bid outcome event (fire-and-forget, non-blocking)
+        emit_bid_outcome(req, resp, start)
+        # Emit deal yield outcome event(s) for any adjust_deal mutations
+        # (fire-and-forget, non-blocking, independent of emit_bid_outcome above)
+        emit_deal_yield_outcome(req, resp)
+    # A bypassed pass emits nothing: the feedback feed records the shader's
+    # decisions, and a pass in which it was deliberately not asked carries no
+    # decision to learn from.
+    timing["emit"] = hop_timing.ms(emit_start)
+    timing["total"] = hop_timing.ms(handler_start)
+    resp_dict["metadata"]["timing"] = {
+        k: timing[k] for k in hop_timing.ORCHESTRATOR_SEGMENTS if k in timing
+    }
+    # Slowest container by its own wall clock, so the log line alone shows
+    # whether fan_out was bound by one container or by the gather itself.
+    slowest = max(all_invocations, key=lambda i: i.latency_ms, default=None)
+    logger.warning(
+        "artf_timing id=%s bypassed=%s containers=%d slowest=%s/%.1fms %s stages=[%s]",
+        req.id,
+        bypassed,
+        len(all_invocations),
+        slowest.name if slowest else "-",
+        slowest.latency_ms if slowest else 0.0,
+        " ".join(f"{k}={v:.2f}" for k, v in resp_dict["metadata"]["timing"].items()),
+        " ".join(f"{s.name}={s.latency_ms:.1f}ms/{len(s.containers)}c" for s in (stages or [])),
+    )
+
+    return resp_dict
+
+
+# ---------------------------------------------------------------------------
+# gRPC server: RTBExtensionPoint/GetMutations for the Prebid hook (plan P3.2)
+# ---------------------------------------------------------------------------
+#
+# Same process and event loop as uvicorn, same handler body as POST /v1/mutations,
+# same Cognito credential (bearer token as `authorization` metadata, verified by
+# the same code the HTTP middleware uses). JSON-over-gRPC: the message is the
+# RTBRequest JSON the HTTP route receives, the reply is the response dict as
+# JSON, so the containers' and the hook's generic clients need no stubs.
+
+ARTF_GRPC_SERVER_PORT = int(os.environ.get("ARTF_GRPC_SERVER_PORT", "50051"))
+_GRPC_MUTATIONS_PATH = "/v1/mutations"  # the route the scope check is keyed on
+
+_GRPC_SERVER: grpc.aio.Server | None = None
+
+
+async def _grpc_get_mutations(request_bytes: bytes, context: grpc.aio.ServicerContext) -> bytes:
+    from orchestrator.auth import grpc_authenticate  # local: auth imports lazily below too
+
+    handler_start = time.perf_counter()
+    auth_start = time.perf_counter()
+    metadata = {k: v for k, v in (context.invocation_metadata() or ())}
+    claims, code, reason = grpc_authenticate(metadata.get("authorization"), _GRPC_MUTATIONS_PATH)
+    if claims is None:
+        # Fail closed, as the HTTP middleware does. The status names the kind of
+        # refusal so the hook can tell a bad credential from a missing scope.
+        await context.abort(code, reason)
+    auth_ms = hop_timing.ms(auth_start)
+
+    try:
+        body = json.loads(request_bytes)
+    except Exception as exc:
+        await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"request is not JSON: {type(exc).__name__}")
+    try:
+        resp_dict = await _mutations_response(
+            body,
+            handler_start=handler_start,
+            auth_ms=auth_ms,
+            fabric_link_id=metadata.get("x-rtb-fabric-link-id"),
+        )
+    except Exception as exc:
+        logger.warning("grpc GetMutations failed: %s", exc)
+        await context.abort(grpc.StatusCode.INTERNAL, type(exc).__name__)
+    return json.dumps(resp_dict).encode()
+
+
+def _build_grpc_server(port: int) -> tuple[grpc.aio.Server, int]:
+    """The server and the port it bound (port 0 asks the OS for one; tests use that)."""
+    server = grpc.aio.server()
+    handler = grpc.unary_unary_rpc_method_handler(
+        _grpc_get_mutations,
+        request_deserializer=lambda x: x,
+        response_serializer=lambda x: x,
+    )
+    service, method = _GRPC_METHOD.lstrip("/").rsplit("/", 1)
+    server.add_generic_rpc_handlers([grpc.method_handlers_generic_handler(service, {method: handler})])
+    bound = server.add_insecure_port(f"[::]:{port}")
+    return server, bound
+
+
+async def _start_grpc_server() -> None:
+    global _GRPC_SERVER
+    if ARTF_GRPC_SERVER_PORT <= 0:
+        logger.warning("ARTF gRPC server disabled (ARTF_GRPC_SERVER_PORT=%d)", ARTF_GRPC_SERVER_PORT)
+        return
+    _GRPC_SERVER, bound = _build_grpc_server(ARTF_GRPC_SERVER_PORT)
+    await _GRPC_SERVER.start()
+    logger.warning("ARTF gRPC RTBExtensionPoint listening on :%d", bound)
+
+
+async def _stop_grpc_server() -> None:
+    global _GRPC_SERVER
+    if _GRPC_SERVER is not None:
+        await _GRPC_SERVER.stop(grace=2.0)
+        _GRPC_SERVER = None
 
 
 async def list_containers(request: Request) -> JSONResponse:
@@ -664,9 +1100,10 @@ async def list_containers(request: Request) -> JSONResponse:
         }
         start = time.monotonic()
         try:
-            channel = grpc.aio.insecure_channel(target)
+            # The cached channel, not a throwaway one: the probe then reports the
+            # readiness of the channel the bid path actually uses, and warms it.
+            channel = _grpc_channel(target)
             await asyncio.wait_for(channel.channel_ready(), timeout=1.0)
-            await channel.close()
             evidence["latencyMs"] = round((time.monotonic() - start) * 1000, 1)
             evidence["ok"] = True
         except Exception as exc:
@@ -1081,9 +1518,10 @@ async def mcp_proxy(request: Request) -> JSONResponse:
             applicable = getattr(req, "applicable_intents", None) or arguments.get("applicable_intents")
 
             start = time.monotonic()
-            all_invocations = await _fan_out(
+            fan_out = await _fan_out_staged(
                 payload, payload_bytes, applicable, timeout_s=timeout_s
             )
+            all_invocations = fan_out.invocations
 
             # Same resolution as POST /v1/mutations. These two paths have drifted
             # before, which is why the fan-out was unified; the resolution goes
@@ -1097,6 +1535,7 @@ async def mcp_proxy(request: Request) -> JSONResponse:
                     api_version="1.0",
                     model_version=f"orchestrator-v1 ({len(all_mutations)} mutations, {elapsed_ms:.1f}ms)",
                     containers=all_invocations,
+                    stages=fan_out.stages,
                     conflicts=conflicts or None,
                 ),
             )
@@ -1532,7 +1971,22 @@ routes += _governance_routes("/api")
 routes += _auction_routes("")
 routes += _auction_routes("/api")
 
-app = Starlette(routes=routes)
+import contextlib  # noqa: E402
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    # The gRPC listener shares uvicorn's event loop. The container HTTP client
+    # and gRPC channels are created on first use; closing them on shutdown lets
+    # in-flight keep-alive connections finish instead of being reset.
+    await _start_grpc_server()
+    yield
+    await _stop_grpc_server()
+    await _close_shared_http_client()
+    await _close_grpc_channels()
+
+
+app = Starlette(routes=routes, lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
 
 # Cognito JWT auth — rejects unauthenticated requests on all non-health endpoints

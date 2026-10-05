@@ -19,9 +19,26 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.artf_types import (
-    IDsPayload, Intent, Metadata, Mutation, Operation,
+    AdjustDealPayload, IDsPayload, Intent, Metadata, Mutation, Operation,
     RTBRequest, RTBResponse, intent_applicable,
 )
+
+# The image copies this directory to /app/container/ (see source/Dockerfile); the
+# tests import app.py by path. Both must find the library.
+try:
+    from container import deal_library  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - exercised by the test import path
+    # By file path, not by adding this directory to sys.path: the other containers
+    # also have an `app.py`, and a path entry here would shadow theirs for any
+    # test that imports more than one container.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "ncf_deal_manager_deal_library",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_library.py"),
+    )
+    deal_library = _ilu.module_from_spec(_spec)  # type: ignore[assignment]
+    sys.modules[_spec.name] = deal_library
+    _spec.loader.exec_module(deal_library)
 
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 
@@ -144,6 +161,11 @@ def _h(v: str, n: int = 2000) -> int:
 def mutate(req: RTBRequest) -> RTBResponse:
     act_ok = intent_applicable(Intent.ACTIVATE_DEALS, req.applicable_intents)
     sup_ok = intent_applicable(Intent.SUPPRESS_DEALS, req.applicable_intents)
+    # The floor that completes a library activation is its own intent, so a request
+    # that narrows ADJUST_DEAL_FLOOR away gets the activation without the floor
+    # (the deal then binds at the impression floor) rather than a mutation it
+    # did not ask for.
+    floor_ok = intent_applicable(Intent.ADJUST_DEAL_FLOOR, req.applicable_intents)
     if not act_ok and not sup_ok:
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
@@ -160,26 +182,57 @@ def mutate(req: RTBRequest) -> RTBResponse:
     # real rather than an undefined value.
     resolved_model_version = MODEL_VERSION
 
+    # The publisher's deal book beyond what this request offered. Scored with
+    # the same model as the request's own deals; a library deal that scores
+    # high enough is ACTIVATED onto the impression, one that does not is left
+    # alone -- never SUPPRESSED, since the publisher never offered it here.
+    library = deal_library.deals_for(req.bid_request)
+
     for imp in req.bid_request.get("imp", []):
         imp_id = imp.get("id", "")
-        deals = (imp.get("pmp") or {}).get("deals", [])
-        if not deals:
+        pmp = imp.get("pmp")
+        deals = (pmp or {}).get("deals", []) or []
+        # Library deals go only onto impressions the publisher opened a private
+        # marketplace on (a `pmp` object, deals or not). An impression with no
+        # `pmp` was never offered to deal buyers, and activating onto it would put
+        # a deal-bound creative in a slot it was not sold for. The isv-ecosystem
+        # scenario's 300x600 rail is the shipped case: a request-level library
+        # applied to every imp would fill it with a 970x250 deal.
+        candidates = deal_library.not_on_request(library, deals) if pmp is not None else []
+        if not deals and not candidates:
             continue
 
         deal_ids = [d.get("id", f"deal-{i}") for i, d in enumerate(deals)]
+        candidate_ids = [d.id for d in candidates]
         to_act, to_sup, served_variant, served_model_version = _score_deals(
-            uid, deal_ids,
+            uid, deal_ids + candidate_ids,
             activate_threshold=activate_threshold,
             suppress_threshold=suppress_threshold,
         )
         if served_model_version:
             resolved_model_version = served_model_version
 
+        # Suppression applies to offered deals only.
+        to_sup = [d for d in to_sup if d in deal_ids]
+        activated_from_library = [c for c in candidates if c.id in to_act]
+
         if to_act and act_ok:
             mutations.append(Mutation(
                 intent=Intent.ACTIVATE_DEALS, op=Operation.ADD,
                 path=f"/imp/{imp_id}", ids=IDsPayload(id=to_act),
             ))
+            # ACTIVATE_DEALS carries ids only (ARTF IDsPayload), so an activated
+            # library deal would reach the seats with no floor and bind at the
+            # impression floor. Its floor from the publisher's book follows as a
+            # separate ADJUST_DEAL_FLOOR on the deal's own path. Emitted after the
+            # activation, which the hook applies in order, so the deal exists when
+            # the floor is written.
+            for lib_deal in activated_from_library if floor_ok else []:
+                mutations.append(Mutation(
+                    intent=Intent.ADJUST_DEAL_FLOOR, op=Operation.REPLACE,
+                    path=f"/imp/{imp_id}/deals/{lib_deal.id}",
+                    adjust_deal=AdjustDealPayload(bidfloor=lib_deal.bidfloor),
+                ))
         if to_sup and sup_ok:
             mutations.append(Mutation(
                 intent=Intent.SUPPRESS_DEALS, op=Operation.REMOVE,

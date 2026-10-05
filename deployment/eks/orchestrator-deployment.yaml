@@ -48,6 +48,11 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+            # RTBExtensionPoint/GetMutations for the Prebid hook (gRPC transport
+            # plan P3.2). Same process, same auth; reached through the headless
+            # orchestrator-grpc Service below, never through the HTTP Service.
+            - containerPort: 50051
+              name: grpc
           env:
             # Service DNS names below match the k8s Service names in
             # artf-containers-deployment.yaml (job-oriented display names — see
@@ -74,6 +79,36 @@ spec:
             # used only if that record omits one.
             - name: ARTF_TEMPLATE_URL
               value: "http://artf-template:8081"
+            # gRPC targets: the headless *-grpc Services (artf-containers-
+            # deployment.yaml), so dns:/// resolution returns every pod and the
+            # channel's round_robin policy spreads calls across replicas. Without
+            # these, app.py derives the gRPC target from *_URL, which is the MCP
+            # host swapped to port 50051 on the ClusterIP name -- reachable, but
+            # pinned to one pod per channel.
+            - name: DLRM_GRPC
+              value: "bid-pricer-grpc:50051"
+            - name: WIDEDEEP_GRPC
+              value: "audience-activator-grpc:50051"
+            - name: NCF_GRPC
+              value: "deal-scorer-grpc:50051"
+            - name: METRICS_GRPC
+              value: "signals-enricher-grpc:50051"
+            - name: YIELD_FLOOR_GRPC
+              value: "yield-optimizer-floor-grpc:50051"
+            - name: YIELD_MARGIN_GRPC
+              value: "yield-optimizer-margin-grpc:50051"
+            # Which transport the fan-out tries first (source/orchestrator/app.py
+            # _call_container): "http" = REST /mutate then MCP, the order the
+            # Phase 0 baseline was measured with; "grpc" = RTBExtensionPoint.
+            # GetMutations on the *_GRPC targets, then REST, then MCP. Flip with
+            #   kubectl set env deploy/orchestrator ARTF_CONTAINER_TRANSPORT=grpc
+            # for a measurement run (no image rebuild); this default becomes
+            # "grpc" once a measured run shows it beats http on this hop.
+            - name: ARTF_CONTAINER_TRANSPORT
+              value: "http"
+            # Port of the orchestrator's own gRPC listener (0 disables it).
+            - name: ARTF_GRPC_SERVER_PORT
+              value: "50051"
             # Container registry table (base stack, created by deploy.sh Step
             # 1.5). Holds store-defined containers: name, display name,
             # description, intents, endpoint and the active flag the Container
@@ -271,11 +306,44 @@ kind: Service
 metadata:
   name: orchestrator
 spec:
-  type: LoadBalancer
+  # ClusterIP for in-cluster callers (Prebid hook, ARTF containers). The
+  # orchestrator has no public address. The UI reaches it through the
+  # <prefix>-ui-api-proxy Lambda (deployment/ui_api_proxy_cfn.yaml), which runs
+  # inside the cluster VPC and forwards to the INTERNAL NLB defined in
+  # orchestrator-internal-nlb.yaml, not to this Service: a Lambda ENI cannot
+  # resolve cluster.local and has no route to a ClusterIP. That is what lets the
+  # stack deploy under VPC Block Public Access block-ingress, where an
+  # internet-facing load balancer could not be created.
+  type: ClusterIP
   ports:
     - port: 80
       targetPort: 8000
       protocol: TCP
+  selector:
+    app: artf
+    component: orchestrator
+---
+# In-cluster gRPC endpoint for the Prebid hook. Headless, so the hook's HTTP/2
+# connections can land on different replicas (a ClusterIP would pin each
+# long-lived connection to one pod). Deliberately NOT a port on the
+# orchestrator Service above: the gRPC listener is for in-cluster hosts, and
+# the UI path stays HTTP through the ui-api-proxy Lambda.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-grpc
+  labels:
+    app: artf
+    component: orchestrator
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      protocol: TCP
+      name: grpc
   selector:
     app: artf
     component: orchestrator

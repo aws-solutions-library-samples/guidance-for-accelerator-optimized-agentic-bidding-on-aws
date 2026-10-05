@@ -20,8 +20,6 @@
         "pmp": {
           "private_auction": 1,
           "deals": [
-            {"id": "deal-premium-video", "bidfloor": 10.00, "at": 1},
-            {"id": "deal-standard-video", "bidfloor": 5.00, "at": 2},
             {"id": "deal-remnant", "bidfloor": 0.50, "at": 2}
           ]
         }

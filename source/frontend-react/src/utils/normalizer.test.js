@@ -321,3 +321,106 @@ describe("normalize() — store-defined (dynamic) containers", () => {
     }
   });
 });
+
+// The orchestrator's flattened `mutations` list is the only account of the order
+// the containers' mutations were applied in. The stops above are in DISPLAY order
+// (dlrm first) which is the reverse of the staging order (dlrm runs last), so a
+// consumer that walks stops to rebuild the request gets the wrong sequence. These
+// tests pin the normalized `mutations` and `stages` fields that RawPanel and the
+// latency widgets read instead.
+describe("normalize() — ordered mutations and stages", () => {
+  const activate = { intent: 2, op: 1, path: "/imp/imp-1/deals", ids: ["deal-home-premium"] };
+  const floor = { intent: 4, op: 3, path: "/imp/imp-1/deals/deal-home-premium", adjust_deal: { bidfloor: 6.5 } };
+  const shade = { intent: 6, op: 3, path: "/imp/imp-1/bidfloor", adjust_bid: { bidfloor: 4.1 } };
+
+  function stagedRaw() {
+    return {
+      id: "req-5",
+      // Application order: deals stage, then yield, then price. Display order of
+      // the stops is dlrm, widedeep, ncf, metrics, yield-floor, yield-margin.
+      mutations: [activate, floor, shade],
+      metadata: {
+        total_latency_ms: 61,
+        containers: [
+          { name: "dlrm-bid-shader", status: "ok", latency_ms: 10, mutations: [shade] },
+          { name: "ncf-deal-manager", status: "ok", latency_ms: 12, mutations: [activate] },
+          { name: "yield-optimizer-floor", status: "ok", latency_ms: 21, mutations: [floor] },
+        ],
+        stages: [
+          { stage: 1, name: "enrich", containers: ["metrics-enricher", "widedeep-segment-activator"], latency_ms: 9.5, budget_ms: 90, applied: 0, rejected: [] },
+          { stage: 2, name: "deals", containers: ["ncf-deal-manager"], latency_ms: 12, budget_ms: 80, applied: 1, rejected: [] },
+          { stage: 3, name: "yield", containers: ["yield-optimizer-floor", "yield-optimizer-margin"], latency_ms: 21, budget_ms: 68, applied: 1,
+            rejected: [{ intent: "ADJUST_DEAL_MARGIN", path: "/imp/imp-1/deals/deal-x", reason: "deal not present" }] },
+          { stage: 4, name: "price", containers: ["dlrm-bid-shader"], latency_ms: 10, budget_ms: 47, applied: 1, rejected: [] },
+        ],
+      },
+    };
+  }
+
+  it("keeps the orchestrator's application order, not the stops' display order", () => {
+    const result = normalize(stagedRaw(), "grpc", {});
+    expect(result.mutations.map((m) => m.intent)).toEqual([
+      "ACTIVATE_DEALS", "ADJUST_DEAL_FLOOR", "BID_SHADE",
+    ]);
+  });
+
+  it("stamps each ordered mutation with the stop that produced it", () => {
+    const result = normalize(stagedRaw(), "grpc", {});
+    expect(result.mutations.map((m) => m.sourceAgent)).toEqual(["ncf", "yield-floor", "dlrm"]);
+    // The model fields RawPanel's applier reads are present on every entry.
+    expect(result.mutations[0].path).toBe("/imp/imp-1/deals");
+    expect(result.mutations[0].payload).toEqual(["deal-home-premium"]);
+  });
+
+  it("falls back to intent attribution when no stop claims the mutation", () => {
+    const raw = stagedRaw();
+    raw.metadata.containers = []; // older server: no per-container lists
+    const result = normalize(raw, "grpc", {});
+    expect(result.mutations.map((m) => m.sourceAgent)).toEqual(["ncf", "yield-floor", "dlrm"]);
+  });
+
+  it("attributes a mutation two containers both produced to the first in stop order", () => {
+    const raw = stagedRaw();
+    raw.metadata.containers.push(
+      { name: "yield-optimizer-margin", status: "ok", latency_ms: 19, mutations: [floor] },
+    );
+    const result = normalize(raw, "grpc", {});
+    // yield-floor is listed before yield-margin in stop order and wins the tie.
+    expect(result.mutations[1].sourceAgent).toBe("yield-floor");
+  });
+
+  it("normalizes metadata.stages into camelCase with rejections preserved", () => {
+    const result = normalize(stagedRaw(), "grpc", {});
+    expect(result.stages).toHaveLength(4);
+    expect(result.stages.map((s) => s.name)).toEqual(["enrich", "deals", "yield", "price"]);
+    expect(result.stages[2]).toEqual({
+      stage: 3,
+      name: "yield",
+      containers: ["yield-optimizer-floor", "yield-optimizer-margin"],
+      latencyMs: 21,
+      budgetMs: 68,
+      applied: 1,
+      rejected: [{ intent: "ADJUST_DEAL_MARGIN", path: "/imp/imp-1/deals/deal-x", reason: "deal not present" }],
+    });
+  });
+
+  it("returns [] for stages on a bypassed pass or an older server, and [] mutations on an RPC error", () => {
+    const bypassed = normalize({ id: "req-6", mutations: [], metadata: { total_latency_ms: 2, containers: [] } }, "grpc", {});
+    expect(bypassed.stages).toEqual([]);
+    expect(bypassed.mutations).toEqual([]);
+
+    const errored = normalize({ id: "req-7", error: { message: "boom" } }, "grpc", {});
+    expect(errored.stages).toEqual([]);
+    expect(errored.mutations).toEqual([]);
+  });
+
+  it("drops malformed stage entries and tolerates missing numeric fields", () => {
+    const raw = stagedRaw();
+    raw.metadata.stages = [null, "nope", { name: "deals", containers: ["ncf-deal-manager", 7] }];
+    const result = normalize(raw, "grpc", {});
+    expect(result.stages).toEqual([{
+      stage: 0, name: "deals", containers: ["ncf-deal-manager"],
+      latencyMs: null, budgetMs: null, applied: 0, rejected: [],
+    }]);
+  });
+});

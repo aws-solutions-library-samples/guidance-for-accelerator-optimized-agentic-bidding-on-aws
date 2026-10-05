@@ -8,11 +8,32 @@ import {
   dealIdFromPath,
   visibleValues,
   cardStateFor,
+  passOf,
+  sawKindInPass,
   BEAT_ORIGIN,
   BEAT_CONTAINER,
   BEAT_BIDS,
   BEAT_RECAP,
+  BEAT_PASS,
+  BEAT_BASELINE,
+  PASS_BASELINE,
+  PASS_ARTF,
 } from "./theaterBeats.js";
+
+/**
+ * The structural beats of pass 1 (banner, origin, bids, baseline) and the
+ * structural beats of pass 2 (banner, origin, bids, recap). Container beats sit
+ * between pass 2's origin and bids.
+ */
+const PASS1_STRUCTURE = [BEAT_PASS, BEAT_ORIGIN, BEAT_BIDS, BEAT_BASELINE];
+const PASS2_HEAD = [BEAT_PASS, BEAT_ORIGIN];
+const PASS2_TAIL = [BEAT_BIDS, BEAT_RECAP];
+const STRUCTURAL_COUNT = PASS1_STRUCTURE.length + PASS2_HEAD.length + PASS2_TAIL.length;
+
+/** The container beats, i.e. pass 2 with its structural beats removed. */
+function containerSlice(beats) {
+  return beats.slice(PASS1_STRUCTURE.length + PASS2_HEAD.length, beats.length - PASS2_TAIL.length);
+}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -89,24 +110,40 @@ const payloadWithDeal = {
 /* ------------------------------------------------------ beat count, BR-1..4 */
 
 describe("buildBeats sequence shape", () => {
-  it("is origin + one beat per mutation + bids + recap", () => {
+  it("is pass 1 (banner, origin, bids, baseline) then pass 2 (banner, origin, one beat per mutation, bids, recap)", () => {
     const beats = buildBeats(payloadWithDeal, result([
       stop("metrics", [metricsMutation]),
       stop("widedeep", [segmentsMutation]),
       stop("yield-floor", [floorMutation]),
     ]));
-    expect(beats).toHaveLength(1 + 3 + 1 + 1);
-    expect(beats[0].kind).toBe(BEAT_ORIGIN);
-    expect(beats[beats.length - 2].kind).toBe(BEAT_BIDS);
-    expect(beats[beats.length - 1].kind).toBe(BEAT_RECAP);
-    expect(beats.slice(1, -2).every((b) => b.kind === BEAT_CONTAINER)).toBe(true);
+    expect(beats).toHaveLength(STRUCTURAL_COUNT + 3);
+    expect(beats.slice(0, 4).map((b) => b.kind)).toEqual(PASS1_STRUCTURE);
+    expect(beats.slice(4, 6).map((b) => b.kind)).toEqual(PASS2_HEAD);
+    expect(beats.slice(-2).map((b) => b.kind)).toEqual(PASS2_TAIL);
+    expect(containerSlice(beats).every((b) => b.kind === BEAT_CONTAINER)).toBe(true);
+  });
+
+  it("stamps every beat with its pass, and pass 1 precedes pass 2 entirely", () => {
+    const beats = buildBeats(payloadWithDeal, result([stop("metrics", [metricsMutation])]));
+    const passes = beats.map((b) => b.pass);
+    expect(passes.slice(0, 4)).toEqual([PASS_BASELINE, PASS_BASELINE, PASS_BASELINE, PASS_BASELINE]);
+    expect(passes.slice(4).every((p) => p === PASS_ARTF)).toBe(true);
+  });
+
+  it("marks the two banners: pass 1 without ARTF, pass 2 with", () => {
+    const beats = buildBeats(payloadWithDeal, result([]));
+    const banners = beats.filter((b) => b.kind === BEAT_PASS);
+    expect(banners).toHaveLength(2);
+    expect(banners[0]).toMatchObject({ pass: PASS_BASELINE, artf: false, movement: "none" });
+    expect(banners[1]).toMatchObject({ pass: PASS_ARTF, artf: true, movement: "none" });
   });
   it("puts the bids beat AFTER every container and BEFORE the recap", () => {
     const beats = buildBeats(payloadWithDeal, result([
       stop("metrics", [metricsMutation]),
       stop("yield-floor", [floorMutation]),
     ]));
-    const bidsAt = beats.findIndex((b) => b.kind === BEAT_BIDS);
+    // Pass 2's bids beat: the LAST bids beat, since pass 1 has one too.
+    const bidsAt = beats.map((b) => b.kind).lastIndexOf(BEAT_BIDS);
     const recapAt = beats.findIndex((b) => b.kind === BEAT_RECAP);
     const lastContainerAt = beats.reduce(
       (acc, b, i) => (b.kind === BEAT_CONTAINER ? i : acc), -1,
@@ -115,20 +152,21 @@ describe("buildBeats sequence shape", () => {
     expect(bidsAt).toBeGreaterThan(lastContainerAt);
     expect(recapAt).toBe(bidsAt + 1);
   });
-  it("emits exactly one bids beat, and it carries no values", () => {
+  it("emits one bids beat per pass, and neither carries values", () => {
     const beats = buildBeats(payloadWithDeal, result([
       stop("metrics", [metricsMutation]),
       stop("widedeep", [segmentsMutation]),
     ]));
     const bids = beats.filter((b) => b.kind === BEAT_BIDS);
-    expect(bids).toHaveLength(1);
-    expect(bids[0].values).toEqual([]);
+    expect(bids).toHaveLength(2);
+    expect(bids.map((b) => b.pass)).toEqual([PASS_BASELINE, PASS_ARTF]);
+    expect(bids.every((b) => b.values.length === 0)).toBe(true);
   });
   it("moves attention to the buy side on the bids beat, not the recap", () => {
     const beats = buildBeats(payloadWithDeal, result([stop("metrics", [metricsMutation])]));
-    const bids = beats.find((b) => b.kind === BEAT_BIDS);
+    const bids = beats.filter((b) => b.kind === BEAT_BIDS);
     const recap = beats.find((b) => b.kind === BEAT_RECAP);
-    expect(bids.movement).toBe("request-to-buy");
+    expect(bids.every((b) => b.movement === "request-to-buy")).toBe(true);
     expect(recap.movement).toBe("none");
   });
 
@@ -149,7 +187,7 @@ describe("buildBeats sequence shape", () => {
 
   it("ignores the ssp and dsp bookend stops", () => {
     const beats = buildBeats(payloadWithDeal, result([]));
-    expect(beats.map((b) => b.kind)).toEqual([BEAT_ORIGIN, BEAT_BIDS, BEAT_RECAP]);
+    expect(beats.map((b) => b.kind)).toEqual([...PASS1_STRUCTURE, ...PASS2_HEAD, ...PASS2_TAIL]);
   });
   it("still emits the bids beat when NO container mutated", () => {
     // Structural, not derived: nothing was enriched, but the seats still bid.
@@ -290,16 +328,43 @@ describe("derived rendering", () => {
     stop("widedeep", [segmentsMutation]),
   ]));
 
-  it("visibleValues accumulates only up to the index", () => {
-    expect(visibleValues(beats, 0)).toHaveLength(0);
-    expect(visibleValues(beats, 1)).toHaveLength(2);
-    expect(visibleValues(beats, 2)).toHaveLength(3);
+  // The first container beat sits after pass 1's four beats and pass 2's banner
+  // and origin.
+  const firstContainerAt = PASS1_STRUCTURE.length + PASS2_HEAD.length;
+
+  it("visibleValues is empty through the whole of pass 1 and accumulates from the first container beat", () => {
+    for (let i = 0; i < firstContainerAt; i++) {
+      expect(visibleValues(beats, i)).toHaveLength(0);
+    }
+    expect(visibleValues(beats, firstContainerAt)).toHaveLength(2);
+    expect(visibleValues(beats, firstContainerAt + 1)).toHaveLength(3);
   });
 
-  it("card state advances neutral to enriching to settled", () => {
-    expect(cardStateFor(beats, 0)).toBe("neutral");
-    expect(cardStateFor(beats, 1)).toBe("enriching");
+  it("card state is neutral through pass 1, enriching from the first container beat, settled at the recap", () => {
+    for (let i = 0; i < firstContainerAt; i++) {
+      expect(cardStateFor(beats, i)).toBe("neutral");
+    }
+    expect(cardStateFor(beats, firstContainerAt)).toBe("enriching");
     expect(cardStateFor(beats, beats.length - 1)).toBe("settled");
+  });
+
+  it("passOf names the pass at each index, and null outside the sequence", () => {
+    expect(passOf(beats, 0)).toBe(PASS_BASELINE);
+    expect(passOf(beats, 3)).toBe(PASS_BASELINE);
+    expect(passOf(beats, 4)).toBe(PASS_ARTF);
+    expect(passOf(beats, beats.length - 1)).toBe(PASS_ARTF);
+    expect(passOf(beats, -1)).toBeNull();
+    expect(passOf(beats, beats.length)).toBeNull();
+    expect(passOf(null, 0)).toBeNull();
+  });
+
+  it("sawKindInPass is scoped to the pass: reaching pass 1's bids says nothing about pass 2's", () => {
+    const pass1Bids = 2;
+    expect(sawKindInPass(beats, pass1Bids, BEAT_BIDS, PASS_BASELINE)).toBe(true);
+    expect(sawKindInPass(beats, pass1Bids, BEAT_BIDS, PASS_ARTF)).toBe(false);
+    // Standing on pass 2's origin: pass 2's bids has not been reached.
+    expect(sawKindInPass(beats, firstContainerAt - 1, BEAT_BIDS, PASS_ARTF)).toBe(false);
+    expect(sawKindInPass(beats, beats.length - 1, BEAT_BIDS, PASS_ARTF)).toBe(true);
   });
 });
 
@@ -366,26 +431,45 @@ const arbStops = fc.array(
 }));
 
 describe("buildBeats properties", () => {
-  // Three structural beats — origin, bids, recap — regardless of what the
-  // containers did. Only the container beats vary with the response.
-  it("beat count is always 3 + the total number of mutations", () => {
+  // Eight structural beats — two banners, two origins, two bids, a baseline and a
+  // recap — regardless of what the containers did. Only the container beats
+  // vary with the response.
+  it("beat count is always 8 + the total number of mutations", () => {
     fc.assert(fc.property(arbStops, (res) => {
       const mutationCount = res.stops
         .filter((s) => s.id !== "ssp" && s.id !== "dsp")
         .reduce((n, s) => n + s.mutations.length, 0);
-      expect(buildBeats(payloadWithDeal, res)).toHaveLength(mutationCount + 3);
+      expect(buildBeats(payloadWithDeal, res)).toHaveLength(mutationCount + STRUCTURAL_COUNT);
     }), { numRuns: 200 });
   });
-  it("always emits exactly one origin, one bids and one recap beat", () => {
+  it("always emits exactly two banners, two origins, two bids, one baseline and one recap", () => {
     fc.assert(fc.property(arbStops, (res) => {
       const kinds = buildBeats(payloadWithDeal, res).map((b) => b.kind);
-      expect(kinds.filter((k) => k === BEAT_ORIGIN)).toHaveLength(1);
-      expect(kinds.filter((k) => k === BEAT_BIDS)).toHaveLength(1);
+      expect(kinds.filter((k) => k === BEAT_PASS)).toHaveLength(2);
+      expect(kinds.filter((k) => k === BEAT_ORIGIN)).toHaveLength(2);
+      expect(kinds.filter((k) => k === BEAT_BIDS)).toHaveLength(2);
+      expect(kinds.filter((k) => k === BEAT_BASELINE)).toHaveLength(1);
       expect(kinds.filter((k) => k === BEAT_RECAP)).toHaveLength(1);
-      // Order is invariant: origin first, then bids, then recap last.
-      expect(kinds[0]).toBe(BEAT_ORIGIN);
-      expect(kinds.indexOf(BEAT_BIDS)).toBe(kinds.length - 2);
+      // Order is invariant: pass 1's four beats, then pass 2 opens with its
+      // banner and origin, and closes with bids then recap.
+      expect(kinds.slice(0, 4)).toEqual(PASS1_STRUCTURE);
+      expect(kinds.slice(4, 6)).toEqual(PASS2_HEAD);
+      expect(kinds.lastIndexOf(BEAT_BIDS)).toBe(kinds.length - 2);
       expect(kinds[kinds.length - 1]).toBe(BEAT_RECAP);
+    }), { numRuns: 200 });
+  });
+
+  it("every pass-1 beat precedes every pass-2 beat, and no container beat is in pass 1", () => {
+    fc.assert(fc.property(arbStops, (res) => {
+      const beats = buildBeats(payloadWithDeal, res);
+      const lastPass1 = beats.map((b) => b.pass).lastIndexOf(PASS_BASELINE);
+      const firstPass2 = beats.map((b) => b.pass).indexOf(PASS_ARTF);
+      expect(lastPass1).toBeLessThan(firstPass2);
+      expect(beats.every((b) => b.pass === PASS_BASELINE || b.pass === PASS_ARTF)).toBe(true);
+      expect(beats.filter((b) => b.kind === BEAT_CONTAINER).every((b) => b.pass === PASS_ARTF)).toBe(true);
+      // Nothing in pass 1 carries a value, so the request card is untouched
+      // through the whole baseline pass.
+      expect(visibleValues(beats, lastPass1)).toEqual([]);
     }), { numRuns: 200 });
   });
 

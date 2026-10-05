@@ -62,13 +62,14 @@ def _auth_role_name(stack_name: str) -> str:
 
 _INVOKE_POLICY_NAME = "closed-loop-agent-invoke"
 _CAPTION_POLICY_NAME = "caption-model-invoke"
+_UI_API_POLICY_NAME = "ui-api-proxy-invoke"
 
 # Every inline policy this script may attach to the authenticated role.
 # ``destroy`` iterates this list: IAM refuses DeleteRole while any inline policy
 # remains, and the delete_role call below only warns on failure, so a policy
 # added without a matching entry here would leave an orphaned role behind
 # silently. Adding to this list is the whole registration step.
-_ROLE_INLINE_POLICIES = (_INVOKE_POLICY_NAME, _CAPTION_POLICY_NAME)
+_ROLE_INLINE_POLICIES = (_INVOKE_POLICY_NAME, _CAPTION_POLICY_NAME, _UI_API_POLICY_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +282,37 @@ def _put_caption_policy(iam, *, role_name: str) -> None:
     _LOG.info("Granted bedrock:Invoke* for Auction Theater captions.")
 
 
+def _put_ui_api_policy(iam, *, role_name: str, function_arn: str) -> None:
+    """Attach/replace the lambda:InvokeFunction grant for the UI API proxy.
+
+    The browser invokes ``<prefix>-ui-api-proxy`` directly with the Identity Pool
+    credentials this role issues; the function forwards to the orchestrator's
+    ClusterIP Service inside the VPC. One action, one function ARN (plus its
+    qualified form for versions/aliases). The orchestrator still validates the
+    Cognito bearer token the browser puts in the forwarded request, so this grant
+    is the outer gate, not the only one. See private-ui-api-express.md FR-3.
+    """
+    if not function_arn or not function_arn.startswith("arn:aws:lambda:"):
+        raise ValueError(f"--ui-api-proxy-arn must be a Lambda function ARN, got {function_arn!r}")
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InvokeUiApiProxy",
+                "Effect": "Allow",
+                "Action": "lambda:InvokeFunction",
+                "Resource": [function_arn, f"{function_arn}:*"],
+            }
+        ],
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName=_UI_API_POLICY_NAME,
+        PolicyDocument=json.dumps(policy),
+    )
+    _LOG.info("Granted lambda:InvokeFunction on %s.", function_arn)
+
+
 def _write_outputs(outputs: dict) -> None:
     with open(_OUTPUTS_PATH, "w", encoding="utf-8") as f:
         json.dump(outputs, f, indent=2)
@@ -475,6 +507,23 @@ def grant_caption_invoke(*, stack_name: str, region: str) -> dict:
     return outputs
 
 
+def grant_ui_api_invoke(*, stack_name: str, region: str, function_arn: str) -> dict:
+    """Idempotently attach the UI API proxy invoke policy to the auth role.
+
+    Runs in the base deploy right after the proxy stack is created (Phase 3), so
+    the Phase 4 frontend build ships against a role that can already call it.
+    """
+    iam = boto3.client("iam", region_name=region)
+    role_name = _auth_role_name(stack_name)
+    # Verify the role exists (deploy must have run first).
+    iam.get_role(RoleName=role_name)
+    _put_ui_api_policy(iam, role_name=role_name, function_arn=function_arn)
+    outputs = _read_outputs()
+    outputs["UiApiProxyArn"] = function_arn
+    _write_outputs(outputs)
+    return outputs
+
+
 def destroy(*, stack_name: str, region: str) -> None:
     """Delete the Identity Pool, authenticated role, and User Pool (best effort)."""
     cognito = boto3.client("cognito-idp", region_name=region)
@@ -522,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--action",
         required=True,
-        choices=["deploy", "destroy", "grant-agent-invoke", "grant-caption-invoke"],
+        choices=["deploy", "destroy", "grant-agent-invoke", "grant-caption-invoke", "grant-ui-api-invoke"],
     )
     parser.add_argument("--stack-name", required=True)
     parser.add_argument("--region", default="us-east-1")
@@ -531,6 +580,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cloudfront-domain", default="localhost")
     parser.add_argument("--adaptive-runtime-arn", default="")
     parser.add_argument("--governance-runtime-arn", default="")
+    parser.add_argument("--ui-api-proxy-arn", default="",
+                        help="Lambda ARN of the UI API proxy (grant-ui-api-invoke)")
     args = parser.parse_args(argv)
     if args.profile:
         # One place for both credential paths: boto3 clients created below, and any
@@ -550,6 +601,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.action == "grant-caption-invoke":
         grant_caption_invoke(stack_name=args.stack_name, region=args.region)
+    elif args.action == "grant-ui-api-invoke":
+        grant_ui_api_invoke(
+            stack_name=args.stack_name, region=args.region, function_arn=args.ui_api_proxy_arn
+        )
     elif args.action == "grant-agent-invoke":
         grant_agent_invoke(
             stack_name=args.stack_name,

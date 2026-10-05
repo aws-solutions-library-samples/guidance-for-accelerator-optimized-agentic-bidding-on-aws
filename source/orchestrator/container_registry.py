@@ -120,6 +120,12 @@ class ContainerCallOutcome:
     # reached for a prediction" both arrive as an empty mutation list. The bid
     # shader's abstention is exactly the second case.
     abstained_reason: str | None = None
+    # The container's own account of where its time went (metadata.timing on its
+    # response; segments in shared/hop_timing.py). None when the container did not
+    # report one. Subtracting its ``total`` from the orchestrator-measured
+    # ``latency_ms`` leaves the transport share -- the number a protocol change
+    # can move.
+    timing: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,9 +242,12 @@ def _entry_from_record(record: dict) -> RegistryEntry:
     description = str(record.get("description") or "")
     grpc = str(record.get("grpc") or "").strip()
     if not grpc and endpoint:
-        # Mirror the code half's convention: the gRPC target is the same
-        # host:port with the scheme stripped.
-        grpc = endpoint.replace("http://", "").replace("https://", "").rstrip("/")
+        # Mirror the code half's convention (app.py _grpc_from_url): the gRPC
+        # target is the endpoint's host on the ARTF gRPC port, not the endpoint's
+        # own (HTTP) port.
+        host = endpoint.split("://", 1)[-1].split("/", 1)[0]
+        host = host.rsplit(":", 1)[0] if ":" in host else host
+        grpc = f"{host}:{int(os.environ.get('ARTF_GRPC_PORT', '50051'))}"
     return RegistryEntry(
         name=name,
         display_name=display_name,

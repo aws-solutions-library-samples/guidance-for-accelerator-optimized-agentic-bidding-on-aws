@@ -1,7 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import DeltaLabel from "./DeltaLabel";
 import nvidiaLogo from "../logos/Nvidia_logo.svg";
-import { authFetch } from "../authFetch.js";
+import { authFetch, isProxyTransport } from "../authFetch.js";
+
+// Progress transport. Through the UI API proxy Lambda (deployed stacks) the
+// panel polls GET /api/v1/loadtest/{id}: a synchronous Invoke returns one payload,
+// so the proxy refuses the SSE stream with 406 and there is no point requesting it.
+// Each poll is one signed invoke (about 180 ms measured), so 1 s keeps the counters
+// and bid bubbles moving without doubling the invoke count. With plain fetch (local
+// dev, port-forward) the SSE stream is tried first and polling is the fallback.
+export const POLL_INTERVAL_MS = 1000;
 
 const PRESETS = [
   { value: "100", label: "100", requests: 100 },
@@ -84,8 +92,12 @@ const SCENARIOS = [
 /**
  * LoadTestPanel — UI for running server-side load tests against the ARTF pipeline.
  *
- * Connects to POST /v1/loadtest to start a test, then opens an EventSource on
- * GET /v1/loadtest/{id}/stream to receive real-time progress events (every 500ms).
+ * Connects to POST /v1/loadtest to start a test, then follows progress over one
+ * of two transports: GET /v1/loadtest/{id}/stream (server-sent events every
+ * 500 ms, plain-fetch builds) or GET /v1/loadtest/{id} polled every
+ * POLL_INTERVAL_MS (proxy builds, and the fallback when the stream fails). The
+ * orchestrator computes both from the same live counters, so the panel shows the
+ * same numbers either way.
  *
  * Props:
  *   onRunningChange(isRunning: boolean) — called when load test starts/stops,
@@ -165,7 +177,9 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
     }
   }, [resetToIdle]);
 
-  // Polling fallback: fetch test status every 2s when SSE is unavailable
+  // Poll transport: GET /api/v1/loadtest/{id} every POLL_INTERVAL_MS. The
+  // orchestrator merges its live counters into the body while state is
+  // "running", so each tick carries real completed/rps/latency numbers.
   const startPolling = useCallback((testId) => {
     if (pollRef.current) return;
     pollRef.current = setInterval(async () => {
@@ -196,7 +210,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       } catch (_) {
         // Network error — keep polling
       }
-    }, 2000);
+    }, POLL_INTERVAL_MS);
   }, [resetToIdle]);
 
   const startTest = useCallback(async () => {
@@ -242,6 +256,13 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
 
       const { id } = await resp.json();
       testIdRef.current = id;
+
+      // Behind the UI API proxy the stream request would be refused (406), so go
+      // straight to polling instead of spending an invoke and a tick to learn that.
+      if (isProxyTransport()) {
+        startPolling(id);
+        return;
+      }
 
       // Open SSE stream using fetch (supports Authorization header, unlike EventSource)
       const abortController = new AbortController();

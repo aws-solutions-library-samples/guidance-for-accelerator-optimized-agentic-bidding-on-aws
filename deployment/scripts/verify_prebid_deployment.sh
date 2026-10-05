@@ -119,6 +119,7 @@ import yaml
 PLACEHOLDERS = (
     "__NAMESPACE__", "__PREBID_ROLE_ARN__", "__IMAGE__", "__CONFIG_BUCKET__", "__AWS_REGION__",
     "__TOKEN_ENDPOINT__", "__CREDENTIAL_SECRET__", "__DEMAND_ENDPOINT__", "__ORCHESTRATOR_URL__",
+    "__ORCHESTRATOR_GRPC_TARGET__", "__ARTF_TRANSPORT__",
     "__ORCHESTRATOR_SCOPE__", "__ARTF_TOKEN_SCOPES__", "__AMT_SIMULATOR_ENDPOINT__",
 )
 for f in ("deployment/eks/prebid-server-deployment.yaml",
