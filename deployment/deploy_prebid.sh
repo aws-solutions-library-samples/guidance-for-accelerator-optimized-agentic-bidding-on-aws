@@ -641,6 +641,37 @@ deploy_artfhouse_demand() {
 }
 
 # ---------------------------------------------------------------------------
+# remove_retired_demand_lambda_artifacts -- what the former demand Lambda left.
+#
+# The stack update that removed the Lambda deletes the function, the API and their
+# stack-owned log group. Two things it never owned stay behind: the function's own
+# log group (/aws/lambda/<prefix>artfhouse-demand, created by Lambda on first
+# invoke) and the zip packages under prebid-lambda/ in the build bucket. Removed
+# here, once the function is confirmed gone, so every stack that migrates is
+# cleaned the same way. Idempotent; absent means nothing to do.
+# ---------------------------------------------------------------------------
+remove_retired_demand_lambda_artifacts() {
+  local bucket="$1" fn="${PFX}artfhouse-demand" group
+  group="/aws/lambda/${fn}"
+  if aws lambda get-function --function-name "${fn}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    warn "Lambda ${fn} still exists; leaving its log group and packages in place."
+    return 0
+  fi
+  if [[ -n "$(aws logs describe-log-groups --log-group-name-prefix "${group}" --region "${AWS_REGION}" \
+        --query "logGroups[?logGroupName=='${group}'].logGroupName" --output text 2>/dev/null)" ]]; then
+    aws logs delete-log-group --log-group-name "${group}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+      && log "  Removed the retired demand Lambda's log group ${group}" \
+      || warn "Could not delete log group ${group}"
+  fi
+  if aws s3api list-objects-v2 --bucket "${bucket}" --prefix prebid-lambda/ --max-items 1 \
+       --query 'Contents[0].Key' --output text 2>/dev/null | grep -q '^prebid-lambda/'; then
+    aws s3 rm "s3://${bucket}/prebid-lambda/" --recursive --region "${AWS_REGION}" >/dev/null 2>&1 \
+      && log "  Removed the retired demand Lambda packages under s3://${bucket}/prebid-lambda/" \
+      || warn "Could not delete s3://${bucket}/prebid-lambda/"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # publish_config_overlay -- render and upload current/prebid-config.yaml.
 #
 # MUST run BEFORE the Kubernetes manifest is applied. The pod's entrypoint copies
@@ -931,6 +962,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     log "ECR repository ${DEMAND_ECR_REPO}: already absent"
   fi
 
+  remove_retired_demand_lambda_artifacts "${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
   log "The shared Cognito user pool was NOT deleted - the frontend and orchestrator use it."
   rm -f "${RECORD_FILE}"
   log "Teardown complete"
@@ -1637,6 +1669,8 @@ if [[ "${START_AT}" -le 6 ]]; then
     "ParameterKey=ConfigBucket,ParameterValue=${CONFIG_BUCKET}" \
     "ParameterKey=DealsTableName,ParameterValue=${DEALS_TABLE}" \
     "ParameterKey=DemandServiceAccountName,ParameterValue=artfhouse-demand-sa"
+
+  remove_retired_demand_lambda_artifacts "${CONFIG_BUCKET}"
 
   PREBID_ROLE_ARN="$(stack_output "${PREBID_STACK}" PrebidHostRoleArn)"
   CREDENTIAL_SECRET="$(stack_output "${PREBID_STACK}" CredentialSecretArn)"
