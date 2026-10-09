@@ -1,8 +1,8 @@
 # Guidance for Accelerator-Optimized Agentic Bidding on AWS
 
-Run AI models that price bids, activate audience segments, and manage private marketplace deals in real time — accelerated by NVIDIA GPUs, deployed on Amazon EKS.
+Run AI models that price bids, activate audience segments, and manage private marketplace deals in real time, accelerated by NVIDIA GPUs and deployed on Amazon EKS.
 
-> 📄 **Full guidance documents:** This Guidance is published in two parts. [GUIDANCE.md](GUIDANCE.md) covers **Part 1** — the real-time, GPU-accelerated bidding pipeline. [GUIDANCE-part2.md](GUIDANCE-part2.md) covers **Part 2** — the closed-loop learning system: bid-outcome capture, retraining (including the Yield Optimizer's XGBoost floor and margin models), and model-promotion governance. Each includes architecture details, model specifications, scaling scenarios, and Well-Architected analysis.
+> **Full guidance documents:** This Guidance is published in two parts. [GUIDANCE.md](GUIDANCE.md) covers **Part 1**: the real-time, GPU-accelerated bidding pipeline. [GUIDANCE-part2.md](GUIDANCE-part2.md) covers **Part 2**: the closed-loop learning system, with bid-outcome capture, retraining (including the Yield Optimizer's XGBoost floor and margin models), and model-promotion governance. Each includes architecture details, model specifications, scaling scenarios, and Well-Architected analysis.
 
 ## Table of Contents
 
@@ -29,13 +29,13 @@ Run AI models that price bids, activate audience segments, and manage private ma
 
 ## Quick start
 
-Before you start, you'll need an AWS account with permission to create Amazon EKS, EC2 (including `g5` GPU instances), S3, ECR, CloudFront, Cognito, and IAM resources, and a `g5.xlarge` GPU quota in your target Region. `deploy.sh` checks for the required CLI tools at startup and tells you exactly what's missing — see [Prerequisites](#prerequisites) for the full list if you want to check ahead of time.
+Before you start, you'll need an AWS account with permission to create Amazon EKS, EC2 (including `g5` GPU instances), S3, ECR, CloudFront, Cognito, and IAM resources, and a `g5.xlarge` GPU quota in your target Region. `deploy.sh` checks for the required CLI tools at startup and tells you exactly what's missing. See [Prerequisites](#prerequisites) for the full list if you want to check ahead of time.
 
-You'll also need an **NVIDIA NGC API key**. `deploy.sh` deploys the closed-loop retraining stack by default ([Part 2](#part-2-closed-loop-learning)), which builds an NVIDIA NeMo-RL training container from a gated NGC image — the key is what authenticates that pull. Get a free one:
+You'll also need an **NVIDIA NGC API key**. `deploy.sh` deploys the closed-loop retraining stack by default ([Part 2](#part-2-closed-loop-learning)), which builds an NVIDIA NeMo-RL training container from a gated NGC image, and the key authenticates that pull. Get a free one:
 
 1. Create an account (or sign in) at [ngc.nvidia.com/signin](https://ngc.nvidia.com/signin).
 2. Click your account icon (top right) → **Setup** → **Generate Personal Key** (older accounts: **Account Settings** → **Generate API Key**).
-3. Give the key a name, leave the default expiration/services, and click **Generate Personal Key**. Copy it now — NGC only shows it once.
+3. Give the key a name, leave the default expiration/services, and click **Generate Personal Key**. Copy it now: NGC only shows it once.
 
 ```bash
 git clone https://github.com/aws-solutions-library-samples/guidance-for-accelerator-optimized-agentic-bidding-on-aws.git
@@ -45,9 +45,9 @@ cd guidance-for-accelerator-optimized-agentic-bidding-on-aws/deployment
 
 `--prefix` is required on every run: exactly three characters, a letter followed by letters or digits (`dv1`, `stg`, `bt3`). It names every resource the deployment creates (`dv1-nvidia-artf-*`), keys the local record of your settings, and is what lets two deployments share one account without colliding. Pick one and keep using it for that environment.
 
-`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix — you only need to pass `--ngc-key` once. With no other flags it provisions, in `us-east-1`: an EKS cluster with one `g5.xlarge` GPU node and three `c5.2xlarge` CPU nodes in private subnets, NVIDIA Triton Inference Server, the six bidding containers, the orchestrator, a React frontend behind CloudFront with Cognito sign-in, an Amazon Bedrock AgentCore MCP runtime, and the Part 2 closed-loop learning stack (feedback pipeline, Glue ETL, SageMaker Model Registry, two Bedrock-backed agent runtimes and their schedules). Container images build on AWS CodeBuild, so Docker is not needed on your machine. It takes roughly 30–40 minutes. When it finishes, it prints a URL and a demo login — open the URL in your browser.
+`deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix, so you only need to pass `--ngc-key` once. With no other flags it provisions, in `us-east-1`: an EKS cluster with one `g5.xlarge` GPU node and three `c5.2xlarge` CPU nodes in private subnets, NVIDIA Triton Inference Server, the six bidding containers, the orchestrator, a React frontend behind CloudFront with Cognito sign-in, an Amazon Bedrock AgentCore MCP runtime, and the Part 2 closed-loop learning stack (feedback pipeline, Glue ETL, SageMaker Model Registry, two Bedrock-backed agent runtimes and their schedules). Container images build on AWS CodeBuild, so Docker is not needed on your machine. It takes roughly 30 to 40 minutes. When it finishes, it prints a URL and a demo login. Open the URL in your browser.
 
-Don't want the closed-loop stack (and don't want to create an NGC account)? Skip it — the core real-time bidding pipeline doesn't need NGC credentials:
+Don't want the closed-loop stack (and don't want to create an NGC account)? Skip it. The core real-time bidding pipeline doesn't need NGC credentials:
 
 ```bash
 ./deploy.sh --prefix dv1 --no-retraining
@@ -59,7 +59,7 @@ Deploying with a named AWS CLI profile rather than your shell's default? Pass it
 ./deploy.sh --prefix dv1 --profile my-admin-profile --ngc-key YOUR_NGC_API_KEY
 ```
 
-Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable, then the profile remembered for that prefix, then `default`. The result is exported and passed explicitly to every script the deploy branches into, and written into the kubeconfig it fetches, so `kubectl` from your own shell authenticates the same way. Once a prefix has been deployed with one profile, a later run that names a different one stops before touching AWS and tells you which profile the prefix belongs to — the point is that the same prefix never lands in two accounts by accident. To move a prefix deliberately, remove its record from `deployment/.deploy-state.json` first.
+Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable, then the profile remembered for that prefix, then `default`. The result is exported and passed explicitly to every script the deploy branches into, and written into the kubeconfig it fetches, so `kubectl` from your own shell authenticates the same way. Once a prefix has been deployed with one profile, a later run that names a different one stops before touching AWS and tells you which profile the prefix belongs to, so the same prefix never lands in two accounts by accident. To move a prefix deliberately, remove its record from `deployment/.deploy-state.json` first.
 
 ## What just happened?
 
@@ -73,16 +73,16 @@ Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable,
 | **Audience Activator** | Activates audience segments from bid-request signals |
 | **Deal Scorer** | Scores and activates/suppresses private marketplace deals |
 | **Signals Enricher** | Adds viewability and brand-safety quality signals |
-| **Yield Optimizer — Floor** | Publisher/SSP-side — adjusts the floor price on private marketplace deals |
-| **Yield Optimizer — Margin** | Publisher/SSP-side — adjusts the margin taken on private marketplace deals |
+| **Yield Optimizer (Floor)** | Publisher/SSP-side: adjusts the floor price on private marketplace deals |
+| **Yield Optimizer (Margin)** | Publisher/SSP-side: adjusts the margin taken on private marketplace deals |
 
-The orchestrator runs every incoming bid request through the six containers in four sequential stages (enrich, deals, yield, price), applying each stage's mutations to a working copy of the request before the next stage runs, and returns a single stage-ordered response. Both yield containers run in stage 3, so each is exercised whenever a deal with the matching floor- or margin-adjustable intent is in the request by then, including deals the Deal Scorer activated in stage 2. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results — that's the "Try it" step below.
+The orchestrator runs every incoming bid request through the six containers in four sequential stages (enrich, deals, yield, price), applying each stage's mutations to a working copy of the request before the next stage runs, and returns a single stage-ordered response. Both yield containers run in stage 3, so each is exercised whenever a deal with the matching floor- or margin-adjustable intent is in the request by then, including deals the Deal Scorer activated in stage 2. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results. That's the "Try it" step below.
 
-The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents — neither is gated on the other — so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
+The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents (neither is gated on the other), so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
 
 ### How the orchestrator sequences the containers
 
-A single parallel fan-out would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
+Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
 
 | Stage | Containers | Intents | What the next stage sees |
 |-------|------------|---------|--------------------------|
@@ -107,7 +107,7 @@ The Auction Theater's two-pass run is unchanged by the staging. Pass 1 sends `ex
 
 Containers and models are not 1:1. Four of the six containers run a real model on
 the GPU; two are deterministic rule engines with no model at all. Every model that
-exists has exactly one container, and every model is a fully separate unit — its own
+exists has exactly one container, and every model is a fully separate unit, with its own
 Triton model name, its own config, its own SageMaker Model Package Group, its own
 training job, and its own promotion lifecycle.
 
@@ -116,20 +116,20 @@ training job, and its own promotion lifecycle.
 |---|---|---|---|---|---|
 | `dlrm_bid_shader` | Bid Pricer | DLRM (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
 | `ncf_deal_manager` | Deal Scorer | NCF/NeuMF (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
-| `deal_yield_manager_floor` | Yield Optimizer — Floor | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
-| `deal_yield_manager_margin` | Yield Optimizer — Margin | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
-| *(none — rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
-| *(none — rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
+| `deal_yield_manager_floor` | Yield Optimizer (Floor) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| `deal_yield_manager_margin` | Yield Optimizer (Margin) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| *(none: rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
+| *(none: rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
 
 The two yield models share one thing by design: the **7-element feature vector** both
 consume. That derivation lives in shared code rather than being duplicated per
 container, because the Glue ETL job reconstructs the same vector when building
-training data — if the two containers computed it differently, or drifted from the
+training data. If the two containers computed it differently, or drifted from the
 ETL job, training data would silently stop matching what the models see at inference
 time.
 
 **Two different serving paths, and why.** ONNX and FIL are not alternatives to each
-other — one is a file format, the other is an inference engine:
+other: one is a file format, the other is an inference engine:
 
 - **Neural networks (DLRM, NCF).** PyTorch → **ONNX** (a portable file format for
   neural networks) → NVIDIA **TensorRT** compiles that ONNX into a `.plan` engine
@@ -137,7 +137,7 @@ other — one is a file format, the other is an inference engine:
   TensorRT is for.
 - **Tree models (floor, margin).** XGBoost → native `xgboost.json` → NVIDIA's
   **FIL** (Forest Inference Library, from RAPIDS/cuML, bundled in Triton) reads that
-  format directly on the GPU. **There is no ONNX and no compile step in this path** —
+  format directly on the GPU. **There is no ONNX and no compile step in this path**:
   FIL loads the tree model as-is.
 
 Both paths run inside the same Triton server on the same GPU node. Note that
@@ -151,7 +151,7 @@ yield models are currently single-version and loaded directly, with no router.
 > both yield models down. The pin matches the SageMaker training-side version.
 
 > **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
-> each yield model in two formats — the native `xgboost.json` that FIL actually loads,
+> each yield model in two formats: the native `xgboost.json` that FIL actually loads,
 > and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
 > registration script can treat all four models identically instead of branching on
 > format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
@@ -160,7 +160,7 @@ yield models are currently single-version and loaded directly, with no router.
 
 > **Note on the two yield containers.** Earlier releases served both yield models from
 > a single container. They are now split, so each model has its own container, image,
-> Kubernetes Deployment, HPA, and load-test target — matching how every other model in
+> Kubernetes Deployment, HPA, and load-test target, matching how every other model in
 > this guidance is deployed. The Triton model names (`deal_yield_manager_floor` /
 > `deal_yield_manager_margin`) and their SageMaker Model Package Groups are unchanged
 > from before the split, so existing registered model versions and promotion history
@@ -173,7 +173,7 @@ yield models are currently single-version and loaded directly, with no router.
 
 > **Note on the models.** The bundled DLRM and both XGBoost models ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data (see [Next steps](#next-steps)). The Deal Scorer (NCF) is trained by the deploy on **sample interactions generated from the deal book, not observed outcomes**: it reproduces the scenario decisions and scores a user it has not seen below the 0.30 suppress threshold on every deal, so for that user it activates nothing and suppresses every deal the request offers. Load tests send random user ids, and about 73 percent of them fall in a user bucket no sample row trained, so most load-test requests that offer deals have them suppressed. The audience activator and signals enricher are deterministic rule engines, not models.
 
-> **How the yield models break their own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change" — and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Both yield containers run an exploration step after the model returns its prediction, which nudges the recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`, settable independently per container) but **structurally scoped to load-test and demo traffic only** — live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what produces the variation each model's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
+> **How the yield models break their own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change", and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Both yield containers run an exploration step after the model returns its prediction, which nudges the recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`, settable independently per container) but **structurally scoped to load-test and demo traffic only**: live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what produces the variation each model's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
 
 ### The 5 deployment phases
 
@@ -241,7 +241,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
 4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
 
-5. (Optional) Click **Load Test** in the navigation to generate synthetic traffic against any single container — including either yield container, selectable independently. This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. A **Traffic scenario** selector shapes the synthetic requests each run generates — a balanced default, or recognisable demand shapes such as a Black Friday retail surge or NFL-Sunday sports traffic (each a weighted mix of publisher domains, content categories, devices, and deal-floor ranges). It shapes the request inputs the pipeline processes; it does not replay real traffic recorded during those events. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
+5. (Optional) Click **Load Test** in the navigation to generate sample traffic against any single container, including either yield container (each selectable on its own). This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. A **Traffic scenario** selector shapes the sample requests each run generates: a balanced default, or recognisable demand shapes such as a Black Friday retail surge or NFL-Sunday sports traffic (each a weighted mix of publisher domains, content categories, devices, and deal-floor ranges). It shapes the request inputs the pipeline processes; it does not replay real traffic recorded during those events. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
 
 ### Demo credentials
 
@@ -300,9 +300,9 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 | Amazon Data Firehose, S3, AWS KMS | 2 delivery streams, raw-outcomes + training-data + scripts buckets, 1 customer-managed key | Part 2 | ~$3 |
 | AWS Glue | 2 ETL jobs × 10 G.1X workers, each on a `cron(0 */6 * * ? *)` schedule (4 runs/day), ~5 min per run at $0.44/DPU-h | Part 2 | ~$88 |
 | Amazon DynamoDB | `parameter-store`, `audit-trail`, `user-features` (on-demand) | Part 2 | ~$5 |
-| Amazon SageMaker Training | up to 4 jobs per daily `rate(24 hours)` trigger on `ml.g5.2xlarge` at $1.515/h, ~30 min each | Part 2 | ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-4-8` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation | Part 2 | ~$3 |
-| Amazon Bedrock (Governance Agent) | same model, invoked on model registration and training-job completion events only | Part 2 | ~$10 |
+| Amazon SageMaker Training | up to 4 jobs per daily `rate(24 hours)` trigger on `ml.g5.2xlarge` at $1.515/h, ~30 min each when the data passes the trainer's gate (about $5 when every job stops at the gate) | Part 2 | up to ~$91 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-4-8` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation ($5 / $25 per million) | Part 2 | ~$2 |
+| Amazon Bedrock (Governance Agent) | same model, invoked on model registration events only | Part 2 | ~$10 |
 | Amazon Bedrock AgentCore | runtime consumption for both agents ($0.0895/vCPU-h, $0.00945/GB-h), ~30 s per invocation | Part 2 | ~$1 |
 | AWS Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC key secret ($0.40), 2 schedules, `vpc-optimizer-proxy` Lambda, alerts topic | Part 2 | ~$2 |
 | **Part 2 subtotal** | | | **~$245** |
@@ -312,8 +312,8 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 
 - **GPU hours.** The deploy installs one scheduled action: the GPU node group scales to zero at 8:00 PM America/New_York every day. Nothing scales it back up automatically; the **Start GPUs** button in the UI does. 260 hours per month corresponds to starting it each weekday morning. Running it 24/7 makes the GPU line $734 and the total roughly **$1,945**. Leaving it stopped makes the GPU line $0.
 - **CPU nodes.** The `cpu-services` node group starts at 3 nodes (minimum 2, maximum 8, `deployment/eks/cluster-config.yaml`). There is no Cluster Autoscaler in this deployment, so the node count only changes when you change it. Dropping to the minimum of 2 saves $248.
-- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count: about $8 at `rate(6 hours)`, $58 at `rate(1 hour)`, and $700 at `rate(5 minutes)`, at ~10K input and ~1K output tokens per invocation. The schedule can also be paused at runtime from the Adaptive Bidding page or the `/api/v1/closed-loop/schedule` endpoint, which takes this line to zero without a teardown. Model choice is `--model-id` (default `global.anthropic.claude-opus-4-8`); a smaller model lowers the per-token rate.
-- **SageMaker training** only runs when the ETL has produced a dataset that passes the trainer's gate; a fresh deployment with no traffic launches no jobs, so this line starts at $0 and grows with real data.
+- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count, about $0.075 per invocation at ~10K input and ~1K output tokens: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. The schedule can also be disabled with the AWS CLI, which takes this line to zero without a teardown (see [pausing scheduled components](GUIDANCE-part2.md#pausing-scheduled-components)). Model choice is `--model-id` (default `global.anthropic.claude-opus-4-8`); a smaller model lowers the per-token rate.
+- **SageMaker training** starts every day from the first day, because the genesis model versions are registered as Approved. A job with no or unfit data ends at the trainer's dataset gate after a minute or two of billing, so this line sits near $5 until datasets pass the gate and grows toward ~$91 as they do.
 - **Part 1 only.** `--no-retraining` removes every Part 2 row: about **$1,225/month** scheduled, **$1,700/month** with the GPU on 24/7.
 - **Prebid variant.** `--with-prebid` adds about $0.40/month (one more Secrets Manager secret); Prebid Server, the artfhouse demand service and the bidder simulator run in the existing cluster and add no nodes or load balancers. See [its cost note](#variant-prebid-server-as-a-second-artf-host-sell-side).
 - **Not in the table:** CloudWatch Logs ingestion beyond a few GB, S3 request charges, CodeBuild build minutes (a per-build charge in Phase 2 only, incurred again only when an image's source changes), and data transfer out to the internet, all of which are small at demo volumes.
@@ -651,8 +651,8 @@ two different retraining paths, one per model type:
 
 | Model | Trained by | Training data | Result loaded as | Compile step? |
 |---|---|---|---|---|
-| `dlrm_bid_shader` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
-| `ncf_deal_manager` | NVIDIA **NeMo-RL** container on SageMaker | `training-data/` | ONNX → TensorRT `.plan` | Yes (`trtexec`) |
+| `dlrm_bid_shader` | PyTorch trainer in the `artf-nemo-rl-training` image (NVIDIA NeMo Framework base) on SageMaker: supervised fit, then shading-policy search | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
+| `ncf_deal_manager` | Same image; trained at deploy time on sample interactions. The scheduled job stops at the dataset gate, because `training-data/` has no `user_id` or `deal_id` columns | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
 | `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
 | `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
 | Audience Activator, Signals Enricher | *not applicable* — rule engines | — | — | — |
@@ -675,7 +675,7 @@ the previous one finishing, so the order matters:
 1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
    outcomes for* (e.g. **Bid Pricer**) — the list shows only models that have a
    training pipeline — leave the variant on **Current (stable)**, optionally pick a
-   **Traffic scenario** to shape the synthetic requests, and run a batch. Only the
+   **Traffic scenario** to shape the sample requests, and run a batch. Only the
    selected target's responses are captured as outcomes.
 2. **Wait for the sweep — about 6 minutes.** Outcomes reach S3 through Kinesis
    Firehose, which buffers up to 300s by default
@@ -703,7 +703,12 @@ the previous one finishing, so the order matters:
    from](CLOSED_LOOP.md#bid-pricer-where-the-bid-shaders-labels-come-from).
 4. **Let governance run.** When training completes, the new version registers in
    its SageMaker Model Package Group automatically, which triggers the Model
-   Promotion Governance Agent: compile TensorRT → stage a canary → live A/B test →
+   Promotion Governance Agent. For a Bid Pricer version trained from a load test,
+   the agent compiles it to TensorRT and stages it as the challenger canary at 0%
+   live traffic, then stops; you compare and promote it yourself. A yield model
+   version needs no compile step and is staged as a FIL canary from the
+   Governance page. Scheduled retraining
+   versions go through the full path: compile, canary, live A/B test, then
    promote, reject, or roll back. The **Model registry versions** table shows the
    resulting approval status and the agent's stated reason, with the full text on
    hover.

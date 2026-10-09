@@ -22,7 +22,7 @@ Solid edges are the real-time request path. Dashed edges are control plane, batc
 
 ## Part 2 loops
 
-Batch retraining: Kinesis Data Streams, Data Firehose, S3 raw outcomes (Parquet, Glue Data Catalog), two Glue ETL jobs every 6 hours, KMS-encrypted S3 training data, SageMaker Training (NeMo-RL for DLRM and NCF, built-in XGBoost for floor and margin), SageMaker Model Registry with four package groups. EventBridge Scheduler triggers retraining at `rate(24 hours)`. Training failures alert through SNS.
+Batch retraining: Kinesis Data Streams, Data Firehose, S3 raw outcomes (Parquet, Glue Data Catalog), two Glue ETL jobs every 6 hours, KMS-encrypted S3 training data, SageMaker Training (PyTorch on the NVIDIA NeMo Framework image for DLRM, built-in XGBoost for floor and margin; NCF is trained at deploy time on sample interactions), SageMaker Model Registry with four package groups. EventBridge Scheduler triggers retraining at `rate(24 hours)`. Training failures alert through SNS.
 
 Governance: a model registration event hits an EventBridge rule, a Lambda shim invokes the Model Promotion Governance Agent (AgentCore). The agent reasons with Bedrock, launches a Model Optimizer Job and controls the Triton canary split through the VPC optimizer proxy Lambda (RBAC scoped to Jobs), evaluates with Welch's t-test and SPRT against CloudWatch per-variant metrics, polls guardrails every 10 s, writes Approved or Rejected to the registry, and records every decision in the append-only DynamoDB audit trail.
 
@@ -30,7 +30,7 @@ Agentic tuning: EventBridge Scheduler invokes the Adaptive Bidding Strategy Agen
 
 ## Services shown
 
-Amazon Cognito, Amazon CloudFront, Amazon S3 (frontend, model repository, raw outcomes, training data), AWS Lambda (UI API proxy, VPC optimizer proxy, invocation shims), Elastic Load Balancing (two internal NLBs), Amazon EKS, Amazon ECR, AWS CodeBuild, AWS Secrets Manager, AWS IAM, Amazon DynamoDB (container registry, parameter store, deals table, audit trail), Amazon Kinesis Data Streams, Amazon Data Firehose, AWS Glue, Amazon SageMaker (Training, Model Registry), Amazon EventBridge (rules, Scheduler), Amazon Bedrock, Amazon Bedrock AgentCore (three runtimes), Amazon CloudWatch, AWS KMS, Amazon SNS. NVIDIA components: Triton Inference Server, TensorRT (Model Optimizer), NeMo-RL (training image).
+Amazon Cognito, Amazon CloudFront, Amazon S3 (frontend, model repository, raw outcomes, training data), AWS Lambda (UI API proxy, VPC optimizer proxy, invocation shims), Elastic Load Balancing (two internal NLBs), Amazon EKS, Amazon ECR, AWS CodeBuild, AWS Secrets Manager, AWS IAM, Amazon DynamoDB (container registry, parameter store, deals table, audit trail), Amazon Kinesis Data Streams, Amazon Data Firehose, AWS Glue, Amazon SageMaker (Training, Model Registry), Amazon EventBridge (rules, Scheduler), Amazon Bedrock, Amazon Bedrock AgentCore (three runtimes), Amazon CloudWatch, AWS KMS, Amazon SNS. NVIDIA components: Triton Inference Server, TensorRT (Model Optimizer), NeMo Framework (training image base).
 
 Not drawn: the DynamoDB user-features table (no edges in the request path), the nightly GPU scheduled shutdown (noted in the gpu node group label), and the NGC key secret flow (noted on Secrets Manager).
 

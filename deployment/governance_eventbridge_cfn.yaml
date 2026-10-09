@@ -3,7 +3,7 @@ Description: >-
   Invocation paths for the closed-loop AgentCore runtimes. EventBridge Rules and
   Scheduler cannot target AgentCore runtimes directly, so both go through a Lambda
   that calls bedrock-agentcore:InvokeAgentRuntime:
-    - EventBridge Scheduler (every 5 min) -> Adaptive Bidding invoker Lambda -> runtime
+    - EventBridge Scheduler (AdaptiveBiddingScheduleRate, default every 24 hours) -> Adaptive Bidding invoker Lambda -> runtime
     - EventBridge Rule (ModelPackageGroupChanged) -> Governance shim Lambda -> runtime
   Each Lambda's role is scoped to invoke only its specific runtime ARN. No Lambda
   Function URLs and no wildcard resource policies.
@@ -389,7 +389,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${StackPrefix}-retraining-trigger'
       Description: >-
-        Scheduled (6h default): resolves the latest Approved model version per
+        Scheduled (RetrainingScheduleRate, default 24h): resolves the latest Approved model version per
         model type and starts a SageMaker training job (fire-and-forget, no polling).
       Runtime: python3.12
       Handler: index.handler

@@ -36,11 +36,12 @@ it was replaced with transparent rules over real bid-request signals, and is
 slated to be replaced by a partner ISV implementation. See
 [RENAME_MAP.md](../../RENAME_MAP.md) for the full old-name → new-name mapping.
 
-> **Serving backend.** The Part 1 baseline serves the exported ONNX models via ONNX
-> Runtime. Part 2 is a progression that upgrades Triton serving to compiled **TensorRT
-> engine plans** (`tensorrt_plan`), built from the same ONNX by an in-cluster Model
-> Optimizer microservice, and rolls new versions out through a Triton-side stable/canary
-> router. See the top-level `README.md` (Part 2) for details.
+> **Serving backend.** Triton serves the bid pricer and deal scorer as compiled
+> **TensorRT engine plans** (`tensorrt_plan`), built from the exported ONNX by an
+> in-cluster Model Optimizer bootstrap Job at deploy time, behind a Triton-side
+> stable/canary router. The two yield models are served by the FIL backend. Part 2 uses
+> the same optimizer and router to roll out retrained versions. See the top-level
+> `README.md` (Part 2) for details.
 
 > **Note on the models.** DLRM and NCF are *reference architectures* following the
 > published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) designs. They are defined
@@ -99,7 +100,7 @@ graph TB
         ORCH["Orchestrator (Starlette)<br/>ClusterIP in-cluster + internal NLB for the UI proxy<br/>no public address<br/>JWT verify + staged pipeline<br/>gRPC / REST / MCP"]
 
         subgraph GPU["GPU node: g5.xlarge, NVIDIA A10G"]
-            TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + FIL + CUDA EP<br/>4 models on GPU"]
+            TRITON["NVIDIA Triton Inference Server<br/>TensorRT plans (stable/canary router) + FIL<br/>4 models on GPU"]
             DLRM_C["Bid Pricer<br/>BID_SHADE"]
             NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
             YIELD_F["Yield Optimizer: Floor<br/>ADJUST_DEAL_FLOOR"]
