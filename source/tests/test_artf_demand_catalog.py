@@ -20,6 +20,7 @@ campaign at all.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,20 @@ if not SAMPLES.is_dir():  # running from inside source/
 
 CATALOG = CampaignCatalog()
 SERVICE = DemandDecisionService()
+
+
+def _seed_deal_floor(deal_id):
+    """The deal floor the deals seed gives ``deal_id``; prices are not restated here."""
+    with open(os.environ["DEALS_SEED_FILE"], encoding="utf-8") as handle:
+        deals = json.load(handle)["deals"]
+    return next(d for d in deals if d["id"] == deal_id)["terms"]["dealfloor"]
+
+
+PREMIUM_VIDEO_FLOOR = _seed_deal_floor("deal-premium-video")
+
+# This scenario's deals are priced under their base floor on purpose: it shows the
+# floor coming down. Its campaigns clear only once the deal floor is lowered.
+PRICED_FOR_A_LOWERED_FLOOR = frozenset({"ridesharer-suburban-midday.json"})
 
 
 def scenario_files():
@@ -91,6 +106,17 @@ def test_every_scenario_deal_campaign_clears_the_binding_floor(scenario, imp, de
     deal_floor = float(deal.get("bidfloor") or 0.0)
     binding = max(imp_floor, deal_floor)
 
+    if scenario in PRICED_FOR_A_LOWERED_FLOOR:
+        assert campaign.declared_cpm < deal_floor, (
+            f"{scenario}: {campaign.campaign_id} clears the base deal floor, so the "
+            f"scenario no longer needs the floor lowered"
+        )
+        assert campaign.declared_cpm >= imp_floor, (
+            f"{scenario}: {campaign.campaign_id} is under the impression floor, so "
+            f"no lowered deal floor can make it clear"
+        )
+        return
+
     if campaign.declared_cpm >= binding:
         return
 
@@ -120,6 +146,15 @@ def test_every_scenario_deal_campaign_can_be_placed_in_the_slot(scenario, imp, d
     )
 
 
+def _deal_bids(response):
+    return [
+        bid
+        for seat in response.get("seatbid") or []
+        for bid in seat.get("bid") or []
+        if bid.get("dealid")
+    ]
+
+
 @pytest.mark.parametrize("scenario", [p.name for p in scenario_files()])
 def test_each_scenario_with_deals_produces_at_least_one_deal_bid(scenario):
     """End to end over the demand service, not just the catalog.
@@ -136,13 +171,19 @@ def test_each_scenario_with_deals_produces_at_least_one_deal_bid(scenario):
     if not has_deals:
         pytest.skip(f"{scenario} declares no deals")
 
+    if scenario in PRICED_FOR_A_LOWERED_FLOOR:
+        assert not _deal_bids(SERVICE.decide(bid_request)), (
+            f"{scenario} should go unsold at its base deal floors"
+        )
+        # The lowest the binding floor can go is the impression floor.
+        lowered = json.loads(json.dumps(bid_request))
+        for imp in lowered["imp"]:
+            for deal in (imp.get("pmp") or {}).get("deals") or []:
+                deal["bidfloor"] = imp["bidfloor"]
+        bid_request = lowered
+
     response = SERVICE.decide(bid_request)
-    deal_bids = [
-        bid
-        for seat in response.get("seatbid") or []
-        for bid in seat.get("bid") or []
-        if bid.get("dealid")
-    ]
+    deal_bids = _deal_bids(response)
     assert deal_bids, (
         f"{scenario} carries deals but this seat produced no deal bid; "
         f"exclusions: "
@@ -164,7 +205,7 @@ def test_video_slots_are_not_offered_a_banner_creative():
         "id": "imp-1",
         "bidfloor": 8.0,
         "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
-        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": PREMIUM_VIDEO_FLOOR}]},
     }
     response = SERVICE.decide({"id": "r", "imp": [video_imp]})
 
@@ -189,7 +230,7 @@ def test_a_video_bid_declares_its_media_type_and_duration():
         "id": "imp-1",
         "bidfloor": 8.0,
         "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
-        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": PREMIUM_VIDEO_FLOOR}]},
     }
     response = SERVICE.decide({"id": "r", "imp": [video_imp]})
     bids = [b for s in response.get("seatbid") or [] for b in s.get("bid") or []]
@@ -248,7 +289,7 @@ def test_a_video_bid_carries_creative_markup():
         "id": "imp-1",
         "bidfloor": 8.0,
         "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
-        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": PREMIUM_VIDEO_FLOOR}]},
     }
     response = SERVICE.decide({"id": "r", "imp": [video_imp]})
     bids = [b for s in response.get("seatbid") or [] for b in s.get("bid") or []]
@@ -271,7 +312,7 @@ def test_the_video_creative_does_not_pretend_to_be_playable():
         "id": "imp-1",
         "bidfloor": 8.0,
         "video": {"w": 640, "h": 480, "minduration": 15, "maxduration": 30},
-        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": 10.0}]},
+        "pmp": {"deals": [{"id": "deal-premium-video", "bidfloor": PREMIUM_VIDEO_FLOOR}]},
     }
     response = SERVICE.decide({"id": "r", "imp": [video_imp]})
     adm = [b for s in response["seatbid"] for b in s["bid"]][0]["adm"]

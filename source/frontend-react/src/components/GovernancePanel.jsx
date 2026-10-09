@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { authFetch } from "../authFetch.js";
 import { invokeGovernance, agentUnavailableReason } from "../agentCoreClient.js";
 import {
@@ -63,6 +63,22 @@ const TRAINING_MODEL_TYPES = [
   { key: "deal_yield_manager_margin", label: "Yield Optimizer — Margin", trainable: true },
   { key: "ncf_deal_manager", label: "NCF Deal Manager (parked — coming in a future release)", trainable: false },
 ];
+
+/**
+ * The Train step's single run list: runs a Glue sweep has already moved into
+ * the training bucket (`ready: true`) plus runs that captured outcomes for this
+ * model but are still on their way (`ready: false`), newest first. Both come
+ * from one GET /v1/governance/trainable-runs response (`runs` and `pending`).
+ */
+export function mergeTrainRunOptions(runs, pending) {
+  const ready = (runs || []).map((r) => ({ ...r, ready: true }));
+  const readyIds = new Set(ready.map((r) => r.id));
+  const waiting = (pending || [])
+    .filter((r) => !readyIds.has(r.id))
+    .map((r) => ({ ...r, ready: false }));
+  const ts = (r) => (r.timestamp ? Date.parse(r.timestamp) || 0 : 0);
+  return [...ready, ...waiting].sort((a, b) => ts(b) - ts(a));
+}
 
 /**
  * GovernancePanel — the A/B model-promotion closed loop.
@@ -263,14 +279,20 @@ export default function GovernancePanel() {
       const data = await resp.json();
       if (resp.ok) {
         const runs = data.runs || [];
+        const pending = data.pending || [];
         setTrainableRuns(runs);
         setTrainEtl(data.etl || null);
-        setPendingRuns(data.pending || []);
-        // This runs on an interval as well as on model change (see below), so
-        // it keeps an existing selection when that run is still listed rather
-        // than snapping back to the newest run under the user every refresh.
+        setPendingRuns(pending);
+        // One picker lists swept AND not-yet-swept runs, newest first, and
+        // defaults to the newest run whether or not it is swept yet: the
+        // pipeline under the picker says where it is, and Train stays disabled
+        // until it lands. Defaulting to the newest SWEPT run would silently
+        // preselect an older load test than the one just finished.
+        // This runs on an interval as well as on model change, so it keeps an
+        // existing selection while that run is still listed.
+        const all = mergeTrainRunOptions(runs, pending);
         setSelectedTrainingRun((cur) => (
-          cur && runs.some((r) => r.id === cur) ? cur : (runs[0]?.id || "")
+          cur && all.some((r) => r.id === cur) ? cur : (all[0]?.id || "")
         ));
       } else {
         setTrainableRuns([]);
@@ -346,6 +368,17 @@ export default function GovernancePanel() {
       setTrainingSubmitting(false);
     }
   }, [trainingModelType, selectedTrainingRun, registryModelType, refreshState]);
+
+  const trainRunOptions = useMemo(
+    () => mergeTrainRunOptions(trainableRuns, pendingRuns),
+    [trainableRuns, pendingRuns]
+  );
+  // Train is enabled only for a run a Glue sweep has already moved into the
+  // training bucket; a run still in the pipeline is selectable so its stages
+  // are visible, but cannot be trained on yet.
+  const selectedRunReady = trainRunOptions.some(
+    (r) => r.id === selectedTrainingRun && r.ready
+  );
 
   // Fetch eligible load-test runs whenever the model type changes, auto-
   // selecting the most recent per role (FR-7). Clears any prior
@@ -733,19 +766,12 @@ export default function GovernancePanel() {
         </section>
       ) : null}
 
-      {/* STEP 2 — the pipeline card shows which runs a Glue ETL sweep has moved
-          into the training bucket. It used to sit beside Step 3 in a two-column
-          row; the two are now separate steps, so the row is gone. */}
-      {step === "outcome-pipeline" ? (
-        <section className="gov-step-panel" data-testid="governance-panel-outcome-pipeline">
-          <div className="cl-section-title">Load test outcome pipeline</div>
-          <LoadTestSweepStatus onRunBecameTrainable={fetchTrainableRuns} />
-        </section>
-      ) : null}
-
-      {/* STEP 3 — Train from load test (FR-4/FR-5, Story 3): real cost/duration
-          estimate + explicit confirmation + concurrency-guarded trigger. Its
-          own model selector (decoupled from the general one) since
+      {/* STEP 2 — Train from load test (FR-4/FR-5, Story 3). One run picker
+          covering swept and not-yet-swept runs, the outcome pipeline for the
+          selected run directly under it, then the real cost/duration estimate,
+          explicit confirmation and the concurrency-guarded trigger. One run
+          selection drives both the pipeline view and the trigger. Its own
+          model selector (decoupled from the general one) since
           ncf_deal_manager training is parked. */}
       {step === "train" ? (
       <section className="gov-step-panel" data-testid="governance-panel-train">
@@ -774,33 +800,26 @@ export default function GovernancePanel() {
             data-testid="governance-train-run-select"
             value={selectedTrainingRun}
             onChange={(e) => setSelectedTrainingRun(e.target.value)}
-            disabled={trainingSubmitting || trainableRuns.length === 0}
+            disabled={trainingSubmitting || trainRunOptions.length === 0}
           >
-            {trainableRuns.length === 0 ? (
-              <option value="">No trainable load test runs yet</option>
+            {trainRunOptions.length === 0 ? (
+              <option value="">No load test runs with outcomes for this model yet</option>
             ) : (
-              trainableRuns.map((r) => (
+              trainRunOptions.map((r) => (
                 <option key={r.id} value={r.id}>
-                  {r.id} — {r.target_model_type} / {r.target_variant}
+                  {r.id}
+                  {r.target_variant ? ` — ${r.target_variant}` : ""}
                   {r.timestamp ? ` (${new Date(r.timestamp).toLocaleString()})` : ""}
+                  {r.ready ? " — ready" : " — in pipeline"}
                 </option>
               ))
             )}
           </select>
         </div>
-        {/* Timestamps are shown on every run above precisely so a run can be
-            told apart from an older one. A run only becomes selectable after a
-            Glue ETL pass has swept its outcomes into the training bucket, so
-            the newest run in this list is NOT necessarily the load test you
-            just finished. */}
-        <div className="cl-train-latency-note" data-testid="governance-train-latency-note">
-          Only runs already swept into the training bucket by a Glue ETL job are
-          listed here, so a load test you just finished will be missing for a few
-          minutes. The Load test outcome pipeline card above shows which stage
-          each run is on. This list refreshes on its own — check the timestamp on
-          the run you select so you are not retraining on data from an earlier
-          load test.
-        </div>
+        {/* Where the selected run's outcomes are: recorded, flushed by Firehose,
+            swept by Glue, trainable. Fires a trainable-runs refresh the moment
+            the sweep lands, which enables the Train button below. */}
+        <LoadTestSweepStatus runId={selectedTrainingRun} onRunBecameTrainable={fetchTrainableRuns} />
         {trainableRunsError && (
           <div className="cl-honest cl-honest-block">Could not load trainable runs: {trainableRunsError}</div>
         )}
@@ -835,25 +854,7 @@ export default function GovernancePanel() {
             test outcomes are never labelled into training data.
           </div>
         )}
-        {/* Recorded outcomes that simply have not been swept yet. This is the
-            usual reason the run you just finished is not in the list, and it is
-            a different situation from a broken job. */}
-        {pendingRuns.length > 0 && (
-          <div className="cl-honest cl-honest-block" data-testid="governance-train-pending">
-            {pendingRuns.length} run{pendingRuns.length === 1 ? "" : "s"} for{" "}
-            {trainingModelType} captured outcomes but{" "}
-            {trainEtl?.never_succeeded
-              ? "cannot be swept until that job succeeds"
-              : "are waiting for the next ETL sweep"}
-            {trainEtl?.last_success
-              ? ` (last successful sweep ${new Date(trainEtl.last_success).toLocaleString()})`
-              : ""}
-            . Newest pending:{" "}
-            {new Date(pendingRuns[0].timestamp).toLocaleString()} (
-            {pendingRuns[0].outcome_sample_count} samples).
-          </div>
-        )}
-        {trainableRuns.length === 0 && !trainableRunsError && !trainEtl?.never_succeeded && pendingRuns.length === 0 && (
+        {trainRunOptions.length === 0 && !trainableRunsError && !trainEtl?.never_succeeded && (
           <div className="cl-honest cl-honest-block">
             No load test run for {trainingModelType} has captured outcomes yet
             — run a load test targeting this model, then wait for the next Glue
@@ -884,7 +885,10 @@ export default function GovernancePanel() {
             className="btn btn-primary sg-interactive"
             data-testid="governance-train-trigger-button"
             onClick={() => setConfirmingTraining(true)}
-            disabled={!trainingEstimate || !selectedTrainingRun || trainingInProgress || trainingSubmitting}
+            disabled={!trainingEstimate || !selectedRunReady || trainingInProgress || trainingSubmitting}
+            title={selectedTrainingRun && !selectedRunReady
+              ? "This run's outcomes are not in the training bucket yet. The pipeline above shows which stage it is on."
+              : undefined}
           >
             {trainingInProgress ? "Training in progress\u2026" : "Train from load test"}
           </button>
@@ -917,7 +921,7 @@ export default function GovernancePanel() {
       </section>
       ) : null}
 
-      {/* STEP 4 — Test Model Versions. Compare load-test outcomes (FR-7/FR-8,
+      {/* STEP 3 — Test Model Versions. Compare load-test outcomes (FR-7/FR-8,
           Story 5) + Promote (FR-9/FR-10, Story 6). Every result below is labeled
           by source — load-test-derived, distinct from the automated pipeline's
           live-canary-CloudWatch-derived decisions. */}

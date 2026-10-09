@@ -237,6 +237,9 @@ spec:
         app: artf
         model: ncf
     spec:
+      # IRSA (deploy.sh Step 7.2): read-only access to the deals table, used to
+      # prime the deal book at startup and refresh it every 30 seconds.
+      serviceAccountName: deal-scorer-sa
       nodeSelector:
         role: __ARTF_NODE_ROLE__
       tolerations:
@@ -263,6 +266,17 @@ spec:
               value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
+            # The served build's label, ncf-neumf-sample-<12 hex>, from the
+            # manifest Step 2 writes (deploy.sh substitutes it). Reported as
+            # model_version; the container refuses to start without it.
+            - name: NCF_MODEL_LABEL
+              value: "__NCF_MODEL_LABEL__"
+            - name: DEALS_TABLE
+              value: "__STACK_NAME__-deals"
+            # botocore reads AWS_DEFAULT_REGION, not AWS_REGION; without it the
+            # deal book prime fails with "You must specify a region".
+            - name: AWS_DEFAULT_REGION
+              value: "__REGION__"
           # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
           # request exhausts it the pod is throttled until the next period,
           # adding latency in 100ms multiples. That compounded with the

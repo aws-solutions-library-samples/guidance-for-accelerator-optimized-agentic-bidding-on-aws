@@ -31,7 +31,7 @@ from orchestrator.training_trigger import _build_training_job_params  # noqa: E4
 
 GOVERNANCE_CFN = REPO_ROOT / "deployment" / "governance_eventbridge_cfn.yaml"
 
-XGB_IMAGE = "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1"
+XGB_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1"
 
 
 def _params(model_type, *, run_id=None):
@@ -51,20 +51,64 @@ def _params(model_type, *, run_id=None):
 # The hyperparameter, for both training shapes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "model_type",
-    ["dlrm_bid_shader", "ncf_deal_manager", "deal_yield_manager_floor", "deal_yield_manager_margin"],
-)
-def test_run_id_is_recorded_as_a_hyperparameter(model_type):
-    params = _params(model_type, run_id="lt-abc123")
-    assert params["HyperParameters"]["load_test_run_id"] == "lt-abc123"
+ALL_SHAPES = ["dlrm_bid_shader", "ncf_deal_manager", "deal_yield_manager_floor", "deal_yield_manager_margin"]
+NEMO_RL = ["dlrm_bid_shader", "ncf_deal_manager"]
+XGBOOST = ["deal_yield_manager_floor", "deal_yield_manager_margin"]
+
+
+def _tags(params):
+    return {t["Key"]: t["Value"] for t in params.get("Tags", [])}
+
+
+@pytest.mark.parametrize("model_type", ALL_SHAPES)
+def test_run_id_and_base_version_are_recorded_as_tags(model_type):
+    """Tags are the carrier both shapes share, so the registration Lambda has
+    one read path for every model."""
+    tags = _tags(_params(model_type, run_id="lt-abc123"))
+    assert tags["load_test_run_id"] == "lt-abc123"
+    assert tags["base_model_version"] == "arn:base"
+
+
+@pytest.mark.parametrize("model_type", NEMO_RL)
+def test_nemo_rl_also_keeps_them_as_hyperparameters(model_type):
+    """The custom NeMo-RL container reads them from its hyperparameters."""
+    hp = _params(model_type, run_id="lt-abc123")["HyperParameters"]
+    assert hp["load_test_run_id"] == "lt-abc123"
+    assert hp["base_model_version"] == "arn:base"
+
+
+@pytest.mark.parametrize("model_type", XGBOOST)
+def test_xgboost_sends_only_xgboost_hyperparameters(model_type):
+    """The built-in XGBoost container fails the job with "Extraneous
+    hyperparameter found" for any key outside its own list."""
+    hp = _params(model_type, run_id="lt-abc123")["HyperParameters"]
+    assert set(hp) == {"max_depth", "eta", "num_round", "objective"}
 
 
 @pytest.mark.parametrize("model_type", ["dlrm_bid_shader", "deal_yield_manager_floor"])
 def test_key_is_absent_rather_than_empty_when_no_run_was_selected(model_type):
     """Scheduled retraining has no originating run. An empty string would read as
     "triggered from a run whose id we lost"."""
-    assert "load_test_run_id" not in _params(model_type)["HyperParameters"]
+    params = _params(model_type)
+    assert "load_test_run_id" not in params["HyperParameters"]
+    assert "load_test_run_id" not in _tags(params)
+
+
+# ---------------------------------------------------------------------------
+# Input channel name, per shape
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("model_type", XGBOOST)
+def test_xgboost_channel_is_train(model_type):
+    """The built-in algorithm reads SM_CHANNEL_TRAIN in algorithm mode. A
+    channel named "training" fails the job with KeyError: 'SM_CHANNEL_TRAIN'."""
+    assert _params(model_type)["InputDataConfig"][0]["ChannelName"] == "train"
+
+
+@pytest.mark.parametrize("model_type", NEMO_RL)
+def test_nemo_rl_channel_is_training(model_type):
+    """source/training/container/train.py reads SM_CHANNEL_TRAINING."""
+    assert _params(model_type)["InputDataConfig"][0]["ChannelName"] == "training"
 
 
 @pytest.mark.parametrize(
@@ -138,17 +182,70 @@ def test_describe_failure_does_not_break_the_listing():
     assert versions[0]["approval_status"] == "Approved"
 
 
+def test_a_sample_build_reports_its_training_data_and_fingerprint():
+    """What register_genesis_models.py records on a deploy-time Deal Scorer build."""
+    versions = read_model_versions(
+        _sagemaker({"training_data": "sample", "label": "implicit-engagement-sample",
+                    "generator": "source/training/ncf_sample", "seed": "20261007",
+                    "fingerprint": "9509e1edf027", "source": "onnx-export"}),
+        "g",
+    )
+    assert versions[0]["training_data"] == "sample"
+    assert versions[0]["fingerprint"] == "9509e1edf027"
+
+
+def test_a_version_that_records_neither_reads_as_none():
+    versions = read_model_versions(_sagemaker({"load_test_run_id": "lt-abc123"}), "g")
+    assert versions[0]["training_data"] is None
+    assert versions[0]["fingerprint"] is None
+
+
 # ---------------------------------------------------------------------------
 # The deployment half of the chain
 # ---------------------------------------------------------------------------
 
 def test_registration_lambda_copies_the_run_id_onto_the_model_package():
-    """A hyperparameter nothing reads back is not provenance. The Lambda that
-    registers the version has to carry it across."""
+    """Provenance nothing reads back is not provenance. The Lambda that registers
+    the version has to carry it across, from hyperparameters (NeMo-RL) or Tags
+    (XGBoost, where hyperparameters cannot hold it)."""
     text = GOVERNANCE_CFN.read_text(encoding="utf-8")
+    assert re.search(r"sm\.list_tags\(ResourceArn=job\['TrainingJobArn'\]\)", text), (
+        "registration Lambda does not read the training job's tags"
+    )
     assert re.search(
-        r"'load_test_run_id':\s*hyperparams\.get\('load_test_run_id',\s*''\)", text
-    ), "registration Lambda does not copy load_test_run_id into CustomerMetadataProperties"
+        r"return hyperparams\.get\(key\) or tags\.get\(key\) or ''", text
+    ), "registration Lambda does not fall back from hyperparameters to tags"
+    for key in ("load_test_run_id", "base_model_version"):
+        assert re.search(rf"'{key}':\s*_provenance\('{key}'\)", text), (
+            f"registration Lambda does not copy {key} into CustomerMetadataProperties"
+        )
+
+
+def _iam_actions_for(text, policy_name):
+    block = text[text.index(f"PolicyName: {policy_name}"):]
+    block = block[: block.index("PolicyName:", 1)] if "PolicyName:" in block[1:] else block
+    return block
+
+
+def test_roles_carry_the_tag_permissions():
+    """CreateTrainingJob with Tags is authorized as sagemaker:AddTags, and the
+    registration Lambda's ListTags read needs its own grant."""
+    text = GOVERNANCE_CFN.read_text(encoding="utf-8")
+    assert "'sagemaker:AddTags'" in _iam_actions_for(text, "StartTrainingJobs")
+    assert "'sagemaker:ListTags'" in _iam_actions_for(text, "DescribeAndRegisterTrainedModels")
+    deploy = (REPO_ROOT / "deployment" / "deploy.sh").read_text(encoding="utf-8")
+    sid = deploy[deploy.index('TrainingTriggerFromGovernanceUI'):]
+    sid = sid[: sid.index("]}")]
+    assert "sagemaker:AddTags" in sid
+
+
+def test_scheduled_trigger_uses_train_channel_for_xgboost():
+    """Scheduled yield retraining had the same channel bug as the UI trigger."""
+    text = GOVERNANCE_CFN.read_text(encoding="utf-8")
+    assert "channel_name = 'train'" in text
+    assert "channel_name = 'training'" in text
+    assert "'ChannelName': channel_name" in text
+    assert "'ChannelName': 'training'" not in text
 
 
 def test_frontend_sends_the_selected_run():

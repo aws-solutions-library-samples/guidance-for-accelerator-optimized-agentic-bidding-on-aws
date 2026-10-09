@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 SOURCE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_DIR))
@@ -279,6 +281,98 @@ class TestTheContainerAbstains:
         text = (CONTAINER_DIR / "app.py").read_text()
 
         assert "class InferenceUnavailable(RuntimeError):" in text
+
+
+def _deal_shade_request(*, imp_floor, deal_floor, dealid, price=35.0):
+    """A shade request for one bid on an impression that offers deal-premium-video.
+
+    The stub prediction (CTR 0.2, conversion value 12.0, slope 0.65) prices the bid at
+    1.56 before the clamp, below every floor used here, so the shaded price is the
+    floor the clamp chose.
+    """
+    from shared.artf_types import RTBRequest
+
+    bid = {"id": "b1", "impid": "imp-1", "price": price}
+    if dealid is not None:
+        bid["dealid"] = dealid
+    return RTBRequest(
+        id="deal-clamp-1",
+        applicable_intents=["BID_SHADE"],
+        bid_request={
+            "id": "deal-clamp-1",
+            "imp": [{
+                "id": "imp-1",
+                "bidfloor": imp_floor,
+                "bidfloorcur": "USD",
+                "pmp": {"deals": [
+                    {"id": "deal-open-remnant", "bidfloor": 0.5, "bidfloorcur": "USD"},
+                    {"id": "deal-premium-video", "bidfloor": deal_floor, "bidfloorcur": "USD"},
+                ]},
+            }],
+        },
+        bid_response={
+            "id": "deal-clamp-1",
+            "seatbid": [{"seat": "artfhouse", "bid": [bid]}],
+        },
+    )
+
+
+def _shaded_price(module, request):
+    response = module.mutate(request)
+    assert len(response.mutations) == 1
+    return response.mutations[0].adjust_bid.price
+
+
+class TestTheDealBidClamp:
+    """A deal floor mutation no longer raises imp.bidfloor, so the Bid Pricer reads the
+    deal floor itself: a shaded deal bid is held to max(impression floor, deal floor)."""
+
+    @pytest.fixture
+    def module(self, monkeypatch):
+        monkeypatch.setenv("USE_TRITON", "true")
+        module, _ = _load_app(lambda **_kwargs: (0.2, "stable", "v1"))
+        return module
+
+    def test_a_deal_bid_is_clamped_at_its_deal_floor(self, module) -> None:
+        request = _deal_shade_request(imp_floor=2.5, deal_floor=8.75, dealid="deal-premium-video")
+        assert _shaded_price(module, request) == 8.75
+
+    def test_a_deal_bid_is_clamped_at_the_impression_floor_when_that_is_higher(self, module) -> None:
+        request = _deal_shade_request(imp_floor=2.5, deal_floor=1.0, dealid="deal-premium-video")
+        assert _shaded_price(module, request) == 2.5
+
+    def test_a_bid_without_a_dealid_is_clamped_at_the_impression_floor_only(self, module) -> None:
+        request = _deal_shade_request(imp_floor=2.5, deal_floor=8.75, dealid=None)
+        assert _shaded_price(module, request) == 2.5
+
+    def test_a_deal_bid_naming_a_deal_not_on_the_request_uses_the_impression_floor(self, module) -> None:
+        request = _deal_shade_request(imp_floor=2.5, deal_floor=8.75, dealid="deal-not-offered")
+        assert _shaded_price(module, request) == 2.5
+
+    def test_a_deal_without_a_floor_uses_the_impression_floor(self, module) -> None:
+        request = _deal_shade_request(imp_floor=2.5, deal_floor=None, dealid="deal-premium-video")
+        assert _shaded_price(module, request) == 2.5
+
+    # The fixture loads the module once per test; each example only swaps the stub
+    # prediction on it, so sharing it across examples is intended.
+    @settings(max_examples=200, deadline=None,
+              suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @given(
+        imp_floor=st.floats(min_value=0.0, max_value=15.0, allow_nan=False),
+        deal_floor=st.floats(min_value=0.01, max_value=20.0, allow_nan=False),
+        price=st.floats(min_value=0.05, max_value=40.0, allow_nan=False),
+        ctr=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+    )
+    def test_a_shaded_deal_bid_is_never_below_its_deal_floor_or_the_impression_floor(
+        self, module, imp_floor, deal_floor, price, ctr
+    ) -> None:
+        module._predict_ctr_from_request = lambda _bid_request: (ctr, "stable", "v1")
+        request = _deal_shade_request(
+            imp_floor=imp_floor, deal_floor=deal_floor, dealid="deal-premium-video", price=price,
+        )
+        for mutation in module.mutate(request).mutations:
+            # The price is rounded to 4 places when the mutation is built.
+            assert mutation.adjust_bid.price >= round(max(imp_floor, deal_floor), 4) - 1e-9
 
 
 class TestTheReasonReachesTheConsumer:

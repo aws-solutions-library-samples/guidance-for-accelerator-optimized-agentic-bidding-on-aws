@@ -20,10 +20,12 @@ deal_id field.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import sys
 from datetime import datetime, timezone
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -73,6 +75,38 @@ else:
         return 1.0, "", ""
 
 
+def _min_deal_floor(deal: dict) -> Optional[float]:
+    """``deal.ext.mindealfloor`` when it is a finite, non-negative number, else None."""
+    ext = deal.get("ext")
+    if not isinstance(ext, dict):
+        return None
+    value = ext.get("mindealfloor")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _is_suppressed(deal: dict) -> bool:
+    """True for a deal the Deal Scorer suppressed earlier in this request.
+
+    The orchestrator applies the deals stage to the working request before the
+    yield stage runs (shared/artf_applier.py marks ``deal.ext.artf.suppressed``),
+    so a suppressed deal arrives here still listed. It will not clear, so it is
+    skipped before feature building: no inference call, no mutation, no latency.
+    ``ext.suppressed`` is accepted too, matching demand/artfhouse/eligibility.py.
+    """
+    ext = deal.get("ext")
+    if not isinstance(ext, dict):
+        return False
+    if ext.get("suppressed") is True:
+        return True
+    artf = ext.get("artf")
+    return isinstance(artf, dict) and artf.get("suppressed") is True
+
+
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations -- ADJUST_DEAL_FLOOR via Triton FIL-served XGBoost."""
     if not intent_applicable(Intent.ADJUST_DEAL_FLOOR, req.applicable_intents):
@@ -98,7 +132,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
         pmp = imp.get("pmp") or {}
         for deal in pmp.get("deals", []):
             deal_id = deal.get("id", "")
-            if not deal_id:
+            if not deal_id or _is_suppressed(deal):
                 continue
 
             feature_vector = build_feature_vector(bid_request, deal, request_time)
@@ -128,6 +162,14 @@ def mutate(req: RTBRequest) -> RTBResponse:
             original_bidfloor = float(deal.get("bidfloor", 0.0) or 0.0)
             # BR-7: a bidfloor can never go negative.
             adjusted_bidfloor = max(0.0, round(original_bidfloor * floor_multiplier, 4))
+            # The deal's own minimum (terms.ext.mindealfloor in the deals table,
+            # carried on the request as deal.ext.mindealfloor): the optimizer may
+            # move the floor, never under it.
+            minimum = _min_deal_floor(deal)
+            if minimum is not None:
+                adjusted_bidfloor = max(minimum, adjusted_bidfloor)
+                if adjusted_bidfloor == original_bidfloor:
+                    continue  # BR-3: the clamp undid the move, so there is no change.
             mutations.append(Mutation(
                 intent=Intent.ADJUST_DEAL_FLOOR, op=Operation.REPLACE,
                 path=f"/imp/{imp_id}/deals/{deal_id}",
@@ -148,9 +190,56 @@ def mutate(req: RTBRequest) -> RTBResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Readiness warm-up (shared.server.WarmupGate)
+# ---------------------------------------------------------------------------
+
+#: Shaped like the yield-optimizer scenario: one video impression with two
+#: open-auction deals, so mutate() runs the floor model through Triton once per
+#: deal. Not a load test and no explore override, so no exploration is drawn.
+#: Run inside the pod only; nothing is emitted.
+WARMUP_REQUEST: dict = {
+    "id": "artf-warmup-yield-optimizer-floor",
+    "tmax": 100,
+    "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+    "applicable_intents": ["ADJUST_DEAL_FLOOR"],
+    "bid_request": {
+        "id": "artf-warmup-auction",
+        "imp": [{
+            "id": "imp-1",
+            "video": {"mimes": ["video/mp4"], "minduration": 15, "maxduration": 30, "w": 1280, "h": 720},
+            "bidfloor": 6.00,
+            "pmp": {
+                "private_auction": 1,
+                "deals": [
+                    {"id": "deal-open-midtier", "bidfloor": 3.25, "at": 2},
+                    {"id": "deal-open-remnant", "bidfloor": 0.75, "at": 2},
+                ],
+            },
+        }],
+        "site": {"id": "artf-warmup-site", "domain": "sportsnetwork.example.com", "cat": ["IAB17"]},
+        "user": {"id": "artf-warmup-user"},
+        "device": {"ua": "Mozilla/5.0", "geo": {"country": "USA", "region": "CA"}},
+    },
+}
+
+
+def warmup_check(resp: RTBResponse) -> None:
+    """On the Triton path, require the floor model to report ready after the call.
+
+    A failed FIL inference returns the no-change value, so the response alone
+    cannot show that the inference succeeded.
+    """
+    if USE_TRITON:
+        from container.triton_inference import is_triton_ready
+        if not is_triton_ready():
+            raise RuntimeError("Triton or the deal_yield_manager_floor model is not ready")
+
+
 if __name__ == "__main__":
-    from shared.server import run_artf_server
+    from shared.server import run_artf_server, warmup_from_request
     run_artf_server(
         mutate, agent_name="yield-optimizer-floor",
         grpc_port=50051, mcp_port=8081, health_port=8080,
+        warmup=warmup_from_request(mutate, WARMUP_REQUEST, require_triton=USE_TRITON, check=warmup_check),
     )

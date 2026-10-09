@@ -20,6 +20,22 @@ one.
 Idempotent: if a Model Package Group already has any registered version, that
 group is skipped (re-running deploy never duplicates or overwrites a version).
 
+ncf_deal_manager is the exception. Its ONNX is no longer seeded weights: deploy.sh
+Step 2 trains it on sample interactions generated from the deal book and writes a
+manifest.json beside it whose fingerprint identifies that build. A new ncf version
+is registered whenever the most recent version that records a `fingerprint` does
+not record this one (or no version records one), with CustomerMetadataProperties
+training_data, label (the manifest's target), generator, seed (the generator seed)
+and fingerprint (12 hex) copied from the manifest. The same fingerprint is never
+registered twice. Its ModelDataUrl is the build's own copy,
+onnx-source/ncf_deal_manager/builds/<fingerprint>/model.onnx, which only a build
+with that fingerprint writes; onnx-source/ncf_deal_manager/model.onnx is
+overwritten by every build, so a version pointing there would name a later
+build's bytes.
+
+--only <model_type> limits a run to the named model types; deploy.sh uses
+`--only ncf_deal_manager` right after Step 3a uploads a new build.
+
 This does NOT emit a ModelPackageGroupChanged event - genesis registration is
 not a governance/promotion action; there is no prior version to A/B test
 against yet.
@@ -38,8 +54,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import re
 import sys
 
 import boto3
@@ -85,6 +103,96 @@ _GENESIS_METADATA_NOTE = (
     "NOT a trained result - it exists so the first retraining job has a real "
     "base model version to fine-tune from."
 )
+
+# The Deal Scorer's build, registered per fingerprint rather than once.
+_NCF_MODEL_TYPE = "ncf_deal_manager"
+_NCF_MANIFEST_KEY = f"onnx-source/{_NCF_MODEL_TYPE}/manifest.json"
+# deploy.sh upload_ncf_source also keeps each build under <prefix>/<fingerprint>/.
+_NCF_BUILDS_PREFIX = f"onnx-source/{_NCF_MODEL_TYPE}/builds"
+_NCF_SAMPLE_DESCRIPTION = (
+    "Deal Scorer trained on sample interactions generated from the deal book, "
+    "not observed outcomes"
+)
+# CustomerMetadataProperties value charset (see the note above) and the 12-hex
+# fingerprint form the registry records.
+_METADATA_VALUE_RE = re.compile(r"^[\w .:/=+\-@]{1,256}$")
+_FP12_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+class ManifestError(ValueError):
+    """The ncf manifest is missing a field the registration needs, or it is malformed."""
+
+
+def _ncf_build_identity(s3_client, bucket: str) -> dict[str, str] | None:
+    """training_data, label, generator, seed and fingerprint (12 hex) from the ncf manifest in S3.
+
+    label is the manifest's ``target``, generator its ``generator.path`` and seed its
+    ``generator_seed``. None when there is no manifest. Raises ManifestError when the
+    manifest cannot supply the five values within the metadata charset, and
+    ClientError for any S3 error other than a missing object.
+    """
+    try:
+        body = s3_client.get_object(Bucket=bucket, Key=_NCF_MANIFEST_KEY)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    try:
+        manifest = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(f"s3://{bucket}/{_NCF_MANIFEST_KEY} is not JSON ({exc})") from exc
+    if not isinstance(manifest, dict):
+        raise ManifestError(f"s3://{bucket}/{_NCF_MANIFEST_KEY} is not a JSON object")
+    fp12 = manifest.get("fingerprint12")
+    if not fp12 and isinstance(manifest.get("fingerprint"), str):
+        fp12 = manifest["fingerprint"][:12]
+    if not isinstance(fp12, str) or not _FP12_RE.match(fp12):
+        raise ManifestError(f"{_NCF_MANIFEST_KEY} has no 12-hex fingerprint (got {fp12!r})")
+    generator = manifest.get("generator")
+    seed = manifest.get("generator_seed")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise ManifestError(f"{_NCF_MANIFEST_KEY} field generator_seed={seed!r} is missing or not an integer")
+    identity = {
+        "training_data": manifest.get("training_data"),
+        "label": manifest.get("target"),
+        "generator": generator.get("path") if isinstance(generator, dict) else None,
+        "seed": str(seed),
+        "fingerprint": fp12,
+    }
+    sources = {"training_data": "training_data", "label": "target", "generator": "generator.path"}
+    for field, source in sources.items():
+        value = identity[field]
+        if not isinstance(value, str) or not _METADATA_VALUE_RE.match(value):
+            raise ManifestError(f"{_NCF_MANIFEST_KEY} field {source}={value!r} is missing or outside the metadata charset")
+    return identity
+
+
+def _latest_recorded_fingerprint(sagemaker_client, model_package_group: str) -> str | None:
+    """The `fingerprint` metadata of the newest version that records one, or None.
+
+    Versions without it (the seeded-weights genesis, retrained versions registered by
+    the governance pipeline) are passed over, so a retrained version on top does not
+    make the same build register again.
+    """
+    kwargs = {
+        "ModelPackageGroupName": model_package_group,
+        "SortBy": "CreationTime",
+        "SortOrder": "Descending",
+        "MaxResults": 100,
+    }
+    while True:
+        response = sagemaker_client.list_model_packages(**kwargs)
+        for summary in response.get("ModelPackageSummaryList", []):
+            detail = sagemaker_client.describe_model_package(
+                ModelPackageName=summary["ModelPackageArn"]
+            )
+            recorded = (detail.get("CustomerMetadataProperties") or {}).get("fingerprint")
+            if recorded:
+                return recorded
+        token = response.get("NextToken")
+        if not token:
+            return None
+        kwargs["NextToken"] = token
 
 
 def _resolve_account_id(sts_client) -> str:
@@ -179,8 +287,11 @@ def register_genesis_models(
     sagemaker_client=None,
     s3_client=None,
     sts_client=None,
+    ecr_client=None,
+    model_types=None,
 ) -> dict[str, str]:
-    """Register the genesis version for each model type that has none yet.
+    """Register the genesis version for each model type that has none yet, and a
+    new ncf_deal_manager version for each new build fingerprint.
 
     Args:
         model_bucket: S3 bucket holding onnx-source/<model>/model.onnx.
@@ -192,32 +303,72 @@ def register_genesis_models(
             type's own tag (from _MODEL_TYPES, e.g. "dlrm"/"ncf") is checked
             for existence before registering that model type.
         account_id: AWS account id. Resolved via STS if not supplied.
-        sagemaker_client / s3_client / sts_client: optional pre-built boto3
-            clients (for testing).
+        sagemaker_client / s3_client / sts_client / ecr_client: optional
+            pre-built boto3 clients (for testing).
+        model_types: model types to process; None processes all of them.
 
     Returns:
         Dict of model_type -> outcome string ("registered:<arn>",
-        "skipped:exists", "skipped:missing-artifact", or
+        "skipped:exists", "skipped:missing-artifact",
+        "skipped:missing-manifest", "skipped:invalid-manifest", or
         "skipped:training-image-not-ready").
     """
     sagemaker_client = sagemaker_client or boto3.client("sagemaker", region_name=region)
     s3_client = s3_client or boto3.client("s3", region_name=region)
     sts_client = sts_client or boto3.client("sts", region_name=region)
-    ecr_client = boto3.client("ecr", region_name=region)
+    ecr_client = ecr_client or boto3.client("ecr", region_name=region)
 
     if account_id is None:
         account_id = _resolve_account_id(sts_client)
 
+    selected = None if model_types is None else set(model_types)
     results: dict[str, str] = {}
 
     for model_type, image_tag in _MODEL_TYPES:
+        if selected is not None and model_type not in selected:
+            continue
         package_group = package_groups.get(model_type)
         if not package_group:
             _LOG.warning("No Model Package Group configured for %s - skipping.", model_type)
             results[model_type] = "skipped:no-package-group"
             continue
 
-        if _has_existing_version(sagemaker_client, package_group):
+        ncf_identity = None
+        if model_type == _NCF_MODEL_TYPE:
+            try:
+                ncf_identity = _ncf_build_identity(s3_client, model_bucket)
+            except ManifestError as exc:
+                _LOG.error("  %s: %s - not registering.", model_type, exc)
+                results[model_type] = "skipped:invalid-manifest"
+                continue
+            if ncf_identity is None:
+                _LOG.error(
+                    "  %s: no manifest at s3://%s/%s - did deploy.sh Step 3a run? "
+                    "Not registering a version whose training data cannot be stated.",
+                    model_type,
+                    model_bucket,
+                    _NCF_MANIFEST_KEY,
+                )
+                results[model_type] = "skipped:missing-manifest"
+                continue
+            recorded = _latest_recorded_fingerprint(sagemaker_client, package_group)
+            if recorded == ncf_identity["fingerprint"]:
+                _LOG.info(
+                    "  %s (%s): fingerprint %s is already registered - skipping.",
+                    model_type,
+                    package_group,
+                    recorded,
+                )
+                results[model_type] = "skipped:exists"
+                continue
+            _LOG.info(
+                "  %s (%s): build fingerprint %s, last registered %s - registering.",
+                model_type,
+                package_group,
+                ncf_identity["fingerprint"],
+                recorded or "none",
+            )
+        elif _has_existing_version(sagemaker_client, package_group):
             _LOG.info(
                 "  %s (%s): already has a registered version - skipping (idempotent).",
                 model_type,
@@ -226,7 +377,11 @@ def register_genesis_models(
             results[model_type] = "skipped:exists"
             continue
 
-        onnx_key = f"onnx-source/{model_type}/model.onnx"
+        if ncf_identity is not None:
+            # The build's own copy: the shared key is overwritten by the next build.
+            onnx_key = f"{_NCF_BUILDS_PREFIX}/{ncf_identity['fingerprint']}/model.onnx"
+        else:
+            onnx_key = f"onnx-source/{model_type}/model.onnx"
         if not _onnx_artifact_exists(s3_client, model_bucket, onnx_key):
             _LOG.error(
                 "  %s: genesis ONNX artifact not found at s3://%s/%s - "
@@ -296,13 +451,32 @@ def register_genesis_models(
                 "note": _GENESIS_METADATA_NOTE,
             },
         }
+        if ncf_identity is not None:
+            # Trained, not seeded: the genesis note and description would be false.
+            # Approved because it is the build deploy.sh just uploaded for serving.
+            create_params["ModelPackageDescription"] = (
+                _NCF_SAMPLE_DESCRIPTION
+                if ncf_identity["training_data"] == "sample"
+                else f"Deal Scorer build {ncf_identity['fingerprint']} exported at deploy time"
+            )
+            create_params["CustomerMetadataProperties"] = {
+                "source": "onnx-export",
+                "training_data": ncf_identity["training_data"],
+                "label": ncf_identity["label"],
+                "generator": ncf_identity["generator"],
+                "seed": ncf_identity["seed"],
+                "fingerprint": ncf_identity["fingerprint"],
+            }
 
         response = sagemaker_client.create_model_package(**create_params)
         model_package_arn = response["ModelPackageArn"]
         _LOG.info(
-            "  %s (%s): registered genesis version - %s",
+            "  %s (%s): registered %s - %s",
             model_type,
             package_group,
+            f"build {ncf_identity['fingerprint']} ({ncf_identity['training_data']})"
+            if ncf_identity is not None
+            else "genesis version",
             model_package_arn,
         )
         results[model_type] = f"registered:{model_package_arn}"
@@ -316,10 +490,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE") or None,
                         help="AWS CLI profile for every call (default: AWS_PROFILE, else the SDK default chain)")
-    parser.add_argument("--dlrm-package-group", required=True, help="Model Package Group name for dlrm_bid_shader")
-    parser.add_argument("--ncf-package-group", required=True, help="Model Package Group name for ncf_deal_manager")
-    parser.add_argument("--yield-floor-package-group", required=True, help="Model Package Group name for deal_yield_manager_floor")
-    parser.add_argument("--yield-margin-package-group", required=True, help="Model Package Group name for deal_yield_manager_margin")
+    # Each group flag is required for the model types this run processes (all of
+    # them unless --only narrows it); checked after parsing.
+    parser.add_argument("--dlrm-package-group", default=None, help="Model Package Group name for dlrm_bid_shader")
+    parser.add_argument("--ncf-package-group", default=None, help="Model Package Group name for ncf_deal_manager")
+    parser.add_argument("--yield-floor-package-group", default=None, help="Model Package Group name for deal_yield_manager_floor")
+    parser.add_argument("--yield-margin-package-group", default=None, help="Model Package Group name for deal_yield_manager_margin")
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=[model_type for model_type, _ in _MODEL_TYPES],
+        default=None,
+        help="Process only this model type (repeatable). Default: all model types.",
+    )
     parser.add_argument(
         "--training-image-repository",
         default="artf-nemo-rl-training",
@@ -327,6 +510,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--account-id", default="", help="AWS account id (resolved via STS if omitted)")
     args = parser.parse_args(argv)
+    group_flags = {
+        "dlrm_bid_shader": ("dlrm_package_group", "--dlrm-package-group"),
+        "ncf_deal_manager": ("ncf_package_group", "--ncf-package-group"),
+        "deal_yield_manager_floor": ("yield_floor_package_group", "--yield-floor-package-group"),
+        "deal_yield_manager_margin": ("yield_margin_package_group", "--yield-margin-package-group"),
+    }
+    selected = args.only or [model_type for model_type, _ in _MODEL_TYPES]
+    missing_flags = [
+        flag for model_type, (dest, flag) in group_flags.items()
+        if model_type in selected and getattr(args, dest) is None
+    ]
+    if missing_flags:
+        parser.error(f"the following arguments are required: {', '.join(missing_flags)}")
     if args.profile:
         # One place for both credential paths: boto3 clients created below, and any
         # subprocess (aws/kubectl) that reads AWS_PROFILE from the environment.
@@ -355,9 +551,13 @@ def main(argv: list[str] | None = None) -> int:
         package_groups=package_groups,
         training_image_repository=args.training_image_repository,
         account_id=args.account_id or None,
+        model_types=args.only,
     )
 
-    missing = [m for m, outcome in results.items() if outcome == "skipped:missing-artifact"]
+    missing = [
+        m for m, outcome in results.items()
+        if outcome in ("skipped:missing-artifact", "skipped:missing-manifest", "skipped:invalid-manifest")
+    ]
     not_ready = [m for m, outcome in results.items() if outcome == "skipped:training-image-not-ready"]
     _LOG.info("Genesis registration complete: %s", results)
     if not_ready:
@@ -369,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     if missing:
         _LOG.error(
-            "%d model type(s) had no genesis artifact to register: %s",
+            "%d model type(s) had no registrable artifact or manifest: %s",
             len(missing),
             missing,
         )

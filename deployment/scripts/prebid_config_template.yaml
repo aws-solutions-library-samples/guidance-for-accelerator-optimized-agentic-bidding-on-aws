@@ -35,7 +35,7 @@
 #
 # Placeholders substituted at deploy time:
 #   __CONFIG_BUCKET__      S3 bucket holding this file
-#   __DEMAND_ENDPOINT__    artfhouse demand endpoint URL (API Gateway HTTP API)
+#   __DEMAND_ENDPOINT__    artfhouse demand Service URL (in-cluster ClusterIP)
 #
 # Environment variables referenced below are set on the container by
 # eks/prebid-server-deployment.yaml, except SSL_KEYSTORE_PATH and SSL_KEYSTORE_PASS,
@@ -71,9 +71,13 @@ adapters:
   artfhouse:
     enabled: true
     endpoint: "__DEMAND_ENDPOINT__"
-    # The demand endpoint is authenticated (Cognito JWT, scope artf-demand/bid:read).
+    # The demand endpoint is the in-cluster artfhouse-demand Service (plain HTTP on
+    # cluster DNS). Prebid's Vert.x HTTP client pools and keeps connections alive by
+    # default, and the service holds them open for 75 s, so a warm auction reuses a
+    # connection. The service checks the Cognito JWT itself (scope
+    # artf-demand/bid:read, the Prebid host's client_id).
     # The bearer token is attached by the adapter at call time from the credential
-    # read via IRSA; it is NOT configured here, and no credential belongs in this file.
+    # delivered to the pod; it is NOT configured here, and no credential belongs in this file.
     #
     # The adapter reads its timeout from Prebid's own per-bidder timeout handling,
     # which is bounded by the auction tmax. No independent timeout is set here: two
@@ -226,21 +230,38 @@ settings:
   # reject a single bid: a stack that looks healthy and does nothing.
   #
   # Single-authority is preserved by a different mechanism instead: fetch is off and
-  # no floor rules are defined, so the only floor in play is the one the hook writes
-  # to imp.bidfloor. FR-21's intent, by a route that actually works.
+  # no floor rule that matches an impression is defined, so the floors in play are the
+  # publisher's imp.bidfloor and the deal floors on the request. ADJUST_DEAL_FLOOR and
+  # ADJUST_DEAL_MARGIN write the deal's floor (imp.pmp.deals[].bidfloor) only, never
+  # imp.bidfloor, so a non-deal bid is held to the publisher's impression floor.
   # ---------------------------------------------------------------------------
   #
   # enforce-deal-floors is set explicitly. Note it DEFAULTS TO TRUE in 3.43.0
   # (application.yaml:191; docs/application-settings.md:44) -- the requirement that
   # said otherwise was wrong for this version.
   #
-  # THE REAL TRAP IS REQUEST-SIDE. Deal enforcement is
+  # Deal enforcement is also request-side:
   #   isTrue(request ext.prebid.floors.enforcement.floorDeals)
   #     && isTrue(account enforce-deal-floors)
-  # (BasicPriceFloorEnforcer.java:204-212), and floorDeals has NO DEFAULT anywhere in
-  # the codebase. A request that omits it gets no deal-floor enforcement whatever this
-  # setting says. Setting it here is necessary and not sufficient; the scenario
-  # generator must send floorDeals: true.
+  # (BasicPriceFloorEnforcer.enforceDealFloors), and floorDeals has no default. Prebid
+  # never reads pmp.deals[].bidfloor: for a deal bid it compares the bid with the
+  # bidder's PriceFloorInfo when set, else the impression floor. So deal floors are
+  # enforced like this:
+  #   - the artfhouse demand endpoint refuses to bid below
+  #     max(impression floor, deal floor);
+  #   - the artfhouse adapter attaches that same value to each deal bid as
+  #     PriceFloorInfo;
+  #   - the orchestrator's auction route (POST /api/v1/auction/run) adds
+  #     ext.prebid.floors with enforcement.floorDeals: true and a one-rule data block
+  #     keyed "artf-no-floor-rule" (schema mediaType, no default), and lists it in
+  #     artf_meta.prepared. The data block is required: PriceFloorRulesValidator
+  #     rejects request floors without data, and the processor then replaces them with
+  #     an empty object that drops enforcement. The rule matches no impression, so
+  #     BasicPriceFloorResolver leaves every imp.bidfloor as sent. A request that
+  #     carries its own ext.prebid.floors is left untouched.
+  # Prebid then rejects a deal bid below the floor the adapter attached. A request
+  # posted to Prebid without that object gets no deal-floor enforcement from Prebid,
+  # whatever this setting says.
   default-account-config: >
     {
       "auction": {
@@ -314,9 +335,9 @@ hooks:
     extension-point-url: ${ARTF_EXTENSION_POINT_URL}
     # Which transport reaches it: http (POST extension-point-url) or grpc
     # (RTBExtensionPoint/GetMutations at grpc-target, the orchestrator's headless
-    # orchestrator-grpc Service). http until a measured run shows gRPC beats it
-    # on this hop; flip with ARTF_TRANSPORT on the pod for a measurement run.
-    transport: ${ARTF_TRANSPORT:http}
+    # orchestrator-grpc Service). deploy_prebid.sh sets ARTF_TRANSPORT (grpc by
+    # default); set it to http there for a comparison run.
+    transport: ${ARTF_TRANSPORT:grpc}
     grpc-target: ${ARTF_GRPC_TARGET:}
     token-endpoint: ${ARTF_TOKEN_ENDPOINT}
     scope: ${ARTF_SCOPE}
@@ -419,8 +440,10 @@ hooks:
 # And a third, from the floors work above:
 #
 # 3. ext.prebid.floors.enforcement.floorDeals
-#    Required for deal-floor enforcement, with no default. See the note on
-#    default-account-config.
+#    Required for deal-floor enforcement, with no default, and only kept by Prebid
+#    when the floors object also carries a valid data block. The orchestrator's
+#    auction route sends both (one rule that matches no impression, so impression
+#    floors are unchanged). See the note on default-account-config.
 #
 # A fourth, for reporting:
 #
@@ -456,8 +479,9 @@ hooks:
 # bucket's maximum for any price above it, keeping the bid. Top buckets are 20 for
 # medium/med/high/auto/dense and 5 for low (PriceGranularity.java:30-38).
 #
-# The catalog's highest declared CPM is 13.40 (camp-meridian-guaranteed, which
-# transacts on yield-optimizer's deal-guaranteed-premium against a 12.00 deal floor).
+# The catalog's highest declared CPM is 13.75 (camp-skyline-video, which transacts on
+# video-deals' deal-premium-video against an 8.75 deal floor). Prices live in
+# deployment/seed/deals_and_campaigns.json; check the maximum there after a price edit.
 # That is under 20, so nothing bites under any granularity EXCEPT "low", where the top
 # bucket is 5 and every campaign above it -- now several, since the video campaigns
 # were added for the shipped scenarios -- would report hb_pb as 5.00. That is a
@@ -465,8 +489,8 @@ hooks:
 # Prebid's own default applies; the constraint is simply not to change it to "low".
 #
 # The figure was 6.35 while the catalog held only the five original banner campaigns.
-# It is asserted in test_artf_demand_bids.py so this comment cannot drift from it
-# silently.
+# test_artf_demand_bids.py and test_seed_price_invariants.py assert that the seed's
+# maximum stays under 20.
 #
 # Recorded because an earlier version of this feature's design stated that a
 # configured bid ceiling would DISCARD bids above it, and that a ceiling had to exceed

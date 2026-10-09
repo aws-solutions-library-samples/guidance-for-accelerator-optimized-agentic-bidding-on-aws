@@ -36,12 +36,12 @@
 #
 # Placeholders follow the repository convention and are substituted at deploy time:
 #   __PREBID_ROLE_ARN__   IRSA role from prebid_cfn.yaml
-#   __IMAGE__             fully qualified image reference, including tag
+#   __IMAGE__             <registry>/<repo>@sha256:<digest>, resolved from ECR after the push
 #   __CONFIG_BUCKET__     S3 bucket holding prebid-server/{default,current}/
 #   __AWS_REGION__        region
 #   __TOKEN_ENDPOINT__    Cognito hosted token endpoint
 #   __CREDENTIAL_SECRET__ ARN of the credential secret
-#   __DEMAND_ENDPOINT__   artfhouse demand endpoint URL
+#   __DEMAND_ENDPOINT__   artfhouse demand Service URL (in-cluster, see artfhouse-demand-deployment.yaml)
 #   __ORCHESTRATOR_URL__  in-cluster orchestrator extension point
 #   __ORCHESTRATOR_GRPC_TARGET__ host:port of the orchestrator's gRPC listener
 #   __ARTF_TRANSPORT__    http | grpc -- which of the two the hook uses

@@ -283,6 +283,11 @@ _run() {
 # Exported because the inline python below reads it to find prebid_release.py.
 # Exported HERE rather than at first use, so no step can run before it is set.
 export SCRIPT_DIR
+# wait_rollout, pin_image_in_manifest (lib/k8s_rollout.sh).
+# shellcheck source=lib/k8s_rollout.sh
+source "${SCRIPT_DIR}/lib/k8s_rollout.sh"
+# Rollouts that did not complete; a non-empty list fails the run at the end.
+ROLLOUT_FAILURES=()
 
 # ---------------------------------------------------------------- names
 # ${STACK_PREFIX:+${STACK_PREFIX}-} yields "" when unset and "prefix-" when set, so
@@ -293,6 +298,12 @@ CLUSTER_NAME="${CLUSTER_NAME:-${STACK_NAME}-triton}"
 PREBID_STACK="${PFX}prebid-artf"
 CB_PROJECT="${STACK_NAME}-image-builder"
 ECR_REPO="${PFX}prebid-server"
+# The in-cluster artfhouse demand service's image, built on the same CodeBuild run.
+DEMAND_ECR_REPO="${PFX}artfhouse-demand"
+DEMAND_MANIFEST="${SCRIPT_DIR}/eks/artfhouse-demand-deployment.yaml"
+# The demand Service's address. Plain HTTP on cluster DNS with keep-alive; the
+# service checks the bearer token itself.
+DEMAND_ENDPOINT="http://artfhouse-demand.${NAMESPACE}.svc.cluster.local/openrtb2/auction"
 # The two prefixes the image entrypoint reads, in this order. `current/` is copied
 # over `default/` into one directory, so a file in both is REPLACED, not merged.
 DEFAULT_CONFIG_PREFIX="prebid-server/default/"
@@ -302,11 +313,11 @@ CONFIG_KEY="prebid-server/current/prebid-config.yaml"
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://orchestrator.${NAMESPACE}.svc.cluster.local/v1/mutations}"
 # The orchestrator's gRPC listener (headless orchestrator-grpc Service in
 # orchestrator-deployment.yaml) and which transport the hook uses to reach the
-# extension point. "http" is the measured baseline; "grpc" becomes the default
-# here once a measured run shows it beats http on this hop. Override either with
-# the env var for a measurement run.
+# extension point. gRPC is the default: the hook's client and the orchestrator's
+# RTBExtensionPoint/GetMutations server are both complete. Set ARTF_TRANSPORT=http
+# for a comparison run.
 ORCHESTRATOR_GRPC_TARGET="${ORCHESTRATOR_GRPC_TARGET:-orchestrator-grpc.${NAMESPACE}.svc.cluster.local:50051}"
-ARTF_TRANSPORT="${ARTF_TRANSPORT:-http}"
+ARTF_TRANSPORT="${ARTF_TRANSPORT:-grpc}"
 case "${ARTF_TRANSPORT}" in http|grpc) ;; *) echo "ARTF_TRANSPORT must be http or grpc, got '${ARTF_TRANSPORT}'" >&2; exit 1 ;; esac
 K8S_MANIFEST="${SCRIPT_DIR}/eks/prebid-server-deployment.yaml"
 CFN_TEMPLATE="${SCRIPT_DIR}/prebid_cfn.yaml"
@@ -576,6 +587,60 @@ deploy_amt_simulator() {
 }
 
 # ---------------------------------------------------------------------------
+# deploy_artfhouse_demand -- the artfhouse seat's demand service, in-cluster.
+#
+# A Deployment, ClusterIP Service, ServiceAccount (IRSA, read-only on the deals
+# table) and a NetworkPolicy admitting only the Prebid pods. It replaced a Lambda
+# behind a public API Gateway with a JWT authorizer, which measured 70 to 90 ms per
+# auction for 2 ms of work; the service now checks the bearer token itself.
+#
+# Needs DEMAND_ROLE_ARN, PREBID_CLIENT_ID, DEALS_TABLE and USER_POOL_ID from the
+# stack, and DEMAND_IMAGE_TAG from Step 5. The image is pinned by digest. A rollout
+# that does not complete is added to ROLLOUT_FAILURES; it is not a soft warning,
+# because Prebid's artfhouse seat has no other demand.
+# ---------------------------------------------------------------------------
+deploy_artfhouse_demand() {
+  [[ -n "${DEMAND_IMAGE_TAG:-}" ]] \
+    || fail "No demand image tag known. Run without --skip-build, or keep ${WORK_DIR}/demand_image_tag.txt."
+  local processed="/tmp/${CLUSTER_NAME}-artfhouse-demand.yaml"
+  sed -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+      -e "s|__DEMAND_ROLE_ARN__|${DEMAND_ROLE_ARN}|g" \
+      -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+      -e "s|__DEALS_TABLE__|${DEALS_TABLE}|g" \
+      -e "s|__USER_POOL_ID__|${USER_POOL_ID}|g" \
+      -e "s|__PREBID_CLIENT_ID__|${PREBID_CLIENT_ID}|g" \
+      "${DEMAND_MANIFEST}" >"${processed}"
+  pin_image_in_manifest "${processed}" "__DEMAND_IMAGE__" "${REGISTRY}" "${DEMAND_ECR_REPO}" \
+      "${DEMAND_IMAGE_TAG}" "${AWS_REGION}" \
+    || fail "ECR has no readable digest for ${DEMAND_ECR_REPO}:${DEMAND_IMAGE_TAG}; refusing to deploy the demand service by tag."
+  log "  Demand image: ${PINNED_IMAGE_REF}"
+  if grep -q '__[A-Z_]*__' "${processed}"; then
+    grep -o '__[A-Z_]*__' "${processed}" | sort -u >&2
+    fail "Unsubstituted placeholders remain in ${processed}"
+  fi
+  if [[ ${#KUBECTL[@]} -eq 1 ]]; then
+    resolve_kube_context || fail "No usable kubectl context; cannot apply the demand service."
+  fi
+  "${KUBECTL[@]}" apply -f "${processed}" >/dev/null || fail "kubectl apply failed for the demand service"
+  ROLLOUT_KUBECTL=("${KUBECTL[@]}")
+  wait_rollout artfhouse-demand "${NAMESPACE}" 300 || ROLLOUT_FAILURES+=("${ROLLOUT_FAILURE}")
+
+  # Whether the NetworkPolicy is enforced. The VPC CNI enforces NetworkPolicy only
+  # with enableNetworkPolicy, which runs the node agent with
+  # --enable-network-policy=true. Reported, not assumed.
+  local np_args
+  np_args="$("${KUBECTL[@]}" get daemonset aws-node -n kube-system \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")].args}' 2>/dev/null || echo '')"
+  if [[ "${np_args}" == *"--enable-network-policy=true"* ]]; then
+    log "  NetworkPolicy enforced: only Prebid pods can reach the demand service"
+  else
+    warn "This cluster's CNI does not enforce NetworkPolicy (VPC CNI enableNetworkPolicy is off)."
+    warn "artfhouse-demand-from-prebid-only is applied but inert; any pod can reach the"
+    warn "demand Service. Requests still need a valid Prebid token with artf-demand/bid:read."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # publish_config_overlay -- render and upload current/prebid-config.yaml.
 #
 # MUST run BEFORE the Kubernetes manifest is applied. The pod's entrypoint copies
@@ -793,6 +858,13 @@ if [[ "${DESTROY}" -eq 1 ]]; then
     "${KUBECTL[@]}" delete service    amt-simulator -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
     "${KUBECTL[@]}" delete configmap  amt-simulator-code -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
 
+    # The artfhouse demand service, also created by this script.
+    "${KUBECTL[@]}" delete -f "${DEMAND_MANIFEST}" -n "${NAMESPACE}" --ignore-not-found=true >/dev/null 2>&1 \
+      || { "${KUBECTL[@]}" delete deployment artfhouse-demand -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+           "${KUBECTL[@]}" delete service artfhouse-demand -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+           "${KUBECTL[@]}" delete networkpolicy artfhouse-demand-from-prebid-only -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true
+           "${KUBECTL[@]}" delete serviceaccount artfhouse-demand-sa -n "${NAMESPACE}" --ignore-not-found=true 2>/dev/null || true; }
+
     # Return the orchestrator to its pre-Prebid authorization behaviour. Leaving the
     # requirement in place would keep an existing component altered by a feature that
     # is no longer installed -- and its only machine caller has just been deleted.
@@ -850,6 +922,13 @@ if [[ "${DESTROY}" -eq 1 ]]; then
       || warn "Could not delete ECR repository ${ECR_REPO}; remove it by hand to stop its storage charge."
   else
     log "ECR repository ${ECR_REPO}: already absent"
+  fi
+  if aws ecr describe-repositories --repository-names "${DEMAND_ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    aws ecr delete-repository --repository-name "${DEMAND_ECR_REPO}" --region "${AWS_REGION}" --force >/dev/null \
+      && log "ECR repository ${DEMAND_ECR_REPO}: deleted" \
+      || warn "Could not delete ECR repository ${DEMAND_ECR_REPO}; remove it by hand to stop its storage charge."
+  else
+    log "ECR repository ${DEMAND_ECR_REPO}: already absent"
   fi
 
   log "The shared Cognito user pool was NOT deleted - the frontend and orchestrator use it."
@@ -1309,15 +1388,24 @@ if [[ "${START_AT}" -le 5 && "${SKIP_BUILD}" -ne 1 ]]; then
   # retention still behaves as designed. --destroy deletes the repository, because
   # the stack no longer does.
   # ---------------------------------------------------------------------------
-  aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 \
-    || aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
-         --image-scanning-configuration scanOnPush=true --image-tag-mutability MUTABLE >/dev/null
+  # The demand image is tagged by its own sources, so a Prebid-only change does not
+  # re-tag it and a demand-only change does.
+  DEMAND_IMAGE_TAG="demand-$(cd "${REPO_ROOT}/source" \
+    && { find demand -type f ! -name '*.pyc' ! -path '*__pycache__*' -print0; printf 'Dockerfile.demand\0'; } \
+    | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)"
+  log "  Demand image tag: ${DEMAND_IMAGE_TAG}"
 
-  # Keep the 5 most recent images. Older ones are rebuildable from the pinned release,
-  # so retaining them indefinitely only accrues per-GB-month storage.
-  aws ecr put-lifecycle-policy --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
-    --lifecycle-policy-text '{"rules":[{"rulePriority":1,"description":"Keep the 5 most recent images; older ones are rebuildable from the pinned release.","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}' \
-    >/dev/null 2>&1 || warn "Could not set the ECR lifecycle policy on ${ECR_REPO}; images will accumulate"
+  for _repo in "${ECR_REPO}" "${DEMAND_ECR_REPO}"; do
+    aws ecr describe-repositories --repository-names "${_repo}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+      || aws ecr create-repository --repository-name "${_repo}" --region "${AWS_REGION}" \
+           --image-scanning-configuration scanOnPush=true --image-tag-mutability MUTABLE >/dev/null
+
+    # Keep the 5 most recent images. Older ones are rebuildable from the pinned release,
+    # so retaining them indefinitely only accrues per-GB-month storage.
+    aws ecr put-lifecycle-policy --repository-name "${_repo}" --region "${AWS_REGION}" \
+      --lifecycle-policy-text '{"rules":[{"rulePriority":1,"description":"Keep the 5 most recent images; older ones are rebuildable from source.","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}' \
+      >/dev/null 2>&1 || warn "Could not set the ECR lifecycle policy on ${_repo}; images will accumulate"
+  done
 
   # ---------------------------------------------------------------------------
   # LET THE CODEBUILD ROLE PUSH TO THIS REPOSITORY.
@@ -1370,10 +1458,12 @@ if [[ "${START_AT}" -le 5 && "${SKIP_BUILD}" -ne 1 ]]; then
   ]
 }
 POLICY
-    aws ecr set-repository-policy --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
-      --policy-text "file://${WORK_DIR}/ecr-repo-policy.json" >/dev/null \
-      && log "  ECR repository policy set: ${CODEBUILD_ROLE_ARN##*/} may push to ${ECR_REPO}" \
-      || warn "Could not set the ECR repository policy; the build will fail on docker push"
+    for _repo in "${ECR_REPO}" "${DEMAND_ECR_REPO}"; do
+      aws ecr set-repository-policy --repository-name "${_repo}" --region "${AWS_REGION}" \
+        --policy-text "file://${WORK_DIR}/ecr-repo-policy.json" >/dev/null \
+        && log "  ECR repository policy set: ${CODEBUILD_ROLE_ARN##*/} may push to ${_repo}" \
+        || warn "Could not set the ECR repository policy on ${_repo}; the build will fail on docker push"
+    done
   else
     # Named plainly instead of continuing into a build whose push cannot succeed.
     warn "Could not resolve the CodeBuild service role for ${CB_PROJECT}."
@@ -1419,16 +1509,27 @@ phases:
           docker build -t "${ECR_REPO}:${IMAGE_TAG}" .
         fi
       - docker tag "${ECR_REPO}:${IMAGE_TAG}" "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+      # The artfhouse demand service, from demand-build/ (source/Dockerfile.demand and
+      # source/demand/), added to this context by deploy_prebid.sh.
+      - docker build -f demand-build/Dockerfile.demand -t "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${DEMAND_ECR_REPO}:${DEMAND_IMAGE_TAG}" demand-build
   post_build:
     commands:
       - docker push "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
       - echo "Pushed ${ECR_REPO}:${IMAGE_TAG}"
+      - docker push "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${DEMAND_ECR_REPO}:${DEMAND_IMAGE_TAG}"
+      - echo "Pushed ${DEMAND_ECR_REPO}:${DEMAND_IMAGE_TAG}"
 SPEC
 
   SOURCE_ZIP="${WORK_DIR}/prebid-build-context.zip"
   rm -f "${SOURCE_ZIP}"
   (cd "${BUILD_CONTEXT}" && zip -qr "${SOURCE_ZIP}" . -x '*/.git/*' -x '*.DS_Store')
   zip -qj "${SOURCE_ZIP}" "${BUILDSPEC}"
+  DEMAND_CTX="${WORK_DIR}/demand-build-stage"
+  rm -rf "${DEMAND_CTX}" && mkdir -p "${DEMAND_CTX}/demand-build"
+  cp "${REPO_ROOT}/source/Dockerfile.demand" "${DEMAND_CTX}/demand-build/Dockerfile.demand"
+  (cd "${REPO_ROOT}/source" && tar cf - --exclude '__pycache__' --exclude '*.pyc' demand) \
+    | (cd "${DEMAND_CTX}/demand-build" && tar xf -)
+  (cd "${DEMAND_CTX}" && zip -qr "${SOURCE_ZIP}" demand-build)
 
   SOURCE_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
   if ! aws s3api head-bucket --bucket "${SOURCE_BUCKET}" 2>/dev/null; then
@@ -1449,6 +1550,8 @@ SPEC
   ENV_OVERRIDES="[
     {\"name\":\"ECR_REPO\",\"value\":\"${ECR_REPO}\",\"type\":\"PLAINTEXT\"},
     {\"name\":\"IMAGE_TAG\",\"value\":\"${IMAGE_TAG}\",\"type\":\"PLAINTEXT\"},
+    {\"name\":\"DEMAND_ECR_REPO\",\"value\":\"${DEMAND_ECR_REPO}\",\"type\":\"PLAINTEXT\"},
+    {\"name\":\"DEMAND_IMAGE_TAG\",\"value\":\"${DEMAND_IMAGE_TAG}\",\"type\":\"PLAINTEXT\"},
     {\"name\":\"AWS_ACCOUNT_ID\",\"value\":\"${ACCOUNT_ID}\",\"type\":\"PLAINTEXT\"},
     {\"name\":\"AWS_DEFAULT_REGION\",\"value\":\"${AWS_REGION}\",\"type\":\"PLAINTEXT\"}
   ]"
@@ -1479,6 +1582,7 @@ SPEC
     esac
   done
   echo "${IMAGE_TAG}" >"${WORK_DIR}/image_tag.txt"
+  echo "${DEMAND_IMAGE_TAG}" >"${WORK_DIR}/demand_image_tag.txt"
 elif [[ "${SKIP_BUILD}" -eq 1 ]]; then
   step "Step 5/8: --skip-build; reusing the image already in ECR"
 fi
@@ -1487,16 +1591,19 @@ if [[ -z "${IMAGE_TAG}" ]]; then
   IMAGE_TAG="$(cat "${WORK_DIR}/image_tag.txt" 2>/dev/null || echo '')"
 fi
 [[ -n "${IMAGE_TAG}" ]] || fail "No image tag known. Pass --tag, or run without --skip-build."
+DEMAND_IMAGE_TAG="${DEMAND_IMAGE_TAG:-$(cat "${WORK_DIR}/demand_image_tag.txt" 2>/dev/null || echo '')}"
 
 # =============================================================================
 # STEP 6 - DEPLOY
 #
 # CloudFormation first (it creates the IRSA role and the secret the pod needs),
-# then the Kubernetes manifest, then an EXPLICIT rollout restart.
+# then the demand service, then the Prebid manifest.
 #
-# The restart is not redundant. `kubectl apply` only rolls pods when the manifest
-# text changes; a rebuilt image under an unchanged tag leaves the old pods running,
-# which is a defect this repository has hit before.
+# Both images are deployed by digest (<repo>@sha256:...), read from ECR after the
+# push. A rebuilt image under an unchanged tag left the old Prebid pod running
+# (imagePullPolicy IfNotPresent, manifest unchanged); a digest changes with the
+# content, so the pod template changes and every rebuild rolls out. Each rollout is
+# waited on, and one that does not complete fails the run with the pods' reasons.
 # =============================================================================
 if [[ "${START_AT}" -le 6 ]]; then
   step "Step 6/8: Deploy"
@@ -1511,35 +1618,13 @@ if [[ "${START_AT}" -le 6 ]]; then
   # The Cognito hosted domain prefix must be globally unique and DNS-safe.
   DOMAIN_PREFIX="$(printf '%s' "${PFX}artf-prebid-${ACCOUNT_ID}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-63)"
 
-  # Package the demand endpoint handler if its source is present. Absent, the stack
-  # deploys a placeholder that returns 501 - an honest "not deployed", never a
-  # synthetic bid response.
-  DEMAND_BUCKET=""
-  DEMAND_KEY=""
-  if [[ -d "${REPO_ROOT}/source/demand" ]]; then
-    DEMAND_ZIP="${WORK_DIR}/artfhouse-demand.zip"
-    rm -f "${DEMAND_ZIP}"
-    (cd "${REPO_ROOT}/source" && zip -qr "${DEMAND_ZIP}" demand -x '*__pycache__*' -x '*.pyc')
-    # The key must be a function of the demand SOURCE, not of IMAGE_TAG. IMAGE_TAG
-    # hashes the Prebid Java build context, so a Python-only change to source/demand
-    # left the key identical, CloudFormation saw no change to the function's Code
-    # property, and the Lambda kept running the previous package. Hashed over paths
-    # relative to source/ so the key does not move with the checkout directory.
-    DEMAND_HASH="$(cd "${REPO_ROOT}/source" \
-      && find demand -type f ! -name '*.pyc' ! -path '*__pycache__*' -print0 \
-      | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)"
-    [[ -n "${DEMAND_HASH}" ]] \
-      || fail "Could not hash source/demand. Refusing to upload under a fixed key, which would silently pin the Lambda to a stale package."
-    DEMAND_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
-    DEMAND_KEY="prebid-lambda/demand-${DEMAND_HASH}/artfhouse-demand.zip"
-    aws s3 cp "${DEMAND_ZIP}" "s3://${DEMAND_BUCKET}/${DEMAND_KEY}" --region "${AWS_REGION}" >/dev/null \
-      || fail "Could not upload the demand endpoint package"
-    log "  Demand endpoint packaged to s3://${DEMAND_BUCKET}/${DEMAND_KEY}"
-  else
-    warn "No source/demand directory - the stack will deploy the 501 placeholder handler."
-  fi
-
   CONFIG_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
+
+  # The demand service loads its campaigns from the deals table deploy.sh creates
+  # and seeds. Without it the service never becomes ready, so stop here.
+  DEALS_TABLE="${STACK_NAME}-deals"
+  aws dynamodb describe-table --table-name "${DEALS_TABLE}" --region "${AWS_REGION}" >/dev/null 2>&1 \
+    || fail "deals table ${DEALS_TABLE} not found; run deploy.sh first"
 
   deploy_cfn_stack "${PREBID_STACK}" "${CFN_TEMPLATE}" \
     "ParameterKey=StackPrefix,ParameterValue=${STACK_PREFIX}" \
@@ -1550,13 +1635,14 @@ if [[ "${START_AT}" -le 6 ]]; then
     "ParameterKey=Namespace,ParameterValue=${NAMESPACE}" \
     "ParameterKey=ServiceAccountName,ParameterValue=prebid-artf-host-sa" \
     "ParameterKey=ConfigBucket,ParameterValue=${CONFIG_BUCKET}" \
-    "ParameterKey=DemandLambdaS3Bucket,ParameterValue=${DEMAND_BUCKET}" \
-    "ParameterKey=DemandLambdaS3Key,ParameterValue=${DEMAND_KEY}"
+    "ParameterKey=DealsTableName,ParameterValue=${DEALS_TABLE}" \
+    "ParameterKey=DemandServiceAccountName,ParameterValue=artfhouse-demand-sa"
 
   PREBID_ROLE_ARN="$(stack_output "${PREBID_STACK}" PrebidHostRoleArn)"
   CREDENTIAL_SECRET="$(stack_output "${PREBID_STACK}" CredentialSecretArn)"
   TOKEN_ENDPOINT="$(stack_output "${PREBID_STACK}" TokenEndpoint)"
-  DEMAND_ENDPOINT="$(stack_output "${PREBID_STACK}" DemandEndpointUrl)"
+  DEMAND_ROLE_ARN="$(stack_output "${PREBID_STACK}" DemandServiceRoleArn)"
+  PREBID_CLIENT_ID="$(stack_output "${PREBID_STACK}" PrebidHostClientId)"
   ORCHESTRATOR_SCOPE="$(stack_output "${PREBID_STACK}" OrchestratorScope)"
   DEMAND_SCOPE="$(stack_output "${PREBID_STACK}" DemandScope)"
   # The pod requests BOTH scopes in one client_credentials grant, space-delimited as
@@ -1567,7 +1653,8 @@ if [[ "${START_AT}" -le 6 ]]; then
   # the pod would start with, say, no scope at all -- which reads as "no scope
   # required" rather than as a deployment fault.
   for pair in "PrebidHostRoleArn:${PREBID_ROLE_ARN}" "CredentialSecretArn:${CREDENTIAL_SECRET}" \
-              "TokenEndpoint:${TOKEN_ENDPOINT}" "DemandEndpointUrl:${DEMAND_ENDPOINT}" \
+              "TokenEndpoint:${TOKEN_ENDPOINT}" "DemandServiceRoleArn:${DEMAND_ROLE_ARN}" \
+              "PrebidHostClientId:${PREBID_CLIENT_ID}" \
               "OrchestratorScope:${ORCHESTRATOR_SCOPE}" "DemandScope:${DEMAND_SCOPE}"; do
     value="${pair#*:}"
     [[ -n "${value}" && "${value}" != "None" ]] \
@@ -1587,9 +1674,12 @@ if [[ "${START_AT}" -le 6 ]]; then
   # (a ClusterIP Service name), so nothing has to be read back to learn it.
   deploy_amt_simulator
 
+  # The first seat's demand, in-cluster. Before the Prebid manifest, so Prebid's first
+  # auction finds it ready.
+  deploy_artfhouse_demand
+
   PROCESSED="/tmp/${CLUSTER_NAME}-prebid-server-deployment.yaml"
   sed -e "s|__PREBID_ROLE_ARN__|${PREBID_ROLE_ARN}|g" \
-      -e "s|__IMAGE__|${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}|g" \
       -e "s|__CONFIG_BUCKET__|${CONFIG_BUCKET}|g" \
       -e "s|__AWS_REGION__|${AWS_REGION}|g" \
       -e "s|__TOKEN_ENDPOINT__|${TOKEN_ENDPOINT}|g" \
@@ -1702,6 +1792,11 @@ PY
   fi
   unset _n_plugin_env
 
+  pin_image_in_manifest "${PROCESSED}" "__IMAGE__" "${REGISTRY}" "${ECR_REPO}" "${IMAGE_TAG}" "${AWS_REGION}" \
+    || fail "ECR has no readable digest for ${ECR_REPO}:${IMAGE_TAG}; refusing to deploy Prebid by tag."
+  PREBID_IMAGE_REF="${PINNED_IMAGE_REF}"
+  log "  Prebid image: ${PREBID_IMAGE_REF}"
+
   if grep -q '__[A-Z_]*__' "${PROCESSED}"; then
     warn "Unsubstituted placeholders remain in ${PROCESSED}:"
     grep -o '__[A-Z_]*__' "${PROCESSED}" | sort -u >&2
@@ -1756,7 +1851,6 @@ PY
   # token fetch has something to read. Idempotent: put-secret-value adds a new
   # version each run, which is what rotating the app client would also do.
   # ---------------------------------------------------------------------------
-  PREBID_CLIENT_ID="$(stack_output "${PREBID_STACK}" PrebidHostClientId)"
   CREDENTIAL_SECRET_ARN="$(stack_output "${PREBID_STACK}" CredentialSecretArn)"
 
   if [[ -n "${PREBID_CLIENT_ID}" && -n "${CREDENTIAL_SECRET_ARN}" ]]; then
@@ -1823,8 +1917,7 @@ PY
   # this topology never sets (${LOG_ANALYTICS_ENABLED}), which is fatal to Spring.
   # Uploading afterwards left the pod in CrashLoopBackOff and made the rollout wait
   # below unsatisfiable. See publish_config_overlay for the failure it produced.
-  publish_config_overlay "${CONFIG_BUCKET}" \
-    "${DEMAND_ENDPOINT:-$(stack_output "${PREBID_STACK}" DemandEndpointUrl)}"
+  publish_config_overlay "${CONFIG_BUCKET}" "${DEMAND_ENDPOINT}"
 
   # Re-resolved only when preflight was skipped via --start-at; otherwise KUBECTL is
   # already pinned and this is a no-op that reprints the same line.
@@ -1833,10 +1926,12 @@ PY
   fi
   "${KUBECTL[@]}" apply -f "${PROCESSED}" || fail "kubectl apply failed for the Prebid manifest"
 
-  log "  Forcing a pod rollout (apply alone does not restart pods when only the image CONTENT changed)"
+  # The image is named by digest, so a rebuild changes the pod template and apply
+  # rolls it. A restart is still issued: the config overlay in S3 is read only at pod
+  # start, and an overlay change alone does not touch the template.
   _run "${KUBECTL[@]}" rollout restart deployment/prebid-server -n "${NAMESPACE}" || true
-  _run "${KUBECTL[@]}" rollout status deployment/prebid-server -n "${NAMESPACE}" --timeout=300s \
-    || warn "The Prebid deployment did not become ready within 300s. Check: kubectl describe pod -l app=prebid-server -n ${NAMESPACE}"
+  ROLLOUT_KUBECTL=("${KUBECTL[@]}")
+  wait_rollout prebid-server "${NAMESPACE}" 300 || ROLLOUT_FAILURES+=("${ROLLOUT_FAILURE}")
 
   # ---------------------------------------------------------------------------
   # Turn ON the orchestrator's machine-scope requirement.
@@ -1885,6 +1980,11 @@ PY
   else
     warn "No orchestrator deployment in namespace ${NAMESPACE}; the live-auction route was not pointed at Prebid."
   fi
+
+  # `kubectl set env` above rolls the orchestrator when a value changed.
+  if "${KUBECTL[@]}" get deployment orchestrator -n "${NAMESPACE}" >/dev/null 2>&1; then
+    wait_rollout orchestrator "${NAMESPACE}" 300 || ROLLOUT_FAILURES+=("${ROLLOUT_FAILURE}")
+  fi
 fi
 
 # =============================================================================
@@ -1897,7 +1997,6 @@ fi
 if [[ "${START_AT}" -le 7 ]]; then
   step "Step 7/8: Configuration overlay"
   CONFIG_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
-  DEMAND_ENDPOINT="${DEMAND_ENDPOINT:-$(stack_output "${PREBID_STACK}" DemandEndpointUrl)}"
 
   # Step 6 already published this, because the pod cannot boot without it. Kept here
   # so `--start-at=7` remains a usable entry point, and idempotent so the normal path
@@ -1920,14 +2019,14 @@ if [[ "${START_AT}" -le 8 ]]; then
   IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
     --image-ids "imageTag=${IMAGE_TAG}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
   [[ "${IMAGE_DIGEST}" == "None" ]] && IMAGE_DIGEST=""
+  DEMAND_IMAGE_DIGEST="$(resolve_ecr_digest "${DEMAND_ECR_REPO}" "${DEMAND_IMAGE_TAG}" "${AWS_REGION}" || echo '')"
 
   # These are normally resolved in step 6. Entering at step 7 or 8 skips that, and
   # recording them as null would overwrite a correct record with a WORSE one -- the
   # file then reports the deployment has no token endpoint and no required scope,
   # which reads as a misconfiguration rather than as an artifact of where the run
   # started. Backfill from the stack so the record is the same wherever we entered.
-  for _out in TOKEN_ENDPOINT:TokenEndpoint DEMAND_ENDPOINT:DemandEndpointUrl \
-              ORCHESTRATOR_SCOPE:OrchestratorScope; do
+  for _out in TOKEN_ENDPOINT:TokenEndpoint ORCHESTRATOR_SCOPE:OrchestratorScope; do
     _var="${_out%%:*}"
     if [[ -z "${!_var:-}" ]]; then
       _val="$(stack_output "${PREBID_STACK}" "${_out#*:}" 2>/dev/null || echo '')"
@@ -1956,6 +2055,9 @@ record = {
     "artf_code_note": "$(if [[ -s "${WORK_DIR}/no_artf_code.txt" ]]; then cat "${WORK_DIR}/no_artf_code.txt"; else echo "built with INCLUDE_AMT_BIDDER=true via amt-bidder/copy-bidder-files.sh"; fi)",
     "token_endpoint": "${TOKEN_ENDPOINT:-}" or None,
     "demand_endpoint": "${DEMAND_ENDPOINT:-}" or None,
+    "demand_ecr_repository": "${DEMAND_ECR_REPO}",
+    "demand_image_tag": "${DEMAND_IMAGE_TAG:-}" or None,
+    "demand_image_digest": "${DEMAND_IMAGE_DIGEST:-}" or None,
     "orchestrator_scope": "${ORCHESTRATOR_SCOPE:-}" or None,
 }
 print(json.dumps(record, indent=2, sort_keys=True))
@@ -1965,8 +2067,13 @@ PY
 fi
 
 echo
+if [[ ${#ROLLOUT_FAILURES[@]} -gt 0 ]]; then
+  for _f in "${ROLLOUT_FAILURES[@]}"; do warn "Rollout did not complete: ${_f}"; done
+  fail "Prebid ARTF host NOT deployed: ${#ROLLOUT_FAILURES[@]} rollout(s) did not complete (see above)."
+fi
 log "Prebid ARTF host deployed."
 log "  Stack:    ${PREBID_STACK}"
-log "  Image:    ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+log "  Image:    ${PREBID_IMAGE_REF:-${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}}"
+log "  Demand:   ${DEMAND_ENDPOINT}"
 log "  In-cluster: http://prebid-server.${NAMESPACE}.svc.cluster.local"
 log "  Teardown: ${0} --prefix ${STACK_PREFIX:-''} --destroy"

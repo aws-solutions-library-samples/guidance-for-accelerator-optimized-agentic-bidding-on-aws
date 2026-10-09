@@ -43,7 +43,7 @@ def _request() -> dict:
                 "banner": {"w": 300, "h": 250},
                 "bidfloor": 2.5,
                 "bidfloorcur": "USD",
-                "pmp": {"deals": [{"id": "deal-remnant-open", "bidfloor": 1.0, "at": 3}]},
+                "pmp": {"deals": [{"id": "deal-remnant-open-hearth", "bidfloor": 1.0, "at": 3}]},
             }
         ],
         "user": {"id": "user-1", "data": [{"id": "dmp", "segment": [{"id": "seg-1"}]}]},
@@ -84,12 +84,12 @@ def test_activate_deals_adds_the_deal_to_imp_pmp_deals():
     res = artf_applier.apply(_request(), [_activate(["deal-home-premium"])])
     assert res.dispositions[0].applied
     deals = res.bid_request["imp"][0]["pmp"]["deals"]
-    assert [d["id"] for d in deals] == ["deal-remnant-open", "deal-home-premium"]
+    assert [d["id"] for d in deals] == ["deal-remnant-open-hearth", "deal-home-premium"]
     assert res.dispositions[0].written == ("/bid_request/imp/0/pmp/deals/1",)
 
 
 def test_activate_deals_does_not_duplicate_a_deal_already_offered():
-    res = artf_applier.apply(_request(), [_activate(["deal-remnant-open"])])
+    res = artf_applier.apply(_request(), [_activate(["deal-remnant-open-hearth"])])
     assert res.dispositions[0].applied
     assert len(res.bid_request["imp"][0]["pmp"]["deals"]) == 1
 
@@ -101,6 +101,56 @@ def test_activate_deals_creates_pmp_on_an_impression_without_one():
     assert res.bid_request["imp"][0]["pmp"]["deals"] == [{"id": "deal-x"}]
 
 
+# ---------------------------------------------------------------------------
+# ACTIVATE_DEALS with a deal book: the inserted deal carries its auction type
+# (not part of the shared Java/JS vectors, which run without a lookup)
+# ---------------------------------------------------------------------------
+
+def test_with_a_deal_lookup_the_activated_deal_carries_its_auction_type():
+    res = artf_applier.apply(
+        _request(), [_activate(["deal-home-premium", "deal-premium-auto"])],
+        deal_lookup={"deal-home-premium": 2, "deal-premium-auto": 1}.get,
+    )
+    assert res.dispositions[0].applied
+    deals = res.bid_request["imp"][0]["pmp"]["deals"]
+    assert deals[1:] == [{"id": "deal-home-premium", "at": 2}, {"id": "deal-premium-auto", "at": 1}]
+    # An offered deal is never rewritten by the lookup.
+    assert deals[0] == {"id": "deal-remnant-open-hearth", "bidfloor": 1.0, "at": 3}
+
+
+def test_a_deal_the_book_does_not_hold_is_inserted_id_only():
+    res = artf_applier.apply(_request(), [_activate(["deal-x"])], deal_lookup=lambda _id: None)
+    assert res.dispositions[0].applied
+    assert res.bid_request["imp"][0]["pmp"]["deals"][1] == {"id": "deal-x"}
+
+
+def test_an_unreadable_deal_book_inserts_id_only_logs_once_and_never_rejects(caplog):
+    def unreadable(_deal_id):
+        raise RuntimeError("deal book not loaded")
+
+    artf_applier._last_lookup_fault = None
+    with caplog.at_level("WARNING", logger="shared.artf_applier"):
+        res = artf_applier.apply(_request(), [_activate(["deal-a", "deal-b"])], deal_lookup=unreadable)
+        artf_applier.apply(_request(), [_activate(["deal-c"])], deal_lookup=unreadable)
+    assert res.dispositions[0].applied
+    assert res.bid_request["imp"][0]["pmp"]["deals"][1:] == [{"id": "deal-a"}, {"id": "deal-b"}]
+    warnings = [r for r in caplog.records if "deal lookup failed" in r.getMessage()]
+    assert len(warnings) == 1
+    artf_applier._last_lookup_fault = None
+
+
+def test_the_activated_deal_carries_at_into_the_floor_and_margin_that_follow():
+    res = artf_applier.apply(
+        _request(),
+        [_activate(["deal-premium-auto"]), _floor("deal-premium-auto", 6.0)],
+        deal_lookup={"deal-premium-auto": 1}.get,
+    )
+    assert all(d.applied for d in res.dispositions)
+    assert res.bid_request["imp"][0]["pmp"]["deals"][1] == {
+        "id": "deal-premium-auto", "at": 1, "bidfloor": 6.0, "bidfloorcur": "USD",
+    }
+
+
 def test_activate_then_floor_on_the_activated_deal_lands_on_that_deal():
     """The Deal Scorer's pair: ACTIVATE_DEALS followed by ADJUST_DEAL_FLOOR for the
     library deal. The floor resolves only because the activation preceded it."""
@@ -108,7 +158,7 @@ def test_activate_then_floor_on_the_activated_deal_lands_on_that_deal():
     assert all(d.applied for d in res.dispositions)
     deal = res.bid_request["imp"][0]["pmp"]["deals"][1]
     assert deal == {"id": "deal-home-premium", "bidfloor": 3.0, "bidfloorcur": "USD"}
-    assert res.bid_request["imp"][0]["bidfloor"] == 3.0
+    assert res.bid_request["imp"][0]["bidfloor"] == 2.5, "the deal floor binds the deal only"
 
 
 def test_floor_before_activation_is_rejected_with_a_reason():
@@ -126,28 +176,44 @@ def test_a_deal_floor_mutation_writes_both_the_floor_and_the_currency():
     req = _request()
     del req["imp"][0]["bidfloorcur"]
     del req["imp"][0]["pmp"]["deals"][0]["at"]
-    res = artf_applier.apply(req, [_floor("deal-remnant-open", 4.0)])
+    res = artf_applier.apply(req, [_floor("deal-remnant-open-hearth", 4.0)])
     deal = res.bid_request["imp"][0]["pmp"]["deals"][0]
     assert deal["bidfloor"] == 4.0 and deal["bidfloorcur"] == "USD"
+    assert "bidfloorcur" not in res.bid_request["imp"][0], "the impression is not written"
+    assert res.dispositions[0].written == ("/bid_request/imp/0/pmp/deals/0/bidfloor",)
+
+
+def test_a_deal_floor_above_the_impression_floor_leaves_the_impression_floor_alone():
+    res = artf_applier.apply(_request(), [_floor("deal-remnant-open-hearth", 4.0)])
+    assert res.dispositions[0].applied
+    assert res.bid_request["imp"][0]["pmp"]["deals"][0]["bidfloor"] == 4.0
+    assert res.bid_request["imp"][0]["bidfloor"] == 2.5, "non-deal bids keep the publisher's floor"
     assert res.bid_request["imp"][0]["bidfloorcur"] == "USD"
 
 
-def test_an_impression_floor_is_never_lowered_by_a_mutation():
-    res = artf_applier.apply(_request(), [_floor("deal-remnant-open", 1.5)])
+def test_a_deal_floor_below_the_impression_floor_leaves_the_impression_floor_alone():
+    res = artf_applier.apply(_request(), [_floor("deal-remnant-open-hearth", 1.5)])
     assert res.dispositions[0].applied
     assert res.bid_request["imp"][0]["pmp"]["deals"][0]["bidfloor"] == 1.5
-    assert res.bid_request["imp"][0]["bidfloor"] == 2.5, "2.5 already set, not lowered"
+    assert res.bid_request["imp"][0]["bidfloor"] == 2.5
+
+
+def test_a_margin_leaves_the_impression_floor_alone():
+    res = artf_applier.apply(_request(), [_margin("deal-remnant-open-hearth", 3.0, MarginCalculationType.CPM)])
+    assert res.bid_request["imp"][0]["pmp"]["deals"][0]["bidfloor"] == pytest.approx(4.0)
+    assert res.bid_request["imp"][0]["bidfloor"] == 2.5
+    assert res.dispositions[0].written == ("/bid_request/imp/0/pmp/deals/0/bidfloor",)
 
 
 def test_a_non_positive_floor_is_rejected_rather_than_written_and_ignored():
-    res = artf_applier.apply(_request(), [_floor("deal-remnant-open", 0.0)])
+    res = artf_applier.apply(_request(), [_floor("deal-remnant-open-hearth", 0.0)])
     assert not res.dispositions[0].applied
     assert "not greater than zero" in res.dispositions[0].reason
     assert res.bid_request == _request()
 
 
 def test_suppression_marks_the_deal_rather_than_removing_it():
-    res = artf_applier.apply(_request(), [_suppress(["deal-remnant-open"])])
+    res = artf_applier.apply(_request(), [_suppress(["deal-remnant-open-hearth"])])
     deals = res.bid_request["imp"][0]["pmp"]["deals"]
     assert len(deals) == 1
     assert deals[0]["ext"]["artf"]["suppressed"] is True
@@ -213,12 +279,12 @@ def _margin(deal, value, calc, imp="imp-1") -> Mutation:
 
 
 def test_a_percent_margin_scales_the_deal_floor_by_the_fraction():
-    res = artf_applier.apply(_request(), [_margin("deal-remnant-open", 0.5, MarginCalculationType.PERCENT)])
+    res = artf_applier.apply(_request(), [_margin("deal-remnant-open-hearth", 0.5, MarginCalculationType.PERCENT)])
     assert res.bid_request["imp"][0]["pmp"]["deals"][0]["bidfloor"] == pytest.approx(1.5)
 
 
 def test_a_cpm_margin_adds_to_the_deal_floor():
-    res = artf_applier.apply(_request(), [_margin("deal-remnant-open", 0.75, MarginCalculationType.CPM)])
+    res = artf_applier.apply(_request(), [_margin("deal-remnant-open-hearth", 0.75, MarginCalculationType.CPM)])
     assert res.bid_request["imp"][0]["pmp"]["deals"][0]["bidfloor"] == pytest.approx(1.75)
 
 
@@ -257,7 +323,7 @@ def test_bid_shade_on_an_unknown_bid_is_rejected():
 # Properties
 # ---------------------------------------------------------------------------
 
-_deal_ids = st.sampled_from(["deal-remnant-open", "deal-home-premium", "deal-retail-run", "deal-x"])
+_deal_ids = st.sampled_from(["deal-remnant-open-hearth", "deal-home-premium", "deal-retail-run", "deal-x"])
 _imp_ids = st.sampled_from(["imp-1", "imp-9"])
 
 _mutation = st.one_of(
@@ -301,6 +367,16 @@ def test_a_single_mutation_either_applies_fully_or_leaves_the_request_untouched(
             node = {"bid_request": res.bid_request, "bid_response": res.bid_response}
             for part in ptr.split("/")[1:]:
                 node = node[int(part)] if isinstance(node, list) else node[part]
+
+
+@settings(max_examples=150, deadline=None)
+@given(st.lists(_mutation, max_size=8))
+def test_no_mutation_sequence_changes_the_impression_floor(mutations):
+    before = _request()["imp"][0]
+    res = artf_applier.apply(_request(), mutations, _response())
+    imp = res.bid_request["imp"][0]
+    assert imp["bidfloor"] == before["bidfloor"]
+    assert imp["bidfloorcur"] == before["bidfloorcur"]
 
 
 # ---------------------------------------------------------------------------

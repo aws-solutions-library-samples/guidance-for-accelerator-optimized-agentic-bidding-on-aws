@@ -24,7 +24,7 @@ const payload = {
       {
         id: "imp-1",
         bidfloor: 2.0,
-        pmp: { deals: [{ id: "deal-remnant-open", bidfloor: 1.0, at: 3 }] },
+        pmp: { deals: [{ id: "deal-remnant-open-hearth", bidfloor: 1.0, at: 3 }] },
       },
     ],
     site: { domain: "hearth-and-home.example" },
@@ -117,7 +117,7 @@ describe("RawPanel request section -- merged document", () => {
     const joined = Array.from(highlighted).map((el) => el.textContent).join("");
     expect(joined).toContain("deal-home-premium");
     // The untouched remnant deal is not highlighted.
-    expect(joined).not.toContain("deal-remnant-open");
+    expect(joined).not.toContain("deal-remnant-open-hearth");
   });
 });
 

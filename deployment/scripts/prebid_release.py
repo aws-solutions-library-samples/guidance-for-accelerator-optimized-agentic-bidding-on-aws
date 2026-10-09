@@ -203,12 +203,6 @@ def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostD
                 basis="per build-minute, not a standing cost",
                 source="charged per build; zero when idle",
             ),
-            CostComponent(
-                name="API Gateway + Lambda (demand endpoint)",
-                monthly_usd=0.0,
-                basis="per request; no standing charge",
-                source="charged per request; zero when idle",
-            ),
         )
     )
 

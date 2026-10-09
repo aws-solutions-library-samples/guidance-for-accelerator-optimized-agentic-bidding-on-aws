@@ -7,6 +7,7 @@ with a stored response presented as live.
 """
 
 import asyncio
+import copy
 import json
 
 import pytest
@@ -142,6 +143,28 @@ class FakeClient:
 
 def _patch_client(monkeypatch, client):
     monkeypatch.setattr(auction_api.httpx, "AsyncClient", lambda **kw: client)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_hop_client(monkeypatch):
+    # The hop client is cached per process; each test patches its own fake in.
+    monkeypatch.setattr(auction_api, "_hop_client", None)
+
+
+def test_the_prebid_client_is_created_once_and_reused(monkeypatch):
+    created = []
+
+    def factory(**kw):
+        created.append(kw)
+        return FakeClient(response=FakeResponse(200, AUCTION))
+
+    monkeypatch.setattr(auction_api.httpx, "AsyncClient", factory)
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    for _ in range(3):
+        response = run(auction_api.run_auction_handler(FakeRequest(VALID_REQUEST)))
+        assert response.status_code == 200
+    assert len(created) == 1
+    assert created[0]["verify"] is False
 
 
 AUCTION = {
@@ -380,7 +403,8 @@ def test_both_seats_are_enabled_on_a_bare_impression():
         {"bidder": "artfhouse", "maxbids": 3},
         {"bidder": "amt", "maxbids": 3},
     ]
-    assert len(prepared) == 5
+    assert out["ext"]["prebid"]["floors"]["enforcement"] == {"floorDeals": True}
+    assert len(prepared) == 6
 
 
 def test_preparation_adds_nothing_that_constitutes_a_bid():
@@ -549,6 +573,101 @@ def test_the_callers_dict_is_not_mutated_by_preparation():
 
 
 # --------------------------------------------------------------------------- #
+# Deal-floor enforcement. PBS-Java 3.43.0 enforces a floor on a bid with a dealid
+# only when the request sets ext.prebid.floors.enforcement.floorDeals and the
+# account sets enforce-deal-floors. A floors object without `data` is dropped by
+# the rules validator (and `enforcement` with it), so a one-rule data block that
+# matches no impression and has no default is sent alongside: no impression floor
+# changes. The floor PBS then compares a deal bid with is the PriceFloorInfo the
+# artfhouse adapter attaches, max(imp.bidfloor, deal bidfloor).
+# --------------------------------------------------------------------------- #
+
+DEAL_FLOOR_ENFORCEMENT = {
+    "enforcement": {"floorDeals": True},
+    "data": {
+        "currency": "USD",
+        "modelGroups": [
+            {"schema": {"fields": ["mediaType"]}, "values": {"artf-no-floor-rule": 0}},
+        ],
+    },
+}
+
+_REQUEST_WITH_DEALS = {
+    "id": "r",
+    "imp": [
+        {
+            "id": "imp-1",
+            "bidfloor": 2.5,
+            "bidfloorcur": "USD",
+            "banner": {"w": 300, "h": 250},
+            "pmp": {"deals": [{"id": "deal-premium-auto", "bidfloor": 6.0, "bidfloorcur": "USD"}]},
+        },
+        {"id": "imp-2", "bidfloor": 1.9, "video": {"w": 640, "h": 360}},
+    ],
+}
+
+
+def test_deal_floor_enforcement_is_added_when_the_request_has_no_floors():
+    out, prepared = auction_api._prepare_for_auction(copy.deepcopy(_REQUEST_WITH_DEALS))
+    assert out["ext"]["prebid"]["floors"] == DEAL_FLOOR_ENFORCEMENT
+    assert (
+        "ext.prebid.floors (turn on PBS deal-floor enforcement; one rule that matches "
+        "no impression, so impression floors are unchanged)"
+    ) in prepared
+
+
+def test_deal_floor_enforcement_changes_no_impression_floor_and_no_deal_floor():
+    out, _ = auction_api._prepare_for_auction(copy.deepcopy(_REQUEST_WITH_DEALS))
+    for before, after in zip(_REQUEST_WITH_DEALS["imp"], out["imp"]):
+        assert after.get("bidfloor") == before.get("bidfloor")
+        assert after.get("bidfloorcur") == before.get("bidfloorcur")
+        assert after.get("pmp") == before.get("pmp")
+
+
+def test_the_floors_rule_key_matches_no_media_type_and_there_is_no_default():
+    # The resolver matches values keys against the imp's media type or "*". A key
+    # that is neither, with no `default`, resolves no floor for any impression.
+    group = auction_api._DEAL_FLOOR_ENFORCEMENT["data"]["modelGroups"][0]
+    assert group["schema"]["fields"] == ["mediaType"]
+    media_types = {"banner", "video", "video-instream", "video-outstream", "native", "audio", "*"}
+    assert not set(k.lower() for k in group["values"]) & media_types
+    assert "default" not in group
+
+
+def test_a_requests_own_floors_are_left_untouched_and_the_omission_is_listed():
+    body = copy.deepcopy(_REQUEST_WITH_DEALS)
+    own = {"enforcement": {"enforcePBS": False}, "floorMin": 1.0}
+    body["ext"] = {"prebid": {"floors": copy.deepcopy(own)}}
+    out, prepared = auction_api._prepare_for_auction(body)
+    assert out["ext"]["prebid"]["floors"] == own
+    assert not any(note.startswith("ext.prebid.floors (turn on") for note in prepared)
+    assert any(note.startswith("ext.prebid.floors left as sent") for note in prepared)
+
+
+def test_the_enforcement_object_is_a_copy_so_one_request_cannot_change_the_next():
+    out, _ = auction_api._prepare_for_auction(copy.deepcopy(_REQUEST_WITH_DEALS))
+    out["ext"]["prebid"]["floors"]["enforcement"]["floorDeals"] = False
+    again, _ = auction_api._prepare_for_auction(copy.deepcopy(_REQUEST_WITH_DEALS))
+    assert again["ext"]["prebid"]["floors"] == DEAL_FLOOR_ENFORCEMENT
+
+
+@pytest.mark.parametrize("query", [{"artf": "on"}, {"artf": "off"}])
+def test_both_passes_send_deal_floor_enforcement_and_list_it(monkeypatch, query):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, dict(AUCTION)))
+    _patch_client(monkeypatch, client)
+
+    payload = body_of(
+        run(auction_api.run_auction_handler(FakeRequest(copy.deepcopy(_REQUEST_WITH_DEALS), query=query)))
+    )
+
+    sent = client.posted["json"]
+    assert sent["ext"]["prebid"]["floors"] == DEAL_FLOOR_ENFORCEMENT
+    assert [imp.get("bidfloor") for imp in sent["imp"]] == [2.5, 1.9]
+    assert any(note.startswith("ext.prebid.floors (turn on") for note in payload["artf_meta"]["prepared"])
+
+
+# --------------------------------------------------------------------------- #
 # Seat non-bid annotation: the price a seat returned, against the floor it faced.
 #
 # Prebid reports a seat whose bid was unusable as NonBidReason 0 (NO_BID) and says
@@ -689,9 +808,9 @@ def test_unparseable_debug_body_annotates_nothing_and_does_not_raise():
     assert auction_api._annotate_seat_nonbids(auction, REQUEST_TWO_IMPS) == 0
 
 
-def test_floors_come_from_the_prepared_request_so_a_raised_floor_is_the_one_reported():
-    # A container raising the floor to 9.00 before the auction means 9.00 is what the
-    # demand faced, and 9.00 is what a reader must be shown.
+def test_floors_come_from_the_request_prebid_was_given():
+    # The impression floor on the submitted request is what a non-deal bid faced, and
+    # is what a reader must be shown.
     auction = _auction_with_debug([{"impid": "imp-1", "price": 3.25}])
     auction_api._annotate_seat_nonbids(auction, {"id": "r", "imp": [{"id": "imp-1", "bidfloor": 9.0}]})
     observed = auction["ext"]["seatnonbid"][0]["nonbid"][0]["ext"]["artf"]["observed"]
@@ -880,3 +999,212 @@ def test_an_unknown_intent_is_a_400_not_a_silent_drop(monkeypatch, bad):
     assert resp.status_code == 400
     assert body_of(resp)["error"] == "invalid_intents"
     assert client.posted is None
+
+
+# --------------------------------------------------------------------------- #
+# The with-ARTF pass carries the hook's own report: artf_meta.extension_point.
+# The Theater builds its with-ARTF beats from it, so it must describe exactly the
+# mutations the auction ran, with a disposition on each, and the baseline pass
+# must not change at all.
+# --------------------------------------------------------------------------- #
+
+_FLOOR = {"intent": 4, "op": 2, "path": "imp.imp-1.pmp.deals.deal-a",
+          "ids": None, "adjust_deal": {"bidfloor": 7.25, "margin": None},
+          "adjust_bid": None, "add_metrics": None}
+_FLOOR_LOSER = dict(_FLOOR, adjust_deal={"bidfloor": 6.0, "margin": None})
+_ACTIVATE = {"intent": 2, "op": 1, "path": "imp.imp-1.pmp.deals",
+             "ids": {"id": ["deal-a"]}, "adjust_deal": None,
+             "adjust_bid": None, "add_metrics": None}
+_SEGMENTS = {"intent": 1, "op": 1, "path": "user.data.segment",
+             "ids": {"id": ["seg-1"]}, "adjust_deal": None,
+             "adjust_bid": None, "add_metrics": None}
+
+HOOK_RESPONSE = {
+    "id": "tid-1",
+    # Survivors, in registry order: segments, activation, the winning floor.
+    "mutations": [_SEGMENTS, _ACTIVATE, _FLOOR],
+    "metadata": {
+        "api_version": "1.0",
+        "model_version": "orchestrator-v1 (3 mutations, 9.0ms)",
+        "containers": [
+            {"name": "widedeep-segment-activator", "status": "ok", "latency_ms": 2.0,
+             "model_version": "wd:3", "mutations": [_SEGMENTS], "superseded": 0},
+            {"name": "yield-optimizer-floor", "status": "ok", "latency_ms": 3.0,
+             "model_version": "yf:1", "mutations": [_FLOOR_LOSER], "superseded": 1},
+            {"name": "ncf-deal-manager", "status": "ok", "latency_ms": 4.0,
+             "model_version": "ncf:7", "mutations": [_ACTIVATE, _FLOOR], "superseded": 0},
+        ],
+        "stages": [{"stage": 1, "name": "enrichment"}, {"stage": 2, "name": "deals"}],
+        "conflicts": [{"path": _FLOOR["path"], "intent": 4,
+                       "winner": "ncf-deal-manager", "losers": ["yield-optimizer-floor"]}],
+    },
+}
+
+
+def _hook_trace(call_values, mutation_values=None, module="artf-orchestrator"):
+    activities = [{"name": "artf-extension-point", "status": "success",
+                   "results": [{"status": "success", "values": call_values}]}]
+    if mutation_values is not None:
+        activities.append({"name": "artf-mutations", "status": "success",
+                           "results": [{"status": "success", "values": mutation_values}]})
+    return {
+        "stages": [{
+            "stage": "processed-auction-request",
+            "outcomes": [{"entity": "auction-request", "groups": [{"invocationresults": [{
+                "hookid": {"module-code": module, "hook-impl-code": "x"},
+                "status": "success",
+                "analyticstags": {"activities": activities},
+            }]}]}],
+        }]
+    }
+
+
+def _traced_auction(trace):
+    auction = json.loads(json.dumps(AUCTION))
+    auction["ext"] = {
+        "debug": {"httpcalls": {"artfhouse": [{"responsebody": json.dumps(
+            {"ext": {"artf": {"excluded": []}}})}]}},
+        "prebid": {"modules": {"trace": trace}},
+    }
+    return auction
+
+
+CALL_VALUES = {"correlation_id": "tid-1", "outcome": "mutations_returned",
+               "consecutive_failures": 0, "request_mutated": True, "latency_ms": 11,
+               "mutations_returned": 3, "response": HOOK_RESPONSE}
+MUTATION_VALUES = {"correlation_id": "tid-1", "applied": 2, "rejected": 1,
+                   "rejections": [{"intent": "ADJUST_DEAL_FLOOR", "path": _FLOOR["path"],
+                                   "reason": "floor 7.25 exceeds cap 7.00"}],
+                   "dispositions": [
+                       {"index": 0, "intent": "ACTIVATE_SEGMENTS", "path": _SEGMENTS["path"], "applied": True},
+                       {"index": 1, "intent": "ACTIVATE_DEALS", "path": _ACTIVATE["path"], "applied": True},
+                       {"index": 2, "intent": "ADJUST_DEAL_FLOOR", "path": _FLOOR["path"], "applied": False,
+                        "reason": "floor 7.25 exceeds cap 7.00"},
+                   ]}
+
+
+def _run_on(monkeypatch, auction, body=None, query=None):
+    monkeypatch.setenv(auction_api.PREBID_AUCTION_URL_ENV, "https://prebid/openrtb2/auction")
+    client = FakeClient(FakeResponse(200, auction))
+    _patch_client(monkeypatch, client)
+    payload = body_of(run(auction_api.run_auction_handler(
+        FakeRequest(body or VALID_REQUEST, query=query))))
+    return client.posted["json"], payload
+
+
+def test_artf_on_requests_verbose_trace_merged_into_ext_prebid(monkeypatch):
+    request = {"id": "req-1", "imp": [{"id": "imp-1"}],
+               "ext": {"prebid": {"channel": {"name": "web"}}}}
+    sent, payload = _run_on(monkeypatch, dict(AUCTION), body=request)
+    assert sent["ext"]["prebid"]["trace"] == "verbose"
+    assert sent["ext"]["prebid"]["debug"] == 1
+    assert sent["ext"]["prebid"]["channel"] == {"name": "web"}
+    assert any("trace=verbose" in note for note in payload["artf_meta"]["prepared"])
+
+
+def test_artf_off_adds_no_trace_and_no_extension_point(monkeypatch):
+    sent, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(CALL_VALUES)),
+                            query={"artf": "off"})
+    assert "trace" not in sent["ext"]["prebid"]
+    assert "extension_point" not in payload["artf_meta"]
+    # The baseline response is Prebid's, untouched: a trace Prebid sent stays.
+    assert "modules" in payload["ext"]["prebid"]
+
+
+def test_artf_off_response_is_unchanged_by_the_extension_point(monkeypatch):
+    # Same auction through the handler with and without the lift code path
+    # reachable: the artf=off body is identical to what the handler produced
+    # before the extension point existed (no new key anywhere).
+    auction = _traced_auction(_hook_trace(CALL_VALUES, MUTATION_VALUES))
+    _, payload = _run_on(monkeypatch, json.loads(json.dumps(auction)), query={"artf": "off"})
+    assert payload["ext"]["prebid"] == auction["ext"]["prebid"]
+    assert set(payload["artf_meta"]) == {
+        "source", "endpoint", "hop_ms", "artf_mutations", "seats",
+        "excluded_source", "seat_nonbids_annotated", "prepared",
+    }
+    assert not any("trace" in note for note in payload["artf_meta"]["prepared"])
+
+
+def test_the_hook_report_is_lifted_with_a_disposition_on_every_mutation(monkeypatch):
+    _, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(CALL_VALUES, MUTATION_VALUES)))
+    ep = payload["artf_meta"]["extension_point"]
+    assert ep["available"] is True
+    assert ep["outcome"] == "mutations_returned"
+    assert ep["correlation_id"] == "tid-1"
+    assert (ep["applied"], ep["rejected"]) == (2, 1)
+    survivors = ep["response"]["mutations"]
+    assert [m["disposition"] for m in survivors] == ["applied", "applied", "rejected"]
+    assert survivors[2]["disposition_reason"] == "floor 7.25 exceeds cap 7.00"
+    by_name = {c["name"]: c for c in ep["response"]["metadata"]["containers"]}
+    assert by_name["widedeep-segment-activator"]["mutations"][0]["disposition"] == "applied"
+    assert by_name["widedeep-segment-activator"]["model_version"] == "wd:3"
+    loser = by_name["yield-optimizer-floor"]["mutations"][0]
+    assert loser["disposition"] == "superseded"
+    assert loser["disposition_reason"] == "superseded by ncf-deal-manager"
+    ncf = by_name["ncf-deal-manager"]["mutations"]
+    assert [m["disposition"] for m in ncf] == ["applied", "rejected"]
+    assert ep["response"]["metadata"]["stages"][1]["name"] == "deals"
+
+
+def test_the_trace_is_stripped_but_debug_and_exclusions_are_kept(monkeypatch):
+    _, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(CALL_VALUES, MUTATION_VALUES)))
+    assert "modules" not in payload["ext"]["prebid"]
+    assert "httpcalls" in payload["ext"]["debug"]
+    assert payload["ext"]["artf"]["excluded"] == []
+
+
+def test_a_trace_the_caller_asked_for_is_not_stripped(monkeypatch):
+    request = {"id": "req-1", "imp": [{"id": "imp-1"}], "ext": {"prebid": {"trace": "basic"}}}
+    sent, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(CALL_VALUES)), body=request)
+    assert sent["ext"]["prebid"]["trace"] == "basic"
+    assert "trace" in payload["ext"]["prebid"]["modules"]
+    assert not any("trace=verbose" in note for note in payload["artf_meta"]["prepared"])
+
+
+def test_no_trace_is_reported_as_unavailable(monkeypatch):
+    _, payload = _run_on(monkeypatch, dict(AUCTION))
+    ep = payload["artf_meta"]["extension_point"]
+    assert ep["available"] is False
+    assert "no module trace" in ep["reason"]
+
+
+def test_another_modules_tags_are_not_the_hooks_report(monkeypatch):
+    _, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(CALL_VALUES, module="other")))
+    ep = payload["artf_meta"]["extension_point"]
+    assert ep["available"] is False
+    assert "no ARTF hook activity" in ep["reason"]
+
+
+def test_an_older_hook_without_the_response_says_redeploy(monkeypatch):
+    values = {k: v for k, v in CALL_VALUES.items() if k != "response"}
+    _, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(values)))
+    ep = payload["artf_meta"]["extension_point"]
+    assert ep["available"] is False
+    assert "redeploy Prebid" in ep["reason"]
+    assert ep["outcome"] == "mutations_returned"
+
+
+def test_a_timeout_is_available_with_no_response(monkeypatch):
+    values = {"correlation_id": "tid-1", "outcome": "timeout", "consecutive_failures": 1,
+              "request_mutated": False, "latency_ms": 90, "budget_ms": 80}
+    _, payload = _run_on(monkeypatch, _traced_auction(_hook_trace(values)))
+    ep = payload["artf_meta"]["extension_point"]
+    assert ep["available"] is True
+    assert ep["outcome"] == "timeout"
+    assert ep["response"] is None
+    assert ep["request_mutated"] is False
+
+
+def test_dispositions_of_the_wrong_length_are_unknown_not_guessed():
+    values = dict(MUTATION_VALUES, dispositions=MUTATION_VALUES["dispositions"][:1])
+    ep = auction_api._lift_extension_point(_traced_auction(_hook_trace(CALL_VALUES, values)))
+    assert {m["disposition"] for m in ep["response"]["mutations"]} == {"unknown"}
+
+
+def test_the_lift_is_pure():
+    auction = _traced_auction(_hook_trace(CALL_VALUES, MUTATION_VALUES))
+    snapshot = json.loads(json.dumps(auction))
+    first = auction_api._lift_extension_point(auction)
+    second = auction_api._lift_extension_point(auction)
+    assert first == second
+    assert auction == snapshot

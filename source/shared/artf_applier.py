@@ -11,10 +11,10 @@ noticing.
 Targets, by path:
 
     /user/data/segment            ACTIVATE_SEGMENTS   append a Data{name: artf} block
-    /imp/{imp}                    ACTIVATE_DEALS      add Deal{id} to imp.pmp.deals
+    /imp/{imp}                    ACTIVATE_DEALS      add Deal{id} (+at with deal_lookup) to imp.pmp.deals
                                   SUPPRESS_DEALS      mark deal.ext.artf.suppressed
-    /imp/{imp}/deals/{deal}       ADJUST_DEAL_FLOOR   deal.bidfloor (+cur), imp.bidfloor
-                                  ADJUST_DEAL_MARGIN  = max(existing, new)
+    /imp/{imp}/deals/{deal}       ADJUST_DEAL_FLOOR   deal.bidfloor (+cur); imp.bidfloor untouched
+                                  ADJUST_DEAL_MARGIN  deal.bidfloor (+cur); imp.bidfloor untouched
     /imp/{imp}/metric             ADD_METRICS/ADD_CIDS append to imp.metric, value in [0,1]
     /seatbid/{seat}/bid/{bid}     BID_SHADE           bid.price on the bid response
 
@@ -26,24 +26,47 @@ Suppression marks rather than removes, because the demand endpoint and the
 Theater both read ``deal.ext.artf.suppressed`` to show that a deal was considered
 and suppressed; a removed deal is indistinguishable from one never offered.
 
-A floor written without a currency is ignored by Prebid's enforcer, so the
-currency is always written with the floor: the deal's own, then the impression's,
-then ``cur[0]``, then USD.
+A deal floor mutation writes the deal's floor and leaves ``imp.bidfloor`` alone:
+non-deal bids stay held to the publisher's impression floor. The deal floor
+binds deal bids: the artfhouse demand endpoint refuses to bid below
+max(impression floor, deal floor), the Bid Pricer clamps a shaded deal bid at
+that value, and on auctions the orchestrator prepares Prebid rejects a deal bid
+below the floor the artfhouse adapter attaches. The currency is always written
+with the floor: the deal's own, then the impression's, then ``cur[0]``, then USD.
 
 A PERCENT margin's ``value`` is a FRACTION (0.12 is twelve percent). That is what
 yield_optimizer_margin emits (shared/yield_exploration.py bounds it to [-0.5, 0.5])
 and what deal_yield_feedback and the frontend read.
 
-Pure. No I/O, no clock, no configuration.
+An ACTIVATE_DEALS insert carries only the deal id, because the ARTF IDsPayload
+carries ids only. A caller holding the publisher's deal book passes
+``deal_lookup`` (deal id -> OpenRTB ``at``), and the inserted deal then carries
+its auction type, which the yield stage reads to pick a CPM or PERCENT margin.
+The orchestrator passes it; the Java hook does not, and its final request keeps
+id-only inserts. A lookup that raises (no deal book installed) leaves the insert
+id-only and logs a warning; it never rejects the mutation.
+
+No clock and no configuration. The only I/O is that warning, logged once per
+distinct lookup fault rather than once per insert.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from shared.artf_types import Intent, MarginCalculationType, Mutation
+
+logger = logging.getLogger(__name__)
+
+#: Deal id -> OpenRTB auction type (``at``), or None when the book has no such deal.
+DealLookup = Callable[[str], Optional[int]]
+
+# The last lookup fault reported, so an unreachable deal book logs once rather
+# than once per activated deal.
+_last_lookup_fault: Optional[str] = None
 
 DEFAULT_CURRENCY = "USD"
 EXT_ARTF = "artf"
@@ -176,7 +199,33 @@ def _apply_user_segments(req: dict, m: Mutation, intent: Intent) -> list[str]:
     return [f"/bid_request/user/data/{len(data) - 1}"]
 
 
-def _apply_imp_deals(req: dict, m: Mutation, intent: Intent, imp_id: str) -> list[str]:
+def _activated_deal(deal_id: str, deal_lookup: Optional[DealLookup]) -> dict:
+    """The Deal object an activation inserts: ``{id}``, plus ``at`` when the book knows it."""
+    global _last_lookup_fault
+    deal: dict[str, Any] = {"id": deal_id}
+    if deal_lookup is None:
+        return deal
+    try:
+        at = deal_lookup(deal_id)
+    except Exception as exc:  # noqa: BLE001 - an unreachable book must not fail the auction
+        fault = f"{type(exc).__name__}: {exc}"
+        if fault != _last_lookup_fault:
+            logger.warning(
+                "deal lookup failed (%s); activated deals are inserted with id only "
+                "until the deal book is readable", fault,
+            )
+            _last_lookup_fault = fault
+        return deal
+    _last_lookup_fault = None
+    if isinstance(at, int) and not isinstance(at, bool) and at > 0:
+        deal["at"] = at
+    return deal
+
+
+def _apply_imp_deals(
+    req: dict, m: Mutation, intent: Intent, imp_id: str,
+    deal_lookup: Optional[DealLookup] = None,
+) -> list[str]:
     idx = _imp_index(req, imp_id)
     if idx < 0:
         raise _Reject(f"no impression with id '{imp_id}'")
@@ -198,7 +247,7 @@ def _apply_imp_deals(req: dict, m: Mutation, intent: Intent, imp_id: str) -> lis
         present = {d.get("id") for d in deals if isinstance(d, dict)}
         for i in ids:
             if i not in present:
-                deals.append({"id": i})
+                deals.append(_activated_deal(i, deal_lookup))
                 present.add(i)
                 written.append(f"/bid_request/imp/{idx}/pmp/deals/{len(deals) - 1}")
         return written
@@ -220,6 +269,8 @@ def _apply_imp_deals(req: dict, m: Mutation, intent: Intent, imp_id: str) -> lis
 
 
 def _resolve_floor(m: Mutation, deal: dict, intent: Intent) -> Optional[float]:
+    """The deal's new floor. A margin is applied to the deal's current floor, never
+    to the impression floor, and the result is written to the deal only."""
     payload = m.adjust_deal
     if payload is None:
         return None
@@ -262,13 +313,7 @@ def _apply_deal_floor(req: dict, m: Mutation, intent: Intent, imp_id: str, deal_
     currency = _currency(req, deal, imp)
     deal["bidfloor"] = new_floor
     deal["bidfloorcur"] = currency
-    existing = _num(imp.get("bidfloor"))
-    imp["bidfloor"] = new_floor if existing is None else max(existing, new_floor)
-    imp["bidfloorcur"] = currency
-    return [
-        f"/bid_request/imp/{idx}/pmp/deals/{di}/bidfloor",
-        f"/bid_request/imp/{idx}/bidfloor",
-    ]
+    return [f"/bid_request/imp/{idx}/pmp/deals/{di}/bidfloor"]
 
 
 def _apply_imp_metrics(req: dict, m: Mutation, intent: Intent, imp_id: str) -> list[str]:
@@ -338,8 +383,13 @@ def apply(
     bid_request: dict,
     mutations: list[Mutation],
     bid_response: Optional[dict] = None,
+    deal_lookup: Optional[DealLookup] = None,
 ) -> ApplyResult:
-    """Apply ``mutations`` in order. The inputs are not modified."""
+    """Apply ``mutations`` in order. The inputs are not modified.
+
+    ``deal_lookup`` gives an activated deal its auction type (see the module
+    docstring). Without it an activation inserts ``{id}`` only.
+    """
     current_req = copy.deepcopy(bid_request) if isinstance(bid_request, dict) else {}
     current_resp = copy.deepcopy(bid_response) if isinstance(bid_response, dict) else None
     dispositions: list[Disposition] = []
@@ -362,7 +412,7 @@ def apply(
             if kind == "user_segments":
                 written = _apply_user_segments(candidate_req, m, intent)
             elif kind == "imp_deals":
-                written = _apply_imp_deals(candidate_req, m, intent, captured[0])
+                written = _apply_imp_deals(candidate_req, m, intent, captured[0], deal_lookup)
             elif kind == "deal_floor":
                 written = _apply_deal_floor(candidate_req, m, intent, captured[0], captured[1])
             elif kind == "imp_metrics":

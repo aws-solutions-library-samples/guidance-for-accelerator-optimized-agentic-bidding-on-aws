@@ -16,12 +16,12 @@ const STAGE_ICONS = {
 
 // Poll faster while the pipeline is still moving, matching GpuControl's
 // transitional-state cadence (15s steady / 10s while scaling).
-const POLL_MS_ACTIVE = 10000;
-const POLL_MS_SETTLED = 30000;
+export const POLL_MS_ACTIVE = 10000;
+export const POLL_MS_SETTLED = 30000;
 
 const SUMMARY_TEXT = {
-  trainable: "Swept into the training bucket — this run is selectable in the picker below.",
-  in_progress: "In progress — the outcomes are still on their way to the training bucket.",
+  trainable: "Swept into the training bucket. This run is ready to train.",
+  in_progress: "In progress. The outcomes are still on their way to the training bucket.",
   waiting: "Waiting for an ETL sweep to pick up this run's outcomes.",
   failed: "The ETL sweep for this run did not succeed.",
   blocked: "This run will not become available for training.",
@@ -35,39 +35,25 @@ const SUMMARY_CLASS = {
   blocked: "cl-sweep-summary--error",
 };
 
-function runOptionLabel(run) {
-  const when = run.timestamp ? ` (${new Date(run.timestamp).toLocaleString()})` : "";
-  const target = run.target_model_type
-    ? `${run.target_model_type}${run.target_variant ? ` / ${run.target_variant}` : ""}`
-    : "no model targeted";
-  const samples = run.outcome_sample_count > 0 ? "" : " — 0 outcomes";
-  return `${run.id} — ${target}${samples}${when}`;
-}
-
 /**
- * LoadTestSweepStatus — where a load test's outcomes are between finishing the
- * run and becoming selectable for training.
+ * LoadTestSweepStatus — where one load test's outcomes are between finishing
+ * the run and becoming selectable for training.
  *
- * The "Train from load test" picker below only lists runs a Glue ETL sweep has
- * already swept into the training bucket, so a run that just finished is simply
- * absent from it with no indication of why. This card polls
- * GET /v1/governance/sweep-status for the four real pipeline stages (DynamoDB
- * record -> Firehose flush -> Glue sweep -> selectable), listing every recorded
- * run and defaulting to the most recent one.
+ * Controlled by the parent: `runId` is the run selected in the Train step's
+ * picker, and this component draws the four real pipeline stages (DynamoDB
+ * record -> Firehose flush -> Glue sweep -> trainable) for that run by polling
+ * GET /v1/governance/sweep-status?run_id=. It owns no picker of its own, so
+ * there is only one run selection on the page.
  *
- * `onRunBecameTrainable` fires when a polled run crosses into trainable, so the
- * parent can refresh its picker immediately rather than on its own interval.
+ * `onRunBecameTrainable` fires when the polled run crosses into trainable, so
+ * the parent can refresh its trainable set (and enable the Train button) at
+ * once rather than on its own interval.
  */
-export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
-  const [runs, setRuns] = useState([]);
-  const [selectedRunId, setSelectedRunId] = useState("");
+export default function LoadTestSweepStatus({ runId, onRunBecameTrainable }) {
   const [status, setStatus] = useState(null);
   const [error, setError] = useState(null);
   const [checking, setChecking] = useState(false);
 
-  // Once the user picks a run explicitly, stop following the newest run so a
-  // poll cannot move the selection out from under them.
-  const pinnedRef = useRef(false);
   const prevTrainableRef = useRef({});
 
   // Held in a ref so a new callback identity from the parent does not change
@@ -76,10 +62,10 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
   useEffect(() => { onTrainableRef.current = onRunBecameTrainable; }, [onRunBecameTrainable]);
 
   const fetchStatus = useCallback(async () => {
+    if (!runId) return;
     setChecking(true);
     try {
-      const qs = pinnedRef.current && selectedRunId ? `?run_id=${encodeURIComponent(selectedRunId)}` : "";
-      const resp = await authFetch(`/api/v1/governance/sweep-status${qs}`);
+      const resp = await authFetch(`/api/v1/governance/sweep-status?run_id=${encodeURIComponent(runId)}`);
 
       // Read as text first. An orchestrator build that predates this endpoint
       // has no such route, and Starlette answers an unmatched route with the
@@ -96,33 +82,24 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
       if (data === null) {
         setStatus(null);
         setError(resp.status === 404
-          ? "The deployed orchestrator does not serve /v1/governance/sweep-status yet. Redeploy the orchestrator to enable this card."
+          ? "The deployed orchestrator does not serve /v1/governance/sweep-status yet. Redeploy the orchestrator to enable the pipeline view."
           : `HTTP ${resp.status} from the orchestrator: ${raw.slice(0, 160)}`);
         return;
       }
 
-      // A pinned run can age out of the 200-record history window; fall back to
-      // following the newest run rather than showing a dead selection.
-      if (resp.status === 404 && data.reason === "run_not_found") {
-        pinnedRef.current = false;
-        setRuns(data.runs || []);
-        setError(null);
-        return;
-      }
       if (!resp.ok) {
         setStatus(null);
+        // run_not_found: the run aged out of the 200-record history window.
         setError(data.error || `HTTP ${resp.status}`);
         return;
       }
 
       setError(null);
-      setRuns(data.runs || []);
       setStatus(data.status || null);
-      if (data.selected_run_id) setSelectedRunId(data.selected_run_id);
 
       // Fire only on a real false -> true transition, so the parent refreshes
-      // its picker the moment a sweep lands. An undefined prior value means
-      // this is the first poll for that run, which is not a transition.
+      // its trainable set the moment a sweep lands. An undefined prior value
+      // means this is the first poll for that run, which is not a transition.
       const st = data.status;
       if (st?.run_id) {
         const was = prevTrainableRef.current[st.run_id];
@@ -136,10 +113,14 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
     } finally {
       setChecking(false);
     }
-  }, [selectedRunId]);
+  }, [runId]);
 
-  // Initial load, and again whenever the user changes the selected run.
+  // Initial load, and again whenever the parent changes the selected run. A
+  // stale status from the previous run must not sit under the new selection
+  // while the first poll is in flight.
   useEffect(() => {
+    setStatus(null);
+    setError(null);
     fetchStatus();
   }, [fetchStatus]);
 
@@ -148,14 +129,10 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
     : POLL_MS_SETTLED;
 
   useEffect(() => {
+    if (!runId) return undefined;
     const timer = setInterval(fetchStatus, pollMs);
     return () => clearInterval(timer);
-  }, [fetchStatus, pollMs]);
-
-  const handleSelect = useCallback((e) => {
-    pinnedRef.current = true;
-    setSelectedRunId(e.target.value);
-  }, []);
+  }, [fetchStatus, pollMs, runId]);
 
   const nodes = useMemo(() => (status?.stages || []).map((s) => ({
     id: s.id,
@@ -165,49 +142,13 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
     state: s.state,
   })), [status]);
 
-  return (
-    <div className="cl-card cl-sweep-card sg-elevated" data-testid="loadtest-sweep-status-card">
-      <div className="cl-control-group">
-        <label htmlFor="cl-sweep-run">Load test:</label>
-        <select
-          id="cl-sweep-run"
-          className="cl-select sg-interactive"
-          data-testid="sweep-status-run-select"
-          value={selectedRunId}
-          onChange={handleSelect}
-          disabled={runs.length === 0}
-        >
-          {runs.length === 0 ? (
-            // An error means the run list was never read, which is not the same
-            // as there being no runs -- the Train picker below may well be
-            // listing some.
-            <option value="">{error ? "Run list unavailable" : "No load test runs recorded yet"}</option>
-          ) : (
-            runs.map((r) => (
-              <option key={r.id} value={r.id}>{runOptionLabel(r)}</option>
-            ))
-          )}
-        </select>
-        <button
-          className="btn btn-secondary sg-interactive"
-          data-testid="sweep-status-refresh-button"
-          onClick={fetchStatus}
-          disabled={checking}
-        >
-          {checking ? <><span className="spinner" /> Checking…</> : "Check now"}
-        </button>
-      </div>
+  if (!runId) return null;
 
+  return (
+    <div className="cl-sweep-body" data-testid="loadtest-sweep-status">
       {error && (
         <div className="cl-honest cl-honest-block" data-testid="sweep-status-error">
           {error}
-        </div>
-      )}
-
-      {!error && runs.length === 0 && (
-        <div className="cl-honest cl-honest-block">
-          No load test has been recorded yet. Run one from the Load Test panel and its
-          progress toward the training bucket will appear here.
         </div>
       )}
 
@@ -235,17 +176,26 @@ export default function LoadTestSweepStatus({ onRunBecameTrainable }) {
               </div>
             ))}
           </div>
-
-          <div className="cl-sweep-meta">
-            <span>Glue job: {status.glue_job_name || "not configured"}</span>
-            {status.glue_run?.id && <span>Latest run: {status.glue_run.id} ({status.glue_run.state})</span>}
-            {status.checked_at && (
-              <span>Checked {new Date(status.checked_at).toLocaleTimeString()}</span>
-            )}
-            <span>Auto-refreshing every {pollMs / 1000}s</span>
-          </div>
         </>
       )}
+
+      <div className="cl-sweep-meta">
+        {status && <span>Glue job: {status.glue_job_name || "not configured"}</span>}
+        {status?.glue_run?.id && <span>Latest run: {status.glue_run.id} ({status.glue_run.state})</span>}
+        {status?.checked_at && (
+          <span>Checked {new Date(status.checked_at).toLocaleTimeString()}</span>
+        )}
+        {status && <span>Auto-refreshing every {pollMs / 1000}s</span>}
+        <button
+          type="button"
+          className="btn-secondary sg-interactive"
+          data-testid="sweep-status-refresh-button"
+          onClick={fetchStatus}
+          disabled={checking}
+        >
+          {checking ? <><span className="spinner" /> Checking…</> : "Check now"}
+        </button>
+      </div>
     </div>
   );
 }

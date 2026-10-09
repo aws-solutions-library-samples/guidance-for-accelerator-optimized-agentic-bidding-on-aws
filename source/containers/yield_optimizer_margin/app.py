@@ -82,6 +82,24 @@ def _margin_calculation_type(at: int | None) -> int:
     return MarginCalculationType.PERCENT
 
 
+def _is_suppressed(deal: dict) -> bool:
+    """True for a deal the Deal Scorer suppressed earlier in this request.
+
+    The orchestrator applies the deals stage to the working request before the
+    yield stage runs (shared/artf_applier.py marks ``deal.ext.artf.suppressed``),
+    so a suppressed deal arrives here still listed. It will not clear, so it is
+    skipped before feature building: no inference call, no mutation, no latency.
+    ``ext.suppressed`` is accepted too, matching demand/artfhouse/eligibility.py.
+    """
+    ext = deal.get("ext")
+    if not isinstance(ext, dict):
+        return False
+    if ext.get("suppressed") is True:
+        return True
+    artf = ext.get("artf")
+    return isinstance(artf, dict) and artf.get("suppressed") is True
+
+
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations -- ADJUST_DEAL_MARGIN via Triton FIL-served XGBoost."""
     if not intent_applicable(Intent.ADJUST_DEAL_MARGIN, req.applicable_intents):
@@ -107,7 +125,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
         pmp = imp.get("pmp") or {}
         for deal in pmp.get("deals", []):
             deal_id = deal.get("id", "")
-            if not deal_id:
+            if not deal_id or _is_suppressed(deal):
                 continue
 
             feature_vector = build_feature_vector(bid_request, deal, request_time)
@@ -159,9 +177,56 @@ def mutate(req: RTBRequest) -> RTBResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Readiness warm-up (shared.server.WarmupGate)
+# ---------------------------------------------------------------------------
+
+#: Shaped like the yield-optimizer scenario: one video impression with two
+#: open-auction deals, so mutate() runs the margin model through Triton once per
+#: deal. Not a load test and no explore override, so no exploration is drawn.
+#: Run inside the pod only; nothing is emitted.
+WARMUP_REQUEST: dict = {
+    "id": "artf-warmup-yield-optimizer-margin",
+    "tmax": 100,
+    "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+    "applicable_intents": ["ADJUST_DEAL_MARGIN"],
+    "bid_request": {
+        "id": "artf-warmup-auction",
+        "imp": [{
+            "id": "imp-1",
+            "video": {"mimes": ["video/mp4"], "minduration": 15, "maxduration": 30, "w": 1280, "h": 720},
+            "bidfloor": 6.00,
+            "pmp": {
+                "private_auction": 1,
+                "deals": [
+                    {"id": "deal-open-midtier", "bidfloor": 3.25, "at": 2},
+                    {"id": "deal-open-remnant", "bidfloor": 0.75, "at": 2},
+                ],
+            },
+        }],
+        "site": {"id": "artf-warmup-site", "domain": "sportsnetwork.example.com", "cat": ["IAB17"]},
+        "user": {"id": "artf-warmup-user"},
+        "device": {"ua": "Mozilla/5.0", "geo": {"country": "USA", "region": "CA"}},
+    },
+}
+
+
+def warmup_check(resp: RTBResponse) -> None:
+    """On the Triton path, require the margin model to report ready after the call.
+
+    A failed FIL inference returns the no-change value, so the response alone
+    cannot show that the inference succeeded.
+    """
+    if USE_TRITON:
+        from container.triton_inference import is_triton_ready
+        if not is_triton_ready():
+            raise RuntimeError("Triton or the deal_yield_manager_margin model is not ready")
+
+
 if __name__ == "__main__":
-    from shared.server import run_artf_server
+    from shared.server import run_artf_server, warmup_from_request
     run_artf_server(
         mutate, agent_name="yield-optimizer-margin",
         grpc_port=50051, mcp_port=8081, health_port=8080,
+        warmup=warmup_from_request(mutate, WARMUP_REQUEST, require_triton=USE_TRITON, check=warmup_check),
     )

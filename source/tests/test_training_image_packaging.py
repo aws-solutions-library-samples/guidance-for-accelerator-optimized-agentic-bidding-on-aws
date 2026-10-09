@@ -47,6 +47,8 @@ EXPECTED_STAGED = (
     "dlrm_features.py",
     "onnx_compat.py",
     "shading_policy.py",
+    "ncf_ids.py",
+    "ncf_model.py",
 )
 
 

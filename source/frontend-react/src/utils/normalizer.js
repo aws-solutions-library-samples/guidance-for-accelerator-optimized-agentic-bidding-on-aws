@@ -33,6 +33,9 @@ function resolveOpName(code) {
   return `OP_${code}`;
 }
 
+/** The host dispositions the orchestrator stamps onto a lifted auction report. */
+const DISPOSITIONS = new Set(["applied", "rejected", "superseded", "unknown"]);
+
 export function toMutationModel(m) {
   const raw = m ?? {};
   const intentCode = raw.intent;
@@ -54,6 +57,15 @@ export function toMutationModel(m) {
     opCode: typeof opCode === "number" ? opCode : 0,
     path: typeof raw.path === "string" ? raw.path : "",
     payload,
+    // What the exchange did with this mutation, when the response says: "applied",
+    // "rejected", "superseded" or "unknown". Present only on responses lifted from
+    // the auction (normalizeExtensionPoint); null on a plain /v1/mutations answer,
+    // which carries no host decision.
+    disposition: DISPOSITIONS.has(raw.disposition) ? raw.disposition : null,
+    dispositionReason:
+      typeof raw.disposition_reason === "string" && raw.disposition_reason
+        ? raw.disposition_reason
+        : null,
     raw,
   };
 }
@@ -375,4 +387,34 @@ export function normalize(raw, transport, submittedPayload) {
     raw,
     submittedPayload: safePayload,
   };
+}
+
+/**
+ * Normalize the ARTF hook's report of a real auction, `artf_meta.extension_point`
+ * from `/v1/auction/run?artf=on`, into the same NormalizedFlowResult `normalize`
+ * returns.
+ *
+ * `extensionPoint.response` is the RTBResponse the hook received, with a
+ * disposition stamped on every mutation, so it goes through `normalize` unchanged:
+ * one normalizer, one beat builder, whichever call the mutations came from. When
+ * the hook got no answer (timeout, transport failure, skip) or the report is
+ * unavailable, the result has no container mutations.
+ *
+ * `artfReport` says where the result came from and whether the hook's report was
+ * usable. A plain `normalize()` result has no `artfReport`.
+ */
+export function normalizeExtensionPoint(extensionPoint, submittedPayload) {
+  const ep = extensionPoint && typeof extensionPoint === "object" ? extensionPoint : {};
+  const raw =
+    ep.response && typeof ep.response === "object"
+      ? ep.response
+      : { id: "", mutations: [], metadata: { containers: [] } };
+  const result = normalize(raw, "PREBID", submittedPayload);
+  result.artfReport = {
+    source: "auction",
+    available: ep.available === true,
+    outcome: typeof ep.outcome === "string" ? ep.outcome : null,
+    reason: typeof ep.reason === "string" ? ep.reason : null,
+  };
+  return result;
 }

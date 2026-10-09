@@ -321,3 +321,98 @@ class TestMarginSpecificRules:
         MARGIN.patch_predict(monkeypatch, 0.123456789)
         resp = margin_app.mutate(_req())
         assert resp.mutations[0].adjust_deal.margin.value == 0.1235
+
+
+# ---------------------------------------------------------------------------
+# Suppressed deals: no inference, no mutation
+# ---------------------------------------------------------------------------
+# The orchestrator applies the deals stage (Deal Scorer SUPPRESS_DEALS) to the
+# working request before calling the yield stage, and shared/artf_applier.py
+# marks a suppressed deal deal.ext.artf.suppressed rather than removing it. A
+# suppressed deal will not clear, so pricing it would only add Triton latency.
+
+def _recording_predict(case, monkeypatch, value):
+    seen: list[str] = []
+
+    def fake(fv, target_variant=None):
+        seen.append(fv)
+        return value, "", ""
+
+    monkeypatch.setattr(case.app, case.predict_name, fake)
+    return seen
+
+
+def _bid_request_with(deals):
+    return {"imp": [{"id": "imp-1", "pmp": {"deals": deals}}], "site": {"cat": ["IAB17"]}}
+
+
+@BOTH
+class TestSuppressedDealsSkipped:
+    def test_artf_marked_deal_gets_no_inference_and_no_mutation(self, case, monkeypatch):
+        calls = []
+        monkeypatch.setattr(case.app, "build_feature_vector",
+                            lambda br, deal, t: calls.append(deal["id"]) or deal["id"])
+        seen = _recording_predict(case, monkeypatch, case.changed)
+        resp = case.app.mutate(_req(bid_request=_bid_request_with([
+            {"id": "deal-live", "bidfloor": 10.0, "at": 1},
+            {"id": "deal-gone", "bidfloor": 5.0, "at": 1, "ext": {"artf": {"suppressed": True}}},
+        ])))
+        assert calls == ["deal-live"]
+        assert seen == ["deal-live"], "the predict/Triton call must not be made for a suppressed deal"
+        assert [m.path for m in resp.mutations] == ["/imp/imp-1/deals/deal-live"]
+
+    def test_ext_suppressed_marker_also_skips(self, case, monkeypatch):
+        seen = _recording_predict(case, monkeypatch, case.changed)
+        resp = case.app.mutate(_req(bid_request=_bid_request_with([
+            {"id": "deal-gone", "bidfloor": 5.0, "at": 1, "ext": {"suppressed": True}},
+        ])))
+        assert seen == []
+        assert resp.mutations == []
+
+    def test_exploration_does_not_reach_a_suppressed_deal(self, case, monkeypatch):
+        """With epsilon forced to 1.0 every scored deal is perturbed; a
+        suppressed deal must still produce nothing, not an explore probe."""
+        case.force_exploration(monkeypatch, epsilon=1.0)
+        seen = _recording_predict(case, monkeypatch, case.no_op)
+        resp = case.app.mutate(_req(
+            bid_request=_bid_request_with([
+                {"id": "deal-gone", "bidfloor": 5.0, "at": 1, "ext": {"artf": {"suppressed": True}}},
+            ]),
+            ext={"model_params": {"explore": True}},
+        ))
+        assert seen == []
+        assert resp.mutations == []
+        assert not resp.metadata.model_version.endswith(":explore")
+
+    def test_falsy_marker_is_still_scored(self, case, monkeypatch):
+        seen = _recording_predict(case, monkeypatch, case.changed)
+        resp = case.app.mutate(_req(bid_request=_bid_request_with([
+            {"id": "deal-a", "bidfloor": 5.0, "at": 1, "ext": {"artf": {"suppressed": False}}},
+            {"id": "deal-b", "bidfloor": 5.0, "at": 1, "ext": {"artf": "x"}},
+        ])))
+        assert len(seen) == 2
+        assert len(resp.mutations) == 2
+
+    def test_deal_suppressed_by_the_applier_is_skipped(self, case, monkeypatch):
+        """End to end on the marker the orchestrator actually writes: apply a
+        Deal Scorer SUPPRESS_DEALS mutation with shared/artf_applier, then hand
+        the resulting working request to the yield container."""
+        from shared import artf_applier
+        from shared.artf_types import IDsPayload, Mutation, Operation
+
+        working = artf_applier.apply(
+            _bid_request_with([
+                {"id": "deal-live", "bidfloor": 10.0, "at": 1},
+                {"id": "deal-gone", "bidfloor": 5.0, "at": 1},
+            ]),
+            [Mutation(intent=Intent.SUPPRESS_DEALS, op=Operation.REMOVE, path="/imp/imp-1",
+                      ids=IDsPayload(id=["deal-gone"]))],
+        )
+        assert working.applied_count == 1
+        seen = []
+        monkeypatch.setattr(case.app, "build_feature_vector", lambda br, deal, t: deal["id"])
+        monkeypatch.setattr(case.app, case.predict_name,
+                            lambda fv, target_variant=None: (seen.append(fv), (case.changed, "", ""))[1])
+        resp = case.app.mutate(_req(bid_request=working.bid_request))
+        assert seen == ["deal-live"]
+        assert [m.path for m in resp.mutations] == ["/imp/imp-1/deals/deal-live"]

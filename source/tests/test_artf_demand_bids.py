@@ -38,7 +38,8 @@ def test_price_is_the_catalogued_cpm_not_the_floor():
     imp = imp_with([{"id": "deal-home-premium"}], floor=1.0)
     _, result = build_for(imp)
     cedar = next(b for b in result.bids if b.campaign_id == "camp-cedar")
-    assert cedar.price == 6.35
+    catalogued = next(c for c in CATALOG.all() if c.campaign_id == "camp-cedar")
+    assert cedar.price == catalogued.declared_cpm
     assert cedar.price != cedar.binding_floor
 
 
@@ -110,9 +111,8 @@ def test_no_bid_carries_a_dealid_key_when_there_is_no_deal():
 
 
 def test_catalogue_maximum_is_exposed_so_the_ceiling_can_be_derived():
-    # The exact value is asserted as a canary: it changes only when a campaign's
-    # price changes, and the two properties below depend on what it is.
-    assert highest_declared_cpm(CATALOG) == 13.40
+    # Derived from the catalog rather than restated: prices live in the deals seed.
+    assert highest_declared_cpm(CATALOG) == max(c.ceiling_cpm for c in CATALOG.all())
 
 
 def test_the_highest_price_stays_inside_the_targeting_bucket_range():
@@ -134,7 +134,7 @@ def test_the_highest_price_stays_inside_the_targeting_bucket_range():
 def test_prices_above_five_are_the_reason_low_granularity_is_ruled_out():
     """Kept as a live count rather than prose, because the number grew.
 
-    When the catalog topped out at 6.35 exactly one campaign sat above the "low"
+    When the catalog topped out at Cedar's banner price exactly one campaign sat above the "low"
     top bucket of 5. The video campaigns added for the shipped scenarios put several
     there, so choosing "low" would now misreport hb_pb for more of the catalog than
     it used to -- worth being able to see, not just assert.

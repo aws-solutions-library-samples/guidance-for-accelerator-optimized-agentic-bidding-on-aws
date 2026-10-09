@@ -16,6 +16,10 @@ Each ARTF container runs this server, which exposes:
 
 The container provides a ``mutate(RTBRequest) -> RTBResponse`` function;
 this module handles all protocol plumbing.
+
+A container may also pass ``warmup`` to :func:`run_artf_server`. ``/health/ready``
+then answers 503 until two consecutive warm-up ``mutate()`` calls have completed
+under ``ARTF_WARMUP_BUDGET_MS`` (see :class:`WarmupGate`). Liveness is not gated.
 """
 
 from __future__ import annotations
@@ -124,6 +128,181 @@ def _attach_timing(resp: RTBResponse, timing: dict[str, float], handler_start: f
     timing["total"] = hop_timing.ms(handler_start)
     data.setdefault("metadata", {})["timing"] = {k: timing[k] for k in hop_timing.CONTAINER_SEGMENTS if k in timing}
     return data
+
+
+# ---------------------------------------------------------------------------
+# Readiness warm-up
+# ---------------------------------------------------------------------------
+#
+# The first mutate() after a pod starts pays for connection setup to Triton, the
+# first inference on each engine and, in dlrm_bid_shader, the first parameter
+# store read. The readiness probe used to pass as soon as the process listened,
+# so that first request was a live bid. With a warm-up the probe stays 503 until
+# a canned request has been through mutate() inside the latency budget twice in a row.
+
+WarmupFunc = Callable[[], None]
+
+#: Milliseconds each warm-up mutate() may take (Q18 A).
+ARTF_WARMUP_BUDGET_MS = float(os.environ.get("ARTF_WARMUP_BUDGET_MS", "20"))
+#: Consecutive in-budget calls that make the pod ready (Q18 A).
+ARTF_WARMUP_CONSECUTIVE = 2
+#: Attempts after which the gate logs ERROR and reports state ``failed``. The pod
+#: stays unready and keeps retrying at the longest backoff: Triton loads its
+#: repository from S3 and runs its own model_warmup before it serves, which can
+#: take minutes, and only an in-budget pair ever makes the pod ready.
+ARTF_WARMUP_MAX_ATTEMPTS = max(1, int(os.environ.get("ARTF_WARMUP_MAX_ATTEMPTS", "50")))
+#: Backoff after a failed or over-budget attempt: doubles from the first value to the second.
+ARTF_WARMUP_BACKOFF_S = (0.1, 5.0)
+
+#: Request id prefix for warm-up requests, so they are recognisable in logs.
+WARMUP_ID_PREFIX = "artf-warmup-"
+
+
+class WarmupNotServed(RuntimeError):
+    """A warm-up mutate() returned without the inference it was meant to exercise."""
+
+
+def warmup_from_request(
+    mutate_fn: MutateFunc,
+    request: dict[str, Any],
+    *,
+    require_triton: bool,
+    check: Callable[[RTBResponse], None] | None = None,
+) -> WarmupFunc:
+    """A warm-up that runs ``mutate_fn`` once on ``request``.
+
+    ``request`` is validated as an RTBRequest here, so a canned request that no
+    longer fits the model fails at startup rather than on every attempt. With
+    ``require_triton`` the call must reach the Triton client at least once
+    (hop_timing records each ``infer``); ``check`` may reject the response, for
+    example a DLRM abstention.
+    """
+    req = RTBRequest(**request)
+    if not req.id.startswith(WARMUP_ID_PREFIX):
+        raise ValueError(f"warm-up request id {req.id!r} must start with {WARMUP_ID_PREFIX!r}")
+
+    def _warmup() -> None:
+        calls = hop_timing.start_triton_accumulator()
+        try:
+            resp = mutate_fn(req)
+        finally:
+            hop_timing.clear_triton_accumulator()
+        if require_triton and not calls:
+            raise WarmupNotServed("mutate() made no Triton call")
+        if check is not None:
+            check(resp)
+
+    return _warmup
+
+
+class WarmupGate:
+    """Readiness state driven by a container's warm-up (Q18 A).
+
+    ``state`` is ``warming`` until ``consecutive`` calls in a row complete within
+    ``budget_ms``, then ``ready``. An attempt that raises or completes over budget
+    resets the run and is retried after a backoff that doubles from
+    ``backoff_s[0]`` to ``backoff_s[1]``. After ``max_attempts`` attempts without
+    readiness the state becomes ``failed`` (logged as an error): still unready,
+    still retrying. Only ``ready`` reports ready.
+    """
+
+    def __init__(
+        self,
+        warmup: WarmupFunc,
+        *,
+        budget_ms: float = ARTF_WARMUP_BUDGET_MS,
+        consecutive: int = ARTF_WARMUP_CONSECUTIVE,
+        max_attempts: int = ARTF_WARMUP_MAX_ATTEMPTS,
+        backoff_s: tuple[float, float] = ARTF_WARMUP_BACKOFF_S,
+        clock: Callable[[], float] = time.perf_counter,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._warmup = warmup
+        self.budget_ms = budget_ms
+        self.consecutive = max(1, consecutive)
+        self.max_attempts = max(1, max_attempts)
+        self.backoff_s = backoff_s
+        self._clock = clock
+        self._sleep = sleep
+        self.state = "warming"
+        self.attempts = 0
+        self.in_budget_run = 0
+        self.last_ms: float | None = None
+        self.last_error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "attempts": self.attempts,
+            "in_budget_run": self.in_budget_run,
+            "consecutive": self.consecutive,
+            "last_ms": self.last_ms,
+            "budget_ms": self.budget_ms,
+            "last_error": self.last_error,
+        }
+
+    def run(self) -> None:
+        """Attempt warm-ups until ready. Blocks."""
+        delay = self.backoff_s[0]
+        while not self.ready:
+            self.attempts += 1
+            started = self._clock()
+            try:
+                self._warmup()
+            except Exception as exc:  # noqa: BLE001 - every failure is retried
+                self.last_ms = None
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("warm-up attempt %d failed: %s", self.attempts, self.last_error)
+            else:
+                self.last_ms = hop_timing.ms(started, self._clock())
+                self.last_error = None
+                if self.last_ms <= self.budget_ms:
+                    self.in_budget_run += 1
+                    if self.in_budget_run >= self.consecutive:
+                        self.state = "ready"
+                        logger.info("warm-up attempt %d completed in %.3f ms, %d in a row within %.1f ms; ready",
+                                    self.attempts, self.last_ms, self.in_budget_run, self.budget_ms)
+                        return
+                    logger.info("warm-up attempt %d completed in %.3f ms (budget %.1f ms, %d of %d in a row)",
+                                self.attempts, self.last_ms, self.budget_ms, self.in_budget_run, self.consecutive)
+                    continue
+                logger.warning("warm-up attempt %d completed in %.3f ms, over the %.1f ms budget",
+                               self.attempts, self.last_ms, self.budget_ms)
+            self.in_budget_run = 0
+            if self.attempts >= self.max_attempts and self.state == "warming":
+                self.state = "failed"
+                logger.error("warm-up not ready after %d attempts (last %s); the pod stays unready "
+                             "and keeps retrying every %.1f s",
+                             self.attempts,
+                             f"{self.last_ms:.3f} ms" if self.last_ms is not None else self.last_error,
+                             self.backoff_s[1])
+            self._sleep(delay)
+            delay = min(delay * 2, self.backoff_s[1])
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, name="artf-warmup", daemon=True)
+        thread.start()
+        return thread
+
+
+def _ready_response(gate: WarmupGate | None) -> JSONResponse:
+    """``/health/ready``: unchanged without a gate, 503 until the gate is ready."""
+    if gate is None:
+        return JSONResponse({"status": "ok"})
+    if not gate.ready:
+        return JSONResponse({"status": gate.state, "warmup": gate.describe()}, status_code=503)
+    return JSONResponse({"status": "ok", "warmup": gate.describe()})
+
+
+def _build_health_app(gate: WarmupGate | None = None) -> Starlette:
+    return Starlette(routes=[
+        Route("/health/live", lambda r: JSONResponse({"status": "ok"})),
+        Route("/health/ready", lambda r: _ready_response(gate)),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +438,15 @@ def _build_grpc_server(mutate_fn: MutateFunc, port: int) -> grpc.Server:
 # MCP (JSON-RPC over HTTP) — extend_rtb tool
 # ---------------------------------------------------------------------------
 
-def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | None = None) -> Starlette:
-    """Build a Starlette app serving MCP JSON-RPC at /mcp and health."""
+def _build_mcp_app(
+    mutate_fn: MutateFunc, agent_name: str, samples_dir: str | None = None,
+    gate: WarmupGate | None = None,
+) -> Starlette:
+    """Build a Starlette app serving MCP JSON-RPC at /mcp and health.
+
+    ``gate`` makes this app's ``/health/ready`` report the same warm-up state as
+    the health port.
+    """
 
     # JSON-RPC helpers
     def _ok(id: Any, result: Any, headers: dict | None = None) -> JSONResponse:
@@ -374,6 +560,9 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    async def ready(request: Request) -> JSONResponse:
+        return _ready_response(gate)
+
     async def mutate_rest(request: Request) -> JSONResponse:
         """Simple REST endpoint — POST RTBRequest JSON, get RTBResponse JSON.
 
@@ -411,7 +600,7 @@ def _build_mcp_app(mutate_fn: MutateFunc, agent_name: str, samples_dir: str | No
         Route("/mutate", mutate_rest, methods=["POST"]),
         Route("/mcp", mcp_endpoint, methods=["POST", "GET", "DELETE", "OPTIONS"]),
         Route("/health/live", health),
-        Route("/health/ready", health),
+        Route("/health/ready", ready),
     ]
 
     app = Starlette(routes=routes)
@@ -436,10 +625,14 @@ def run_artf_server(
     grpc_port: int = 50051,
     mcp_port: int = 8081,
     health_port: int = 8080,
+    warmup: WarmupFunc | None = None,
 ) -> None:
     """Start gRPC, MCP, and health servers for an ARTF container.
 
-    This blocks until interrupted.
+    ``warmup`` (optional) runs on a background thread once the servers are
+    started; ``/health/ready`` on both HTTP ports is 503 until two consecutive
+    calls complete under budget (see WarmupGate). Without it readiness is 200 from
+    the start, as before. This blocks until interrupted.
     """
     import uvicorn
 
@@ -450,11 +643,11 @@ def run_artf_server(
     grpc_server.start()
     logger.info("gRPC RTBExtensionPoint listening on :%d", grpc_port)
 
+    # --- Readiness warm-up ---
+    gate = WarmupGate(warmup) if warmup is not None else None
+
     # --- Health (simple HTTP) ---
-    health_app = Starlette(routes=[
-        Route("/health/live", lambda r: JSONResponse({"status": "ok"})),
-        Route("/health/ready", lambda r: JSONResponse({"status": "ok"})),
-    ])
+    health_app = _build_health_app(gate)
 
     def _run_health():
         uvicorn.run(health_app, host="0.0.0.0", port=health_port, log_level="warning")
@@ -463,7 +656,11 @@ def run_artf_server(
     health_thread.start()
     logger.info("Health probes on :%d", health_port)
 
+    if gate is not None:
+        gate.start()
+        logger.info("Readiness waits for warm-up (budget %.1f ms)", gate.budget_ms)
+
     # --- MCP + Web (Starlette on mcp_port) ---
-    mcp_app = _build_mcp_app(mutate_fn, agent_name)
+    mcp_app = _build_mcp_app(mutate_fn, agent_name, gate=gate)
     logger.info("MCP (JSON-RPC) on :%d/mcp", mcp_port)
     uvicorn.run(mcp_app, host="0.0.0.0", port=mcp_port, log_level="info")

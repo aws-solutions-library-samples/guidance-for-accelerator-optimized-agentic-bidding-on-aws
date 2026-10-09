@@ -67,6 +67,38 @@ export const INTENT_LABEL = Object.freeze({
   BID_SHADE: "BID_SHADE",
 });
 
+/**
+ * The sentence appended to a mutation the exchange did not apply.
+ *
+ * Fixed wording with no numerals: the disposition reason can carry numbers (a
+ * floor, a cap) that trace to no beat value, so the reason itself never enters a
+ * caption and is rendered beside it instead (BR3-13).
+ */
+const NOT_APPLIED_SENTENCE = Object.freeze({
+  rejected: "Not applied: rejected by the exchange.",
+  superseded: "Not applied: superseded by a higher-priority container.",
+  unknown: "The exchange did not report whether this was applied.",
+});
+
+/**
+ * The recap's statement when the auction's own report has no mutations to show,
+ * in words. Keyed by the hook's outcome; `unavailable` covers a report the
+ * response did not carry.
+ */
+const HOOK_REPORT_SENTENCE = Object.freeze({
+  unavailable: "The auction did not report the ARTF hook's mutations, so none are shown.",
+  timeout: "The ARTF hook timed out, so this auction ran unmutated.",
+  transport_failure: "The ARTF hook could not reach the orchestrator, so this auction ran unmutated.",
+  skipped_insufficient_budget:
+    "The ARTF hook had too little time left to call the orchestrator, so this auction ran unmutated.",
+});
+
+export function hookReportSentence(report) {
+  if (!report) return null;
+  if (report.available !== true) return HOOK_REPORT_SENTENCE.unavailable;
+  return HOOK_REPORT_SENTENCE[report.outcome] ?? null;
+}
+
 /** One phrase per value, in the beat's own order. */
 function valuePhrases(values) {
   return (values ?? []).map((v) => {
@@ -99,7 +131,10 @@ function valuePhrases(values) {
  *   phrases: string[],
  *   latencyMs: number|null,
  *   explored: boolean,
+ *   sampleTrained: boolean,
  *   unrendered: boolean,
+ *   disposition: string|null,
+ *   dispositionReason: string|null,
  *   text: string,
  * }}
  */
@@ -112,7 +147,10 @@ export function mutationNarration(beat, context) {
     phrases: [],
     latencyMs: null,
     explored: false,
+    sampleTrained: false,
     unrendered: false,
+    disposition: null,
+    dispositionReason: null,
     text: "",
   };
   if (!beat) return base;
@@ -145,10 +183,8 @@ export function mutationNarration(beat, context) {
   }
 
   if (beat.kind === BEAT_BIDS) {
-    // No count here on purpose. This beat is built before the auction is fired, so
-    // the number of bids is not known to it; the offers column is what states how
-    // many arrived and from which seats. Naming a number here would either be
-    // wrong or require the beat to wait on the auction.
+    // No count here on purpose. The offers column states how many bids arrived and
+    // from which seats; this beat is structural and carries no bid values.
     return {
       ...base,
       text: beat.pass === PASS_BASELINE
@@ -167,6 +203,10 @@ export function mutationNarration(beat, context) {
 
   if (beat.kind === BEAT_RECAP) {
     const n = beat.contributors?.length ?? 0;
+    // The hook's report said why nothing could be shown: say that, not "no
+    // container mutated", which would claim the containers answered.
+    const reportSentence = n === 0 ? hookReportSentence(beat.artfReport) : null;
+    if (reportSentence) return { ...base, text: reportSentence };
     return {
       ...base,
       // Unchanged wording: this exact string is the run's headline count and is
@@ -187,6 +227,10 @@ export function mutationNarration(beat, context) {
   // what a screen reader gets and what the fallback path shows, so leaving the
   // intent to the pill alone would make it visual-only.
   const attribution = intent ? `${containerLabel} · ${intent}` : containerLabel;
+  const disposition = typeof beat.disposition === "string" ? beat.disposition : null;
+  const notApplied = disposition && disposition !== "applied"
+    ? ` ${NOT_APPLIED_SENTENCE[disposition] ?? NOT_APPLIED_SENTENCE.unknown}`
+    : "";
 
   return {
     ...base,
@@ -197,10 +241,17 @@ export function mutationNarration(beat, context) {
     phrases,
     latencyMs: beat.latencyMs ?? null,
     explored: beat.explored === true,
+    // Rendered beside the sentence, not in it: the sentence is what the caption
+    // validator checks.
+    sampleTrained: beat.sampleTrained === true,
     unrendered: phrases.length === 0,
+    disposition,
+    dispositionReason: notApplied && typeof beat.dispositionReason === "string"
+      ? beat.dispositionReason
+      : null,
     text: phrases.length
-      ? `${attribution}: ${phrases.join("; ")}.${latency}${explore}`
-      : `${containerLabel} returned a ${intent ?? "mutation"} this view does not yet render.${latency}`,
+      ? `${attribution}: ${phrases.join("; ")}.${latency}${explore}${notApplied}`
+      : `${containerLabel} returned a ${intent ?? "mutation"} this view does not yet render.${latency}${notApplied}`,
   };
 }
 

@@ -1,5 +1,6 @@
 package org.prebid.server.hooks.modules.artf.client;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -234,9 +235,13 @@ public class ArtfExtensionPointGrpcClient implements ExtensionPointClient {
             return new ExtensionPointOutcome.TransportFailure("orchestrator returned an empty body", latency);
         }
 
+        final JsonNode tree;
         final RtbResponse decoded;
         try {
-            decoded = mapper.readValue(message, RtbResponse.class);
+            tree = mapper.readTree(message);
+            decoded = tree == null || tree.isMissingNode() || tree.isNull()
+                    ? null
+                    : mapper.treeToValue(tree, RtbResponse.class);
         } catch (Exception e) {
             return new ExtensionPointOutcome.TransportFailure(
                     "orchestrator response could not be parsed: " + e.getClass().getSimpleName(), latency);
@@ -247,9 +252,9 @@ public class ArtfExtensionPointGrpcClient implements ExtensionPointClient {
 
         // An answer with nothing in it is NOT a failure (BR-6), same as the HTTP client.
         return decoded.mutationsOrEmpty().isEmpty()
-                ? new ExtensionPointOutcome.NoMutations(latency, decoded.metadata())
+                ? new ExtensionPointOutcome.NoMutations(latency, decoded.metadata(), tree)
                 : new ExtensionPointOutcome.MutationsReturned(
-                        decoded.mutationsOrEmpty(), latency, decoded.metadata());
+                        decoded.mutationsOrEmpty(), latency, decoded.metadata(), tree);
     }
 
     /**

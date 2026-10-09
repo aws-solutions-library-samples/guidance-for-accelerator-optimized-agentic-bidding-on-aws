@@ -875,12 +875,19 @@ fi
 # to avoid.
 PYTHON_BIN_DIR="$(cd "$(dirname "$(command -v "${PYTHON}" 2>/dev/null || echo "${PYTHON}")")" 2>/dev/null && pwd || true)"
 
-# Ensure required Python packages are available (install if missing)
-REQUIRED_PY_PACKAGES="torch onnx onnxscript boto3"
+# Ensure required Python packages are available (install if missing).
+# onnxruntime: Step 2's Deal Scorer gate scores the exported ONNX with it, and the
+# export fails without it. When missing it is installed at ONNXRUNTIME_PIN, the
+# version the gate was verified with.
+REQUIRED_PY_PACKAGES="torch onnx onnxscript onnxruntime boto3"
+ONNXRUNTIME_PIN="onnxruntime==1.27.0"
 MISSING_PY_PACKAGES=""
 for pkg in ${REQUIRED_PY_PACKAGES}; do
   if ! ${PYTHON} -c "import ${pkg}" 2>/dev/null; then
-    MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${pkg}"
+    case "${pkg}" in
+      onnxruntime) MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${ONNXRUNTIME_PIN}" ;;
+      *) MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${pkg}" ;;
+    esac
   fi
 done
 if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
@@ -917,6 +924,8 @@ STATE_PYTHON="${PYTHON}"
 source "${SCRIPT_DIR}/lib/deploy_state.sh"
 # shellcheck source=lib/deploy_gate.sh
 source "${SCRIPT_DIR}/lib/deploy_gate.sh"
+# shellcheck source=lib/k8s_rollout.sh
+source "${SCRIPT_DIR}/lib/k8s_rollout.sh"
 
 # =========================================================================
 # AWS profile -- resolved here, before the first AWS call in any mode
@@ -963,6 +972,71 @@ sys.exit(0 if sys.argv[1] in botocore.session.Session().available_profiles else 
   fi
 fi
 say "  AWS profile: ${AWS_PROFILE} (${DEPLOY_PROFILE_SOURCE})"
+
+# =========================================================================
+# What this checkout would deploy, for the phase probe (read-only)
+# =========================================================================
+# The probe can see the Phase 1 marker in the model bucket and the Deal Scorer
+# engine's source-fingerprint, but not what THIS checkout would put there. These
+# two values are that; lib/deploy_gate.sh passes them to every probe, which reads
+# Phase 1 (marker) and Phase 3 (engine) as stale when they differ. Computed here,
+# before --status and the first gate_refresh, and without any AWS call.
+DEPLOY_EXPECT_DEALS_SEED_SHA=""
+DEPLOY_EXPECT_NCF_FINGERPRINT=""
+
+# Phases _run_phase runs even when the probe reads them as complete, each with
+# the reason it prints. Exporting FORCE_PHASE_<n>=1 before the run forces one by
+# hand; force_phase sets them from the read-only checks below.
+FORCE_PHASE_1="${FORCE_PHASE_1:-0}"; FORCE_PHASE_1_WHY="FORCE_PHASE_1=1 is set"
+FORCE_PHASE_3="${FORCE_PHASE_3:-0}"; FORCE_PHASE_3_WHY="FORCE_PHASE_3=1 is set"
+FORCE_PHASE_5="${FORCE_PHASE_5:-0}"; FORCE_PHASE_5_WHY="FORCE_PHASE_5=1 is set"
+
+# force_phase <1|3|5> <why>: make _run_phase run phase n, and say why.
+force_phase() {
+  local n="$1" why="$2" prev
+  case "${n}" in
+    1) prev=""; if [[ "${FORCE_PHASE_1}" == 1 ]]; then prev="${FORCE_PHASE_1_WHY}"; fi
+       FORCE_PHASE_1=1; FORCE_PHASE_1_WHY="${prev:+${prev}; }${why}" ;;
+    3) prev=""; if [[ "${FORCE_PHASE_3}" == 1 ]]; then prev="${FORCE_PHASE_3_WHY}"; fi
+       FORCE_PHASE_3=1; FORCE_PHASE_3_WHY="${prev:+${prev}; }${why}" ;;
+    5) prev=""; if [[ "${FORCE_PHASE_5}" == 1 ]]; then prev="${FORCE_PHASE_5_WHY}"; fi
+       FORCE_PHASE_5=1; FORCE_PHASE_5_WHY="${prev:+${prev}; }${why}" ;;
+  esac
+  return 0
+}
+
+# file_sha256 <path>: hex sha256 of the file's bytes (same digest as shasum -a 256).
+file_sha256() {
+  ${PYTHON} -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+# compute_phase_expectations: set DEPLOY_EXPECT_DEALS_SEED_SHA (sha256 of the
+# deals seed Step 1.5 writes) and DEPLOY_EXPECT_NCF_FINGERPRINT (the training
+# fingerprint Step 2 builds, from build.py --fingerprint-only). A value that
+# cannot be computed forces Phase 1, whose own step then reports the cause.
+compute_phase_expectations() {
+  local seed="${SCRIPT_DIR}/seed/deals_and_campaigns.json" out
+  out="$(file_sha256 "${seed}" 2>/dev/null || true)"
+  if [[ "${out}" =~ ^[0-9a-f]{64}$ ]]; then
+    DEPLOY_EXPECT_DEALS_SEED_SHA="${out}"
+  else
+    warn "Could not hash ${seed}; running Phase 1 so Step 1.5 reports why."
+    force_phase 1 "the local deals seed could not be hashed"
+  fi
+  out="$(${PYTHON} "${SCRIPT_DIR}/../source/training/ncf_sample/build.py" --fingerprint-only 2>/dev/null || true)"
+  out="${out##*$'\n'}"
+  if [[ "${out}" =~ ^[0-9a-f]{64}$ ]]; then
+    DEPLOY_EXPECT_NCF_FINGERPRINT="${out}"
+  else
+    warn "Could not compute the local Deal Scorer fingerprint (source/training/ncf_sample/build.py --fingerprint-only); running Phase 1 so Step 2 reports why."
+    force_phase 1 "the local Deal Scorer fingerprint could not be computed"
+  fi
+  return 0
+}
+
+if [[ "${STATUS_ONLY}" -eq 1 ]] || [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; then
+  compute_phase_expectations
+fi
 
 # --status: answer from AWS and stop. Deliberately before every other check --
 # it needs no credentials beyond read access, no kubeconfig, no Docker, and no
@@ -1145,10 +1219,15 @@ fi
 # and Phase 3 runs whenever it did; Phase 5 likewise when the AgentCore image is
 # among the rebuilt ones, since the runtime only picks a new image up through
 # update-agent-runtime.
+#
+# The same gap exists without a rebuild in this run, which the probe cannot see
+# either: pods still on an older digest than ECR holds for the tag, or an AgentCore
+# runtime registered with an older AgentCore image. The read-only checks before
+# Phase 1 find those and force_phase 3 or 5 (FORCE_PHASE_<n>, with the reason).
 _IMAGES_REBUILT=0
 _AGENTCORE_IMAGE_REBUILT=0
 _run_phase() {
-  local n="$1" st
+  local n="$1" st why=""
   [[ "${START_AT}" -le "${n}" ]] || return 1
   gate_wait "${n}" "${STACK_PREFIX}" || true
   if gate_should_run "${n}"; then
@@ -1168,6 +1247,17 @@ _run_phase() {
   fi
   if [[ "${n}" -eq 5 && "${_AGENTCORE_IMAGE_REBUILT}" -eq 1 ]]; then
     say "  Phase 5/5 reads as complete in AWS, but Step 4 rebuilt the AgentCore image; running it so the runtime is updated."
+    return 0
+  fi
+  if [[ "${n}" -eq 1 && "${FORCE_PHASE_1:-0}" == 1 ]]; then
+    why="${FORCE_PHASE_1_WHY:-FORCE_PHASE_1=1 is set}"
+  elif [[ "${n}" -eq 3 && "${FORCE_PHASE_3:-0}" == 1 ]]; then
+    why="${FORCE_PHASE_3_WHY:-FORCE_PHASE_3=1 is set}"
+  elif [[ "${n}" -eq 5 && "${FORCE_PHASE_5:-0}" == 1 ]]; then
+    why="${FORCE_PHASE_5_WHY:-FORCE_PHASE_5=1 is set}"
+  fi
+  if [[ -n "${why}" ]]; then
+    say "  Phase ${n}/5 reads as complete in AWS, but ${why}; running it."
     return 0
   fi
   st="$(gate_status "${n}")"
@@ -1273,6 +1363,13 @@ LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
 # parameter-store: that stack is optional, and coupling the template container
 # to it would leave a base-stack user with no template at all.
 CONTAINER_REGISTRY_TABLE="${STACK_NAME}-container-registry"
+# Deals table: IAB Tech Lab Deals API v1.0 deals and the demand endpoint's
+# campaigns, in its own CloudFormation stack (deployment/deals_table_cfn.yaml),
+# seeded from deployment/seed/deals_and_campaigns.json in Step 1.5. Read by the
+# in-cluster demand service (deploy_prebid.sh, IRSA), the Deal Scorer pod (Step 7.2 IRSA) and the
+# orchestrator (Step 7.5 DealsBook statement, read-only).
+DEALS_TABLE="${STACK_NAME}-deals"
+DEALS_STACK="${STACK_NAME}-deals"
 # Deterministic name matching feedback_pipeline_cfn.yaml's BidOutcomeStream
 # naming (HasStackPrefix condition). Only resolves to a real stream once
 # deploy_closed_loop.sh Step 1 creates it (--with-retraining, default on) —
@@ -1405,6 +1502,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # triton-sa here was a gap.
   eksctl delete iamserviceaccount --name triton-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
   eksctl delete iamserviceaccount --name model-optimizer-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+  eksctl delete iamserviceaccount --name deal-scorer-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
   eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null || true
 
   say "Deleting Triton model bucket..."
@@ -1452,10 +1550,12 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   EKS_SCALE_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${EKS_SCALE_POLICY_NAME}"
   CLOSED_LOOP_POLICY_NAME="${STACK_NAME}-closed-loop-${STACK_UID}"
   CLOSED_LOOP_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLOSED_LOOP_POLICY_NAME}"
+  DEAL_SCORER_POLICY_NAME="${STACK_NAME}-deal-scorer-deals-read-${STACK_UID}"
+  DEAL_SCORER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DEAL_SCORER_POLICY_NAME}"
 
   # model-optimizer-s3 (Step 7.1's IRSA policy) was missing from this cleanup —
   # every other IRSA/orchestrator policy Step 7/7.5/7.6/9 creates was already here.
-  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${OPTIMIZER_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}" "${CLOSED_LOOP_POLICY_ARN}"; do
+  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${OPTIMIZER_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}" "${CLOSED_LOOP_POLICY_ARN}" "${DEAL_SCORER_POLICY_ARN}"; do
     # Detach from all entities before deletion
     for ENTITY in $(aws iam list-entities-for-policy --policy-arn "${POLICY_ARN}" --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
       aws iam detach-role-policy --role-name "${ENTITY}" --policy-arn "${POLICY_ARN}" 2>/dev/null || true
@@ -1583,6 +1683,9 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   say "Deleting closed-loop-core stack (${CLOSED_LOOP_STACK})..."
   aws cloudformation delete-stack --stack-name "${CLOSED_LOOP_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
   aws cloudformation wait stack-delete-complete --stack-name "${CLOSED_LOOP_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+  say "Deleting deals table stack (${DEALS_STACK})..."
+  aws cloudformation delete-stack --stack-name "${DEALS_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
+  aws cloudformation wait stack-delete-complete --stack-name "${DEALS_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
 
   say "Deleting agentcore-security stack (${AGENTCORE_SECURITY_STACK})..."
   aws cloudformation delete-stack --stack-name "${AGENTCORE_SECURITY_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
@@ -1784,6 +1887,511 @@ REPOS=(
   ${STACK_NAME}-agentcore
 )
 
+# =========================================================================
+# Deal Scorer build identity (ncf_deal_manager)
+# =========================================================================
+# Step 2 trains the Deal Scorer on sample interactions generated from the deal
+# book (source/training/ncf_sample/build.py) and writes manifest.json beside its
+# ONNX. The manifest's 64-hex `fingerprint` travels with the build as S3 metadata
+# source-fingerprint on onnx-source/ncf_deal_manager/model.onnx and as
+# ncf_fingerprint in the Phase 1 marker; its `model_version`
+# (ncf-neumf-sample-<12 hex>) becomes NCF_MODEL_LABEL on the deal-scorer
+# Deployment, which refuses to start on Triton without one. Each build is also
+# kept under NCF_BUILDS_PREFIX/<12 hex>/, the key its Model Registry version
+# names, because the keys directly under NCF_SOURCE_PREFIX are overwritten by
+# every build.
+NCF_LABEL_RE='^ncf-neumf-sample-[0-9a-f]{12}$'
+NCF_SOURCE_PREFIX="onnx-source/ncf_deal_manager"
+NCF_MANIFEST_KEY="${NCF_SOURCE_PREFIX}/manifest.json"
+NCF_BUILDS_PREFIX="${NCF_SOURCE_PREFIX}/builds"
+PHASE1_MARKER_KEY="deploy-markers/phase1.json"
+NCF_FINGERPRINT=""
+NCF_MODEL_LABEL=""
+
+# ncf_manifest_field <manifest.json> <field>: print a non-empty string field, or
+# exit non-zero with the reason on stderr.
+ncf_manifest_field() {
+  ${PYTHON} - "$1" "$2" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as handle:
+        value = json.load(handle).get(field)
+except (OSError, ValueError, AttributeError) as exc:
+    sys.exit(f"{path}: {exc}")
+if not isinstance(value, str) or not value:
+    sys.exit(f"{path} has no string field {field!r}")
+print(value)
+PY
+}
+
+# upload_ncf_source <dir>: upload the Deal Scorer build in <dir> (model.onnx,
+# manifest.json, interactions.csv) to onnx-source/ncf_deal_manager/builds/<12 hex>/
+# and then to onnx-source/ncf_deal_manager/, with source-fingerprint metadata on
+# both copies of model.onnx, then set NCF_FINGERPRINT and NCF_MODEL_LABEL from its
+# manifest. The Model Optimizer reads the keys under onnx-source/ncf_deal_manager/;
+# register_genesis_models.py points the build's registry version at its builds/
+# copy, which no later build overwrites.
+upload_ncf_source() {
+  local dir="$1" fp label f build_prefix
+  for f in model.onnx manifest.json interactions.csv; do
+    [[ -f "${dir}/${f}" ]] \
+      || fail 1 "Step 2 left no ${f} in ${dir}; the Deal Scorer build is incomplete. Re-run Step 2 (source/triton/export_models.py --model ncf)."
+  done
+  fp="$(ncf_manifest_field "${dir}/manifest.json" fingerprint)" \
+    || fail 1 "The Deal Scorer manifest ${dir}/manifest.json has no fingerprint."
+  [[ "${fp}" =~ ^[0-9a-f]{64}$ ]] \
+    || fail 1 "The Deal Scorer manifest fingerprint '${fp}' is not 64 hex characters."
+  label="$(ncf_manifest_field "${dir}/manifest.json" model_version)" \
+    || fail 1 "The Deal Scorer manifest ${dir}/manifest.json has no model_version."
+  [[ "${label}" =~ ${NCF_LABEL_RE} ]] \
+    || fail 1 "The Deal Scorer manifest model_version '${label}' does not match ${NCF_LABEL_RE}."
+  build_prefix="${NCF_BUILDS_PREFIX}/${fp:0:12}"
+  quiet "s3 cp ncf_deal_manager/model.onnx -> ${build_prefix}/" \
+    aws s3 cp "${dir}/model.onnx" "s3://${MODEL_BUCKET}/${build_prefix}/model.onnx" \
+      --metadata "source-fingerprint=${fp}" --region "${AWS_REGION}" \
+    || fail 1 "Could not upload the Deal Scorer ONNX to s3://${MODEL_BUCKET}/${build_prefix}/"
+  for f in manifest.json interactions.csv; do
+    quiet "s3 cp ncf_deal_manager/${f} -> ${build_prefix}/" \
+      aws s3 cp "${dir}/${f}" "s3://${MODEL_BUCKET}/${build_prefix}/${f}" --region "${AWS_REGION}" \
+      || fail 1 "Could not upload the Deal Scorer ${f} to s3://${MODEL_BUCKET}/${build_prefix}/"
+  done
+  quiet "s3 cp ncf_deal_manager/model.onnx -> onnx-source/ (source-fingerprint ${fp:0:12})" \
+    aws s3 cp "${dir}/model.onnx" "s3://${MODEL_BUCKET}/${NCF_SOURCE_PREFIX}/model.onnx" \
+      --metadata "source-fingerprint=${fp}" --region "${AWS_REGION}" \
+    || fail 1 "Could not upload the Deal Scorer ONNX to s3://${MODEL_BUCKET}/${NCF_SOURCE_PREFIX}/"
+  quiet "s3 cp ncf_deal_manager/manifest.json -> onnx-source/" \
+    aws s3 cp "${dir}/manifest.json" "s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY}" --region "${AWS_REGION}" \
+    || fail 1 "Could not upload the Deal Scorer manifest to s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY}"
+  quiet "s3 cp ncf_deal_manager/interactions.csv -> onnx-source/" \
+    aws s3 cp "${dir}/interactions.csv" "s3://${MODEL_BUCKET}/${NCF_SOURCE_PREFIX}/interactions.csv" --region "${AWS_REGION}" \
+    || fail 1 "Could not upload the Deal Scorer interactions to s3://${MODEL_BUCKET}/${NCF_SOURCE_PREFIX}/"
+  NCF_FINGERPRINT="${fp}"
+  NCF_MODEL_LABEL="${label}"
+  log "  Deal Scorer build ${NCF_MODEL_LABEL} uploaded to s3://${MODEL_BUCKET}/${NCF_SOURCE_PREFIX}/ (kept at ${build_prefix}/)"
+}
+
+# write_phase1_marker <deals_seed_sha256> <ncf_fingerprint>: record what Phase 1
+# seeded and built, as deploy-markers/phase1.json in the model bucket.
+write_phase1_marker() {
+  local seed_sha="$1" ncf_fp="$2" tmp
+  [[ "${seed_sha}" =~ ^[0-9a-f]{64}$ ]] || fail 1 "Deals seed sha256 '${seed_sha}' is not 64 hex characters."
+  [[ "${ncf_fp}" =~ ^[0-9a-f]{64}$ ]] || fail 1 "Deal Scorer fingerprint '${ncf_fp}' is not 64 hex characters."
+  tmp="$(mktemp)"
+  ${PYTHON} - "${seed_sha}" "${ncf_fp}" > "${tmp}" <<'PY'
+import datetime
+import json
+import sys
+
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+marker = {"deals_seed_sha256": sys.argv[1], "ncf_fingerprint": sys.argv[2], "written_at": now}
+print(json.dumps(marker, sort_keys=True))
+PY
+  if ! quiet "s3 cp ${PHASE1_MARKER_KEY}" \
+      aws s3 cp "${tmp}" "s3://${MODEL_BUCKET}/${PHASE1_MARKER_KEY}" \
+        --content-type application/json --region "${AWS_REGION}"; then
+    rm -f "${tmp}"
+    fail 1 "Could not write s3://${MODEL_BUCKET}/${PHASE1_MARKER_KEY}"
+  fi
+  rm -f "${tmp}"
+  log "  Phase 1 marker: s3://${MODEL_BUCKET}/${PHASE1_MARKER_KEY} (deals seed ${seed_sha:0:12}, Deal Scorer ${ncf_fp:0:12})"
+}
+
+# register_ncf_build: warn-only. Registers the uploaded Deal Scorer build in its
+# Model Registry group when retraining is on and the group already exists; on a
+# first deploy the group is created, and the build registered, in Phase 5.
+register_ncf_build() {
+  local group="${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager"
+  [[ "${WITH_RETRAINING}" -eq 1 ]] || return 0
+  if ! aws sagemaker describe-model-package-group --model-package-group-name "${group}" \
+      --region "${AWS_REGION}" >/dev/null 2>&1; then
+    log "  Model Registry group ${group} does not exist yet; Phase 5 registers the Deal Scorer build"
+    return 0
+  fi
+  quiet "register_genesis_models.py --only ncf_deal_manager" \
+    ${PYTHON} "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
+      --model-bucket "${MODEL_BUCKET}" \
+      --region "${AWS_REGION}" \
+      ${AWS_PROFILE:+--profile "${AWS_PROFILE}"} \
+      --ncf-package-group "${group}" \
+      --only ncf_deal_manager \
+      --training-image-repository artf-nemo-rl-training \
+    || warn "  Deal Scorer Model Registry update failed (non-fatal); Phase 5 runs the registration again."
+}
+
+# resolve_ncf_model_label: NCF_MODEL_LABEL as Phase 1 of this run set it, else
+# from onnx-source/ncf_deal_manager/manifest.json in the model bucket (a run that
+# skips Phase 1). Fails when neither yields a valid label.
+resolve_ncf_model_label() {
+  local tmp label
+  if [[ -n "${NCF_MODEL_LABEL}" ]]; then
+    [[ "${NCF_MODEL_LABEL}" =~ ${NCF_LABEL_RE} ]] \
+      || fail 3 "NCF_MODEL_LABEL '${NCF_MODEL_LABEL}' does not match ${NCF_LABEL_RE}."
+    return 0
+  fi
+  tmp="$(mktemp)"
+  if ! aws s3 cp "s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY}" "${tmp}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    rm -f "${tmp}"
+    fail 3 "No Deal Scorer label: Phase 1 did not run in this deploy and s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY} could not be read. Run ./deploy.sh --start-at 1 so Step 2 builds the Deal Scorer."
+  fi
+  if ! label="$(ncf_manifest_field "${tmp}" model_version)"; then
+    rm -f "${tmp}"
+    fail 3 "s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY} has no model_version."
+  fi
+  rm -f "${tmp}"
+  [[ "${label}" =~ ${NCF_LABEL_RE} ]] \
+    || fail 3 "s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY} model_version '${label}' does not match ${NCF_LABEL_RE}."
+  NCF_MODEL_LABEL="${label}"
+  log "  Deal Scorer label from s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY}: ${NCF_MODEL_LABEL}"
+}
+
+# =========================================================================
+# Staleness the phase probe cannot see (read-only)
+# =========================================================================
+# The probe reads what EXISTS. It cannot tell whether a running pod's image is
+# the one ECR now holds for the deploy's tag (a rebuild under the same tag leaves
+# the pod template unchanged), which AgentCore image the MCP runtime was last
+# registered with (AgentCore resolves the tag when the runtime is created or
+# updated), or whether the Prebid host was deployed from the current sources.
+# These functions answer with read-only calls (kubectl get, aws ecr
+# describe-images) and the values .deploy-state.json recorded after the last
+# successful Step 10 and Step 12. A digest or record that cannot be read counts
+# as stale.
+
+# The Deployments rolled out after Step 8b's apply. Each runs one image,
+# ${STACK_NAME}-<name> in ECR.
+MANAGED_DEPLOYMENTS=(bid-pricer audience-activator deal-scorer signals-enricher
+                     yield-optimizer-floor yield-optimizer-margin artf-template orchestrator)
+STALE_DEPLOYMENTS=()
+STALE_DEPLOYMENT_LINES=()
+AGENTCORE_STALE_WHY=""
+PREBID_FINGERPRINT=""
+PREBID_STEP_WHY=""
+
+# recorded_image_tag: the tag Phase 2 deploys under. .image-outputs.json pins it
+# to the last build's tag when that build was for this registry; otherwise the
+# tag this run was given.
+recorded_image_tag() {
+  local f="${SCRIPT_DIR}/.image-outputs.json" tag="" reg=""
+  if [[ -f "${f}" ]]; then
+    tag="$(jq -r '.ImageTag // empty' "${f}" 2>/dev/null || echo '')"
+    reg="$(jq -r '.Registry // empty' "${f}" 2>/dev/null || echo '')"
+  fi
+  if [[ -n "${tag}" && "${reg}" == "${REGISTRY}" ]]; then
+    printf '%s\n' "${tag}"
+  else
+    printf '%s\n' "${IMAGE_TAG}"
+  fi
+}
+
+# ecr_image_digest <repo> <tag>: the manifest digest (sha256:<64 hex>) ECR holds
+# for <repo>:<tag>, or nothing when there is none or it cannot be read.
+ecr_image_digest() {
+  local digest
+  digest="$(aws ecr describe-images --repository-name "$1" --image-ids "imageTag=$2" \
+    --region "${AWS_REGION}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+  if [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "${digest}"
+  fi
+  return 0
+}
+
+# _stale_verdicts <kubectl-json> <stack> <name=digest>...: one line per name,
+# "<verdict><TAB><name><TAB><detail>", where verdict is fresh (every live pod of
+# the Deployment runs <digest>), stale (one runs another digest), unknown (a digest
+# cannot be read on either side) or absent (no such Deployment). Pods are matched
+# to Deployments through their ReplicaSet's ownerReferences; terminating, Succeeded
+# and Failed pods are not compared. imageID is the repo digest the runtime pulled
+# (<registry>/<repo>@sha256:<hex>, with a docker-pullable:// prefix on Docker).
+_stale_verdicts() {
+  ${PYTHON} - "$@" <<'PY'
+import json
+import re
+import sys
+
+path, stack, pairs = sys.argv[1], sys.argv[2], [a.split("=", 1) for a in sys.argv[3:]]
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def out(verdict, name, detail):
+    print(f"{verdict}\t{name}\t{detail}")
+
+
+def repo_of(image):
+    last = (image or "").split("@", 1)[0].rsplit("/", 1)[-1]
+    return last.split(":", 1)[0]
+
+
+def digest_of(image_id):
+    tail = (image_id or "").rsplit("@", 1)[-1] if "@" in (image_id or "") else ""
+    return tail if DIGEST.fullmatch(tail) else ""
+
+
+try:
+    with open(path) as handle:
+        items = json.load(handle).get("items")
+    if not isinstance(items, list):
+        raise ValueError("no items")
+except (OSError, ValueError, AttributeError):
+    for name, _ in pairs:
+        out("unknown", name, "the cluster's Deployments and pods could not be read")
+    sys.exit(0)
+
+def meta(item):
+    return item.get("metadata") or {}
+
+deployments = {meta(i).get("name"): i for i in items if i.get("kind") == "Deployment"}
+rs_owner = {}
+for i in items:
+    if i.get("kind") != "ReplicaSet":
+        continue
+    for ref in meta(i).get("ownerReferences") or []:
+        if ref.get("kind") == "Deployment":
+            rs_owner[meta(i).get("name")] = ref.get("name")
+pods = {}
+for i in items:
+    if i.get("kind") != "Pod" or meta(i).get("deletionTimestamp"):
+        continue
+    if (i.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
+        continue
+    for ref in meta(i).get("ownerReferences") or []:
+        if ref.get("kind") == "ReplicaSet" and ref.get("name") in rs_owner:
+            pods.setdefault(rs_owner[ref["name"]], []).append(i)
+
+for name, want in pairs:
+    repo = f"{stack}-{name}"
+    deployment = deployments.get(name)
+    if deployment is None:
+        out("absent", name, "no such Deployment")
+        continue
+    if not want:
+        out("unknown", name, f"ECR has no readable digest for {repo} at this tag")
+        continue
+    template = (((deployment.get("spec") or {}).get("template") or {}).get("spec") or {})
+    containers = {c.get("name") for c in template.get("containers") or []
+                  if repo_of(c.get("image")) == repo}
+    live = pods.get(name, [])
+    if not containers:
+        out("unknown", name, f"the Deployment runs no {repo} container")
+        continue
+    if not live:
+        out("unknown", name, "no live pods to compare")
+        continue
+    stale, unknown = [], []
+    for pod in live:
+        statuses = [cs for cs in (pod.get("status") or {}).get("containerStatuses") or []
+                    if cs.get("name") in containers]
+        if not statuses:
+            unknown.append(f"pod {meta(pod).get('name')} reports no container status yet")
+        for cs in statuses:
+            running = digest_of(cs.get("imageID"))
+            if not running:
+                unknown.append(f"pod {meta(pod).get('name')} reports no image digest yet")
+            elif running != want:
+                stale.append(f"pod {meta(pod).get('name')} runs {running[7:19]}")
+    if stale:
+        out("stale", name, f"ECR holds {want[7:19]}; " + ", ".join(stale))
+    elif unknown:
+        out("unknown", name, "; ".join(unknown))
+    else:
+        out("fresh", name, f"{len(live)} pod(s) on {want[7:19]}")
+PY
+}
+
+# stale_deployments <tag> [kube-context]: set STALE_DEPLOYMENTS to the managed
+# Deployments that exist and are stale or unknown by _stale_verdicts against
+# ECR's digest for ${STACK_NAME}-<name>:<tag>, and STALE_DEPLOYMENT_LINES to one
+# reason per name. Without a context kubectl uses its current one. Sets globals,
+# so call it bare, never inside $(...).
+stale_deployments() {
+  local tag="$1" ctx="${2:-}" tmp name verdicts="" verdict detail
+  local kargs=() pairs=()
+  STALE_DEPLOYMENTS=()
+  STALE_DEPLOYMENT_LINES=()
+  if [[ -n "${ctx}" ]]; then kargs=(--context "${ctx}"); fi
+  tmp="$(mktemp)"
+  kubectl ${kargs[@]+"${kargs[@]}"} get deployments,replicasets,pods -o json >"${tmp}" 2>/dev/null \
+    || : >"${tmp}"
+  for name in "${MANAGED_DEPLOYMENTS[@]}"; do
+    pairs+=("${name}=$(ecr_image_digest "${STACK_NAME}-${name}" "${tag}")")
+  done
+  verdicts="$(_stale_verdicts "${tmp}" "${STACK_NAME}" "${pairs[@]}" 2>/dev/null)" || verdicts=""
+  rm -f "${tmp}"
+  if [[ -z "${verdicts}" ]]; then
+    for name in "${MANAGED_DEPLOYMENTS[@]}"; do
+      verdicts+="unknown"$'\t'"${name}"$'\t'"the digest comparison did not run"$'\n'
+    done
+  fi
+  while IFS=$'\t' read -r verdict name detail; do
+    [ -n "${name}" ] || continue
+    case "${verdict}" in
+      stale|unknown)
+        STALE_DEPLOYMENTS+=("${name}")
+        STALE_DEPLOYMENT_LINES+=("${name}: ${verdict}, ${detail}") ;;
+    esac
+  done <<VERDICTS
+${verdicts}
+VERDICTS
+  return 0
+}
+
+# restart_stale_deployments <tag>: Step 8b's rollout. Restarts only the managed
+# Deployments whose pods do not run ECR's image for <tag> (or whose digest cannot
+# be read), against kubectl's current context like the apply before it.
+restart_stale_deployments() {
+  local tag="$1" line name restarted=0
+  stale_deployments "${tag}"
+  for line in ${STALE_DEPLOYMENT_LINES[@]+"${STALE_DEPLOYMENT_LINES[@]}"}; do
+    log "    ${line}"
+  done
+  if [[ ${#STALE_DEPLOYMENTS[@]} -eq 0 ]]; then
+    log "  Every managed Deployment runs ECR's image for tag ${tag}; none restarted"
+    return 0
+  fi
+  for name in "${STALE_DEPLOYMENTS[@]}"; do
+    if kubectl get "deployment/${name}" >/dev/null 2>&1; then
+      if kubectl rollout restart "deployment/${name}" >/dev/null 2>&1; then
+        restarted=$((restarted + 1))
+      else
+        warn "  Could not restart deployment/${name}"
+      fi
+    fi
+  done
+  log "  Restarted ${restarted} Deployment(s) not on ECR's image for tag ${tag}"
+  return 0
+}
+
+# agentcore_image_stale <tag>: true when the digest ECR holds for
+# ${STACK_NAME}-agentcore:<tag> is not the one recorded after the last successful
+# Step 10, or either cannot be read. Sets AGENTCORE_STALE_WHY.
+agentcore_image_stale() {
+  local tag="$1" recorded current
+  AGENTCORE_STALE_WHY=""
+  recorded="$(state_read "${STACK_PREFIX}" resolved.agentcoreImageDigest)"
+  current="$(ecr_image_digest "${STACK_NAME}-agentcore" "${tag}")"
+  if [[ -z "${current}" ]]; then
+    AGENTCORE_STALE_WHY="ECR has no readable digest for ${STACK_NAME}-agentcore:${tag}"
+  elif [[ -z "${recorded}" ]]; then
+    AGENTCORE_STALE_WHY="no AgentCore image digest is recorded for this prefix in ${DEPLOY_STATE_FILE}"
+  elif [[ "${recorded}" != "${current}" ]]; then
+    AGENTCORE_STALE_WHY="the MCP runtime was registered with AgentCore image ${recorded:7:12}, and ECR now holds ${current:7:12} for ${STACK_NAME}-agentcore:${tag}"
+  else
+    return 1
+  fi
+  return 0
+}
+
+# record_agentcore_digest <digest>: after Step 10 registers the MCP runtime,
+# remember the image digest it was registered with for the next run's check.
+record_agentcore_digest() {
+  if [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    state_set "${STACK_PREFIX}" resolved "agentcoreImageDigest=$1"
+    log "  AgentCore image ${1:7:12} recorded for the next run's Phase 5 check"
+  else
+    warn "  Could not read the AgentCore image digest from ECR; the next run registers the MCP runtime again."
+  fi
+  return 0
+}
+
+# prebid_fingerprint <repo-root> <deals-seed-sha256>: sha256 over the git-visible
+# files deploy_prebid.sh builds or applies (source/prebid/, source/demand/,
+# deployment/prebid_cfn.yaml, deployment/deploy_prebid.sh,
+# deployment/scripts/prebid_config_template.yaml, its three eks/ manifests,
+# source/Dockerfile.demand and lib/k8s_rollout.sh) and the deals seed sha256.
+# Fails on a malformed seed sha.
+prebid_fingerprint() {
+  local root="$1" seed_sha="$2" files="" p f
+  local list=()
+  [[ "${seed_sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  for p in source/prebid source/demand; do
+    if [[ -d "${root}/${p}" ]]; then files+="$(_hashable_files "${root}/${p}")"$'\n'; fi
+  done
+  for p in deployment/prebid_cfn.yaml deployment/deploy_prebid.sh \
+           deployment/scripts/prebid_config_template.yaml \
+           deployment/eks/prebid-server-deployment.yaml deployment/eks/amt-simulator-deployment.yaml \
+           deployment/eks/artfhouse-demand-deployment.yaml source/Dockerfile.demand \
+           deployment/lib/k8s_rollout.sh; do
+    files+="${root}/${p}"$'\n'
+  done
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    list+=("${f}")
+  done <<PREBID_FILES
+${files}
+PREBID_FILES
+  ${PYTHON} - "${root}" "${seed_sha}" ${list[@]+"${list[@]}"} <<'PY'
+import hashlib
+import os
+import sys
+
+root, seed = os.path.realpath(sys.argv[1]), sys.argv[2]
+lines = []
+for path in sorted({os.path.realpath(p) for p in sys.argv[3:]}):
+    rel = os.path.relpath(path, root)
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            lines.append(f"{rel}:{hashlib.sha256(handle.read()).hexdigest()}")
+    else:
+        lines.append(f"{rel}:absent")
+lines.append(f"deals_seed_sha256:{seed}")
+print(hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest())
+PY
+}
+
+# prebid_step_needed <phase5-ran>: whether Step 12 (deploy_prebid.sh) runs. Never
+# without --with-prebid; always when Phase 5 ran, as before; otherwise when
+# PREBID_FINGERPRINT differs from the one recorded after the last successful
+# Step 12, none is recorded, or it could not be computed. Sets PREBID_STEP_WHY.
+prebid_step_needed() {
+  local ran="$1" recorded
+  PREBID_STEP_WHY=""
+  if [[ "${WITH_PREBID}" -ne 1 ]]; then return 1; fi
+  if [[ "${ran}" -eq 1 ]]; then return 0; fi
+  recorded="$(state_read "${STACK_PREFIX}" resolved.prebidFingerprint)"
+  if [[ -z "${PREBID_FINGERPRINT}" ]]; then
+    PREBID_STEP_WHY="the Prebid host's sources could not be fingerprinted"
+  elif [[ -z "${recorded}" ]]; then
+    PREBID_STEP_WHY="no Prebid host fingerprint is recorded for this prefix in ${DEPLOY_STATE_FILE}"
+  elif [[ "${recorded}" != "${PREBID_FINGERPRINT}" ]]; then
+    PREBID_STEP_WHY="the Prebid host's sources or deals seed changed since its last deploy (${recorded:0:12} to ${PREBID_FINGERPRINT:0:12})"
+  else
+    return 1
+  fi
+  return 0
+}
+
+# check_unprobed_staleness: Phase 3 and Phase 5 staleness, checked once before
+# the phases run; each finding becomes force_phase 3 or 5. Phase 1 and the Deal
+# Scorer engine are the probe's (see compute_phase_expectations). Sets globals,
+# so call it bare.
+check_unprobed_staleness() {
+  local tag line
+  tag="$(recorded_image_tag)"
+  if [[ "${START_AT}" -le 3 ]]; then
+    # The probe's context for THIS cluster, never kubectl's current one: before
+    # Step 5.5 that may belong to another deployment.
+    if [[ -n "${DEPLOY_KUBE_CONTEXT:-}" ]]; then
+      stale_deployments "${tag}" "${DEPLOY_KUBE_CONTEXT}"
+      if [[ ${#STALE_DEPLOYMENTS[@]} -gt 0 ]]; then
+        force_phase 3 "${#STALE_DEPLOYMENTS[@]} Deployment(s) do not run ECR's image for tag ${tag} (${STALE_DEPLOYMENTS[*]})"
+        for line in "${STALE_DEPLOYMENT_LINES[@]}"; do log "    ${line}"; done
+      fi
+    else
+      force_phase 3 "the running pods' image digests could not be read (no kubeconfig context for ${CLUSTER_NAME})"
+    fi
+  fi
+  if [[ "${SKIP_AGENTCORE}" -eq 0 ]] && agentcore_image_stale "${tag}"; then
+    force_phase 5 "${AGENTCORE_STALE_WHY}"
+  fi
+  return 0
+}
+
+if [[ "${EXPORT_ONLY}" -eq 0 ]]; then
+  check_unprobed_staleness
+fi
+
 if _run_phase 1; then
 phase 1 "Preparing models"
 step "Step 1: Ensuring ECR repositories"
@@ -1865,6 +2473,44 @@ if aws dynamodb put-item \
 else
   log "  Registry record artf-template already present — left untouched"
 fi
+# Deals table stack and seed. The table is a CloudFormation resource (on-demand,
+# KMS encryption at rest, point-in-time recovery); the seed is written on every
+# deploy through the stack's put-only DealsSeedRole, so a seed edit reaches the
+# table here and the Deal Scorer picks it up on its next 30 second refresh.
+DEALS_STATUS="$(aws cloudformation describe-stacks --stack-name "${DEALS_STACK}" --region "${AWS_REGION}" \
+  --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo '')"
+if [[ "${DEALS_STATUS}" == "ROLLBACK_COMPLETE" ]]; then
+  log "  ${DEALS_STACK} is ${DEALS_STATUS}; deleting before recreate"
+  aws cloudformation delete-stack --stack-name "${DEALS_STACK}" --region "${AWS_REGION}"
+  aws cloudformation wait stack-delete-complete --stack-name "${DEALS_STACK}" --region "${AWS_REGION}"
+  DEALS_STATUS=""
+fi
+DEALS_ACTION="create-stack"
+[[ -n "${DEALS_STATUS}" && "${DEALS_STATUS}" != "None" ]] && DEALS_ACTION="update-stack"
+DEALS_CFN_LOG="/tmp/cfn-deploy-${DEALS_STACK}-$(date +%s).log"
+if aws cloudformation "${DEALS_ACTION}" --stack-name "${DEALS_STACK}" \
+    --template-body "file://${SCRIPT_DIR}/deals_table_cfn.yaml" \
+    --capabilities CAPABILITY_IAM --region "${AWS_REGION}" \
+    --parameters "ParameterKey=TableName,ParameterValue=${DEALS_TABLE}" \
+    >"${DEALS_CFN_LOG}" 2>&1; then
+  DEALS_WAIT="stack-create-complete"
+  [[ "${DEALS_ACTION}" == "update-stack" ]] && DEALS_WAIT="stack-update-complete"
+  aws cloudformation wait "${DEALS_WAIT}" --stack-name "${DEALS_STACK}" --region "${AWS_REGION}" \
+    || fail 1 "Deals table stack ${DEALS_STACK} did not reach ${DEALS_WAIT}; see: aws cloudformation describe-stack-events --stack-name ${DEALS_STACK}"
+elif ! grep -q "No updates are to be performed" "${DEALS_CFN_LOG}"; then
+  fail 1 "Deals table stack ${DEALS_STACK} ${DEALS_ACTION} failed: $(cat "${DEALS_CFN_LOG}")"
+fi
+DEALS_SEED_ROLE_ARN="$(_cfn_output "${DEALS_STACK}" DealsSeedRoleArn)"
+[[ -n "${DEALS_SEED_ROLE_ARN}" ]] || fail 1 "${DEALS_STACK} has no DealsSeedRoleArn output."
+log "  Deals table stack ready: ${DEALS_STACK} (table ${DEALS_TABLE})"
+${PYTHON} "${SCRIPT_DIR}/scripts/seed_deals_table.py" \
+  --table "${DEALS_TABLE}" \
+  --role-arn "${DEALS_SEED_ROLE_ARN}" \
+  --seed "${SCRIPT_DIR}/seed/deals_and_campaigns.json" \
+  --region "${AWS_REGION}" \
+  --origin-prefix "${STACK_PREFIX}" \
+  ${AWS_PROFILE:+--profile "${AWS_PROFILE}"} \
+  || fail 1 "seed_deals_table.py could not seed ${DEALS_TABLE} from deployment/seed/deals_and_campaigns.json (see its error above)."
 
 # =========================================================================
 # Step 2: Export PyTorch models to ONNX
@@ -1876,7 +2522,7 @@ step "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
 # with the router/engine configs committed under triton/model_repository/.
 ONNX_STAGING="${SCRIPT_DIR}/../source/triton/onnx_export"
 rm -rf "${ONNX_STAGING}"
-run_step "Exporting DLRM and NCF to ONNX" \
+run_step "Exporting DLRM to ONNX; training, exporting and gating the Deal Scorer (NCF)" \
   ${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
     --output-dir "${ONNX_STAGING}"
 
@@ -1972,6 +2618,12 @@ YIELD_MODELS=(deal_yield_manager_floor deal_yield_manager_margin)
 # 3a. Upload exported ONNX to onnx-source/ — the Model Optimizer reads these to
 #     build TensorRT engines. NOT served directly by Triton.
 for m in "${RECOMMENDER_MODELS[@]}"; do
+  # The Deal Scorer build also carries its training interactions and its
+  # fingerprint (upload_ncf_source above).
+  if [[ "${m}" == "ncf_deal_manager" ]]; then
+    upload_ncf_source "${ONNX_STAGING}/${m}/1"
+    continue
+  fi
   quiet "s3 cp ${m}/model.onnx -> onnx-source/" \
     aws s3 cp "${ONNX_STAGING}/${m}/1/model.onnx" \
       "s3://${MODEL_BUCKET}/onnx-source/${m}/model.onnx" --region "${AWS_REGION}"
@@ -1986,6 +2638,9 @@ for m in "${RECOMMENDER_MODELS[@]}"; do
   fi
 done
 log "  ONNX uploaded to s3://${MODEL_BUCKET}/onnx-source/"
+# Phase 5 gate-skips on a healthy stack, so a new Deal Scorer build is registered
+# here as well (the script registers a version only for a new fingerprint).
+register_ncf_build
 
 # 3a2. Yield Optimizer genesis: ONNX form for registry bookkeeping
 # (onnx-source/, matches the DLRM/NCF convention exactly so
@@ -2050,6 +2705,13 @@ quiet "s3 cp optimizer bootstrap spec" \
     "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
 rm -f "${BOOTSTRAP_TMP}"
 log "  Model Optimizer bootstrap spec uploaded"
+
+# 3d. Phase 1 marker: the deals seed and the Deal Scorer build this phase put in
+#     place. Written last, so a phase that stops part way leaves the previous
+#     marker (or none) behind.
+write_phase1_marker \
+  "$(file_sha256 "${SCRIPT_DIR}/seed/deals_and_campaigns.json")" \
+  "${NCF_FINGERPRINT}"
 ok "Models exported and uploaded"
 fi # START_AT <= 1 (Phase 1)
 
@@ -2068,14 +2730,10 @@ _EKSCTL_LOG="${DEPLOY_LOG}"
 _KUBECTL_LOG="${DEPLOY_LOG}"
 IMAGE_OUTPUTS="${SCRIPT_DIR}/.image-outputs.json"
 
-# Always read the outputs file if it exists (needed for --start-at to use the correct tag)
-if [[ -f "${IMAGE_OUTPUTS}" ]]; then
-  PREV_TAG="$(jq -r '.ImageTag // empty' "${IMAGE_OUTPUTS}" 2>/dev/null || echo '')"
-  PREV_REGISTRY="$(jq -r '.Registry // empty' "${IMAGE_OUTPUTS}" 2>/dev/null || echo '')"
-  if [[ -n "${PREV_TAG}" && "${PREV_REGISTRY}" == "${REGISTRY}" ]]; then
-    IMAGE_TAG="${PREV_TAG}"
-  fi
-fi
+# Always read the outputs file if it exists (needed for --start-at to use the correct
+# tag). recorded_image_tag reads ${IMAGE_OUTPUTS}; the staleness checks before Phase 1
+# use the same function, so they compare against the tag deployed here.
+IMAGE_TAG="$(recorded_image_tag)"
 
 # =========================================================================
 # Content-hash helpers — detect source drift under a reused IMAGE_TAG
@@ -2099,13 +2757,44 @@ _sha256() {
   fi
 }
 
+# List the files under directory $1 that count as image source, one absolute
+# path per line, sorted. Uses git so gitignored artifacts (__pycache__/*.pyc
+# from local pytest runs, .pytest_cache, .hypothesis, .DS_Store, node_modules)
+# do not change the hash: a plain `find` included them, so running the tests
+# changed every Python image's hash and the next deploy rebuilt all of them.
+# remote_build.sh already drops __pycache__ and .DS_Store from the CodeBuild
+# zip, so those files were never in the built image either.
+#
+# -c lists tracked files and -o --exclude-standard adds untracked files that are
+# not ignored. Contents are read from the working tree, so uncommitted edits
+# and new uncommitted files still change the hash.
+#
+# Outside a git checkout (e.g. a source tarball) it falls back to find with the
+# same artifacts excluded explicitly.
+_hashable_files() {
+  local dir="$1" root
+  root="$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null || echo '')"
+  if [[ -n "${root}" ]]; then
+    git -C "${root}" -c core.quotePath=false ls-files -co --exclude-standard -- "${dir}" 2>/dev/null \
+      | while IFS= read -r f; do [ -n "${f}" ] && printf '%s/%s\n' "${root}" "${f}"; done \
+      | LC_ALL=C sort
+  else
+    find "${dir}" \( -name __pycache__ -o -name .pytest_cache -o -name .hypothesis \
+        -o -name .mypy_cache -o -name .ruff_cache -o -name node_modules -o -name dist \) -prune \
+      -o -type f ! -name '*.pyc' ! -name .DS_Store -print | LC_ALL=C sort
+  fi
+}
+
 # Compute a short content hash for the given image key over exactly the files
 # that Dockerfile actually COPYs (kept in sync with build_image_local's cases
 # and the Dockerfiles under source/). Returns empty on an unrecognized key so
 # callers can fail safe (rebuild) instead of silently trusting a stale image.
 _source_hash() {
   local key="$1"
-  local src="${SCRIPT_DIR}/../source"
+  # Physical path, so it matches the git toplevel prefix _hashable_files emits
+  # and ${f#${src}/} below strips it.
+  local src
+  src="$(cd "${SCRIPT_DIR}/../source" 2>/dev/null && pwd -P || echo "${SCRIPT_DIR}/../source")"
   local paths=()
   case "${key}" in
     dlrm-bid-shader|ncf-deal-manager|yield-optimizer-floor|yield-optimizer-margin)
@@ -2150,9 +2839,11 @@ _source_hash() {
       # Verified output-identical to the previous form over nine cases, including
       # every directory this function is called with, a missing path, a single
       # file, a mixed set, and an empty directory.
-      _found="$(find "${p}" -type f | LC_ALL=C sort)"
+      _found="$(_hashable_files "${p}")"
       while IFS= read -r f; do
         [ -n "${f}" ] || continue
+        # ls-files still lists a tracked file deleted in the working tree.
+        [ -f "${f}" ] || continue
         rel="${f#${src}/}"
         manifest+="${rel}:$(_sha256 < "${f}" | awk '{print $1}')"$'\n'
       done <<MANIFEST_FILES
@@ -2318,6 +3009,16 @@ build_images() {
     NGC_FLAG=()
     if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
     elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
+    # CodeBuild adds the src-<hash> tags itself once every image is pushed, so a
+    # deploy.sh killed while waiting below still leaves the cache populated and
+    # the next run reuses those images. The client-side tagging loop after the
+    # build stays as the fallback and is a no-op when the tags already exist.
+    _SRC_TAG_PAIRS=""
+    for i in "${!HASH_KEYS[@]}"; do
+      _SRC_TAG_PAIRS+="${STACK_NAME}-$(display_name "${HASH_KEYS[$i]}")=${HASH_VALS[$i]} "
+    done
+    SRC_TAGS_FLAG=()
+    if [[ -n "${_SRC_TAG_PAIRS}" ]]; then SRC_TAGS_FLAG=(--src-tags "${_SRC_TAG_PAIRS% }"); fi
     # remote_build.sh narrates on stderr and polls CodeBuild every 15 s; all of that is
     # in the detail log. The terminal shows this one label until the build finishes.
     run_step "CodeBuild: ${#MISSING_KEYS[@]} image(s), tag ${IMAGE_TAG}" \
@@ -2327,6 +3028,7 @@ build_images() {
         --tag "${IMAGE_TAG}" \
         --region "${AWS_REGION}" \
         --profile "${AWS_PROFILE}" \
+        ${SRC_TAGS_FLAG[@]+"${SRC_TAGS_FLAG[@]}"} \
         ${NGC_FLAG[@]+"${NGC_FLAG[@]}"}
         # ^ bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`, so a
         #   plain "${NGC_FLAG[@]}" aborts the run when no NGC flag was given.
@@ -2369,6 +3071,33 @@ EOF
 # Step 5: Create or reuse EKS cluster
 # =========================================================================
 # Render the eksctl ClusterConfig and run `eksctl create cluster`.
+# update_managed_policy ARN NAME DOC: make DOC the default version of an existing
+# customer-managed policy. IAM caps a managed policy at five versions and refuses
+# CreatePolicyVersion beyond that, so while five exist the oldest non-default
+# version is deleted first. A failed prune or update stops the deploy: a swallowed
+# failure leaves the previous default in force while the step reports success,
+# which is how the closed-loop policy lost its yield training ARNs and how the
+# Step 7.5 DealsBook statement could be dropped.
+update_managed_policy() {
+  local arn="$1" name="$2" doc="$3" count oldest err
+  while :; do
+    count="$(aws iam list-policy-versions --policy-arn "${arn}" --query 'length(Versions)' --output text 2>/dev/null || echo 0)"
+    [[ "${count}" =~ ^[0-9]+$ && "${count}" -ge 5 ]] || break
+    oldest="$(aws iam list-policy-versions --policy-arn "${arn}" \
+      --query 'sort_by(Versions[?IsDefaultVersion==`false`], &CreateDate)[0].VersionId' --output text 2>/dev/null || echo '')"
+    if [[ -z "${oldest}" || "${oldest}" == "None" ]]; then
+      fail "${name} has ${count} versions and no non-default version to prune"
+    fi
+    log "  Pruning old ${name} version ${oldest} (IAM 5-version limit)"
+    aws iam delete-policy-version --policy-arn "${arn}" --version-id "${oldest}" >/dev/null \
+      || fail "could not prune old version ${oldest} of ${name}"
+  done
+  if ! err="$(aws iam create-policy-version --policy-arn "${arn}" \
+      --policy-document "${doc}" --set-as-default 2>&1 >/dev/null)"; then
+    fail "could not update ${name}: ${err}"
+  fi
+  return 0
+}
 create_eks_cluster() {
   log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
   local CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
@@ -2653,6 +3382,45 @@ if [[ -z "${OPTIMIZER_ROLE_ARN}" ]]; then
   fail "Model Optimizer IRSA role annotation did not populate after 30s. If model-optimizer-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa model-optimizer-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite (find the role ARN via: aws cloudformation describe-stacks --stack-name eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa --query 'Stacks[0].Outputs')"
 fi
 log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
+# =========================================================================
+# Step 7.2: IRSA for the Deal Scorer (deals table read)
+# The Deal Scorer primes its deal book from the deals table at startup and
+# refreshes it every 30 seconds off the request path. Read-only, on the one
+# table. Its own service account rather than the node role, which every pod on
+# the node shares. The floor and margin containers get no table access.
+# =========================================================================
+step "Step 7.2: Ensuring IRSA for the Deal Scorer deals table read"
+DEAL_SCORER_POLICY_NAME="${STACK_NAME}-deal-scorer-deals-read-${STACK_UID}"
+DEAL_SCORER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DEAL_SCORER_POLICY_NAME}"
+DEAL_SCORER_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:Scan\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${DEALS_TABLE}\"}]}"
+if aws iam get-policy --policy-arn "${DEAL_SCORER_POLICY_ARN}" >/dev/null 2>&1; then
+  update_managed_policy "${DEAL_SCORER_POLICY_ARN}" "${DEAL_SCORER_POLICY_NAME}" "${DEAL_SCORER_POLICY_DOC}"
+else
+  aws iam create-policy \
+    --policy-name "${DEAL_SCORER_POLICY_NAME}" \
+    --policy-document "${DEAL_SCORER_POLICY_DOC}" >/dev/null
+fi
+quiet "eksctl create iamserviceaccount deal-scorer-sa" \
+  eksctl create iamserviceaccount \
+    --name deal-scorer-sa \
+    --namespace default \
+    --cluster "${CLUSTER_NAME}" \
+    --region "${AWS_REGION}" \
+    --attach-policy-arn "${DEAL_SCORER_POLICY_ARN}" \
+    --approve \
+    --override-existing-serviceaccounts || true
+DEAL_SCORER_ROLE_ARN=""
+for attempt in $(seq 1 10); do
+  DEAL_SCORER_ROLE_ARN="$(kubectl get sa deal-scorer-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+  [[ -n "${DEAL_SCORER_ROLE_ARN}" ]] && break
+  sleep 3
+done
+if [[ -z "${DEAL_SCORER_ROLE_ARN}" ]]; then
+  # Fatal: without the annotation the Deal Scorer cannot read its deal book, so
+  # it fails its prime and never becomes ready.
+  fail "Deal Scorer IRSA role annotation did not populate after 30s. If deal-scorer-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-deal-scorer-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa deal-scorer-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite"
+fi
+log "  Deal Scorer IRSA role: ${DEAL_SCORER_ROLE_ARN}"
 
 # =========================================================================
 # Step 7.5: DynamoDB permissions for orchestrator pods
@@ -2660,21 +3428,21 @@ log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
 step "Step 7.5: Ensuring DynamoDB access for orchestrator"
 DYNAMO_POLICY_NAME="${STACK_NAME}-dynamo-loadtest-${STACK_UID}"
 DYNAMO_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DYNAMO_POLICY_NAME}"
-# Two statements, each scoped to one table ARN — no wildcard resource. The
+# Three statements, each scoped to one table ARN, no wildcard resource. The
 # registry statement grants UpdateItem (the activation toggle uses a SET
 # expression so it cannot clobber a display name or description written
 # concurrently) but deliberately NOT Scan: the table's constant partition key
-# means one Query returns every record.
+# means one Query returns every record. DealsBook is read-only on the deals
+# table: shared/deal_library.py Queries the base table (no index) for the
+# auction type of each deal the Deal Scorer activates.
 DYNAMO_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"LoadTestHistory\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:PutItem\",\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:Scan\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${LOADTEST_TABLE}\"},\
-{\"Sid\":\"ContainerRegistry\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CONTAINER_REGISTRY_TABLE}\"}\
+{\"Sid\":\"ContainerRegistry\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${CONTAINER_REGISTRY_TABLE}\"},\
+{\"Sid\":\"DealsBook\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${DEALS_TABLE}\"}\
 ]}"
 
 if aws iam get-policy --policy-arn "${DYNAMO_POLICY_ARN}" >/dev/null 2>&1; then
-  aws iam create-policy-version \
-    --policy-arn "${DYNAMO_POLICY_ARN}" \
-    --policy-document "${DYNAMO_POLICY_DOC}" \
-    --set-as-default >>"${DEPLOY_LOG:-/dev/null}" 2>&1 || true
+  update_managed_policy "${DYNAMO_POLICY_ARN}" "${DYNAMO_POLICY_NAME}" "${DYNAMO_POLICY_DOC}"
 else
   aws iam create-policy \
     --policy-name "${DYNAMO_POLICY_NAME}" \
@@ -2737,7 +3505,7 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"ParameterStoreAndAudit\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:BatchGetItem\",\"dynamodb:DescribeTable\"],\"Resource\":[\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/audit-trail\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-parameter-store\",\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/*-audit-trail\"]},\
 {\"Sid\":\"SchedulerToggle\",\"Effect\":\"Allow\",\"Action\":[\"scheduler:GetSchedule\",\"scheduler:UpdateSchedule\"],\"Resource\":[\"arn:aws:scheduler:${AWS_REGION}:${ACCOUNT_ID}:schedule/default/*\"]},\
 {\"Sid\":\"ModelRegistryRead\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListModelPackages\",\"sagemaker:DescribeModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package-group/*artf-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
-{\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm-bid-shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf-deal-manager-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-floor-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-margin-*\"]},\
+{\"Sid\":\"TrainingTriggerFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:CreateTrainingJob\",\"sagemaker:AddTags\",\"sagemaker:DescribeTrainingJob\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/dlrm-bid-shader-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/ncf-deal-manager-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-floor-*\",\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:training-job/deal-yield-manager-margin-*\"]},\
 {\"Sid\":\"ListTrainingJobsFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:ListTrainingJobs\"],\"Resource\":\"*\"},\
 {\"Sid\":\"GlueJobRunsForTrainableRunFilter\",\"Effect\":\"Allow\",\"Action\":[\"glue:GetJobRuns\"],\"Resource\":[\"arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:job/*feature-engineering-etl\"]},\
 {\"Sid\":\"GlueOnDemandSweepAfterLoadTest\",\"Effect\":\"Allow\",\"Action\":[\"glue:StartJobRun\"],\"Resource\":[\"arn:aws:glue:${AWS_REGION}:${ACCOUNT_ID}:job/*feature-engineering-etl\"]},\
@@ -2748,25 +3516,7 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 ]}"
 
 if aws iam get-policy --policy-arn "${CLOSED_LOOP_POLICY_ARN}" >/dev/null 2>&1; then
-  # IAM caps a managed policy at 5 versions. Once 5 exist, create-policy-version
-  # fails with LimitExceeded -- which was previously swallowed by `2>/dev/null
-  # || true`, silently pinning the policy to a STALE version. That is exactly
-  # how the orchestrator ended up without the deal-yield-manager CreateTrainingJob
-  # ARNs (yield "Train from load test" 403'd) even though this doc grants them.
-  # Prune the oldest non-default version(s) to make room, then update loudly.
-  while [[ "$(aws iam list-policy-versions --policy-arn "${CLOSED_LOOP_POLICY_ARN}" --query 'length(Versions)' --output text 2>/dev/null || echo 0)" -ge 5 ]]; do
-    OLDEST_VID="$(aws iam list-policy-versions --policy-arn "${CLOSED_LOOP_POLICY_ARN}" \
-      --query 'sort_by(Versions[?IsDefaultVersion==`false`], &CreateDate)[0].VersionId' --output text 2>/dev/null)"
-    [[ -z "${OLDEST_VID}" || "${OLDEST_VID}" == "None" ]] && break
-    log "  Pruning old closed-loop policy version ${OLDEST_VID} (IAM 5-version limit)"
-    aws iam delete-policy-version --policy-arn "${CLOSED_LOOP_POLICY_ARN}" --version-id "${OLDEST_VID}" \
-      || fail "could not prune old version ${OLDEST_VID} of ${CLOSED_LOOP_POLICY_NAME}"
-  done
-  aws iam create-policy-version \
-    --policy-arn "${CLOSED_LOOP_POLICY_ARN}" \
-    --policy-document "${CLOSED_LOOP_POLICY_DOC}" \
-    --set-as-default >/dev/null \
-    || fail "could not update ${CLOSED_LOOP_POLICY_NAME} (orchestrator would keep stale closed-loop permissions -- e.g. no yield-model training)"
+  update_managed_policy "${CLOSED_LOOP_POLICY_ARN}" "${CLOSED_LOOP_POLICY_NAME}" "${CLOSED_LOOP_POLICY_DOC}"
 else
   aws iam create-policy \
     --policy-name "${CLOSED_LOOP_POLICY_NAME}" \
@@ -2789,6 +3539,10 @@ fi
 if _run_phase 3; then
 phase 3 "Deploying workloads"
 step "Step 8: Applying Kubernetes manifests"
+
+# The deal-scorer Deployment's NCF_MODEL_LABEL (substituted below). Resolved first
+# so a missing build stops the phase before anything is applied.
+resolve_ncf_model_label
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
 run_step "Provisioning the Cognito user pool (orchestrator auth)" \
@@ -2991,7 +3745,10 @@ for manifest in "${_APPLIED_MANIFESTS[@]}"; do
       -e "s|__OUTCOME_SIMULATOR_CONVERSION_VALUE__|${OUTCOME_SIMULATOR_CONVERSION_VALUE}|g" \
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
+      -e "s|__NCF_MODEL_LABEL__|${NCF_MODEL_LABEL}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
+  grep -q '__NCF_MODEL_LABEL__' "${PROCESSED}" \
+    && fail 3 "${manifest} still has an unsubstituted __NCF_MODEL_LABEL__"
   quiet "kubectl apply ${manifest}" kubectl apply -f "${PROCESSED}"
 done
 log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"
@@ -3017,34 +3774,51 @@ for OBJ in "deployment/yield-optimizer" "service/yield-optimizer" "hpa/yield-hpa
   fi
 done
 
-# --- Force a rollout when only image CONTENT changed.
-# IMAGE_TAG is pinned to PREV_TAG from .image-outputs.json whenever the registry
-# matches, so a rebuild that changes only the source inside an image produces an
-# identical pod template. `kubectl apply` is then a no-op, and `imagePullPolicy:
-# Always` only takes effect for pods that are newly created -- so the old pod keeps
-# serving the old code while every step above reports success.
+# --- Roll out a Deployment when only its image CONTENT changed.
+# IMAGE_TAG is pinned to the tag recorded in .image-outputs.json whenever the
+# registry matches, so a rebuild that changes only the source inside an image
+# produces an identical pod template. `kubectl apply` is then a no-op, and
+# `imagePullPolicy: Always` only takes effect for pods that are newly created -- so
+# the old pod keeps serving the old code while every step above reports success.
 #
-# That failure mode is silent, which is what makes it worth an unconditional
-# restart here rather than a conditional one: a restart of an unchanged deployment
-# costs one rolling replacement, whereas a missed restart costs a debugging session
-# against a container that looks deployed.
-#
-# Applies to the orchestrator too, which shares source/shared/ with the containers.
-log "  Rolling out containers so content-only changes take effect..."
-for DEPLOY in bid-pricer audience-activator deal-scorer signals-enricher \
-              yield-optimizer-floor yield-optimizer-margin artf-template orchestrator; do
-  if kubectl get "deployment/${DEPLOY}" >/dev/null 2>&1; then
-    kubectl rollout restart "deployment/${DEPLOY}" >/dev/null 2>&1 || \
-      warn "  Could not restart deployment/${DEPLOY}"
+# Each managed Deployment's running pods are compared with the digest ECR holds for
+# its image at IMAGE_TAG, and only the ones that differ are restarted. A digest that
+# cannot be read on either side (a pod still starting, an unreadable cluster or
+# repository) counts as different, so a missed restart is never the result of not
+# knowing. Applies to the orchestrator too, which shares source/shared/ with the
+# containers.
+log "  Restarting the Deployments whose pods do not run ECR's image for ${IMAGE_TAG}..."
+restart_stale_deployments "${IMAGE_TAG}"
+
+# Every Deployment this step applied or restarted is waited on, and a rollout that
+# does not complete fails the deploy with the pods' reasons and last log lines. A
+# step that carried on here once reported "Deployed" over a crash-looping Deal
+# Scorer. Triton gets 900 s: a new GPU node can take several minutes to join and
+# pull the image. The rest get 300 s.
+wait_managed_rollouts() {
+  local name timeout failed=()
+  for name in triton-inference-server "${MANAGED_DEPLOYMENTS[@]}"; do
+    kubectl get "deployment/${name}" >/dev/null 2>&1 || continue
+    timeout=300
+    [[ "${name}" == "triton-inference-server" ]] && timeout=900
+    say "  Waiting for deployment/${name} to roll out (up to ${timeout}s)..."
+    if ! wait_rollout "${name}" "" "${timeout}"; then
+      failed+=("${ROLLOUT_FAILURE}")
+      [[ "${name}" == "triton-inference-server" ]] && \
+        warn "  GPU capacity: kubectl get nodes -l nvidia.com/gpu=present"
+    fi
+  done
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf '%s; ' "${failed[@]}")"
+    _DEPLOY_DEGRADED=1
+    _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }rollouts that did not complete (${joined%; })"
+    warn "Rollouts did not complete: ${joined%; }"
+    return 1
   fi
-done
-
-run_step "Waiting for Triton Inference Server to roll out" \
-  kubectl rollout status deployment/triton-inference-server --timeout=300s || \
-  warn "Triton not ready yet — check GPU node availability with: kubectl get nodes -l nvidia.com/gpu=present"
-
-run_step "Waiting for the orchestrator to roll out" \
-  kubectl rollout status deployment/orchestrator --timeout=120s || true
+  return 0
+}
+wait_managed_rollouts || true
 
 # NOTE: the orchestrator is intentionally NOT patched with any agent runtime ARN.
 # It must never invoke the closed-loop agents (FR-6) — the browser invokes them
@@ -3221,7 +3995,9 @@ fi # START_AT <= 4 (Phase 4)
 # whole region is wrapped here. Everything the Summary reads from inside it
 # (COGNITO_USER_POOL_ID in particular) is referenced with a `:-` default, which is
 # what makes skipping this block safe.
+_PHASE5_RAN=0
 if _run_phase 5; then
+_PHASE5_RAN=1
 phase 5 "Registering agents"
 if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   step "Step 10: Deploying AgentCore MCP runtime"
@@ -3250,6 +4026,9 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
 
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
   AC_IMAGE="${REGISTRY}/${STACK_NAME}-agentcore:${IMAGE_TAG}"
+  # Read before the registration, which resolves the same tag; recorded only once
+  # the registration succeeds (record_agentcore_digest).
+  _AC_DIGEST="$(ecr_image_digest "${STACK_NAME}-agentcore" "${IMAGE_TAG}")"
   run_logged "${_AC_LOG}" "Registering MCP runtime ${AC_RUNTIME_NAME}" \
     ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
       --action deploy \
@@ -3259,6 +4038,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
       --region "${AWS_REGION}" \
       --profile "${AWS_PROFILE}" \
     || fail "AgentCore MCP runtime registration failed (detail in ${_AC_LOG})"
+  record_agentcore_digest "${_AC_DIGEST}"
 else
   warn "Skipping AgentCore deployment (--skip-agentcore)"
 fi
@@ -3380,6 +4160,8 @@ else
   warn "Phase 5/5 incomplete: ${_DEGRADED_DETAIL}"
 fi
 
+fi # _run_phase 5 (Phase 5)
+
 # =========================================================================
 # Step 12 (optional): Deploy Prebid Server as the sell-side ARTF host
 #
@@ -3387,12 +4169,25 @@ fi
 # specific to Prebid lives in deploy_prebid.sh: this block only decides whether
 # to call it and passes through what it cannot discover for itself.
 #
+# Runs with --with-prebid whenever Phase 5 runs, and also when Phase 5 is skipped
+# but the Prebid host's sources or the deals seed changed since the last
+# successful Step 12 (prebid_fingerprint, recorded in .deploy-state.json), so a
+# re-run picks up a Prebid change without calling deploy_prebid.sh by hand.
+#
 # --yes is passed because deploy.sh has already been invoked deliberately with
 # --with-prebid. deploy_prebid.sh still PRINTS its cost disclosure; it just does
 # not stop mid-deployment to ask a question the operator answered by adding the
 # flag. Run deploy_prebid.sh directly for the interactive confirmation.
 # =========================================================================
 if [[ "${WITH_PREBID}" -eq 1 ]]; then
+  _PB_SEED_SHA="$(file_sha256 "${SCRIPT_DIR}/seed/deals_and_campaigns.json" 2>/dev/null || true)"
+  PREBID_FINGERPRINT="$(prebid_fingerprint "${SCRIPT_DIR}/.." "${_PB_SEED_SHA}" 2>/dev/null || true)"
+  if ! [[ "${PREBID_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then PREBID_FINGERPRINT=""; fi
+fi
+if prebid_step_needed "${_PHASE5_RAN}"; then
+  if [[ "${_PHASE5_RAN}" -eq 0 ]]; then
+    say "  Phase 5/5 reads as complete in AWS, but ${PREBID_STEP_WHY}; running Step 12."
+  fi
   log ""
   step "Step 12: Deploying Prebid Server as the sell-side ARTF host (--with-prebid)"
   log ""
@@ -3437,15 +4232,20 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
     done
     warn "Full output: ${DEPLOY_LOG}"
     warn "Re-run on its own: ${SCRIPT_DIR}/deploy_prebid.sh ${PREBID_ARGS}"
+  elif [[ -n "${PREBID_FINGERPRINT}" ]]; then
+    # Recorded only after a successful Step 12, so a failed or interrupted one runs
+    # again on the next deploy.
+    state_set "${STACK_PREFIX}" resolved "prebidFingerprint=${PREBID_FINGERPRINT}"
+    log "  Prebid host fingerprint ${PREBID_FINGERPRINT:0:12} recorded for the next run"
   fi
-else
+elif [[ "${WITH_PREBID}" -eq 1 ]]; then
+  ok "Prebid ARTF host already deployed from these sources (${PREBID_FINGERPRINT:0:12}); skipping Step 12"
+elif [[ "${_PHASE5_RAN}" -eq 1 ]]; then
   log ""
   log "  Skipping the Prebid ARTF host (pass --with-prebid to enable)."
   log "  This includes: a pinned Prebid Server build, a Cognito domain and M2M client,"
   log "  a Secrets Manager credential, and the artfhouse demand endpoint."
 fi
-
-fi # _run_phase 5 (Phase 5)
 
 # =========================================================================
 # Summary

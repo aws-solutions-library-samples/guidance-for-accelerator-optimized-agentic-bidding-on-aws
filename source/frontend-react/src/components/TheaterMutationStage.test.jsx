@@ -141,4 +141,23 @@ describe("TheaterMutationStage — dwell and dismissal", () => {
     expect(card().className).not.toContain("is-leaving");
     expect(q("mutation-text").textContent).toBe("Segment Activator added 3 segments.");
   });
+  it("renders the exchange's reason for a declined mutation beside the sentence", () => {
+    mount({
+      narration: {
+        ...NARRATION,
+        text: "Deal Scorer · ADJUST_DEAL_FLOOR: deal floor set to $2.60. Not applied: rejected by the exchange.",
+        disposition: "rejected",
+        dispositionReason: "floor 2.60 exceeds cap 2.50",
+      },
+    });
+    const reason = q("theater-mutation-disposition");
+    expect(reason).not.toBeNull();
+    expect(reason.textContent).toContain("rejected");
+    expect(reason.textContent).toContain("floor 2.60 exceeds cap 2.50");
+    expect(q("mutation-text").textContent).not.toContain("2.50");
+  });
+  it("renders no reason for an applied mutation", () => {
+    mount({ narration: { ...NARRATION, disposition: "applied", dispositionReason: null } });
+    expect(q("theater-mutation-disposition")).toBeNull();
+  });
 });

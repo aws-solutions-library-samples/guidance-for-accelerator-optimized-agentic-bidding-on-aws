@@ -7,7 +7,7 @@
 
 ## Overview
 
-Part 1 of this Guidance demonstrates ARTF-compliant containers that make real-time bidding decisions using deep learning models on NVIDIA Triton Inference Server. Those models ship with seeded random weights and never improve — every bid uses the same static logic.
+Part 1 of this Guidance demonstrates ARTF-compliant containers that make real-time bidding decisions using deep learning models on NVIDIA Triton Inference Server. Those models ship with static weights (seeded random weights, except the Deal Scorer, which the deploy trains on sample interactions generated from the deal book) and never improve: every bid uses the same static logic.
 
 Part 2 closes the loop. It observes the outcome of every bid, uses that feedback to retrain and validate new model versions, and rolls the winners into production without touching the real-time bidstream. It also introduces an AI agent that continuously tunes bidding parameters from live market signals. Three feedback mechanisms work together:
 

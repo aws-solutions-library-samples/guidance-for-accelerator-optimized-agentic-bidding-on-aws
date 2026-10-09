@@ -1,7 +1,9 @@
 package org.prebid.server.bidder.artfhouse;
 
 import com.iab.openrtb.request.BidRequest;
+import com.iab.openrtb.request.Deal;
 import com.iab.openrtb.request.Imp;
+import com.iab.openrtb.request.Pmp;
 import io.vertx.core.http.HttpMethod;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -9,12 +11,14 @@ import org.prebid.server.bidder.model.BidderBid;
 import org.prebid.server.bidder.model.BidderCall;
 import org.prebid.server.bidder.model.HttpRequest;
 import org.prebid.server.bidder.model.HttpResponse;
+import org.prebid.server.bidder.model.PriceFloorInfo;
 import org.prebid.server.bidder.model.Result;
 import org.prebid.server.hooks.modules.artf.client.TokenCache;
 import org.prebid.server.json.JacksonMapper;
 import org.prebid.server.json.ObjectMapperProvider;
 import org.prebid.server.proto.openrtb.ext.response.BidType;
 
+import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -229,7 +233,123 @@ class ArtfhouseBidderTest {
         assertThat(result.getErrors().get(0).getMessage()).contains("no usable bids");
     }
 
+    // ------------------------------------------------- deal floor for Prebid
+
+    @Test
+    void aDealBidCarriesTheHigherOfTheImpressionFloorAndItsDealFloor() {
+        // deal-1 floor 6.00 is above the 2.50 impression floor; deal-2 floor 1.00 is below.
+        final BidRequest sent = requestWithDeals(deal("deal-1", "6.00", "USD"), deal("deal-2", "1.00", "USD"));
+
+        final Result<List<BidderBid>> result = bidder.makeBids(callSent(sent, twoBidResponse()), sent);
+
+        final PriceFloorInfo first = result.getValue().get(0).getPriceFloorInfo();
+        assertThat(first.getFloor()).isEqualByComparingTo("6.00");
+        assertThat(first.getCurrency()).isEqualTo("USD");
+        final PriceFloorInfo second = result.getValue().get(1).getPriceFloorInfo();
+        assertThat(second.getFloor()).isEqualByComparingTo("2.50");
+        assertThat(second.getCurrency()).isEqualTo("USD");
+    }
+
+    @Test
+    void aBidWithoutADealIdCarriesNoFloorInfo() {
+        final BidRequest sent = requestWithDeals(deal("deal-1", "6.00", "USD"));
+        final String body = """
+                {"id":"auction-1","cur":"USD","seatbid":[{"seat":"artfhouse","bid":[
+                  {"id":"bid-open","impid":"imp-1","price":3.00,"crid":"cr-o","w":300,"h":250}]}]}
+                """;
+
+        final Result<List<BidderBid>> result = bidder.makeBids(callSent(sent, body), sent);
+
+        assertThat(result.getValue().get(0).getPriceFloorInfo()).isNull();
+    }
+
+    @Test
+    void aDealWithoutAFloorLeavesTheImpressionFloor() {
+        final BidRequest sent = requestWithDeals(deal("deal-1", null, null), deal("deal-2", null, null));
+
+        final Result<List<BidderBid>> result = bidder.makeBids(callSent(sent, twoBidResponse()), sent);
+
+        assertThat(result.getValue().get(0).getPriceFloorInfo().getFloor()).isEqualByComparingTo("2.50");
+        assertThat(result.getValue().get(0).getPriceFloorInfo().getCurrency()).isEqualTo("USD");
+    }
+
+    @Test
+    void aDealIdNotOnTheRequestLeavesTheImpressionFloor() {
+        final BidRequest sent = requestWithDeals(deal("deal-other", "9.00", "USD"));
+
+        final Result<List<BidderBid>> result = bidder.makeBids(callSent(sent, twoBidResponse()), sent);
+
+        assertThat(result.getValue().get(0).getPriceFloorInfo().getFloor()).isEqualByComparingTo("2.50");
+    }
+
+    @Test
+    void aDealBidOnAnImpressionWithNoFloorAtAllCarriesNone() {
+        final Result<List<BidderBid>> result = bidder.makeBids(call(twoBidResponse()), request("imp-1"));
+
+        assertThat(result.getValue()).allSatisfy(bid -> assertThat(bid.getPriceFloorInfo()).isNull());
+    }
+
+    @Test
+    void theFloorIsReadFromTheRequestTheCallSent() {
+        // The call's payload is the bidder request, which holds the deal floor the ARTF
+        // hook wrote. The bidRequest argument is used only when the call carries none.
+        final BidRequest sent = requestWithDeals(deal("deal-1", "6.00", "USD"));
+        final BidRequest other = requestWithDeals(deal("deal-1", "1.00", "USD"));
+
+        final Result<List<BidderBid>> fromCall = bidder.makeBids(callSent(sent, twoBidResponse()), other);
+        final Result<List<BidderBid>> fallback = bidder.makeBids(call(twoBidResponse()), other);
+
+        assertThat(fromCall.getValue().get(0).getPriceFloorInfo().getFloor()).isEqualByComparingTo("6.00");
+        assertThat(fallback.getValue().get(0).getPriceFloorInfo().getFloor()).isEqualByComparingTo("2.50");
+    }
+
+    @Test
+    void theFloorCurrencyIsTheDealsThenTheImpressionsThenUsd() {
+        // Distinct codes so each source is identifiable; no conversion is involved.
+        final BidRequest dealCur = requestWithImpCurrency("GBP", deal("deal-1", "6.00", "EUR"));
+        final BidRequest impCur = requestWithImpCurrency("GBP", deal("deal-1", "6.00", null));
+        final BidRequest noCur = requestWithImpCurrency(null, deal("deal-1", "6.00", null));
+
+        assertThat(firstFloorInfo(dealCur).getCurrency()).isEqualTo("EUR");
+        assertThat(firstFloorInfo(impCur).getCurrency()).isEqualTo("GBP");
+        assertThat(firstFloorInfo(noCur).getCurrency()).isEqualTo("USD");
+    }
+
     // --------------------------------------------------------------- helpers
+
+    private PriceFloorInfo firstFloorInfo(BidRequest sent) {
+        return bidder.makeBids(callSent(sent, twoBidResponse()), sent).getValue().get(0).getPriceFloorInfo();
+    }
+
+    /** imp-1 with a 2.50 USD impression floor and the given deals. */
+    private static BidRequest requestWithDeals(Deal... deals) {
+        return requestWithImpCurrency("USD", deals);
+    }
+
+    private static BidRequest requestWithImpCurrency(String impCurrency, Deal... deals) {
+        final Imp imp = Imp.builder()
+                .id("imp-1")
+                .bidfloor(new BigDecimal("2.50"))
+                .bidfloorcur(impCurrency)
+                .pmp(Pmp.builder().deals(List.of(deals)).build())
+                .build();
+        return BidRequest.builder().id("auction-1").cur(List.of("USD")).imp(List.of(imp)).build();
+    }
+
+    private static Deal deal(String id, String floor, String currency) {
+        return Deal.builder()
+                .id(id)
+                .bidfloor(floor == null ? null : new BigDecimal(floor))
+                .bidfloorcur(currency)
+                .build();
+    }
+
+    private BidderCall<BidRequest> callSent(BidRequest sent, String body) {
+        return BidderCall.succeededHttp(
+                HttpRequest.<BidRequest>builder().uri(ENDPOINT).payload(sent).build(),
+                HttpResponse.of(200, null, body),
+                null);
+    }
 
     private static BidRequest request(String... impIds) {
         return BidRequest.builder()

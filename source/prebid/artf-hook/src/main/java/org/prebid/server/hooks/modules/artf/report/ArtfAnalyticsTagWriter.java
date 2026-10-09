@@ -1,5 +1,6 @@
 package org.prebid.server.hooks.modules.artf.report;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -27,6 +28,12 @@ import java.util.Objects;
  * <p>Five signals per auction (U3-NFR-15, D7): call latency, outcome state, per-mutation
  * disposition counts, <b>per-intent</b> counts, and the consecutive-failure counter -- each
  * carrying the {@code source.tid} correlation id (U3-NFR-16).
+ *
+ * <p>Two reporting additions sit beside those signals: the {@code artf-extension-point}
+ * activity carries the orchestrator's answer verbatim as {@code response} when it answered,
+ * and the {@code artf-mutations} activity carries {@code dispositions}, one entry per
+ * mutation in application order. The orchestrator's {@code /v1/auction/run} lifts both into
+ * {@code artf_meta.extension_point} for the Auction Theater.
  *
  * <p>Per-intent counts are here because they answer the question this feature will actually
  * be asked: <i>which</i> ARTF intent did nothing. An aggregate outcome cannot.
@@ -101,10 +108,12 @@ public class ArtfAnalyticsTagWriter {
             case ExtensionPointOutcome.MutationsReturned returned -> {
                 values.put("mutations_returned", returned.mutations().size());
                 putMetadata(values, returned.metadata());
+                putResponse(values, returned.response());
             }
             case ExtensionPointOutcome.NoMutations noMutations -> {
                 values.put("mutations_returned", 0);
                 putMetadata(values, noMutations.metadata());
+                putResponse(values, noMutations.response());
             }
             case ExtensionPointOutcome.Timeout timeout -> values.put("budget_ms", timeout.budgetMs());
             case ExtensionPointOutcome.TransportFailure failure -> values.put("reason", failure.reason());
@@ -159,6 +168,21 @@ public class ArtfAnalyticsTagWriter {
             }
         }
 
+        // One entry per mutation, in the order the applier saw them (BR-15). Index i matches
+        // mutations[i] of the forwarded response, so a reader can attribute each decision.
+        final ArrayNode dispositions = values.putArray("dispositions");
+        for (int i = 0; i < applied.dispositions().size(); i++) {
+            final Disposition disposition = applied.dispositions().get(i);
+            final ObjectNode entry = dispositions.addObject();
+            entry.put("index", i);
+            entry.put("intent", disposition.intent().wireName());
+            entry.put("path", disposition.path());
+            entry.put("applied", disposition.applied());
+            if (!disposition.applied()) {
+                entry.put("reason", disposition.reason());
+            }
+        }
+
         return ActivityImpl.of(ACTIVITY_MUTATIONS, STATUS_SUCCESS,
                 List.of(ResultImpl.of(STATUS_SUCCESS, values, null)));
     }
@@ -201,9 +225,22 @@ public class ArtfAnalyticsTagWriter {
             if (container.latencyMs() != null) {
                 node.put("latency_ms", container.latencyMs());
             }
+            if (container.modelVersion() != null && !container.modelVersion().isBlank()) {
+                node.put("model_version", container.modelVersion());
+            }
             if (container.displayName() != null && !container.displayName().isBlank()) {
                 node.put("display_name", container.displayName());
             }
         });
+    }
+
+    /**
+     * The orchestrator's answer exactly as received, so a reader sees the mutations, the
+     * per-container lists, stages and conflicts that the typed model does not keep.
+     */
+    private static void putResponse(ObjectNode values, JsonNode response) {
+        if (response != null && response.isObject()) {
+            values.set("response", response);
+        }
     }
 }

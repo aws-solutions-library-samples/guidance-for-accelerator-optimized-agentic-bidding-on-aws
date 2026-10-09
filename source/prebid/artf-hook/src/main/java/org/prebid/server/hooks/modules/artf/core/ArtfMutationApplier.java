@@ -30,8 +30,9 @@ import java.util.Objects;
  * <p>PURE in the sense that matters: no I/O, no clock, no configuration. It takes a request
  * and a mutation list and returns a new request plus one disposition per mutation.
  *
- * <p><b>Four locations only</b> (FR-4, BR-11): {@code imp.pmp.deals}, {@code imp.bidfloor},
- * {@code user.data}, {@code imp.metric}. Nothing here can name a bidder (BR-12) -- Prebid's
+ * <p><b>Three locations only</b> (FR-4, BR-11): {@code imp.pmp.deals} (including each deal's
+ * {@code bidfloor}), {@code user.data}, {@code imp.metric}. A deal floor mutation never writes
+ * {@code imp.bidfloor}. Nothing here can name a bidder (BR-12) -- Prebid's
  * module rules require a module to expose its data to all bidders rather than privileging
  * one, so writing into a single bidder's namespace would block this module from ever being
  * packaged for general use. That constraint is what keeps it distributable.
@@ -50,12 +51,9 @@ public class ArtfMutationApplier {
     /**
      * Fallback floor currency. Used only when the request declares none.
      *
-     * <p>A currency is not optional here. Prebid drops an impression from its floor-
-     * enforcement map unless {@code bidfloorcur} is non-blank AND the floor is {@code > 0}
-     * ({@code ExchangeService.java:766-770}, {@code BidderUtil.isValidPrice}). A floor
-     * written without a currency is therefore silently ignored -- it applies, changes
-     * nothing, and reports no error. That is the exact failure this unit exists to avoid,
-     * so the currency is always written alongside the floor.
+     * <p>The currency is always written alongside the deal floor: the artfhouse adapter
+     * attaches the deal floor to a deal bid in {@code deal.bidfloorcur}, and Prebid's floor
+     * enforcer converts that floor from it before comparing it with the bid.
      */
     private static final String DEFAULT_CURRENCY = "USD";
 
@@ -240,7 +238,7 @@ public class ArtfMutationApplier {
         return List.copyOf(result);
     }
 
-    // ---------------------------------------------- deal floor + imp.bidfloor
+    // ---------------------------------------------- deal floor
 
     private Outcome applyDealFloor(BidRequest request, ArtfMutation mutation, Intent intent,
                                    String path, MutationTarget.DealFloor target) {
@@ -287,30 +285,15 @@ public class ArtfMutationApplier {
                 .bidfloorcur(currency)
                 .build());
 
-        final Imp.ImpBuilder impBuilder = imp.toBuilder()
-                .pmp(pmp.toBuilder().deals(List.copyOf(updatedDeals)).build());
+        // The deal floor binds deal bids only, so imp.bidfloor and imp.bidfloorcur are left
+        // as the publisher set them and non-deal bids keep that floor. Prebid compares a
+        // deal bid with the PriceFloorInfo the artfhouse adapter attaches,
+        // max(imp.bidfloor, deal.bidfloor), when the request turns on floorDeals.
+        final Imp updatedImp = imp.toBuilder()
+                .pmp(pmp.toBuilder().deals(List.copyOf(updatedDeals)).build())
+                .build();
 
-        // ------------------------------------------------------------------
-        // ALSO write the IMPRESSION floor, and the currency with it.
-        //
-        // Prebid's floor enforcer compares a bid against the map it builds from
-        // imp.bidfloor + imp.bidfloorcur (ExchangeService.java:766-770). A deal-level
-        // floor is CARRIED to the bidders but is not what that enforcer compares, so a
-        // deal floor written alone applies and changes nothing -- FR-19's mutation would
-        // be visible in the request and unable to reject any bid.
-        //
-        // Raised to the maximum of the existing floor and the new one, so a mutation
-        // never LOWERS a floor the publisher already set. Lowering one would let the
-        // enrichment weaken the publisher's own protection, which is not a decision an
-        // agent gets to make.
-        // ------------------------------------------------------------------
-        final BigDecimal existingImpFloor = imp.getBidfloor();
-        final BigDecimal impFloor = existingImpFloor == null
-                ? newFloor
-                : existingImpFloor.max(newFloor);
-        impBuilder.bidfloor(impFloor).bidfloorcur(currency);
-
-        return Outcome.applied(withImp(request, index, impBuilder.build()), intent, path);
+        return Outcome.applied(withImp(request, index, updatedImp), intent, path);
     }
 
     /**

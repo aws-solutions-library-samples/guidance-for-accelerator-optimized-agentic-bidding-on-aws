@@ -15,6 +15,8 @@
 //
 // Pure. No I/O, no clock, no randomness.
 
+import { appliedValues } from "./theaterBeats.js";
+
 /** A value that was genuinely not available, distinct from zero. */
 export const NOT_RECORDED = null;
 
@@ -35,12 +37,14 @@ function money(n) {
  */
 function floorDecisionFor(values, dealId) {
   if (!dealId) return null;
-  return (values ?? []).find((v) => v.kind === "floor" && v.dealId === dealId) ?? null;
+  // Only a decision the exchange applied: a rejected or superseded floor did not
+  // set the floor the auction faced.
+  return appliedValues(values).find((v) => v.kind === "floor" && v.dealId === dealId) ?? null;
 }
 
 function marginDecisionFor(values, dealId) {
   if (!dealId) return null;
-  return (values ?? []).find((v) => v.kind === "margin" && v.dealId === dealId) ?? null;
+  return appliedValues(values).find((v) => v.kind === "margin" && v.dealId === dealId) ?? null;
 }
 
 /**

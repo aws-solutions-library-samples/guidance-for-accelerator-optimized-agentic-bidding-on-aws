@@ -38,7 +38,9 @@ WORKDIR /app
 COPY shared/ /app/shared/
 COPY ${CONTAINER}/ /app/container/
 
-RUN adduser --disabled-password --no-create-home appuser
+# The build context keeps the host's file modes, so a source file that is not
+# world-readable there would be unreadable to appuser. Normalize before USER.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home appuser
 USER appuser
 
 # gRPC + MCP + Health

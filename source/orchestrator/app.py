@@ -34,7 +34,7 @@ from starlette.routing import Route
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared import artf_applier, artf_stages, hop_timing  # noqa: E402
+from shared import artf_applier, artf_stages, deal_library, hop_timing  # noqa: E402
 from shared.artf_types import (  # noqa: E402
     ConflictModel,
     ContainerInvocationModel,
@@ -669,6 +669,31 @@ async def _close_shared_http_client() -> None:
 STAGE_MIN_TIMEOUT_S = 0.010
 
 
+# The publisher's deal book, read for one thing: the auction type (OpenRTB `at`)
+# of a deal the Deal Scorer activates. ACTIVATE_DEALS carries ids only, so without
+# it the working request holds `{id}` and the margin container, which picks a CPM
+# or PERCENT margin from `at`, treats every activated first-price deal as PERCENT.
+# Set by the lifespan once the snapshot thread is running (shared/deal_library.py:
+# primed at startup, refreshed every 30 s, never read from the table on a request).
+# None means no deal book: activations are inserted id-only.
+_deal_lookup = None
+
+
+def _start_deal_book() -> None:
+    """Start the deal book snapshot; an unconfigured or unreachable book never blocks startup."""
+    global _deal_lookup
+    try:
+        deal_library.configured_source()
+    except ValueError as exc:
+        logger.warning(
+            "no deal book configured (%s); activated deals reach the yield stage without "
+            "an auction type", exc,
+        )
+        return
+    deal_library.start(prime_required=False)
+    _deal_lookup = deal_library.auction_type
+
+
 @dataclass
 class FanOutResult:
     """What the staged fan-out produced.
@@ -758,7 +783,8 @@ async def _fan_out_staged(
             (inv.name, m) for inv in stage_invocations for m in inv.mutations
         ]
         applied = artf_applier.apply(
-            working_req, [m for _, m in stage_mutations], working_resp
+            working_req, [m for _, m in stage_mutations], working_resp,
+            deal_lookup=_deal_lookup,
         )
         working_req, working_resp = applied.bid_request, applied.bid_response
 
@@ -1895,11 +1921,13 @@ try:
     try:
         from orchestrator.auction_api import (  # noqa: E402
             auction_status_handler as auction_status,
+            close_hop_client as _close_auction_hop_client,
             run_auction_handler as auction_run,
         )
     except ImportError:
         from auction_api import (  # noqa: E402
             auction_status_handler as auction_status,
+            close_hop_client as _close_auction_hop_client,
             run_auction_handler as auction_run,
         )
     _AUCTION_AVAILABLE = True
@@ -1984,10 +2012,15 @@ async def _lifespan(_app):
     # and gRPC channels are created on first use; closing them on shutdown lets
     # in-flight keep-alive connections finish instead of being reset.
     await _start_grpc_server()
+    # One read of the deals table, off the event loop; a failure is logged and
+    # retried by the snapshot thread, never fatal.
+    await asyncio.to_thread(_start_deal_book)
     yield
     await _stop_grpc_server()
     await _close_shared_http_client()
     await _close_grpc_channels()
+    if _AUCTION_AVAILABLE:
+        await _close_auction_hop_client()
 
 
 app = Starlette(routes=routes, lifespan=_lifespan)

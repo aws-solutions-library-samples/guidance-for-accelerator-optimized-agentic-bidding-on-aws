@@ -33,6 +33,15 @@ Three consequences worth stating, because they are the point:
 Usage:
     deploy_status.py --prefix bt1 [--region us-east-1] [--json]
                      [--no-retraining] [--with-prebid] [--skip-agentcore]
+                     [--expect-deals-seed-sha <sha256>]
+                     [--expect-ncf-fingerprint <sha256>]
+
+The two --expect-* values are what the local checkout would deploy (the sha256
+of deployment/seed/deals_and_campaigns.json and the Deal Scorer training
+fingerprint). Given either, Phase 1 compares it with deploy-markers/phase1.json in
+the model bucket, and Phase 3 compares the fingerprint with the Deal Scorer
+engine's source-fingerprint metadata. A difference reads as `stale`, which is not
+ok, so deploy.sh runs the phase.
 
 Exit status: 0 when everything expected is present and healthy, 1 otherwise.
 """
@@ -63,10 +72,15 @@ IN_PROGRESS = "in_progress"
 MISSING = "missing"
 FAILED = "failed"
 UNKNOWN = "unknown"
+# Present and healthy, but built from inputs other than the ones this checkout
+# would deploy (a changed deals seed or Deal Scorer fingerprint). Not ok, so the
+# phase runs; ranked just above ok so a missing, failing or in-flight check in the
+# same phase still names the phase's status.
+STALE = "stale"
 
 # Ordered worst-last: a phase's status is the worst of its checks, except that
 # IN_PROGRESS outranks MISSING (something being built is not something absent).
-_SEVERITY = {OK: 0, UNKNOWN: 1, MISSING: 2, IN_PROGRESS: 3, FAILED: 4}
+_SEVERITY = {OK: 0, STALE: 1, UNKNOWN: 2, MISSING: 3, IN_PROGRESS: 4, FAILED: 5}
 
 def _marks() -> Dict[str, str]:
     """Check/cross marks, with an ASCII fallback.
@@ -94,6 +108,7 @@ def _marks() -> Dict[str, str]:
         MISSING: f"{bad} missing",
         FAILED: f"{bad} FAILED ",
         UNKNOWN: f"{huh} unknown",
+        STALE: f"{bad} stale  ",
     }
 
 
@@ -147,7 +162,28 @@ CLOSED_LOOP_STACKS = (
 def phase_status(checks: List[Dict[str, Any]]) -> str:
     if not checks:
         return UNKNOWN
-    return max((c["status"] for c in checks), key=lambda s: _SEVERITY.get(s, 1))
+    return max((c["status"] for c in checks), key=lambda s: _SEVERITY.get(s, _SEVERITY[UNKNOWN]))
+
+
+# The Phase 1 marker deploy.sh writes last in Phase 1 (Step 3d), and the Deal
+# Scorer engine the Model Optimizer bootstrap writes in Phase 3. Must match
+# deploy.sh (PHASE1_MARKER_KEY) and deployment/optimizer-bootstrap.json.
+PHASE1_MARKER_KEY = "deploy-markers/phase1.json"
+NCF_ENGINE_KEY = "triton-models/ncf_deal_manager_stable/1/model.plan"
+# Engine metadata written by source/optimizer/app.py (S3 returns user metadata keys
+# lowercased, without the x-amz-meta- prefix). An engine with no provisioned-by
+# predates the metadata and counts as a bootstrap engine, as in the optimizer.
+META_SOURCE_FINGERPRINT = "source-fingerprint"
+META_PROVISIONED_BY = "provisioned-by"
+_BOOTSTRAP_PROVISIONERS = ("", "bootstrap")
+
+
+def _client_error_code(exc: Exception) -> str:
+    return str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code", ""))
+
+
+def _short(value: str) -> str:
+    return value[:12] if value else "<none>"
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +218,21 @@ def prefixed(prefix: str, name: str) -> str:
 
 
 class Probe:
+    # Local values the bucket's records are compared with. Empty means "not given",
+    # and the comparison that needs the value is skipped.
+    expect_deals_seed_sha = ""
+    expect_ncf_fingerprint = ""
+
     def __init__(self, prefix: str, region: str, *, retraining: bool,
                  prebid: bool, agentcore: bool, manifest_dir: str,
-                 profile: Optional[str] = None):
+                 profile: Optional[str] = None,
+                 expect_deals_seed_sha: str = "",
+                 expect_ncf_fingerprint: str = ""):
         self.prefix = prefix
         self.region = region
         self.profile = profile or None
+        self.expect_deals_seed_sha = expect_deals_seed_sha or ""
+        self.expect_ncf_fingerprint = expect_ncf_fingerprint or ""
         # The kubectl subprocesses below authenticate through the kubeconfig's exec
         # plugin (`aws eks get-token`), which reads AWS_PROFILE from the environment,
         # not from this process's boto3 session. Export it so both paths agree.
@@ -296,8 +341,12 @@ class Probe:
 
     # -- Phase 1: models in S3 -------------------------------------------
 
+    def _model_bucket(self) -> str:
+        """deploy.sh: MODEL_BUCKET="${STACK_NAME}-triton-models-${STACK_UID}"."""
+        return f"{self.stack}-triton-models-{self.uid}" if self.uid else ""
+
     def phase1(self) -> List[Dict[str, Any]]:
-        bucket = f"{self.stack}-triton-models-{self.uid}" if self.uid else ""
+        bucket = self._model_bucket()
         if not bucket:
             return [self._check("model bucket", UNKNOWN, "account not resolved")]
         s3 = self._client("s3")
@@ -321,7 +370,49 @@ class Probe:
             return [self._check("model bucket", UNKNOWN, f"{bucket}: {exc}")]
         if count == 0:
             return [self._check("ONNX models in S3", MISSING, f"{bucket} is empty")]
-        return [self._check("ONNX models in S3", OK, bucket)]
+        checks = [self._check("ONNX models in S3", OK, bucket)]
+        if self.expect_deals_seed_sha or self.expect_ncf_fingerprint:
+            checks.append(self._phase1_marker(s3, bucket))
+        return checks
+
+    def _phase1_marker(self, s3, bucket: str) -> Dict[str, Any]:
+        """Compare deploy-markers/phase1.json with this checkout's seed and Deal Scorer.
+
+        A non-empty bucket is all the check above can see, so on a healthy stack a
+        changed deals seed or Deal Scorer build would never reach Step 1.5 or Step 2.
+        The marker records what the last complete Phase 1 seeded and built; a missing
+        one means no Phase 1 has recorded that yet. Read-only: GetObject.
+        """
+        name = "Phase 1 marker"
+        try:
+            body = s3.get_object(Bucket=bucket, Key=PHASE1_MARKER_KEY)["Body"].read()
+        except ClientError as exc:
+            code = _client_error_code(exc)
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return self._check(name, STALE,
+                                   f"s3://{bucket}/{PHASE1_MARKER_KEY} is missing; no Phase 1 has "
+                                   "recorded its deals seed and Deal Scorer build")
+            return self._check(name, UNKNOWN, f"{PHASE1_MARKER_KEY}: {code or exc}")
+        except Exception as exc:
+            return self._check(name, UNKNOWN, f"{PHASE1_MARKER_KEY}: {exc}")
+        try:
+            marker = json.loads(body)
+            if not isinstance(marker, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            return self._check(name, STALE, f"{PHASE1_MARKER_KEY} is not readable JSON ({exc})")
+
+        changed = []
+        recorded_seed = str(marker.get("deals_seed_sha256") or "")
+        if self.expect_deals_seed_sha and recorded_seed != self.expect_deals_seed_sha:
+            changed.append(f"deals seed {_short(recorded_seed)} -> {_short(self.expect_deals_seed_sha)}")
+        recorded_fp = str(marker.get("ncf_fingerprint") or "")
+        if self.expect_ncf_fingerprint and recorded_fp != self.expect_ncf_fingerprint:
+            changed.append(f"Deal Scorer fingerprint {_short(recorded_fp)} -> "
+                           f"{_short(self.expect_ncf_fingerprint)}")
+        if changed:
+            return self._check(name, STALE, "changed since the last Phase 1: " + "; ".join(changed))
+        return self._check(name, OK, f"written {marker.get('written_at') or '?'}")
 
     # -- Phase 2: images, builds, cluster, nodes -------------------------
 
@@ -593,6 +684,50 @@ class Probe:
     # -- Phase 3: workloads ----------------------------------------------
 
     def phase3(self) -> List[Dict[str, Any]]:
+        checks = self._workloads()
+        if self.expect_ncf_fingerprint:
+            checks.append(self._ncf_engine())
+        return checks
+
+    def _ncf_engine(self) -> Dict[str, Any]:
+        """Compare the Deal Scorer engine's source-fingerprint with this checkout's.
+
+        Phase 3 re-applies the Model Optimizer bootstrap Job, and only that Job
+        rebuilds a bootstrap engine whose fingerprint no longer matches its source.
+        On a healthy stack Phase 3 is otherwise skipped, so a retrained Deal Scorer
+        would never be compiled. An engine a promotion wrote is never replaced by a
+        deploy, so it is not stale. Read-only: HeadObject.
+        """
+        name = "Deal Scorer engine"
+        bucket = self._model_bucket()
+        if not bucket:
+            return self._check(name, UNKNOWN, "account not resolved")
+        s3 = self._client("s3")
+        if not s3:
+            return self._check(name, UNKNOWN, "no s3 client")
+        try:
+            head = s3.head_object(Bucket=bucket, Key=NCF_ENGINE_KEY)
+        except ClientError as exc:
+            code = _client_error_code(exc)
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return self._check(name, MISSING,
+                                   f"no engine at {NCF_ENGINE_KEY}; the Model Optimizer bootstrap "
+                                   "builds it in Phase 3")
+            return self._check(name, UNKNOWN, f"{NCF_ENGINE_KEY}: {code or exc}")
+        except Exception as exc:
+            return self._check(name, UNKNOWN, f"{NCF_ENGINE_KEY}: {exc}")
+        meta = {str(k).lower(): str(v) for k, v in (head.get("Metadata") or {}).items()}
+        provisioned_by = meta.get(META_PROVISIONED_BY, "")
+        if provisioned_by not in _BOOTSTRAP_PROVISIONERS:
+            return self._check(name, OK, f"provisioned by {provisioned_by}; a deploy does not replace it")
+        engine_fp = meta.get(META_SOURCE_FINGERPRINT, "")
+        if engine_fp == self.expect_ncf_fingerprint:
+            return self._check(name, OK, f"built from {_short(engine_fp)}")
+        return self._check(name, STALE,
+                           f"built from {_short(engine_fp)}, this checkout builds "
+                           f"{_short(self.expect_ncf_fingerprint)}")
+
+    def _workloads(self) -> List[Dict[str, Any]]:
         """Kubernetes readiness. Needs kubectl; says so when it cannot look.
 
         Reported as UNKNOWN rather than OK when kubectl is unavailable. The previous
@@ -1062,6 +1197,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--skip-agentcore", dest="agentcore", action="store_false", default=True)
     ap.add_argument("--manifest-dir", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eks"))
+    ap.add_argument("--expect-deals-seed-sha", default="",
+                    help="sha256 of the local deals seed; Phase 1 is stale when the bucket marker differs")
+    ap.add_argument("--expect-ncf-fingerprint", default="",
+                    help="local Deal Scorer fingerprint; Phase 1 and the Phase 3 engine are stale when it differs")
     args = ap.parse_args(argv)
 
     if boto3 is None:
@@ -1070,7 +1209,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     probe = Probe(args.prefix, args.region, retraining=args.retraining,
                   prebid=args.prebid, agentcore=args.agentcore,
-                  manifest_dir=args.manifest_dir, profile=args.profile)
+                  manifest_dir=args.manifest_dir, profile=args.profile,
+                  expect_deals_seed_sha=args.expect_deals_seed_sha,
+                  expect_ncf_fingerprint=args.expect_ncf_fingerprint)
     result = probe.run()
     if args.shell:
         sys.stdout.write(render_shell(result) + "\n")

@@ -1,4 +1,4 @@
-# Architecture — Guidance for Accelerator-Optimized Agentic Bidding on AWS
+# Architecture: Guidance for Accelerator-Optimized Agentic Bidding on AWS
 
 This document describes the solution architecture and its request flow. It is the
 text companion to the architecture visual. The canonical embeddable image for the
@@ -18,19 +18,19 @@ on **NVIDIA Triton Inference Server**; two are deterministic and rule-based on C
 | **Audience Activator** (`audience-activator`) | Activates audience segments from bid-request signals | `ACTIVATE_SEGMENTS` | Rule-based (no Triton) |
 | **Deal Scorer** (`deal-scorer`) | Scores and activates/suppresses PMP deals | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | NCF / NeuMF (Triton) |
 | **Signals Enricher** (`signals-enricher`) | Adds viewability + brand-safety quality signals | `ADD_METRICS` | Rule-based (no Triton) |
-| **Yield Optimizer — Floor** (`yield-optimizer-floor`) | SSP/publisher-side: adjusts the floor price on PMP deals | `ADJUST_DEAL_FLOOR` | XGBoost via Triton FIL (Triton) |
-| **Yield Optimizer — Margin** (`yield-optimizer-margin`) | SSP/publisher-side: adjusts the margin taken on PMP deals | `ADJUST_DEAL_MARGIN` | XGBoost via Triton FIL (Triton) |
+| **Yield Optimizer: Floor** (`yield-optimizer-floor`) | SSP/publisher-side: adjusts the floor price on PMP deals | `ADJUST_DEAL_FLOOR` | XGBoost via Triton FIL (Triton) |
+| **Yield Optimizer: Margin** (`yield-optimizer-margin`) | SSP/publisher-side: adjusts the margin taken on PMP deals | `ADJUST_DEAL_MARGIN` | XGBoost via Triton FIL (Triton) |
 
 Triton serves **two deep-learning models** (DLRM for the bid pricer, NCF for the
 deal scorer) plus **two independent XGBoost tree models** for the yield optimizer
-(one for floor, one for margin, each served by its own container — Triton's Forest
+(one for floor, one for margin, each served by its own container; Triton's Forest
 Inference Library backend doesn't support multi-output regression, so these were
 always two models) on a single NVIDIA **A10G GPU** (`g5.xlarge` by default;
 the node group also accepts `g5.2xlarge` and `g5.4xlarge`) with the CUDA
 Execution Provider. The TensorRT engines Part 2 compiles are specific to the
 A10G, so the node group is pinned to the `g5` family. The audience activator and signals enricher
 are rule-based and need no GPU model. The audience activator previously scored
-segments with a Wide & Deep neural network on Triton — that model's ONNX graph
+segments with a Wide & Deep neural network on Triton. That model's ONNX graph
 could not be compiled to a TensorRT engine (a `BatchNorm1d` fusion limitation), so
 it was replaced with transparent rules over real bid-request signals, and is
 slated to be replaced by a partner ISV implementation. See
@@ -44,19 +44,33 @@ slated to be replaced by a partner ISV implementation. See
 
 > **Note on the models.** DLRM and NCF are *reference architectures* following the
 > published NVIDIA DeepLearningExamples (DLRM, NeuMF/NCF) designs. They are defined
-> in `source/triton/export_models.py` and exported to ONNX with **randomly
-> initialized (seeded) weights** — they are **not pretrained or production-trained**.
-> They exist to demonstrate the GPU inference path and the ARTF container/Triton
-> integration; train the architectures on your own data (or supply your own ONNX
+> in `source/triton/export_models.py` and exported to ONNX. DLRM uses **seeded
+> initial weights**. NCF is **trained on sample interactions** and must pass the
+> scenario acceptance gate in `training/ncf_sample/build.py` before it is exported.
+> Neither is **pretrained or production-trained**. They exist to demonstrate the GPU
+> inference path and the ARTF container/Triton integration; train the architectures
+> on your own data (or supply your own ONNX
 > models) before relying on their predictions. The Triton Inference Server image
 > (`nvcr.io/nvidia/tritonserver:24.08-py3`) is the genuine upstream NVIDIA NGC
 > container.
 
 An **orchestrator** (Starlette) receives the OpenRTB request, verifies the caller's
-Amazon Cognito JWT, and **fans out in parallel** to the six containers over the ARTF
-extension point (gRPC or REST, selected per deployment) with an MCP path for AI-agent
-and tool interoperability.
+Amazon Cognito JWT, and calls the six containers over the ARTF extension point (gRPC
+or REST, selected per deployment) as a **staged pipeline**: 1 enrich (Signals
+Enricher, Audience Activator), 2 deals (Deal Scorer), 3 yield (both Yield
+Optimizers), 4 price (Bid Pricer). Containers within a stage run in parallel; the
+orchestrator applies each stage's mutations before the next stage runs, so the Deal
+Scorer sees the activated segments and the Bid Pricer sees the adjusted deals. An
+MCP path serves AI-agent and tool interoperability.
 It merges the per-container mutations into a single `RTBResponse`.
+
+With `--with-prebid`, an optional **Prebid Server** host runs in the same EKS
+cluster. Its ARTF hook calls the orchestrator's extension point over gRPC. Its
+artfhouse adapter requests bids over OpenRTB from the **artfhouse demand service**,
+a Deployment and ClusterIP Service next to Prebid. That service checks the Cognito
+M2M token itself and serves from an in-memory catalog of the DynamoDB deals table,
+refreshed every 30 s, so the bid path makes no DynamoDB call. A simulator seat
+(`amt`) returns static OpenRTB bids so the auction is contested.
 
 A **React frontend** is hosted on Amazon S3 and delivered through Amazon CloudFront;
 Amazon Cognito provides user-pool authentication (SRP, admin-created users, no
@@ -82,20 +96,28 @@ graph TB
         PROXY["UI API proxy<br/>AWS Lambda, VPC-attached<br/>forwards /api/* to the orchestrator"]
 
     subgraph EKS["Compute (Amazon EKS)"]
-        ORCH["Orchestrator (Starlette)<br/>ClusterIP in-cluster + internal NLB for the UI proxy<br/>no public address<br/>JWT verify + parallel fan-out<br/>gRPC / REST / MCP"]
+        ORCH["Orchestrator (Starlette)<br/>ClusterIP in-cluster + internal NLB for the UI proxy<br/>no public address<br/>JWT verify + staged pipeline<br/>gRPC / REST / MCP"]
 
         subgraph GPU["GPU node: g5.xlarge, NVIDIA A10G"]
             TRITON["NVIDIA Triton Inference Server<br/>ONNX Runtime + FIL + CUDA EP<br/>4 models on GPU"]
             DLRM_C["Bid Pricer<br/>BID_SHADE"]
             NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
-            YIELD_F["Yield Optimizer — Floor<br/>ADJUST_DEAL_FLOOR"]
-            YIELD_M["Yield Optimizer — Margin<br/>ADJUST_DEAL_MARGIN"]
+            YIELD_F["Yield Optimizer: Floor<br/>ADJUST_DEAL_FLOOR"]
+            YIELD_M["Yield Optimizer: Margin<br/>ADJUST_DEAL_MARGIN"]
         end
 
         WD_C["Audience Activator<br/>ACTIVATE_SEGMENTS (rule-based)"]
         MET_C["Signals Enricher<br/>ADD_METRICS (rule-based)"]
+
+        subgraph PBH["Prebid host (--with-prebid, optional)"]
+            PBS["Prebid Server<br/>ARTF hook"]
+            DEM["artfhouse demand service<br/>in-memory deal catalog, 30 s refresh"]
+            SIM["Simulator seat (amt)"]
+        end
     end
     end
+
+    DDB["Amazon DynamoDB<br/>deals and campaigns table"]
 
     subgraph Models["Model Storage"]
         S3M["Amazon S3 model repository<br/>dlrm_bid_shader · ncf_deal_manager<br/>deal_yield_manager_floor · deal_yield_manager_margin<br/>(model.onnx / xgboost.json)"]
@@ -112,18 +134,22 @@ graph TB
     Browser -->|"lambda:InvokeFunction (SigV4)<br/>event carries the Bearer token"| PROXY
     PROXY -->|"HTTP to the internal NLB (orchestrator-internal)"| ORCH
     ORCH -->|"verify JWT via JWKS"| COG
-    ORCH -->|"gRPC / MCP fan-out"| DLRM_C
-    ORCH -->|"gRPC / MCP fan-out"| WD_C
-    ORCH -->|"gRPC / MCP fan-out"| NCF_C
-    ORCH -->|"gRPC / MCP fan-out"| MET_C
-    ORCH -->|"gRPC / MCP fan-out"| YIELD_F
-    ORCH -->|"gRPC / MCP fan-out"| YIELD_M
+    ORCH -->|"1 enrich"| MET_C
+    ORCH -->|"1 enrich"| WD_C
+    ORCH -->|"2 deals"| NCF_C
+    ORCH -->|"3 yield"| YIELD_F
+    ORCH -->|"3 yield"| YIELD_M
+    ORCH -->|"4 price"| DLRM_C
+    PBS -->|"ARTF hook (gRPC)"| ORCH
+    PBS -->|"OpenRTB (in-cluster)"| DEM
+    PBS -->|"OpenRTB"| SIM
+    DEM -.->|"catalog refresh (off the bid path)"| DDB
     DLRM_C -->|"tritonclient"| TRITON
     NCF_C -->|"tritonclient"| TRITON
     YIELD_F -->|"tritonclient"| TRITON
     YIELD_M -->|"tritonclient"| TRITON
     TRITON -.->|"load models at startup"| S3M
-    AC -.->|"extend_rtb → orchestrator"| ORCH
+    AC -.->|"extend_rtb to orchestrator"| ORCH
 
     style TRITON fill:#76b900,color:#000
     style DLRM_C fill:#16a34a,color:#fff
@@ -160,8 +186,10 @@ graph TB
    requests exactly as before. This path works in accounts running VPC Block Public
    Access in block-ingress mode, where an internet-facing load balancer would be
    dropped at the internet gateway.
-4. The orchestrator **fans out the OpenRTB request in parallel** to the six
-   containers, respecting the OpenRTB `tmax` timeout.
+4. The orchestrator runs the six containers as a **staged pipeline** (enrich,
+   deals, yield, price), in parallel within a stage, applying each stage's
+   mutations before the next and splitting the OpenRTB `tmax` budget across the
+   stages.
 5. The bid pricer, deal scorer, and both yield optimizers call **Triton** via
    `tritonclient` for GPU inference; the audience activator and signals enricher
    return rule-based mutations.
@@ -171,7 +199,7 @@ graph TB
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
    it through the proxy Lambda to the browser.
 
-The same fan-out is reachable as an MCP tool (`extend_rtb`) — either through the
+The same pipeline is reachable as an MCP tool (`extend_rtb`), either through the
 orchestrator's `/api/mcp` endpoint or through the **Bedrock AgentCore** MCP runtime,
 which `deploy.sh` registers by default (`--skip-agentcore` omits it).
 

@@ -52,10 +52,10 @@ _MAX_RUNTIME_SECONDS = 14400
 # requires a schema change (deal_id field + per-deal event fan-out in
 # feedback_integration.py, using OpenRTB's real BidResponse.SeatBid.Bid.dealid
 # to determine which activated deal actually won) -- tracked as a follow-up,
-# not implemented here. train.py's build_features() already raises a clear
-# ValueError for ncf_deal_manager rather than silently misbehaving; this
-# set is the earlier, UI-facing enforcement point so the option is never
-# offered in the first place.
+# not implemented here. train.py can train ncf_deal_manager, but only from
+# interactions that carry a deal_id (the deploy's sample build from the deal
+# book); this set is the UI-facing enforcement point so on-demand training
+# from outcome events is never offered.
 TRAINABLE_MODEL_TYPES: frozenset[str] = frozenset({
     "dlrm_bid_shader", "deal_yield_manager_floor", "deal_yield_manager_margin",
 })
@@ -377,37 +377,54 @@ def _build_training_job_params(
     XGBoostTrainingImageNotConfiguredError if model_type is xgboost-shaped
     and no image URI was supplied.
 
-    ``load_test_run_id`` is recorded as a hyperparameter purely as provenance:
-    which load-test run the operator selected when triggering this job. The
-    registration Lambda copies it onto the resulting model package version
-    (governance_eventbridge_cfn.yaml), so a later comparison can use that run as
-    its control.
+    ``base_model_version`` and ``load_test_run_id`` are provenance: which
+    approved version this job descends from and which load-test run the
+    operator selected when triggering it. The registration Lambda copies both
+    onto the resulting model package version (governance_eventbridge_cfn.yaml),
+    so a later comparison can use that run as its control.
 
-    It does NOT scope the training input. Both shapes read an entire S3 prefix
-    (`training-data/` or `training-data-deal-yield-*/`), which holds every run
-    swept so far -- so this is "the run this job was triggered from", not "the
-    only data it learned from". Anything presenting it must say so.
+    They travel as training-job Tags on both shapes. The built-in XGBoost
+    container validates every hyperparameter against XGBoost's own list and
+    fails the job with "Extraneous hyperparameter found" for anything else
+    (sagemaker_algorithm_toolkit/hyperparameter_validation.py), so they cannot
+    ride as hyperparameters there. The NeMo-RL shape additionally keeps them as
+    hyperparameters because the custom container reads them.
+
+    ``load_test_run_id`` does NOT scope the training input. Both shapes read an
+    entire S3 prefix (`training-data/` or `training-data-deal-yield-*/`), which
+    holds every run swept so far -- so this is "the run this job was triggered
+    from", not "the only data it learned from". Anything presenting it must say
+    so.
     """
     shape = _TRAINING_SHAPE.get(model_type, "nemo-rl")
     output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
+
+    tags = [{"Key": "base_model_version", "Value": base_model_version}]
+    if load_test_run_id:
+        tags.append({"Key": "load_test_run_id", "Value": load_test_run_id})
 
     if shape == "xgboost":
         if not xgboost_training_image_uri:
             raise XGBoostTrainingImageNotConfiguredError(model_type)
         training_image = xgboost_training_image_uri
         training_data_prefix = _XGBOOST_TRAINING_DATA_PREFIX[model_type]
+        # The built-in algorithm hardcodes its input channel name: in
+        # algorithm mode it reads SM_CHANNEL_TRAIN
+        # (sagemaker_xgboost_container/training.py), so the channel must be
+        # named "train". "training" starts the job and fails it at import
+        # time with KeyError: 'SM_CHANNEL_TRAIN'.
+        channel_name = "train"
         hyperparameters = {
-            "base_model_version": base_model_version,
             "max_depth": "6",
             "eta": "0.3",
             "num_round": "100",
             "objective": "reg:squarederror",
         }
-        if load_test_run_id:
-            hyperparameters["load_test_run_id"] = load_test_run_id
     else:
         training_image = f"{training_image_registry}/artf-nemo-rl-training:{_IMAGE_TAG[model_type]}"
         training_data_prefix = "training-data"
+        # source/training/container/train.py reads SM_CHANNEL_TRAINING.
+        channel_name = "training"
         hyperparameters = {
             "model_type": model_type,
             "base_model_version": base_model_version,
@@ -426,7 +443,7 @@ def _build_training_job_params(
         },
         "RoleArn": sagemaker_role_arn,
         "InputDataConfig": [{
-            "ChannelName": "training",
+            "ChannelName": channel_name,
             "DataSource": {"S3DataSource": {
                 "S3DataType": "S3Prefix",
                 "S3Uri": f"s3://{training_data_bucket}/{training_data_prefix}/",
@@ -442,6 +459,7 @@ def _build_training_job_params(
         },
         "StoppingCondition": {"MaxRuntimeInSeconds": _MAX_RUNTIME_SECONDS},
         "HyperParameters": hyperparameters,
+        "Tags": tags,
     }
 
 

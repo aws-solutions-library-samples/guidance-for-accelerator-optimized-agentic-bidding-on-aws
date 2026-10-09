@@ -30,6 +30,7 @@ alone -- stated here rather than left as an unexplained flag.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -50,6 +51,28 @@ PREBID_AUCTION_URL_ENV = "PREBID_AUCTION_URL"
 # longer than a 1500 ms tmax while connections and credentials warm up, and a
 # tighter client timeout here would report that as an orchestrator failure.
 HOP_TIMEOUT_S = 15.0
+
+#: One client for the Prebid hop, created on first use. A client per auction paid a
+#: fresh TLS handshake every call (measured ~7 ms of an ~8.5 ms bare round trip);
+#: the pooled connection is reused instead. Closed by the app's lifespan.
+_hop_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_hop_client() -> httpx.AsyncClient:
+    global _hop_client
+    if _hop_client is None:
+        # verify=False: see the module docstring -- Prebid presents a certificate it
+        # generated for itself at container start.
+        _hop_client = httpx.AsyncClient(verify=False, timeout=HOP_TIMEOUT_S)
+    return _hop_client
+
+
+async def close_hop_client() -> None:
+    """Close the pooled Prebid client. Called on application shutdown."""
+    global _hop_client
+    client, _hop_client = _hop_client, None
+    if client is not None:
+        await client.aclose()
 
 #: The seats this endpoint enables on an ARTF request. Named once: the imp-level
 #: enablement below and the multibid request both need the same list, and a seat
@@ -220,15 +243,22 @@ async def run_auction_handler(request: Request) -> JSONResponse:
         body, note = _with_applicable_intents(body, intents)
         prepared.append(note)
     body = _with_debug_enabled(body)
+    # Only the with-ARTF pass asks for the module trace: that is where the hook's
+    # analytics tags travel, and the baseline pass has no hook report to lift.
+    caller_set_trace = False
+    if artf_mode == ARTF_MODE_ON:
+        body, caller_set_trace = _with_module_trace(body)
+        if not caller_set_trace:
+            prepared.append(
+                "ext.prebid.trace=verbose (so the ARTF hook's analytics tags reach the "
+                "response; removed again before returning)"
+            )
 
     started = time.monotonic()
     try:
-        # verify=False: see the module docstring -- Prebid presents a certificate it
-        # generated for itself at container start.
-        async with httpx.AsyncClient(verify=False, timeout=HOP_TIMEOUT_S) as client:
-            response = await client.post(
-                url, json=body, headers={"Content-Type": "application/json"}
-            )
+        response = await _get_hop_client().post(
+            url, json=body, headers={"Content-Type": "application/json"}
+        )
     except httpx.TimeoutException as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         log.warning("auction hop to %s timed out after %dms: %s", url, elapsed_ms, exc)
@@ -285,8 +315,8 @@ async def run_auction_handler(request: Request) -> JSONResponse:
 
     if isinstance(auction, dict):
         excluded, excluded_source = _lift_artf_exclusions(auction)
-        # `body` is the prepared request, so the floors reported are the ones Prebid
-        # enforced -- including any a container raised.
+        # `body` is the prepared request, so the impression floors reported are the
+        # ones Prebid enforced on non-deal bids (no deal floor raises them).
         observed_count = _annotate_seat_nonbids(auction, body)
         auction["artf_meta"] = {
             "source": "prebid",
@@ -320,7 +350,30 @@ async def run_auction_handler(request: Request) -> JSONResponse:
         }
         if excluded is not None:
             auction.setdefault("ext", {}).setdefault("artf", {})["excluded"] = excluded
+        if artf_mode == ARTF_MODE_ON:
+            auction["artf_meta"]["extension_point"] = _lift_extension_point(auction)
+            if not caller_set_trace:
+                _strip_module_trace(auction)
     return JSONResponse(auction)
+
+
+#: The request floors object that turns on Prebid's deal-floor enforcement and sets
+#: no impression floor (PBS-Java 3.43.0). A request floors object without `data` is
+#: rejected by PriceFloorRulesValidator ("Price floor rules data must be present")
+#: and replaced with an empty one, which drops `enforcement`. So one rule is sent
+#: whose key is neither a media type nor the `*` wildcard, with no `default`:
+#: BasicPriceFloorResolver matches nothing, and every imp.bidfloor stays as sent.
+#: The enforcer then compares a deal bid with the floor the artfhouse adapter
+#: attaches to it, max(imp.bidfloor, deal bidfloor).
+_DEAL_FLOOR_ENFORCEMENT: dict = {
+    "enforcement": {"floorDeals": True},
+    "data": {
+        "currency": "USD",
+        "modelGroups": [
+            {"schema": {"fields": ["mediaType"]}, "values": {"artf-no-floor-rule": 0}},
+        ],
+    },
+}
 
 
 def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
@@ -338,6 +391,10 @@ def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
     NOTHING else. It does not add a bid, a price, a campaign, a deal, or a category:
     what each seat then bids is entirely the bidders' own answer. Everything added
     is listed in artf_meta.prepared so it is visible rather than implied.
+
+    It turns on Prebid's deal-floor enforcement (`ext.prebid.floors`, see
+    _DEAL_FLOOR_ENFORCEMENT) unless the request carries floors of its own, which are
+    then left untouched. No impression floor changes either way.
 
     It also moves `imp.ext.artf.categories` to `imp.ext.data.artf.categories`,
     because Prebid deletes unrecognised `imp.ext` keys as unknown bidder names --
@@ -412,6 +469,22 @@ def _prepare_for_auction(body: dict) -> tuple[dict, list[str]]:
         # each seat's own hb_pb_BIDDER keys; harmless, and useful for diagnosis.
         prebid["targeting"] = {"includewinners": True}
         prepared.append("ext.prebid.targeting.includewinners (mark the winning bid)")
+
+    if prebid.get("floors") is None:
+        # Prebid skips floor enforcement on a bid with a dealid unless the request
+        # sets ext.prebid.floors.enforcement.floorDeals (the account already sets
+        # enforce-deal-floors). See _DEAL_FLOOR_ENFORCEMENT for why a rule block is
+        # sent with it and why it changes no impression floor.
+        prebid["floors"] = copy.deepcopy(_DEAL_FLOOR_ENFORCEMENT)
+        prepared.append(
+            "ext.prebid.floors (turn on PBS deal-floor enforcement; one rule that matches "
+            "no impression, so impression floors are unchanged)"
+        )
+    else:
+        prepared.append(
+            "ext.prebid.floors left as sent (the request carries its own floors, so "
+            "deal-floor enforcement follows them)"
+        )
 
     if "multibid" not in prebid and _BIDDERS:
         # Prebid keeps ONE bid per bidder per impression unless asked otherwise, and
@@ -509,6 +582,236 @@ def _with_debug_enabled(body: dict) -> dict:
     return out
 
 
+def _with_module_trace(body: dict) -> tuple[dict, bool]:
+    """Ask Prebid for its verbose module trace, merged into the existing ext.prebid.
+
+    PBS-Java copies hook analytics tags into the response only at verbose trace
+    level (see ArtfAnalyticsTagWriter's javadoc), and those tags are the only place
+    the hook reports which mutations it received and what it did with each.
+
+    Returns (body, caller_set_trace). A trace level the caller chose is kept as is,
+    and the flag tells the handler not to strip a trace the caller asked for.
+    Copied shallowly, with ext and ext.prebid copied too, like _with_debug_enabled.
+    """
+    out = dict(body)
+    ext = dict(out.get("ext") or {})
+    prebid = dict(ext.get("prebid") or {})
+    caller_set_trace = "trace" in prebid
+    if not caller_set_trace:
+        prebid["trace"] = "verbose"
+    ext["prebid"] = prebid
+    out["ext"] = ext
+    return out, caller_set_trace
+
+
+#: The ARTF hook's module code (ArtfModule.CODE). Its analytics tags are keyed by it
+#: in the module trace. Mirrors prebid/verify_auction.py, which the orchestrator
+#: image does not ship.
+ARTF_HOOK_MODULE_CODE = "artf-orchestrator"
+_ACTIVITY_EXTENSION_POINT = "artf-extension-point"
+_ACTIVITY_MUTATIONS = "artf-mutations"
+_ANSWERED_OUTCOMES = frozenset({"mutations_returned", "no_mutations"})
+_EXTENSION_POINT_SOURCE = "prebid hook analytics tags (ext.prebid.modules.trace, verbose)"
+
+
+def _module_trace(auction: dict) -> Optional[dict]:
+    modules = ((auction.get("ext") or {}).get("prebid") or {}).get("modules")
+    if not isinstance(modules, dict):
+        return None
+    trace = modules.get("trace")
+    return trace if isinstance(trace, dict) else None
+
+
+def _artf_hook_activities(auction: dict) -> list[dict]:
+    """Every analytics activity the ARTF hook wrote, from the verbose module trace.
+
+    Path: ext.prebid.modules.trace.stages[].outcomes[].groups[].invocationresults[]
+    .analyticstags.activities[]. PBS serialises lower-cased keys; camelCase is
+    tolerated. Other modules' activities are ignored.
+    """
+    trace = _module_trace(auction) or {}
+    found: list[dict] = []
+    for stage in trace.get("stages") or []:
+        for outcome in (stage or {}).get("outcomes") or []:
+            for group in (outcome or {}).get("groups") or []:
+                group = group or {}
+                for inv in group.get("invocationresults") or group.get("invocationResults") or []:
+                    inv = inv or {}
+                    hook_id = inv.get("hookid") or inv.get("hookId") or {}
+                    module = hook_id.get("module-code") or hook_id.get("moduleCode") or ""
+                    if module and module != ARTF_HOOK_MODULE_CODE:
+                        continue
+                    tags = inv.get("analyticstags") or inv.get("analyticsTags") or {}
+                    for activity in tags.get("activities") or []:
+                        if isinstance(activity, dict):
+                            found.append(activity)
+    return found
+
+
+def _activity_values(activities: list[dict], name: str) -> Optional[dict]:
+    for activity in activities:
+        if activity.get("name") != name:
+            continue
+        for result in activity.get("results") or []:
+            values = (result or {}).get("values")
+            if isinstance(values, dict):
+                return values
+    return None
+
+
+def _mutation_key(mutation: Any) -> str:
+    """Canonical identity of one mutation: its intent, op, path and payload."""
+    if not isinstance(mutation, dict):
+        return json.dumps(mutation, sort_keys=True, default=str)
+    return json.dumps(
+        {
+            k: mutation.get(k)
+            for k in ("intent", "op", "path", "ids", "adjust_deal", "adjust_bid", "add_metrics")
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _stamp_dispositions(response: dict, dispositions: Optional[list]) -> dict:
+    """Return a copy of the hook's RTBResponse with a disposition on every mutation.
+
+    Survivors (`response.mutations[i]`) take the hook's `dispositions[i]`: applied,
+    or rejected with the hook's reason. When the hook reported no list of the same
+    length, the survivor is `unknown`.
+
+    Per-container mutations (`metadata.containers[].mutations`) are the orchestrator's
+    raw proposals. The survivors are an in-order subset of them (resolve_conflicts),
+    so they are matched by walking the containers in order. A container mutation
+    that lost a (path, intent) contest is `superseded`, named after the winner in
+    `metadata.conflicts`. Derived from this response alone: no stored state.
+    """
+    out = json.loads(json.dumps(response))
+    raw_survivors = out.get("mutations") or []
+    usable = isinstance(dispositions, list) and len(dispositions) == len(raw_survivors)
+    survivors = []
+    for index, mutation in enumerate(raw_survivors):
+        if not isinstance(mutation, dict):
+            continue
+        entry = dispositions[index] if usable else None
+        if not isinstance(entry, dict) or not isinstance(entry.get("applied"), bool):
+            mutation["disposition"] = "unknown"
+            mutation["disposition_reason"] = None
+        elif entry["applied"]:
+            mutation["disposition"] = "applied"
+            mutation["disposition_reason"] = None
+        else:
+            mutation["disposition"] = "rejected"
+            mutation["disposition_reason"] = entry.get("reason") or "rejected by the exchange"
+        survivors.append(mutation)
+
+    metadata = out.get("metadata") if isinstance(out.get("metadata"), dict) else {}
+    contests: dict[tuple[Any, Any], dict] = {}
+    for conflict in metadata.get("conflicts") or []:
+        if isinstance(conflict, dict):
+            contests[(conflict.get("path"), conflict.get("intent"))] = conflict
+
+    pointer = 0
+    for container in metadata.get("containers") or []:
+        if not isinstance(container, dict):
+            continue
+        name = container.get("name")
+        for mutation in container.get("mutations") or []:
+            if not isinstance(mutation, dict):
+                continue
+            contest = contests.get((mutation.get("path"), mutation.get("intent")))
+            lost = (
+                contest is not None
+                and name in (contest.get("losers") or [])
+                and name != contest.get("winner")
+            )
+            if (
+                not lost
+                and pointer < len(survivors)
+                and _mutation_key(mutation) == _mutation_key(survivors[pointer])
+            ):
+                mutation["disposition"] = survivors[pointer]["disposition"]
+                mutation["disposition_reason"] = survivors[pointer]["disposition_reason"]
+                pointer += 1
+                continue
+            mutation["disposition"] = "superseded"
+            winner = (contest or {}).get("winner")
+            mutation["disposition_reason"] = (
+                f"superseded by {winner}" if winner and winner != name else "superseded"
+            )
+    return out
+
+
+def _lift_extension_point(auction: dict) -> dict:
+    """The ARTF hook's own report of this auction, as artf_meta.extension_point.
+
+    `response` is the RTBResponse the hook received, with a disposition on every
+    mutation, so a consumer narrates what the auction actually ran rather than a
+    separate call. `available` is False, with a `reason`, when the response carries
+    no usable report. Pure: reads `auction`, writes nothing.
+    """
+    if _module_trace(auction) is None:
+        return {
+            "available": False,
+            "source": _EXTENSION_POINT_SOURCE,
+            "reason": "Prebid returned no module trace, so the ARTF hook's report is not in the response",
+        }
+    activities = _artf_hook_activities(auction)
+    call = _activity_values(activities, _ACTIVITY_EXTENSION_POINT)
+    if call is None:
+        return {
+            "available": False,
+            "source": _EXTENSION_POINT_SOURCE,
+            "reason": "the module trace carries no ARTF hook activity",
+        }
+    outcome = call.get("outcome")
+    applied_values = _activity_values(activities, _ACTIVITY_MUTATIONS) or {}
+    raw_response = call.get("response")
+    if outcome in _ANSWERED_OUTCOMES and not isinstance(raw_response, dict):
+        return {
+            "available": False,
+            "source": _EXTENSION_POINT_SOURCE,
+            "reason": (
+                "this Prebid image's ARTF hook does not report its mutations; "
+                "redeploy Prebid"
+            ),
+            "correlation_id": call.get("correlation_id"),
+            "outcome": outcome,
+        }
+    response = (
+        _stamp_dispositions(raw_response, applied_values.get("dispositions"))
+        if isinstance(raw_response, dict)
+        else None
+    )
+    return {
+        "available": True,
+        "source": _EXTENSION_POINT_SOURCE,
+        "correlation_id": call.get("correlation_id"),
+        "outcome": outcome,
+        "latency_ms": call.get("latency_ms"),
+        "request_mutated": bool(call.get("request_mutated")),
+        "applied": applied_values.get("applied", 0),
+        "rejected": applied_values.get("rejected", 0),
+        "response": response,
+    }
+
+
+def _strip_module_trace(auction: dict) -> None:
+    """Remove the verbose module trace this endpoint asked for, after lifting it.
+
+    ext.debug (httpcalls, which the offers view reads) is not touched.
+    """
+    prebid = (auction.get("ext") or {}).get("prebid")
+    if not isinstance(prebid, dict):
+        return
+    modules = prebid.get("modules")
+    if not isinstance(modules, dict):
+        return
+    modules.pop("trace", None)
+    if not modules:
+        prebid.pop("modules", None)
+
+
 def _lift_artf_exclusions(auction: dict) -> tuple[Optional[list], str]:
     """Pull the demand endpoint's own exclusion list out of Prebid's debug output.
 
@@ -598,10 +901,11 @@ def _seat_returned_prices(auction: dict) -> dict[tuple[str, str], float]:
 def _imp_floors(request_body: dict) -> dict[str, float]:
     """Each impression's floor, from the request as submitted.
 
-    The floor is `imp.bidfloor` on the request Prebid was given -- which is the
-    request AFTER the ARTF containers mutated it, so a floor a container raised is
-    the floor reported here. That is the point: the sell-side decision and the
-    demand it turned away are the same story.
+    The floor is `imp.bidfloor` on the request Prebid was given. Deal floors do not
+    raise it: an ADJUST_DEAL_FLOOR or ADJUST_DEAL_MARGIN mutation writes the deal's
+    own floor, and a deal bid is held to max(impression floor, deal floor) by the
+    demand endpoint and by Prebid's deal-floor enforcement. So this is the floor a
+    non-deal bid faced.
     """
     floors: dict[str, float] = {}
     for imp in request_body.get("imp") or []:

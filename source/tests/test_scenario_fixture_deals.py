@@ -7,8 +7,9 @@ shows two identical columns. So the rule for every request fixture is:
 
   * the publisher offers only the deal(s) whose id contains "open" or "remnant";
   * every other deal a campaign in the artfhouse catalog transacts on for that
-    publisher is in the Deal Scorer's library (containers/ncf_deal_manager/
-    deal_library.py), so it can still reach the auction -- by activation;
+    publisher is in the Deal Scorer's library (shared/deal_library.py, loaded
+    from the deals seed), so it can still reach the
+    auction -- by activation;
   * a fixture that can receive activations declares ACTIVATE_DEALS, and its
     ScenarioCard entry tags that intent and lists the NCF Deal Manager.
 
@@ -36,6 +37,8 @@ REQUEST_FIXTURES = (
     "home-lifestyle.json",
     "isv-ecosystem.json",
     "parenting-narrative.json",
+    "ridesharer-airport-evening.json",
+    "ridesharer-suburban-midday.json",
     "video-deals.json",
     "yield-optimizer.json",
 )
@@ -54,12 +57,19 @@ def _offered(payload):
 
 @pytest.fixture(scope="module")
 def deal_library():
-    path = os.path.join(_ROOT, "containers", "ncf_deal_manager", "deal_library.py")
+    path = os.path.join(_ROOT, "shared", "deal_library.py")
     spec = importlib.util.spec_from_file_location("ncf_deal_library_for_scenarios", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module.load()
     return module
+
+
+@pytest.fixture(scope="module")
+def seed_deals():
+    with open(os.environ["DEALS_SEED_FILE"], encoding="utf-8") as handle:
+        return {d["id"]: d for d in json.load(handle)["deals"]}
 
 
 @pytest.fixture(scope="module")
@@ -89,21 +99,33 @@ def test_every_offered_deal_is_in_the_library_at_the_same_terms(fixture, deal_li
     for imp_id, deal in _offered(payload):
         assert deal["id"] in book, f"{fixture} {imp_id} offers {deal['id']} which the library does not know"
         assert (book[deal["id"]].bidfloor, book[deal["id"]].at) == (deal["bidfloor"], deal["at"])
+        # A sample that carries the record-built fields must carry the record's values.
+        built = book[deal["id"]].as_openrtb()
+        for key in ("bidfloorcur", "guar", "wseat"):
+            if key in deal:
+                assert deal[key] == built.get(key), f"{fixture} {deal['id']} {key}"
+        if "ext" in deal and "mindealfloor" in deal["ext"]:
+            assert deal["ext"]["mindealfloor"] == built["ext"]["mindealfloor"], f"{fixture} {deal['id']} ext.mindealfloor"
 
 
 @pytest.mark.parametrize("fixture", REQUEST_FIXTURES)
-def test_the_catalog_deals_for_this_publisher_are_all_reachable(fixture, deal_library):
+def test_the_catalog_deals_for_this_publisher_are_all_reachable(fixture, deal_library, seed_deals):
     # Reachable = offered on the request, or activatable from the library. A deal a
     # campaign would bid on that is neither can never transact in this scenario.
+    # Every deal belongs to one publisher (its record's seller), so a campaign that
+    # buys on several publishers holds one deal per publisher, and only this
+    # publisher's deals have to be reachable here.
     payload = _load(fixture)
     book = {d.id for d in deal_library.deals_for(payload["bid_request"])}
     offered = {deal["id"] for _, deal in _offered(payload)}
+    reachable = book | offered
+    sellers = {seed_deals[d]["seller"] for d in reachable if d in seed_deals}
     catalog = CampaignCatalog()
     expected_deals = set()
     for campaign in catalog.all():
-        if campaign.deal_ids and set(campaign.deal_ids) & (book | offered):
-            expected_deals |= set(campaign.deal_ids)
-    assert expected_deals <= (book | offered)
+        if campaign.deal_ids and set(campaign.deal_ids) & reachable:
+            expected_deals |= {d for d in campaign.deal_ids if seed_deals[d]["seller"] in sellers}
+    assert expected_deals <= reachable
 
 
 @pytest.mark.parametrize("fixture", REQUEST_FIXTURES)
