@@ -177,32 +177,32 @@ yield models are currently single-version and loaded directly, with no router.
 
 ### The 5 deployment phases
 
-`deploy.sh` prints its progress as 5 numbered phases (`Phase N/5: ...`), naming each step as it enters it and marking it `✓` or `✗` as it finishes:
+`deploy.sh` prints its progress as 5 numbered phases (`Phase N/5: ...`), naming each step as it enters it and marking it `✓` or `✗` as it finishes. Abbreviated example for prefix `bt1`:
 
 ```
-=== Phase 5/5  Registering agents ===
+Phase 5/5: Registering agents
   -> Step 10: Deploying AgentCore MCP runtime
-  ✓ Registering bt1_nvidia_artf_recommenders_mcp
-  -> Step 11: Deploying closed-loop retraining infrastructure
+  ✓ Registering MCP runtime bt1_nvidia_artf_recommenders_mcp
+  -> Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)
   ✓ Building Adaptive Bidding agent image (arm64)
-  ✗ Registering bt1_adaptive_bidding_agent (HTTP) — exit 1
-    last 15 lines of deployment/.deploy-bt1-closed-loop.log:
+  ✗ Registering bt1_AdaptiveBiddingStrategyAgent (HTTP): exit 1
+    last 15 lines of deployment/.deploy-bt1-closed-loop-detail.log:
       botocore: connect timeout to bedrock-agentcore
 ```
 
-While a step is running its line animates in place, so a long wait is visibly a wait rather than a hang. The genuinely noisy commands — arm64 image builds, the AgentCore SDK's INFO logging — write their output to `deployment/.deploy-*.log` instead of the terminal. **A failure is never quiet:** the last 15 lines of the log are printed inline and the file is named, so you do not have to know where to look.
+While a step is running its line animates in place, so a long wait is visibly a wait rather than a hang. The noisy commands (arm64 image builds, the AgentCore SDK's INFO logging) write their output to `deployment/.deploy-*.log` instead of the terminal. **A failure is never quiet:** the last 15 lines of the log are printed inline and the file is named, so you do not have to know where to look.
 
 Pass `--verbose` to see every underlying command instead of just the step summaries; use `--start-at N` to resume from a given phase (for example after fixing a one-off failure) without redoing earlier ones. Set `DEPLOY_NO_SPINNER=1` to hold the line still. The animation is skipped automatically when output is redirected, so a `nohup`-ed log stays readable text.
 
 | Phase | What happens |
 |-------|---------------|
-| **1/5 — Preparing models** | Creates the ECR repositories and the DynamoDB load-test-history table; exports the PyTorch DLRM/NCF models to ONNX and the yield optimizer's genesis XGBoost models (best-effort — the deploy continues even if this step is skipped); uploads all of it, plus the Triton router/model-config repository, to the S3 model bucket. |
-| **2/5 — Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster: Kubernetes 1.31 across three Availability Zones, a `gpu-inference` node group (1 node, `g5.xlarge` with `g5.2xlarge`/`g5.4xlarge` as fallbacks, all NVIDIA A10G) and a `cpu-services` node group (3 `c5.2xlarge` nodes), both in private subnets behind one NAT gateway per AZ. The two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
-| **3/5 — Deploying workloads** | Provisions the Cognito user pool, app client and identity pool, then applies the Kubernetes manifests for Triton (behind an internal-only load balancer), the six ARTF containers, the orchestrator (a ClusterIP Service for in-cluster callers plus an internal-only NLB for the UI API proxy; no public address) and their Horizontal Pod Autoscalers. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node — this runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Deploys the `<prefix>-ui-api-proxy` Lambda that carries the browser's `/api/*` calls into the VPC, and creates the GPU node group's nightly scheduled shutdown (desired and minimum size set to 0 at 8:00 PM America/New_York every day; the **Start GPUs** button in the UI brings the node back). |
-| **4/5 — Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
-| **5/5 — Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime (skip it with `--skip-agentcore`), then — unless you passed `--no-retraining` — deploys the entire Part 2 closed-loop stack: the bid-outcome and deal-yield feedback pipelines (two Kinesis streams, two Firehose delivery streams, a KMS key), the two Glue ETL jobs, the DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously — this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
+| **1/5: Preparing models** | Creates the ECR repositories and the DynamoDB load-test-history table; exports the PyTorch DLRM/NCF models to ONNX and the yield optimizer's genesis XGBoost models (best-effort: the deploy continues even if this step is skipped); uploads all of it, plus the Triton router/model-config repository, to the S3 model bucket. |
+| **2/5: Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster: Kubernetes 1.31 across three Availability Zones, a `gpu-inference` node group (1 node, `g5.xlarge` with `g5.2xlarge`/`g5.4xlarge` as fallbacks, all NVIDIA A10G) and a `cpu-services` node group (3 `c5.2xlarge` nodes), both in private subnets behind one NAT gateway per AZ. The two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
+| **3/5: Deploying workloads** | Provisions the Cognito user pool, app client and identity pool, then applies the Kubernetes manifests for Triton (behind an internal-only load balancer), the six ARTF containers, the orchestrator (a ClusterIP Service for in-cluster callers plus an internal-only NLB for the UI API proxy; no public address) and their Horizontal Pod Autoscalers. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node. This runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Deploys the `<prefix>-ui-api-proxy` Lambda that carries the browser's `/api/*` calls into the VPC, and creates the GPU node group's nightly scheduled shutdown (desired and minimum size set to 0 at 8:00 PM America/New_York every day; the **Start GPUs** button in the UI brings the node back). |
+| **4/5: Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
+| **5/5: Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime (skip it with `--skip-agentcore`), then, unless you passed `--no-retraining`, deploys the entire Part 2 closed-loop stack: the bid-outcome and deal-yield feedback pipelines (two Kinesis streams, two Firehose delivery streams, a KMS key), the two Glue ETL jobs, the DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously; this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
 
-**Cost while it's running:** approximately **$1,470/month** at `us-east-1` on-demand prices with the default settings and the included nightly GPU shutdown (about **$1,945/month** if the GPU node runs 24/7). That figure includes Part 2 (closed-loop learning), which deploys by default; about half of it is the three-node CPU node group. The Adaptive Bidding Agent calls Amazon Bedrock once every 24 hours by default, so it is a small line at that cadence; see [Cost](#cost) for what it becomes if you shorten the interval. Part 1 alone (`--no-retraining`) is about **$1,225/month**. See [Cost](#cost) for the line items and the assumptions behind them. Deploy, try it, and [tear it down](#cleanup) when you're done — a short session costs a few dollars.
+**Cost while it's running:** approximately **$1,470/month** at `us-east-1` on-demand prices with the default settings and the included nightly GPU shutdown (about **$1,945/month** if the GPU node runs 24/7). That figure includes Part 2 (closed-loop learning), which deploys by default; about half of it is the three-node CPU node group. The Adaptive Bidding Agent calls Amazon Bedrock once every 24 hours by default, so it is a small line at that cadence; see [Cost](#cost) for what it becomes if you shorten the interval. Part 1 alone (`--no-retraining`) is about **$1,225/month**. See [Cost](#cost) for the line items and the assumptions behind them. Deploy, try it, and [tear it down](#cleanup) when you're done. A short session costs a few dollars.
 
 **Confirm everything is healthy:**
 
@@ -211,13 +211,13 @@ kubectl get nodes    # at least one GPU node + CPU nodes, all Ready
 kubectl get pods     # Triton, the 6 containers, and the orchestrator all Running
 ```
 
-Triton and the model-optimizer bootstrap Job may take a few minutes to finish loading/compiling models after the script exits — `deploy.sh`'s final summary tells you whether that finished and how to check.
+Triton and the model-optimizer bootstrap Job may take a few minutes to finish loading/compiling models after the script exits. `deploy.sh`'s final summary tells you whether that finished and how to check.
 
 ## Try it
 
 1. Open the frontend URL from the deployment summary and sign in with the demo username and password shown there. On first login, Cognito will prompt you to set a new password. See [Demo credentials](#demo-credentials) below if you missed them or need to reset the password.
 
-2. Click **Containers** in the navigation to check status. The GPU node group scales to zero when idle to save cost — if Triton shows *offline*, click **Start GPUs** (takes about 3–5 minutes).
+2. Click **Containers** in the navigation to check status. The GPU node group scales to zero when idle to save cost. If Triton shows *offline*, click **Start GPUs** (takes about 3 to 5 minutes).
 
    Once Triton has loaded its models, every container shows a green **ready** badge.
 
@@ -227,19 +227,18 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 
    <img src="assets/images/scenarios-ui.png" alt="Scenarios UI" height="400">
 
-   | Scenario | Containers exercised |
-   |----------|----------------------|
-   | Banner Ad — Segment Activation | Audience Activator, Signals Enricher |
-   | Bid Shading — Price Optimization | Bid Pricer |
-   | Video + PMP Deals — Deal Scoring | Deal Scorer, Signals Enricher |
-   | SSP Enrichment — 3 Containers | Audience Activator, Deal Scorer, Signals Enricher |
-   | PMP Deals — Yield Optimizer | Yield Optimizer — Floor, Yield Optimizer — Margin |
+   | Scenarios | Containers exercised |
+   |-----------|----------------------|
+   | Home & Lifestyle, Sports Banner, Two Impressions (SSP enrichment) | Audience Activator, Deal Scorer, Signals Enricher |
+   | Finance Vertical, Parenting Article, Mid-roll Video, both RideSharer scenarios | Audience Activator, Deal Scorer, Yield Optimizer (Floor and Margin), Signals Enricher |
+   | CTV Guaranteed | Deal Scorer, Yield Optimizer (Floor and Margin) |
+   | The four Bid Response scenarios | Bid Pricer, Signals Enricher |
 
    <img src="assets/images/scenario-result.png" alt="Scenario result" height="350">
 
    The result view shows the mutated bid request, a per-container latency breakdown, and the individual mutations each container proposed.
 
-4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke — see [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
+4. (Optional) Call the same pipeline over MCP. An Amazon Bedrock AgentCore runtime exposes an `extend_rtb` tool that any Bedrock-hosted agent can invoke. See [GUIDANCE.md](GUIDANCE.md#amazon-bedrock-agentcore-integration) for a working example.
 
 5. (Optional) Click **Load Test** in the navigation to generate sample traffic against any single container, including either yield container (each selectable on its own). This isn't only a throughput demo: for the yield models, load-test traffic travels the same real closed-loop feedback path production traffic uses (a real `DealYieldOutcomeEvent`, tagged `source=load_test` so it's never confused with production data), which is how their training data actually gets bootstrapped before real auction outcomes accumulate. A **Traffic scenario** selector shapes the sample requests each run generates: a balanced default, or recognisable demand shapes such as a Black Friday retail surge or NFL-Sunday sports traffic (each a weighted mix of publisher domains, content categories, devices, and deal-floor ranges). It shapes the request inputs the pipeline processes; it does not replay real traffic recorded during those events. See [Part 2: closed-loop learning](#part-2-closed-loop-learning).
 
@@ -251,15 +250,15 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 |---|---|
 | **Username** | `admin@example.com` (set `DEMO_USER_EMAIL` before deploying to use a different address) |
 | **Password** | A 16-character temporary password, generated locally and **printed only once**, in the summary |
-| **First login** | Cognito requires you to set a permanent password — the user is created with a *temporary* one, so the password change is forced, not optional |
+| **First login** | Cognito requires you to set a permanent password. The user is created with a *temporary* one, so the password change is forced, not optional |
 
-**If you missed the password, or it has scrolled past.** It cannot be recovered. Cognito stores passwords hashed, `admin-get-user` returns no credential, and `admin-create-user` does not return the temporary password it set — so the only option is to set a new one. The deployment summary prints this command with your real User Pool ID already filled in; if you no longer have the summary, find the ID first:
+**If you missed the password, or it has scrolled past.** It cannot be recovered. Cognito stores passwords hashed, `admin-get-user` returns no credential, and `admin-create-user` does not return the temporary password it set, so the only option is to set a new one. The deployment summary prints this command with your real User Pool ID already filled in; if you no longer have the summary, find the ID first:
 
 ```bash
 # Find your User Pool ID (look for <prefix->nvidia-artf-recommenders)
 aws cognito-idp list-user-pools --max-results 60 --region us-east-1
 
-# Set a permanent password — you will NOT be prompted to change it at next login
+# Set a permanent password; you will NOT be prompted to change it at next login
 aws cognito-idp admin-set-user-password \
   --user-pool-id <your-user-pool-id> \
   --username admin@example.com \
@@ -276,11 +275,11 @@ It is also recorded locally: `jq -r '.deployments["dv1"].resolved.cognitoUserPoo
 
 ![Architecture](assets/images/architecture.svg)
 
-An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in private subnets) runs two node groups: a `gpu-inference` node group of NVIDIA A10G instances (`g5.xlarge` by default, with `g5.2xlarge` and `g5.4xlarge` accepted as capacity fallbacks; the TensorRT engines are compiled for the A10G, so the group is pinned to the `g5` family) running NVIDIA Triton Inference Server, and a `cpu-services` node group of three `c5.2xlarge` instances running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference — the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; a `ui-api-proxy` Lambda inside the VPC carries the browser's API calls to the orchestrator, which has no public address; and an Amazon Bedrock AgentCore runtime, deployed by default and skippable with `--skip-agentcore`, exposes the same pipeline over MCP.
+An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in private subnets) runs two node groups: a `gpu-inference` node group of NVIDIA A10G instances (`g5.xlarge` by default, with `g5.2xlarge` and `g5.4xlarge` accepted as capacity fallbacks; the TensorRT engines are compiled for the A10G, so the group is pinned to the `g5` family) running NVIDIA Triton Inference Server, and a `cpu-services` node group of three `c5.2xlarge` instances running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference: the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; a `ui-api-proxy` Lambda inside the VPC carries the browser's API calls to the orchestrator, which has no public address; and an Amazon Bedrock AgentCore runtime, deployed by default and skippable with `--skip-agentcore`, exposes the same pipeline over MCP.
 
 Full component-by-component detail, model specifications, and a request-flow diagram: [assets/images/architecture.md](assets/images/architecture.md). Container-naming history (what changed, what didn't, and why): [RENAME_MAP.md](RENAME_MAP.md).
 
-**One architectural variant ships with this Guidance.** The topology above has a single ARTF host — the orchestrator, called directly. Adding `--with-prebid` deploys **Prebid Server into the same cluster as a second, independent host**, which calls that same orchestrator from inside a real auction and then resolves the auction itself. It is opt-in and additive: without the flag, nothing above changes. It runs a **contested** auction: two independent seats bid, so there is a real winner and real losers. See [Variant: Prebid Server as a second ARTF host](#variant-prebid-server-as-a-second-artf-host-sell-side) for the architecture, a full page-load walkthrough, and what is and is not real about it.
+**One architectural variant ships with this Guidance.** The topology above has a single ARTF host: the orchestrator, called directly. Adding `--with-prebid` deploys **Prebid Server into the same cluster as a second, independent host**, which calls that same orchestrator from inside a real auction and then resolves the auction itself. It is opt-in and additive: without the flag, nothing above changes. It runs a **contested** auction: two independent seats bid, so there is a real winner and real losers. See [Variant: Prebid Server as a second ARTF host](#variant-prebid-server-as-a-second-artf-host-sell-side) for the architecture, a full page-load walkthrough, and what is and is not real about it.
 
 ### Cost
 
@@ -333,7 +332,7 @@ brew install jq eksctl kubectl                   # or your Linux package manager
 docker buildx version                            # only needed for --local-build
 ```
 
-**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-4-8` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region — check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
+**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-4-8` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region. Check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
 
 **NVIDIA NGC API key:** required by default, since Part 2 (closed-loop retraining) is on unless you pass `--no-retraining`; it is used only to pull the gated NeMo-RL base image, and is stored once in Secrets Manager as `<prefix>-nvidia-artf-recommenders-ngc-api-key`. `nvcr.io/nvidia/tritonserver` itself is a public image and needs no key. See the [Quick start](#quick-start) above for how to get one.
 
@@ -376,16 +375,16 @@ DEMO_USER_EMAIL=you@example.com ./deploy.sh --prefix dv1    # demo Cognito user 
 
 `--resume` is accepted and does nothing; a plain re-run already probes AWS and continues from whatever is missing. Re-deploying or resuming by hand is not a supported path: always go back through `deploy.sh --prefix <p>` (with `--start-at N` to force a phase). It is the one place the profile, region and remembered inputs are resolved, and every child script and helper receives them from it.
 
-By default, images build remotely on **AWS CodeBuild** — no local Docker required, and ARM64 images (AgentCore) build natively on Graviton. The first deploy provisions a CodeBuild stack automatically; later runs skip rebuilding images whose source hasn't changed. Pass `--local-build` if you'd rather build with Docker on your own machine (needs ~30 GB free disk, plus buildx for the ARM64 cross-compile).
+By default, images build remotely on **AWS CodeBuild**: no local Docker required, and ARM64 images (AgentCore) build natively on Graviton. The first deploy provisions a CodeBuild stack automatically; later runs skip rebuilding images whose source hasn't changed. Pass `--local-build` if you'd rather build with Docker on your own machine (needs ~30 GB free disk, plus buildx for the ARM64 cross-compile).
 
-The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training container from a gated NGC image, which is a long build (15–50 minutes) that runs asynchronously — the rest of the deployment doesn't wait on it. If you already stored your NGC key in Secrets Manager on a prior run (or via `aws secretsmanager create-secret --name my-secret-name --secret-string YOUR_NGC_API_KEY`), pass `--ngc-secret my-secret-name` instead of `--ngc-key` to reuse it. Check the NeMo build's status any time with:
+The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training container from a gated NGC image, which is a long build (15 to 50 minutes) that runs asynchronously; the rest of the deployment doesn't wait on it. If you already stored your NGC key in Secrets Manager on a prior run (or via `aws secretsmanager create-secret --name my-secret-name --secret-string YOUR_NGC_API_KEY`), pass `--ngc-secret my-secret-name` instead of `--ngc-key` to reuse it. Check the NeMo build's status any time with:
 
 ```bash
 ./check_builds.sh --prefix stg          # one-time check
 ./check_builds.sh --prefix stg --watch  # refresh every 30s
 ```
 
-**Breaking change:** `deploy.sh --start-at` now takes a phase number 1–5 instead of the old internal step numbers. If you have scripts referencing the old numbering, see the old-step-to-new-phase mapping table in [RENAME_MAP.md](RENAME_MAP.md).
+**Breaking change:** `deploy.sh --start-at` now takes a phase number 1 to 5 instead of the old internal step numbers. If you have scripts referencing the old numbering, see the old-step-to-new-phase mapping table in [RENAME_MAP.md](RENAME_MAP.md).
 ### Deals and campaigns: the deals table
 Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-deals` (for example `stg-nvidia-artf-recommenders-deals`). Nothing is defined in code: `source/demand/artfhouse/catalog.py` and `source/shared/deal_library.py` (read by the Deal Scorer and the orchestrator) build their objects from the table's records.
 
@@ -407,7 +406,7 @@ Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-
 
 ### Resuming, re-running, and remembered settings
 
-**Re-running does not require a teardown first.** Every phase is idempotent: existing ECR repositories, DynamoDB tables and EKS clusters are reused, images whose source has not changed are not rebuilt, manifests are re-applied, and the demo Cognito user is left alone if it already exists. Run `./deploy.sh` again as often as you like. Use `--destroy` when you actually want the resources gone — to stop paying for them, or to start from a genuinely clean account — not as a precaution before redeploying.
+**Re-running does not require a teardown first.** Every phase is idempotent: existing ECR repositories, DynamoDB tables and EKS clusters are reused, images whose source has not changed are not rebuilt, manifests are re-applied, and the demo Cognito user is left alone if it already exists. Run `./deploy.sh` again as often as you like. Use `--destroy` when you actually want the resources gone (to stop paying for them, or to start from a clean account), not as a precaution before redeploying.
 
 **Where did I get to? Ask AWS.**
 
@@ -415,21 +414,23 @@ Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-
 ./deploy.sh --prefix bt1 --status
 ```
 
+Abbreviated example output:
+
 ```
-Deployment status — prefix 'bt1'
+Deployment status: prefix 'bt1'
   account 123456789012 · region us-east-1 · stack bt1-nvidia-artf-recommenders
-  (read live from AWS — safe to run any time, from anywhere, while a deploy is running)
+  (read live from AWS; safe to run any time, from anywhere, while a deploy is running)
 
   ✓         Phase 1/5  Preparing models
   ✗ missing Phase 2/5  Building containers & provisioning infrastructure
-            ✗ missing container images — repos exist but hold no image: adaptive-bidding-agent
-            ✓         EKS cluster — bt1-nvidia-artf-recommenders-triton ACTIVE
-            ✓         node group gpu-inference — 1 node(s) registered, ['g5.xlarge']
+            ✗ missing container images: repos exist but hold no image: adaptive-bidding-agent
+            ✓         EKS cluster: bt1-nvidia-artf-recommenders-triton ACTIVE
+            ✓         node group gpu-inference: 1 node(s) registered, ['g5.xlarge']
   ✓         Phase 3/5  Deploying workloads
   ✓         Phase 4/5  Setting up access
   ✗ missing Phase 5/5  Registering agents
-            ✗ missing stack bt1-governance-eventbridge — not created
-            ✗ missing agent runtime *AdaptiveBiddingStrategyAgent — not created
+            ✗ missing stack bt1-governance-eventbridge: not created
+            ✗ missing agent runtime *AdaptiveBiddingStrategyAgent: not created
 ```
 
 `✓` is deployed and `✗` is not; the word after the cross says which kind of "not",
@@ -439,7 +440,7 @@ because *never created* and *created and broken* need different responses:
 |---|---|
 | `✓` | Present and ready |
 | `✗ missing` | Does not exist. Re-running the phase creates it |
-| `✗ FAILED` | Exists and is broken — a rolled-back stack, a pod that will not schedule. Needs a look, not just a re-run |
+| `✗ FAILED` | Exists and is broken: a rolled-back stack, a pod that will not schedule. Needs a look, not just a re-run |
 | `· working` | AWS is mid-operation. A re-run waits for it rather than competing |
 | `? unknown` | Could not be determined (usually no `kubectl` context for the cluster). The phase is **run**, not skipped |
 | `✗ stale` | Present, but built from other inputs than this checkout: the bucket's Phase 1 marker records another deals seed or Deal Scorer build (Phase 1), or the Deal Scorer engine was built from another one (Phase 3). The phase is **run** |
@@ -448,7 +449,7 @@ Terminals without UTF-8 get `+`, `x` and `.` instead. These are the same marks t
 deploy itself prints, so a phase looks identical whether you are watching it happen
 or asking about it afterwards.
 
-That comes from CloudFormation stack statuses, CodeBuild build states, EKS nodegroups **and the nodes actually registered in the cluster**, ECR images, Kubernetes readiness, CloudFront, Cognito and AgentCore runtimes — not from a local file. So it works from any machine, after a reboot, for a colleague, and while a deploy is running, because it only reads. It exits 0 only when everything expected is present, so it is usable in a script.
+That comes from CloudFormation stack statuses, CodeBuild build states, EKS nodegroups **and the nodes actually registered in the cluster**, ECR images, Kubernetes readiness, CloudFront, Cognito and AgentCore runtimes, not from a local file. So it works from any machine, after a reboot, for a colleague, and while a deploy is running, because it only reads. It exits 0 only when everything expected is present, so it is usable in a script.
 
 **If a deploy stops part-way, run the same command again.** No flags, no prompt:
 
@@ -459,16 +460,16 @@ That comes from CloudFormation stack statuses, CodeBuild build states, EKS nodeg
 It probes AWS first, prints the table above, then does only what is missing:
 
 - A phase whose resources already exist is **skipped**, and says so.
-- If AWS is **mid-operation** — a stack creating, a CodeBuild build running — it **waits for that** rather than starting a competing one. Two terminals running this at once is therefore safe, and useful, instead of a race.
+- If AWS is **mid-operation** (a stack creating, a CodeBuild build running), it **waits for that** rather than starting a competing one. Two terminals running this at once is therefore safe, and useful, instead of a race.
 - A phase whose state **cannot be verified** is run, not skipped. Every phase is idempotent, so re-running one costs time; skipping one would ship a deployment that claims to be complete and is not.
 - Some changes leave everything present and ready, so a phase would otherwise skip: pods still running an older image digest than ECR holds for their tag (Phase 3), an AgentCore runtime registered with an older AgentCore image (Phase 5), or, with `--with-prebid`, Prebid host sources (`source/prebid/`, `source/demand/`, the Prebid template, script and manifests) or a deals seed that changed since the last successful `deploy_prebid.sh` (Step 12 alone). Each is checked with read-only calls before the phases run, makes its phase or step run, and prints why. Phase 3 restarts only the Deployments whose pods do not run ECR's digest; a digest that cannot be read counts as different.
-- `--start-at N` still forces a starting phase, for when you know something the probe cannot — "rebuild my container even though an image exists".
+- `--start-at N` still forces a starting phase, for when you know something the probe cannot, such as "rebuild my container even though an image exists".
 
 There is no resume prompt, because there is no longer a question to ask. `--resume` is accepted as a no-op so older scripts and notes keep working.
 
-If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, and the output prints the exact `aws eks update-kubeconfig` command. It will never report another cluster's pods as yours — which matters, because every deploy rewrites the shared `~/.kube/config`.
+If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, and the output prints the exact `aws eks update-kubeconfig` command. It will never report another cluster's pods as yours. That matters because every deploy rewrites the shared `~/.kube/config`.
 
-**Detaching is supported.** With no terminal attached — `nohup`, a detached session, CI — nothing prompts. If a subsystem fails, the run prints a partial-completion summary with a freshly probed status table, names what failed, and **exits non-zero**. It will not print a success banner for a deploy that did not finish.
+**Detaching is supported.** With no terminal attached (`nohup`, a detached session, CI), nothing prompts. If a subsystem fails, the run prints a partial-completion summary with a freshly probed status table, names what failed, and **exits non-zero**. It will not print a success banner for a deploy that did not finish.
 
 **Docker is started for you when it is needed.** Phase 5 builds the two AgentCore agent images locally by design (AgentCore needs arm64, and the builds are small). If the Docker daemon is not running at that point, `deploy.sh` starts it and waits instead of failing with a connect error. Same for `--local-build`.
 
@@ -490,12 +491,12 @@ The AWS profile is the one remembered value that is also **enforced**: if a late
 Three things worth knowing about the record:
 
 - It is keyed on `--prefix`, so `./deploy.sh --prefix dv1` and `./deploy.sh --prefix stg` never read each other's values. If the record's account or stack name disagrees with the current invocation, nothing is reused and the script says why.
-- It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password — only the *name* of the Secrets Manager secret.
+- It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password, only the *name* of the Secrets Manager secret.
 - It records **no progress**. That was tried and removed: a file describing what the script had done disagreed with what the account actually contained, and reported a phase complete for a workload that had never started. Progress comes from `--status`. Two values describe what was shipped where AWS keeps nothing to compare: the AgentCore image digest the MCP runtime was last registered with, and the fingerprint of the Prebid host sources and deals seed of the last successful Step 12. A missing value makes the next run register or deploy again, so deleting the file never skips work.
 
-**What the terminal shows, and where the rest went.** The terminal prints phases and steps only. Everything a step runs — the ONNX export, S3 copies, `eksctl`, every `kubectl apply`, CodeBuild polling, the AgentCore SDK's logging, and the `deploy_prebid.sh` and `deploy_closed_loop.sh` children — goes to one file per run, `deployment/.deploy-<prefix>.log` (the previous run is kept as `.deploy-<prefix>.prev.log`). The path is printed at the start of every run and again by every failure, and a failure also prints the last 15 lines of it inline. Pass `--verbose` to stream everything to the terminal instead.
+**What the terminal shows, and where the rest went.** The terminal prints phases and steps only. Everything a step runs (the ONNX export, S3 copies, `eksctl`, every `kubectl apply`, CodeBuild polling, the AgentCore SDK's logging, and the `deploy_prebid.sh` and `deploy_closed_loop.sh` children) goes to one file per run, `deployment/.deploy-<prefix>.log` (the previous run is kept as `.deploy-<prefix>.prev.log`). The path is printed at the start of every run and again by every failure, and a failure also prints the last 15 lines of it inline. Pass `--verbose` to stream everything to the terminal instead.
 
-**A flag the script does not recognise stops the run.** Nothing is created first. This includes a flag whose leading dashes were turned into an em dash by a chat client or word processor (`—with-prebid`); the message says so, because the substitution is invisible on screen and a dropped flag would otherwise deploy a different stack than the one asked for.
+**A flag the script does not recognise stops the run.** Nothing is created first. This includes a flag whose leading dashes were turned into a single em dash character (U+2014) by a chat client or word processor; the message says so, because the substitution is invisible on screen and a dropped flag would otherwise deploy a different stack than the one asked for.
 
 ### Network layout: nothing in the VPC is internet-facing
 
@@ -510,7 +511,7 @@ The **orchestrator has no public address.** In-cluster callers use its `ClusterI
 
 The load-test panel's live stream is the one feature this changes: a synchronous invoke cannot carry server-sent events, so the proxy answers `406 streaming_not_supported` immediately and the panel uses its existing 500 ms polling path instead.
 
-Why this shape: an account running [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) in `block-ingress` mode drops inbound traffic at the internet gateway for every VPC in the account — commonly as an organisation-level control the operator cannot change. Private nodes behind NAT are unaffected, because `block-ingress` permits NAT-gateway egress; an internet-facing load balancer (and a CloudFront VPC origin) would be created and then accept no traffic. A VPC-attached Lambda ENI is not an internet path, so the stack deploys and the UI works in such an account with no exclusion, no override, and no change to the bidstream hot path (Prebid Server → orchestrator → containers → Triton never leaves the cluster). Earlier releases created a public load balancer and stopped the deploy with a "create an exclusion" instruction; that gate no longer exists because nothing needs public ingress.
+Why this shape: an account running [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) in `block-ingress` mode drops inbound traffic at the internet gateway for every VPC in the account, commonly as an organisation-level control the operator cannot change. Private nodes behind NAT are unaffected, because `block-ingress` permits NAT-gateway egress; an internet-facing load balancer (and a CloudFront VPC origin) would be created and then accept no traffic. A VPC-attached Lambda ENI is not an internet path, so the stack deploys and the UI works in such an account with no exclusion, no override, and no change to the bidstream hot path (Prebid Server → orchestrator → containers → Triton never leaves the cluster). Earlier releases created a public load balancer and stopped the deploy with a "create an exclusion" instruction; that gate no longer exists because nothing needs public ingress.
 
 To reach the orchestrator from your own machine for debugging: `kubectl port-forward svc/orchestrator 8080:80`, then `curl http://localhost:8080/health/ready`.
 
@@ -526,7 +527,7 @@ Everything except the logic is already done: the gRPC/MCP/health server, the ECR
 2. **Rebuild that one image**: `cd deployment && ./deploy.sh --prefix <prefix> --start-at 2`
 3. **Restart that one Deployment**: `kubectl rollout restart deployment/artf-template`
    Don't skip this. `deploy.sh` reuses the previous image tag when the registry already has it, so `kubectl apply` is a no-op when only the image *content* changed and the old pod keeps serving your old code.
-4. **Activate it** in the Container Health panel. No redeploy — the flag lives in a DynamoDB registry table, and every orchestrator replica picks it up within the cache TTL (30s by default; the UI tells you the window).
+4. **Activate it** in the Container Health panel. No redeploy: the flag lives in a DynamoDB registry table, and every orchestrator replica picks it up within the cache TTL (30s by default; the UI tells you the window).
 
 Full walkthrough, including how to add a Triton model or a second container: [`source/containers/artf_template/README.md`](source/containers/artf_template/README.md).
 
@@ -535,7 +536,7 @@ Full walkthrough, including how to add a Triton model or a second container: [`s
 | Status | Meaning |
 |---|---|
 | `disabled` | Inactive. Not called. Not a failure |
-| `unreachable` | Active, but nothing answered — pod down, no Service endpoints, wrong port |
+| `unreachable` | Active, but nothing answered: pod down, no Service endpoints, wrong port |
 | `error` | Answered, but the response was unusable |
 | `timeout` | Exceeded the request's `tmax` budget |
 | `no_mutations` | Ran, and returned nothing. What the unmodified template reports |
@@ -559,9 +560,9 @@ An inactive, absent, broken or slow container never breaks the flow: the other c
 
 The registry record is authoritative for routing. Changing only the env var leaves the orchestrator filtering on the old intent, so your container never gets called.
 
-`ADD_CIDS` is the default intent because it is the one intent in the ARTF enum that no shipped container implements — the template fills a gap rather than shadowing working code. Two containers *may* claim the same intent: both are called, and the orchestrator then decides which one's mutation is returned for a given path. See [Precedence](#precedence-when-two-containers-claim-the-same-intent) below. The panel flags a shared intent and names who wins.
+`ADD_CIDS` is the default intent because it is the one intent in the ARTF enum that no shipped container implements, so the template fills a gap rather than shadowing working code. Two containers *may* claim the same intent: both are called, and the orchestrator then decides which one's mutation is returned for a given path. See [Precedence](#precedence-when-two-containers-claim-the-same-intent) below. The panel flags a shared intent and names who wins.
 
-The six shipped containers stay defined in the orchestrator's code and cannot be renamed, re-targeted or deactivated from the UI or the registry table — the real-time bidding path is deliberately not UI-mutable.
+The six shipped containers stay defined in the orchestrator's code and cannot be renamed, re-targeted or deactivated from the UI or the registry table. The real-time bidding path is deliberately not UI-mutable.
 
 ### Attaching a container built outside this guidance
 
@@ -587,14 +588,14 @@ cd deployment
 cat eks/external-floor-agent.yaml
 kubectl apply -f eks/external-floor-agent.yaml
 
-# 3. Activate it — in the Container Health panel, or here.
+# 3. Activate it in the Container Health panel, or here.
 aws dynamodb update-item \
   --table-name "${STACK_NAME}-container-registry" --region us-east-1 \
   --key '{"registry":{"S":"artf-containers"},"name":{"S":"floor-agent"}}' \
   --update-expression 'SET active = :a' \
   --expression-attribute-values '{":a":{"BOOL":true}}'
 
-# 4. Teardown — record first, then workload. The script enforces that order.
+# 4. Teardown: record first, then workload. The script enforces that order.
 ./attach_artf_container.sh --detach floor-agent --stack "${STACK_NAME}"
 ```
 
@@ -607,7 +608,7 @@ aws dynamodb update-item \
 | `--variant gpu` when the image's `agent-manifest` label does not advertise a GPU serving mode | The label is the authority. A manifest can be rendered for a shape the image cannot serve, and the failure would then appear as a startup refusal instead of a refusal to attach |
 | Detaching a built-in container | Built-ins have no registry record, so the deletion would silently succeed and change nothing |
 
-**The cross-account image pull is not something this repository can grant.** The image lives in the producer's account. Copying it into yours still requires `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on *their* repository, which only they can grant with a repository policy. What the copy buys is *where and when* that gap surfaces: once, at attach time, with a named error — rather than on every node, continuously, as `ImagePullBackOff` after a registry record that already looks healthy. Use `--no-copy` to register the foreign reference directly and take the ongoing dependency instead.
+**The cross-account image pull is not something this repository can grant.** The image lives in the producer's account. Copying it into yours still requires `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on *their* repository, which only they can grant with a repository policy. What the copy buys is *where and when* that gap surfaces: once, at attach time, with a named error, rather than on every node, continuously, as `ImagePullBackOff` after a registry record that already looks healthy. Use `--no-copy` to register the foreign reference directly and take the ongoing dependency instead.
 
 #### Precedence: when two containers claim the same intent
 
@@ -616,7 +617,7 @@ Both containers are called. For any given `(path, intent)` only one mutation is 
 1. **Higher `priority` wins.** It is an integer on the registry record, defaulting to `0`.
 2. **Equal priority falls back to registry order**, where code-defined containers come first and store-defined ones follow.
 
-Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent — and the built-in's mutation is computed and then discarded. That is not new behaviour: it is what a consumer applying an unresolved mutation list already did, since the last write to a path is the one that sticks. What is new is that it is now decided in one place, reported, and controllable.
+Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent, and the built-in's mutation is computed and then discarded. That is not new behaviour: it is what a consumer applying an unresolved mutation list already did, since the last write to a path is the one that sticks. What is new is that it is now decided in one place, reported, and controllable.
 
 If an attached container claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer** also claims, attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
 
@@ -624,7 +625,7 @@ If an attached container claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield 
 ./attach_artf_container.sh --record ... --stack "${STACK_NAME}" --priority -1
 ```
 
-Built-in containers are pinned at priority `0` and **cannot be deactivated** — the bid path is not UI-mutable. Priority is the only lever, which is why it exists.
+Built-in containers are pinned at priority `0` and **cannot be deactivated**: the bid path is not UI-mutable. Priority is the only lever, which is why it exists.
 
 The losing mutation is not hidden. `metadata.conflicts` names the path, the intent, the winner and the losers; each container's `superseded` count says how many of its mutations lost; and its own `mutations` list still shows what it computed. The Container Health panel shows the priority and who wins, and the flow pipeline marks a container whose work was overridden.
 
@@ -655,11 +656,11 @@ two different retraining paths, one per model type:
 | `ncf_deal_manager` | Same image; trained at deploy time on sample interactions. The scheduled job stops at the dataset gate, because `training-data/` has no `user_id` or `deal_id` columns | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
 | `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
 | `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
-| Audience Activator, Signals Enricher | *not applicable* — rule engines | — | — | — |
+| Audience Activator, Signals Enricher | *not applicable*: rule engines | n/a | n/a | n/a |
 
 Each model has its own SageMaker Model Package Group, so versions, approval status,
 and promotions are tracked independently. The two yield models train from two
-separately labeled datasets produced by a **single** Glue ETL job — one job is
+separately labeled datasets produced by a **single** Glue ETL job. One job is
 sufficient because its dedup key includes the ARTF intent, which is what separates
 floor rows from margin rows. Tree models skip TensorRT entirely: FIL loads the
 retrained `xgboost.json` directly, so there is no engine-compile stage in that path.
@@ -673,15 +674,15 @@ The **Governance** page drives the whole loop from a load test. Each step gates 
 the previous one finishing, so the order matters:
 
 1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
-   outcomes for* (e.g. **Bid Pricer**) — the list shows only models that have a
-   training pipeline — leave the variant on **Current (stable)**, optionally pick a
+   outcomes for* (e.g. **Bid Pricer**; the list shows only models that have a
+   training pipeline), leave the variant on **Current (stable)**, optionally pick a
    **Traffic scenario** to shape the sample requests, and run a batch. Only the
    selected target's responses are captured as outcomes.
-2. **Wait for the sweep — about 6 minutes.** Outcomes reach S3 through Kinesis
+2. **Wait for the sweep, about 6 minutes.** Outcomes reach S3 through Kinesis
    Firehose, which buffers up to 300s by default
    (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into
    `training-data/`. A completed load test schedules that sweep itself, waiting
-   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first —
+   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first;
    sweeping earlier would mark the run ready with no data behind it. If you raise
    the Firehose interval, raise this too. The Glue schedule (every 6 hours by
    default, `ScheduleIntervalHours`) remains as a backstop. The **Load test
@@ -689,14 +690,14 @@ the previous one finishing, so the order matters:
 3. **Train.** Under **Train from load test**, pick the run, review the cost
    estimate, and confirm. This starts a real SageMaker training job. Note the
    picker only lists runs a sweep has already covered, so the run you just
-   finished appears a few minutes later — check the timestamp so you aren't
+   finished appears a few minutes later, so check the timestamp so you aren't
    retraining on an older test.
 
    The trainer checks the dataset before it trains and **refuses** a run it cannot
    learn anything from, rather than producing a model whose loss falls convincingly
    and means nothing. The common refusal is a single-class label: bid shading needs
-   both responses and non-responses, and a non-response cannot be observed directly
-   — nothing emits a "no click" event. The Bid Pricer therefore needs the optional
+   both responses and non-responses, and a non-response cannot be observed directly:
+   nothing emits a "no click" event. The Bid Pricer therefore needs the optional
    **outcome simulator** enabled and a `CONVERSION_LAG_HOURS` set, which is what
    turns "no conversion reported, and its attribution window has closed" into a real
    negative. See [where the bid shader's labels come
@@ -725,12 +726,12 @@ empty list:
 |---|---|
 | *"N runs … waiting for the next ETL sweep"* | Normal. The outcomes are recorded; the sweep hasn't covered them yet. |
 | *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
-| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now — a challenger-targeted test is refused rather than quietly run against the stable model. |
-| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail) — this is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
-| Training job failed with *"a single-class label trains the model to predict a constant"* | The dataset gate working as intended. Every labelled row has the same outcome, so there is nothing to learn. Enable the outcome simulator and set `CONVERSION_LAG_HOURS` — see [step 3](#testing-the-governance-flow-end-to-end). |
+| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now. A challenger-targeted test is refused rather than quietly run against the stable model. |
+| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail). This is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
+| Training job failed with *"a single-class label trains the model to predict a constant"* | The dataset gate working as intended. Every labelled row has the same outcome, so there is nothing to learn. Enable the outcome simulator and set `CONVERSION_LAG_HOURS`; see [step 3](#testing-the-governance-flow-end-to-end). |
 | Training job failed with *"all N rows have a NULL label"* | No response signal reached the dataset at all for the chosen objective. The outcome simulator is off, or no win notice / pixel path is wired in. |
 
-**Reading the comparison.** The primary metric is advertiser surplus — the
+**Reading the comparison.** The primary metric is advertiser surplus: the
 impression's value to the advertiser minus what was actually paid, and zero on a
 loss. Higher is better, and it has an interior optimum: bidding too low forfeits
 winnable impressions and bidding too high overpays for them, so it rewards what
@@ -744,8 +745,8 @@ those models' own floor/margin decisions, so a yield canary-vs-stable comparison
 should not be read as a verdict on the model.
 
 *The Bid Pricer, when the outcome simulator is supplying the labels.* The simulator
-derives each outcome from the request ID alone — deliberately, because that is what
-makes a training run reproducible — so the same request yields the same
+derives each outcome from the request ID alone (deliberately, because that is what
+makes a training run reproducible), so the same request yields the same
 win/impression/click/conversion no matter what price was bid. A simulated dataset
 therefore contains no relationship between price and winning, which has two
 consequences worth being explicit about: the model cannot learn one from it, and a
@@ -757,7 +758,7 @@ See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Ad
 
 ### Variant: Prebid Server as a second ARTF host (sell side)
 
-This Guidance's default topology has one ARTF host: the orchestrator, called directly over `POST /v1/mutations`. This variant adds a **second, independent host** — [Prebid Server](https://docs.prebid.org/prebid-server/overview/prebid-server-overview.html) Java — that calls the *same* orchestrator from *inside* a real auction, and resolves that auction itself.
+This Guidance's default topology has one ARTF host: the orchestrator, called directly over `POST /v1/mutations`. This variant adds a **second, independent host**, [Prebid Server](https://docs.prebid.org/prebid-server/overview/prebid-server-overview.html) Java, that calls the *same* orchestrator from *inside* a real auction, and resolves that auction itself.
 
 It is **opt-in and additive**. Without it, nothing in the topology above changes:
 
@@ -767,7 +768,7 @@ cd deployment
 ./deploy_prebid.sh --prefix <prefix>       # onto an existing one
 ```
 
-**Why this is worth having.** The default path proves the ARTF containers can transform a bid request. It cannot show *who calls ARTF in production*. Real sell-side infrastructure does not POST to a mutations endpoint out of band — it runs an auction, and enrichment happens on the auction's own critical path, inside the auction's own time budget. This variant puts ARTF exactly there, so the latency it costs is the latency the bidders lose.
+**Why this is worth having.** The default path proves the ARTF containers can transform a bid request. It cannot show *who calls ARTF in production*. Real sell-side infrastructure does not POST to a mutations endpoint out of band. It runs an auction, and enrichment happens on the auction's own critical path, inside the auction's own time budget. This variant puts ARTF exactly there, so the latency it costs is the latency the bidders lose.
 
 #### How it differs from the AWS Prebid guidance
 
@@ -775,7 +776,7 @@ The upstream [Guidance for Deploying a Prebid Server on AWS](https://github.com/
 
 That is a deliberate deviation, on one ground: **Fargate in a second VPC reinstates the network hop ARTF exists to shorten.** The hook's whole job is to enrich a request within an auction's `tmax`, and a cross-VPC hop plus peering or an RTB Fabric link is spent budget. In-cluster, the hook's measured round trip to the orchestrator is **19 to 21 ms** at steady state (hook analytics `latency_ms`, with 14.7 to 14.9 ms of that inside the orchestrator's three stages); a cross-VPC hop would come out of the same budget. Co-location is also closer to how a real bidding stack is laid out.
 
-**Nothing upstream is forked.** The pinned `prebid-server-java` release is fetched at deploy time and our sources are *added* to the checkout through the one extension point the upstream Dockerfile provides. The deploy proves it rather than asserting it — `diff -rq` against the pristine release reports **0 modified files, 0 removals, 5 additions**, and the deploy script prints `Upstream files modified by this step: 0 (additions only)` as it runs.
+**Nothing upstream is forked.** The pinned `prebid-server-java` release is fetched at deploy time and our sources are *added* to the checkout through the one extension point the upstream Dockerfile provides. The deploy proves it rather than asserting it: `diff -rq` against the pristine release reports **0 modified files, 0 removals, 5 additions**, and the deploy script prints `Upstream files modified by this step: 0 (additions only)` as it runs.
 
 #### The two integration points
 
@@ -796,7 +797,7 @@ What actually happens, in order, when a browser loads a page carrying prebid.js.
 
 2. **Prebid reaches the `processed-auction-request` stage.** This is before any bidder is called, which is the only place a request-side mutation can still affect every bidder equally. Prebid invokes the hooks named in its execution plan, here `artf-orchestrator`.
 
-3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance (20 ms) and a reserve held back for bidder fan-out and auction resolution (60 ms), and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget`, which is not an error: nothing decided and nothing broke, the orchestrator was simply never asked.
+3. **The module decides whether it has time.** `CallBudgetCalculator` takes the auction's remaining budget, subtracts a transport allowance (20 ms) and a reserve held back for calling bidders and resolving the auction (60 ms), and caps the result at the ARTF `tmax` (100 ms). If too little remains it returns `SkippedInsufficientBudget`, which is not an error: nothing decided and nothing broke, the orchestrator was simply never asked.
 
 4. **The module calls the orchestrator.** Over gRPC by default (`RTBExtensionPoint/GetMutations` on the headless `orchestrator-grpc` Service; `ARTF_TRANSPORT=http` in `deploy_prebid.sh` selects `POST /v1/mutations` instead), with a bearer token it already holds, a Cognito `client_credentials` token refreshed on a timer and never fetched on the auction path. The orchestrator runs the containers through stages 1 to 3 (enrich, deals, yield; see [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)) and replies with the stage-ordered list plus per-container status. On the measured runs the hook saw the round trip at **19 to 21 ms** steady state, of which 14.7 to 14.9 ms was spent inside the orchestrator. One run, as the hook recorded it:
 
@@ -842,11 +843,11 @@ Prebid Server is a ClusterIP Service with no public address, and deliberately ke
 | `GET /api/v1/auction/status` | whether a live auction is available |
 | `POST /api/v1/auction/run` | the auction, as Prebid returned it |
 
-The response body is Prebid's own — no bid added, no price altered. Timing, the resolved endpoint, the seats that bid, and anything the orchestrator added to the request are reported separately under `artf_meta`.
+The response body is Prebid's own: no bid added, no price altered. Timing, the resolved endpoint, the seats that bid, and anything the orchestrator added to the request are reported separately under `artf_meta`.
 
 **When Prebid is not deployed, `/run` answers `501` and says so.** It does not replay a stored response. An empty auction and an undeployed exchange are different facts and return different statuses: `200` with no `seatbid` versus `501`. A timeout is `504`, an unreachable Prebid is `502`, and a request Prebid rejects comes back with Prebid's own explanation. None of them return anything shaped like an auction.
 
-The Auction Theater uses this. If a live auction is available the offers column shows it; if not, it shows the captured fixture with a notice saying so. A fixture is never presented as live, and the check for "live" is a positive one — the orchestrator marks a real auction, rather than the UI assuming anything that is not the fixture must be real.
+The Auction Theater uses this. If a live auction is available the offers column shows it; if not, it shows the captured fixture with a notice saying so. A fixture is never presented as live, and the check for "live" is a positive one: the orchestrator marks a real auction, rather than the UI assuming anything that is not the fixture must be real.
 
 The switch is `PREBID_AUCTION_URL`, set on the orchestrator by `deploy_prebid.sh` and removed by its `--destroy`. It is deployment state rather than a probe: probing the Service per request would make a transient failure read as "Prebid was never deployed".
 
@@ -880,31 +881,31 @@ A note on honesty, consistent with the section above: the Theater shows a live a
 
 Worth being exact, because "we deployed Prebid" invites a bigger claim than the topology supports.
 
-**Real:** the auction mechanism, and all of Prebid's own logic — floor enforcement, currency, deal handling, top-bid selection, targeting keys, `ext.seatnonbid`. Real: the ARTF call, the GPU inference behind it, the mutations, and their application to the request. The winner is *computed*, not declared.
+**Real:** the auction mechanism, and all of Prebid's own logic (floor enforcement, currency, deal handling, top-bid selection, targeting keys, `ext.seatnonbid`). Real: the ARTF call, the GPU inference behind it, the mutations, and their application to the request. The winner is *computed*, not declared.
 
 **Real: the competition.** Two independent seats bid. `artfhouse` calls the ARTF demand endpoint; `amt` is the AWS Prebid guidance's own adapter, injected from the release at build time and pointed at the bidder simulator that same release provides, running in-cluster. Prebid compares them against the same floor, so there is a real winner, real losers, and a populated `ext.seatnonbid`. Which seat wins depends on the request: on `yield-optimizer` ARTF takes it at 13.40 on `deal-guaranteed-premium` against the simulator's 12.50, while on `banner-basic` the simulator wins at 3.25 because that scenario carries no deal ARTF holds. Change the impression's categories and the winner changes with it.
 
-**Not real: the prices.** Both catalogs are authored. ARTF's campaigns are a fixture you control, and the simulator answers with static creatives at fixed CPMs. So the auction *mechanism* and the *contest* are real while the *numbers going into it* are yours. Nor are the creatives playable: no video asset ships here, so both seats' video bids carry VAST that says "placeholder" and points at a path that is not shipped — enough for the exchange to accept the bid, and honest about what it is. This is market *behaviour*, not market data.
+**Not real: the prices.** Both catalogs are authored. ARTF's campaigns are a fixture you control, and the simulator answers with static creatives at fixed CPMs. So the auction *mechanism* and the *contest* are real while the *numbers going into it* are yours. Nor are the creatives playable: no video asset ships here, so both seats' video bids carry VAST that says "placeholder" and points at a path that is not shipped. That is enough for the exchange to accept the bid, and the VAST states that it is a placeholder. This is market *behaviour*, not market data.
 
 **Turning the second seat off:** `--no-simulator` deploys ARTF as the only seat. The auction then resolves one seat against the publisher's floor, which is a weaker demonstration but a smaller footprint.
 
-**Not run:** the Java unit tests. The upstream image build passes `-Dmaven.test.skip`, so the module's and adapter's tests are compiled by no toolchain in the deploy path. What the deploy does verify is that the Java **compiles** (2057 source files) and that the classes are **in the shipped jar** — the failure mode this design guards against is an image that builds cleanly and contains none of your code.
+**Not run:** the Java unit tests. The upstream image build passes `-Dmaven.test.skip`, so the module's and adapter's tests are compiled by no toolchain in the deploy path. What the deploy does verify is that the Java **compiles** (2057 source files) and that the classes are **in the shipped jar**. The failure mode this design guards against is an image that builds cleanly and contains none of your code.
 
 #### Three behaviours that look correct and are not
 
 Each of these produces a plausible-looking result while quietly doing the wrong thing, so they are configured for you and called out here.
 
 - **`ext.prebid.multibid` is required to see more than one campaign.** Without it Prebid keeps **one** bid per impression per seat and silently drops the rest. One campaign appears, and nothing indicates the others were discarded.
-- **Do not configure `low` price granularity.** There is no bid ceiling in Prebid Server 3.43.0 — a high bid is not dropped. What happens instead is that `hb_pb` is *clamped* to the top bucket, so the bid survives with a **misreported** targeting key. `low` tops out at 5.00; `medium` and above top out at 20.
-- **`BID_SHADE` cannot apply at this stage.** It addresses a bid in the auction *response*, and `processed-auction-request` runs before any `seatbid` exists. It is excluded from the module's intent set and rejected with a reason if requested — left in, it would be a silent no-op, which is why the Bid Pricer reports `skipped` above.
+- **Do not configure `low` price granularity.** There is no bid ceiling in Prebid Server 3.43.0, so a high bid is not dropped. What happens instead is that `hb_pb` is *clamped* to the top bucket, so the bid survives with a **misreported** targeting key. `low` tops out at 5.00; `medium` and above top out at 20.
+- **`BID_SHADE` cannot apply at this stage.** It addresses a bid in the auction *response*, and `processed-auction-request` runs before any `seatbid` exists. It is excluded from the module's intent set and rejected with a reason if requested. Left in, it would be a silent no-op, which is why the Bid Pricer reports `skipped` above.
 
-One more, for anyone building on this: the demand endpoint's per-campaign **exclusion reasons cannot cross Prebid's `Bidder` contract**. `CompositeBidderResponse` carries bids, errors, FLEDGE configs and IGI — there is no response-`ext` channel, and an excluded campaign has no bid to attach to. They survive only in `ext.debug.httpcalls.artfhouse[].responsebody`, which is **account-gated** (a stricter gate than the `ext.prebid.trace` one on the hook's analytics tags). Read them from there or from the endpoint directly, never from `seatbid`.
+One more, for anyone building on this: the demand endpoint's per-campaign **exclusion reasons cannot cross Prebid's `Bidder` contract**. `CompositeBidderResponse` carries bids, errors, FLEDGE configs and IGI; there is no response-`ext` channel, and an excluded campaign has no bid to attach to. They survive only in `ext.debug.httpcalls.artfhouse[].responsebody`, which is **account-gated** (a stricter gate than the `ext.prebid.trace` one on the hook's analytics tags). Read them from there or from the endpoint directly, never from `seatbid`.
 
 #### Authentication
 
-The orchestrator is a Cognito-protected service and the auction path is **not exempted from it** — exempting an endpoint to make a hot path cheaper is how an internal service ends up open.
+The orchestrator is a Cognito-protected service and the auction path is **not exempted from it**. Exempting an endpoint to make a hot path cheaper is how an internal service ends up open.
 
-The Prebid host gets its own Cognito app client and a `client_credentials` grant scoped to `artf-orchestrator/mutations:write`. The module refreshes that token on a timer and reads it synchronously from memory, so no auction ever waits on token acquisition. When no valid token is held the call is reported as a **transport failure** — the call could not be made — rather than being retried on the auction's budget.
+The Prebid host gets its own Cognito app client and a `client_credentials` grant scoped to `artf-orchestrator/mutations:write`. The module refreshes that token on a timer and reads it synchronously from memory, so no auction ever waits on token acquisition. When no valid token is held the call is reported as a **transport failure** (the call could not be made) rather than being retried on the auction's budget.
 
 Authorization on the orchestrator is a **list of mechanisms**, any one of which grants a request: `user_session` for the frontend's user token, and `machine_scope` for a scoped machine credential. Both are needed. A rule keyed only on scope would lock the UI out of itself, because a Cognito *user pool* access token can never carry a resource-server scope. A refusal names every mechanism tried and what each wanted:
 
@@ -914,15 +915,15 @@ Authorization on the orchestrator is a **list of mechanisms**, any one of which 
      machine_scope: machine credential lacks the required scope (artf-orchestrator/mutations:write)
 ```
 
-**Enforcement is opt-in and off by default.** `ARTF_MUTATIONS_REQUIRED_SCOPE` is empty unless you deploy with `--with-prebid`, and while it is empty no route is scope-protected and the orchestrator authorizes exactly as it did before this variant existed. `deploy_prebid.sh` sets it, `--destroy` clears it, and the deploy checks that the running orchestrator image actually contains the enforcement code — setting the variable on an older image is a silent no-op, and a control that reads as protection without being one is worse than none.
+**Enforcement is opt-in and off by default.** `ARTF_MUTATIONS_REQUIRED_SCOPE` is empty unless you deploy with `--with-prebid`, and while it is empty no route is scope-protected and the orchestrator authorizes exactly as it did before this variant existed. `deploy_prebid.sh` sets it, `--destroy` clears it, and the deploy checks that the running orchestrator image actually contains the enforcement code. Setting the variable on an older image is a silent no-op, and a control that reads as protection without being one is worse than none.
 
-> **The credential reaches the pod as a Kubernetes Secret, not through the AWS SDK.** The Prebid image is built from the pinned upstream release, whose pom declares only the AWS SDK's `s3` module — the jar carries no `secretsmanager` and no `sts`, so there is no client to call Secrets Manager with and no way to use the pod's IRSA identity. Adding either dependency would mean editing the upstream pom, which is a fork. So `deploy_prebid.sh` reads the secret with credentials that can and writes a Kubernetes Secret, referenced by `secretKeyRef` so the value never lands in a manifest. Secrets Manager remains the source of record; only the delivery route changed.
+> **The credential reaches the pod as a Kubernetes Secret, not through the AWS SDK.** The Prebid image is built from the pinned upstream release, whose pom declares only the AWS SDK's `s3` module: the jar carries no `secretsmanager` and no `sts`, so there is no client to call Secrets Manager with and no way to use the pod's IRSA identity. Adding either dependency would mean editing the upstream pom, which is a fork. So `deploy_prebid.sh` reads the secret with credentials that can and writes a Kubernetes Secret, referenced by `secretKeyRef` so the value never lands in a manifest. Secrets Manager remains the source of record; only the delivery route changed.
 
 #### Cost
 
 Everything runs on the cluster you already have, so there is no second VPC, no second NAT gateway, no ALB and no Fargate task.
 
-The deploy discloses cost **before** it provisions anything, and it will not accept that disclosure from a pipe. Known standing cost is **$0.40/month** — one Secrets Manager secret. Cognito domains, resource servers and app clients carry no standing charge; CodeBuild is per-use and zero when idle. The demand service runs as two small pods on the existing cluster. The disclosure also names what it *cannot* price: ECR image storage, which depends on the built image size and is unknown until the image exists. It says so rather than printing a total that looks complete.
+The deploy discloses cost **before** it provisions anything, and it will not accept that disclosure from a pipe. Known standing cost is **$0.40/month**, for one Secrets Manager secret. Cognito domains, resource servers and app clients carry no standing charge; CodeBuild is per-use and zero when idle. The demand service runs as two small pods on the existing cluster. The disclosure also names what it *cannot* price: ECR image storage, which depends on the built image size and is unknown until the image exists. It says so rather than printing a total that looks complete.
 
 The upstream guidance's published ~$241.50/month figure describes **its** ECS Fargate deployment, not this one, and is not carried over.
 
@@ -939,9 +940,9 @@ The upstream guidance's published ~$241.50/month figure describes **its** ECS Fa
 | Prebid config (floors, bidders, granularity, `multibid`) | `prebid-server/current/prebid-config.yaml` in the config bucket, then `kubectl rollout restart deployment/prebid-server` | rendered from `deployment/scripts/prebid_config_template.yaml` |
 | Orchestrator scope enforcement | `ARTF_MUTATIONS_REQUIRED_SCOPE` on the orchestrator Deployment | empty (inert) unless `--with-prebid` |
 | Demand endpoint campaigns and deals | `deployment/seed/deals_and_campaigns.json`, loaded into the `<stack>-deals` table by `deploy.sh` (see [Deals and campaigns](#deals-and-campaigns-the-deals-table)) | the bundled seed |
-| Resume a failed deploy at a step | `deploy_prebid.sh --start-at N` (1-8), `--skip-build` | — |
+| Resume a failed deploy at a step | `deploy_prebid.sh --start-at N` (1-8), `--skip-build` | n/a |
 
-Editing the config overlay in S3 is the supported way to reconfigure; the deploy **never overwrites an existing overlay**, so your edits survive a redeploy. No rebuild is needed — just restart the Deployment.
+Editing the config overlay in S3 is the supported way to reconfigure; the deploy **never overwrites an existing overlay**, so your edits survive a redeploy. No rebuild is needed; restart the Deployment.
 
 #### Teardown
 
@@ -950,18 +951,18 @@ cd deployment
 ./deploy_prebid.sh --prefix <prefix> --destroy
 ```
 
-Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to its pre-variant authorization behaviour — leaving it set would keep an existing component altered by a feature that is no longer installed. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
+Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to its pre-variant authorization behaviour. Leaving it set would keep an existing component altered by a feature that is no longer installed. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
 
 #### Alternative: the upstream stack, standalone
 
-If you want Prebid Server in its own isolated VPC on ECS Fargate — with the upstream bidder simulator supplying competing demand, and its Glue/Athena/QuickSight analytics pipeline — deploy [the upstream guidance](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) separately with its own scripts. It is a self-contained CDK app; nothing here forks or vendors it. You would then need a network path between the two VPCs (VPC peering or an [AWS RTB Fabric](https://aws.amazon.com/rtb-fabric/) link — the orchestrator already records `network_path: "rtb-fabric"` when an `x-rtb-fabric-link-id` header is present) and service-to-service auth, which is the work this variant does for you in-cluster.
+If you want Prebid Server in its own isolated VPC on ECS Fargate, with the upstream bidder simulator supplying competing demand and its Glue/Athena/QuickSight analytics pipeline, deploy [the upstream guidance](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) separately with its own scripts. It is a self-contained CDK app; nothing here forks or vendors it. You would then need a network path between the two VPCs (VPC peering or an [AWS RTB Fabric](https://aws.amazon.com/rtb-fabric/) link. The orchestrator already records `network_path: "rtb-fabric"` when an `x-rtb-fabric-link-id` header is present) and service-to-service auth, which is the work this variant does for you in-cluster.
 
-**Licensing.** Prebid Server and the upstream AWS guidance are Apache-2.0; this Guidance is MIT-0. This variant copies no upstream source — it fetches a pinned release at deploy time and adds files to it — so the distinction stays a documentation matter. Vendor any of their source into this repo and Apache-2.0 attribution applies, including carrying forward their `NOTICE.txt`.
+**Licensing.** Prebid Server and the upstream AWS guidance are Apache-2.0; this Guidance is MIT-0. This variant copies no upstream source (it fetches a pinned release at deploy time and adds files to it), so the distinction stays a documentation matter. Vendor any of their source into this repo and Apache-2.0 attribution applies, including carrying forward their `NOTICE.txt`.
 
 ### Next steps
 
-- **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data — there's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
-- **Add or swap containers.** Use the containers under `source/containers/` as reference implementations for additional ARTF intents, then register them with the orchestrator fan-out.
+- **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data. There's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
+- **Add or swap containers.** Use the containers under `source/containers/` as reference implementations for additional ARTF intents, then register each one in the matching stage of the orchestrator's staged pipeline (1 enrich, 2 deals, 3 yield, 4 price).
 - **Scale for production traffic.** The included Horizontal Pod Autoscalers add container and orchestrator replicas with load inside the node capacity you have provisioned; no Cluster Autoscaler is installed, so node counts are set by `deployment/eks/cluster-config.yaml` (`cpu-services` desired 3, min 2, max 8) and `--maxGPUs` (GPU maximum, default 3), and change only when you scale the node groups. See [GUIDANCE.md](GUIDANCE.md#scaling-scenarios) for reference sizing at different QPS levels.
 - **Connect to a live DSP.** Route real OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream. See [GUIDANCE.md](GUIDANCE.md#integration-with-a-dsp) for the integration steps.
 
@@ -972,7 +973,7 @@ cd deployment
 ./deploy.sh --prefix <prefix> --destroy
 ```
 
-The script prompts for confirmation — type `destroy` to proceed. Include the same `--prefix` used at deploy time to tear down a specific namespaced stack.
+The script prompts for confirmation: type `destroy` to proceed. Include the same `--prefix` used at deploy time to tear down a specific namespaced stack.
 
 `--destroy` removes, in dependency order: the Kubernetes workloads; the `ui-api-proxy` and `vpc-optimizer-proxy` Lambda stacks (before the cluster, so their VPC ENIs do not block subnet deletion); the EKS cluster with both node groups, its VPC and NAT gateways, the internal Triton load balancer and the GPU scheduled action; the S3 model bucket; the `loadtest-history` and `container-registry` DynamoDB tables; the CloudFront distribution and frontend bucket; the MCP runtime and both closed-loop agent runtimes; the Part 2 stacks (`governance-eventbridge`, `closed-loop-core` after emptying its SageMaker Model Package Groups, `agentcore-security`, `glue-etl`, `feedback-pipeline`) with their DynamoDB tables and S3 buckets; the `<prefix>-prebid-artf` stack if it exists; the CodeBuild stack and its source bucket; the Cognito user pool, identity pool and authenticated role; the IAM policies and roles this Guidance created; every ECR repository named `<prefix>-nvidia-artf-recommenders-*` with its images; and the prefix's record in `deployment/.deploy-state.json`.
 
@@ -999,13 +1000,13 @@ CloudWatch log groups created by the Lambda functions, CodeBuild and the AgentCo
 
 **Deployed the [Prebid variant](#variant-prebid-server-as-a-second-artf-host-sell-side) too?** `--destroy` here covers most of it: the Kubernetes objects go with the cluster, and it deletes the `<prefix>-prebid-artf` stack explicitly if it exists. Run `./deploy_prebid.sh --prefix <prefix> --destroy` instead, or afterwards, to also remove the `<prefix>-prebid-server` ECR repository and clear the orchestrator's `ARTF_MUTATIONS_REQUIRED_SCOPE`.
 
-**Required permission for teardown:** disabling CloudFormation termination protection (which `eksctl` enables automatically) needs `cloudformation:UpdateTerminationProtection`. If your session denies that action, `--destroy` logs a warning and the EKS stacks won't delete — re-run it from a session that allows the action.
+**Required permission for teardown:** disabling CloudFormation termination protection (which `eksctl` enables automatically) needs `cloudformation:UpdateTerminationProtection`. If your session denies that action, `--destroy` logs a warning and the EKS stacks won't delete. Re-run it from a session that allows the action.
 
 ### Stopping a deployment in progress
 
 **Ctrl+C stops the script, not the deployment.** None of `deploy.sh`, `deploy_prebid.sh` or `remote_build.sh` installs a signal handler, so interrupting them kills the local shell loop and leaves every AWS-side operation running: CloudFormation stacks keep creating, `eksctl`'s cluster and node-group stacks keep going, and a CodeBuild build keeps building. A half-created cluster bills for its control plane, its nodes and its NAT gateway exactly like a finished one.
 
-So the first decision is not *how* to stop — it is whether to stop at all.
+So the first decision is not *how* to stop; it is whether to stop at all.
 
 **First, see where things actually got to.** `--status` reads live from AWS and is safe to run while a deploy is still going, from any machine:
 
@@ -1032,9 +1033,9 @@ aws codebuild list-builds-for-project --project-name "${STACK_NAME}-image-builde
       --query 'builds[0].[id,buildStatus]' --output text
 ```
 
-#### Option 1 — resume instead of stopping (usually right)
+#### Option 1: resume instead of stopping (usually right)
 
-The EKS cluster takes 15–20 minutes and an interrupted run does not lose it. Every phase is idempotent, so re-running the same command picks up where it left off:
+The EKS cluster takes 15 to 20 minutes and an interrupted run does not lose it. Every phase is idempotent, so re-running the same command picks up where it left off:
 
 ```bash
 cd deployment
@@ -1043,7 +1044,7 @@ cd deployment
 
 See [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings) for how the live probe, `--start-at` and the remembered flags in `.deploy-state.json` interact. The short version: you do not need to tear down before redeploying, and `--destroy` is for when you want the resources *gone*, not as a precaution.
 
-#### Option 2 — stop the in-flight work, keep what exists
+#### Option 2: stop the in-flight work, keep what exists
 
 ```bash
 # Stop a running build. Immediate, and it cannot leave a usable-looking bad image:
@@ -1054,7 +1055,7 @@ aws codebuild stop-build --id "<build-id>" --region "$AWS_REGION"
 
 **A CloudFormation stack mid-`CREATE` cannot be cancelled.** `cancel-update-stack` applies only to `UPDATE_IN_PROGRESS`; there is no equivalent for a create. Your choices are to let it reach `CREATE_COMPLETE` or `CREATE_FAILED`, or to call `delete-stack`, which queues the deletion behind the create it is already performing. Waiting is normally faster and always less confusing.
 
-#### Option 3 — tear it all down
+#### Option 3: tear it all down
 
 ```bash
 cd deployment
@@ -1063,8 +1064,8 @@ cd deployment
 
 Three things to know before you run it on an interrupted deployment:
 
-- **It needs an interactive terminal.** It prompts for the word `destroy` and fails outright if it cannot read a TTY — so it will not work backgrounded, piped, or from CI.
-- **Let the in-flight stacks settle first.** `--destroy` clears `eksctl`'s termination protection only on stacks in `CREATE_COMPLETE`, `UPDATE_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`. A stack still in `CREATE_IN_PROGRESS` — precisely what an interrupted deploy leaves — is not in that list, so its protection stays on and the delete can stall. Wait for the status to settle, then destroy.
+- **It needs an interactive terminal.** It prompts for the word `destroy` and fails outright if it cannot read a TTY, so it will not work backgrounded, piped, or from CI.
+- **Let the in-flight stacks settle first.** `--destroy` clears `eksctl`'s termination protection only on stacks in `CREATE_COMPLETE`, `UPDATE_COMPLETE` or `UPDATE_ROLLBACK_COMPLETE`. A stack still in `CREATE_IN_PROGRESS` (precisely what an interrupted deploy leaves) is not in that list, so its protection stays on and the delete can stall. Wait for the status to settle, then destroy.
 - **It deletes every `<prefix>-nvidia-artf-recommenders-*` ECR repository**, including any created by `attach_artf_container.sh` under that name. The four resources listed under [Cleanup](#cleanup) as outside its scope stay behind.
 
 **If a stack is wedged**, deal with `eksctl`'s stacks through `eksctl` rather than CloudFormation, because it knows the dependency order between the cluster and its node groups:

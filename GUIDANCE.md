@@ -71,7 +71,7 @@ The solution provides six production-ready ARTF-compliant containers, each doing
 
 ### ARTF Container Protocol Stack
 
-Each ARTF container exposes three interfaces per the IAB Tech Lab ARTF v1.0 specification. The gRPC interface is the ARTF-specified wire protocol for real-time auction integration and the orchestrator can fan out over it or over the REST equivalent (`ARTF_CONTAINER_TRANSPORT`); the MCP interface is an optional testing and simulation endpoint for AI agent experimentation, and is not required for the core bidding stack:
+Each ARTF container exposes three interfaces per the IAB Tech Lab ARTF v1.0 specification. The gRPC interface is the ARTF-specified wire protocol for real-time auction integration and the orchestrator can call containers over it or over the REST equivalent (`ARTF_CONTAINER_TRANSPORT`, `http` by default); the MCP interface is an optional testing and simulation endpoint for AI agent experimentation, and is not required for the core bidding stack:
 
 | Port | Protocol | Endpoint | Description |
 |------|----------|----------|-------------|
