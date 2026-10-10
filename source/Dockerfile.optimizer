@@ -30,6 +30,15 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY optimizer/ /app/optimizer/
 
+# Same non-root user as the ARTF containers (source/Dockerfile), with the UID
+# stated so it matches the runAsUser that model-optimizer-bootstrap-job.yaml
+# pins; the kubelet cannot verify runAsNonRoot against a named USER. The
+# service writes only to tempfile.mkdtemp() under /tmp, so /app stays root-owned
+# and read-only. Normalize modes first: the build context keeps the host's file
+# modes, and a non-world-readable source file would be unreadable to appuser.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home --uid 1000 appuser
+USER appuser
+
 # HTTP service on 8080 (POST /v1/optimize, GET /health)
 EXPOSE 8080
 

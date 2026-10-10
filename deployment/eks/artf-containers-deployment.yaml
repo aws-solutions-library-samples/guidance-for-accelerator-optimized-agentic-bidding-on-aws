@@ -59,6 +59,18 @@ spec:
         - name: dlrm
           image: __REGISTRY__/__STACK_NAME__-bid-pricer:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -160,6 +172,18 @@ spec:
         - name: widedeep
           image: __REGISTRY__/__STACK_NAME__-audience-activator:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -250,6 +274,18 @@ spec:
         - name: ncf
           image: __REGISTRY__/__STACK_NAME__-deal-scorer:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -353,6 +389,18 @@ spec:
         - name: metrics
           image: __REGISTRY__/__STACK_NAME__-signals-enricher:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -555,6 +603,18 @@ spec:
         - name: yield-floor
           image: __REGISTRY__/__STACK_NAME__-yield-optimizer-floor:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -688,6 +748,18 @@ spec:
         - name: yield-margin
           image: __REGISTRY__/__STACK_NAME__-yield-optimizer-margin:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -825,6 +897,18 @@ spec:
         - name: template
           image: __REGISTRY__/__STACK_NAME__-artf-template:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
