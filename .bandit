@@ -10,5 +10,5 @@ skips:
   - B607   # partial executable path: fixed binaries invoked with validated arguments
   - B110   # try/except/pass: best effort cleanup paths
   - B112   # try/except/continue: best effort cleanup paths
-  - B104   # bind all interfaces: containers bind all interfaces behind a Kubernetes Service
+  - B104   # bind all interfaces: containers bind all interfaces inside their runtime, behind a Kubernetes Service on EKS or the AgentCore runtime boundary
   - B108   # hardcoded tmp directory: test temp paths

@@ -94,7 +94,7 @@ Resources:
       cfn_nag:
         rules_to_suppress:
           - id: W92
-            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
+            reason: Reserved concurrency is left unset so low volume request driven invocations from the orchestrator are never throttled
           - id: W58
             reason: CloudWatch Logs permissions come from the managed AWSLambdaVPCAccessExecutionRole policy on the role
     Properties:
