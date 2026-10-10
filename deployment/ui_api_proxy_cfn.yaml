@@ -41,6 +41,11 @@ Conditions:
 Resources:
   ProxyFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !If [HasStackPrefix, !Sub '${StackPrefix}-ui-api-proxy-role', 'ui-api-proxy-role']
       AssumeRolePolicyDocument:
@@ -58,6 +63,11 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
   ProxyLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log group uses the default CloudWatch Logs encryption which is the documented choice for this guidance
     Properties:
       LogGroupName: !If
         - HasStackPrefix

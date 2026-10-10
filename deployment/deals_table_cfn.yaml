@@ -17,6 +17,11 @@ Parameters:
 Resources:
   DealsTable:
     Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     # The contents are reproducible from the seed file, so the table goes with
     # its stack on --destroy rather than being retained.
     DeletionPolicy: Delete

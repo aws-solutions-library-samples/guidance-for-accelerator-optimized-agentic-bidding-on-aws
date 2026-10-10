@@ -37,6 +37,13 @@ Resources:
   # =========================================================================
   CodeBuildRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: ecr:GetAuthorizationToken does not support resource-level permissions
     Properties:
       RoleName: !Sub '${StackName}-codebuild-role'
       Description: Execution role for ARTF container image builds in CodeBuild
@@ -174,6 +181,11 @@ Resources:
   # =========================================================================
   ImageBuilderProject:
     Type: AWS::CodeBuild::Project
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W32
+            reason: CodeBuild project produces no artifacts so the default AWS managed S3 key is sufficient
     Properties:
       Name: !Sub '${StackName}-image-builder'
       Description: >-
@@ -223,6 +235,11 @@ Resources:
   # =========================================================================
   ArmImageBuilderProject:
     Type: AWS::CodeBuild::Project
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W32
+            reason: CodeBuild project produces no artifacts so the default AWS managed S3 key is sufficient
     Properties:
       Name: !Sub '${StackName}-arm-image-builder'
       Description: >-

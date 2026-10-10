@@ -76,6 +76,11 @@ Resources:
   # ---------------------------------------------------------------------------
   ParameterStoreTable:
     Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -111,6 +116,11 @@ Resources:
   # ---------------------------------------------------------------------------
   AuditTrailTable:
     Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -232,6 +242,13 @@ Resources:
   # ---------------------------------------------------------------------------
   SageMakerTrainingExecutionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: ecr:GetAuthorizationToken and cloudwatch:PutMetricData do not support resource-level permissions
     Condition: HasTrainingBuckets
     Properties:
       RoleName: !If
@@ -404,6 +421,11 @@ Resources:
   # ---------------------------------------------------------------------------
   UserFeatureTable:
     Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:

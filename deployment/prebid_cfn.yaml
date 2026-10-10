@@ -174,6 +174,11 @@ Resources:
   # template creates the container so teardown is a stack delete.
   PrebidCredentialSecret:
     Type: AWS::SecretsManager::Secret
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: Secret uses the default AWS managed Secrets Manager key which is the documented choice for this guidance
     Properties:
       Name: !If
         - HasStackPrefix
@@ -190,6 +195,11 @@ Resources:
   # The pod's identity. Trust is scoped to ONE ServiceAccount by exact match.
   PrebidHostRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts and EKS RBAC bindings reference this role by its predictable prefixed name
     Properties:
       RoleName: !If
         - HasStackPrefix
@@ -304,6 +314,11 @@ Resources:
   # deals table.
   DemandServiceRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts and EKS RBAC bindings reference this role by its predictable prefixed name
     Properties:
       RoleName: !If
         - HasStackPrefix

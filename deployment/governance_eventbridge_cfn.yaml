@@ -158,6 +158,13 @@ Resources:
 
   AdaptiveBiddingInvokerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Properties:
       FunctionName: !Sub '${StackPrefix}-adaptive-bidding-invoker'
       Description: Invokes the Adaptive Bidding Strategy Agent runtime (from Scheduler).
@@ -191,6 +198,11 @@ Resources:
 
   AdaptiveBiddingInvokerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !Sub '${StackPrefix}-adaptive-bidding-invoker-role'
       AssumeRolePolicyDocument:
@@ -216,6 +228,11 @@ Resources:
 
   AdaptiveBiddingSchedulerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !Sub '${StackPrefix}-scheduler-invoke-adaptive-bidding'
       AssumeRolePolicyDocument:
@@ -266,6 +283,13 @@ Resources:
 
   GovernanceInvokerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Properties:
       FunctionName: !Sub '${StackPrefix}-governance-invoker'
       Description: >-
@@ -312,6 +336,13 @@ Resources:
 
   GovernanceInvokerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: cloudwatch:PutMetricData does not support resource-level permissions and is scoped by a cloudwatch:namespace condition
     Properties:
       RoleName: !Sub '${StackPrefix}-governance-invoker-role'
       AssumeRolePolicyDocument:
@@ -385,6 +416,13 @@ Resources:
 
   RetrainingTriggerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Condition: HasRetrainingConfig
     Properties:
       FunctionName: !Sub '${StackPrefix}-retraining-trigger'
@@ -553,6 +591,11 @@ Resources:
 
   RetrainingTriggerFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-retraining-trigger-role'
@@ -598,6 +641,11 @@ Resources:
 
   RetrainingSchedulerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-scheduler-invoke-retraining-trigger'
@@ -647,6 +695,13 @@ Resources:
 
   RetrainingRegistrationFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Condition: HasRetrainingConfig
     Properties:
       FunctionName: !Sub '${StackPrefix}-retraining-registration'
@@ -798,6 +853,13 @@ Resources:
 
   RetrainingRegistrationFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: ecr:GetAuthorizationToken does not support resource-level permissions
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-retraining-registration-role'
