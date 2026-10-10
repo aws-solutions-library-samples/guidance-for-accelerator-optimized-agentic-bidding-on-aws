@@ -228,7 +228,7 @@ def format_cost_disclosure(disclosure: CostDisclosure) -> str:
     lines.append("")
     lines.append(f"  Known standing total: ${disclosure.known_total:.2f}/month")
 
-    if not disclosure.is_complete:
+    if not disclosure.is_complete:  # nosemgrep: is-function-without-parentheses is_complete is a property
         lines.append("")
         lines.append("  INCOMPLETE. These components have no figure yet:")
         for component in disclosure.unknown_components:

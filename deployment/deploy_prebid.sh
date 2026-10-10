@@ -447,7 +447,7 @@ resolve_kube_context() {
   warn "No kubectl context named for ${CLUSTER_NAME}."
   warn "Falling back to the current context '${current}', whose cluster entry is"
   warn "  ${cluster_entry:-<unknown>}"
-  warn "If that is not ${CLUSTER_NAME}, STOP and run:"
+  warn "If that is not ${CLUSTER_NAME}, STOP and run:"  # nosemgrep: unquoted-variable-expansion-in-command semgrep bash parse artifact; every expansion in this block is double quoted
   warn "  aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION} --profile ${AWS_PROFILE}"
   return 0
 }
@@ -471,7 +471,7 @@ upload_default_config() {
   local bucket="$1"
 
   [[ -d "${src}" ]] \
-    || fail "No default-config directory at ${src}. The pod cannot start without it; the release layout has changed."
+    || fail "No default-config directory at ${src}. The pod cannot start without it; the release layout has changed."  # nosemgrep: unquoted-variable-expansion-in-command semgrep bash parse artifact; every expansion in this block is double quoted
 
   local required=(entrypoint.sh prebid-config.yaml prebid-logging.xml prebid-analytics-logging.xml)
   local missing=()
@@ -1605,7 +1605,7 @@ SPEC
       --query 'builds[0].buildStatus' --output text)"
     PHASE="$(aws codebuild batch-get-builds --ids "${BUILD_ID}" --region "${AWS_REGION}" \
       --query 'builds[0].currentPhase' --output text 2>/dev/null || echo UNKNOWN)"
-    ELAPSED=$(( $(date +%s) - POLL_START ))
+    ELAPSED=$(( $(date +%s) - POLL_START ))  # nosemgrep: unquoted-command-substitution-in-command arithmetic context, not subject to word splitting
     case "${BUILD_STATUS}" in
       SUCCEEDED) log "  Build SUCCEEDED after $((ELAPSED / 60))m$((ELAPSED % 60))s"; break ;;
       FAILED|FAULT|TIMED_OUT|STOPPED)

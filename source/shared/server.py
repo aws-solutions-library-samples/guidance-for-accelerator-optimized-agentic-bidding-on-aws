@@ -606,7 +606,7 @@ def _build_mcp_app(
     app = Starlette(routes=routes)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=["*"],  # nosemgrep: wildcard-cors the containers are reached by the orchestrator inside the cluster, not by browsers
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Mcp-Session-Id", "Last-Event-ID"],
         expose_headers=["Mcp-Session-Id"],

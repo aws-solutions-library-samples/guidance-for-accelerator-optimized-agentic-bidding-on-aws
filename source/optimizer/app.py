@@ -359,8 +359,8 @@ def _build_engine(
     # fp32 => no precision flag (default).
 
     logger.info("Running: %s", " ".join(cmd))
-    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use — fixed binary, validated args
-        cmd,
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit fixed trtexec binary, args built from validated fields
+        cmd,  # nosemgrep: dangerous-subprocess-use-tainted-env-args the only env input is TRTEXEC_PATH, set by the deployment manifest; the rest are paths this job created
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

@@ -43,7 +43,7 @@ function render(props = {}) {
         onSelect={() => {}}
         onSend={() => {}}
         onOpenTheater={() => {}}
-        {...props}
+        {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */
       />
     );
   });

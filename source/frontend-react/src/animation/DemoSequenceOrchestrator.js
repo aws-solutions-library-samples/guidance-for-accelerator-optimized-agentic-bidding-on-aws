@@ -86,7 +86,7 @@ class DemoSequenceOrchestrator {
 
           this._consecutiveFailures++;
           console.warn(
-            `[DemoSequenceOrchestrator] Scenario "${scenario.name}" failed (${this._consecutiveFailures}/${this._options.maxConsecutiveFailures}):`,
+            `[DemoSequenceOrchestrator] Scenario "${scenario.name}" failed (${this._consecutiveFailures}/${this._options.maxConsecutiveFailures}):`, // nosemgrep: unsafe-formatstring scenario.name comes from the bundled scenario definitions, not from user input
             err.message || err
           );
 

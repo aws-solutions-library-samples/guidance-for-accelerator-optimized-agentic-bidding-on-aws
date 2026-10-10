@@ -106,7 +106,7 @@ def _wait_for_metric_visibility(
         except Exception as exc:  # best-effort — report honestly, never raise
             logger.warning("Visibility check for %s/%s failed: %s", namespace, metric_name, exc)
             return False, time.time() - started
-        time.sleep(poll_interval_seconds)
+        time.sleep(poll_interval_seconds)  # nosemgrep: arbitrary-sleep polling interval between CloudWatch visibility checks
     return False, time.time() - started
 
 

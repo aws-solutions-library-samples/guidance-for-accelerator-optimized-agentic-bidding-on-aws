@@ -84,7 +84,7 @@ async def discover_peers() -> list[str]:
 
 def is_forwarded(request: Request) -> bool:
     """True when this request already came from a sibling; it must not fan out again."""
-    return bool(request.headers.get(NO_FORWARD_HEADER))
+    return bool(request.headers.get(NO_FORWARD_HEADER))  # nosemgrep: nan-injection presence check on a header, not a numeric cast
 
 
 def _forward_headers(request: Request) -> dict[str, str]:

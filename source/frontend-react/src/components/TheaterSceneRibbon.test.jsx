@@ -125,7 +125,7 @@ describe("TheaterSceneRibbon", () => {
 
   it("reports unknown rather than zero when the request carries no deals", () => {
     const noDeals = JSON.parse(JSON.stringify(PAYLOAD));
-    delete noDeals.bid_request.imp[0].pmp;
+    delete noDeals.bid_request.imp[0].pmp; // nosemgrep: no-stringify-keys array index into imp, not an object key
     render(buildScenarioContext(noDeals));
     // "0" would read as a measured count of an open-market request; the ribbon's
     // absent-value treatment is the honest one.

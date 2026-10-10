@@ -66,7 +66,7 @@ def _build() -> Snapshot:
         }))
     return Snapshot(
         service=DemandDecisionService(catalog),
-        campaigns=len(catalog.all()),
+        campaigns=len(catalog.all()),  # nosemgrep: len-all-count CampaignCatalog.all() returns a tuple, not a Django queryset
         deals=len(deal_records),
         loaded_at=datetime.now(timezone.utc),
     )

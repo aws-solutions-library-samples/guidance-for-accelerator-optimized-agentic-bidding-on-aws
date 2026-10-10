@@ -62,8 +62,9 @@ def _get_hop_client() -> httpx.AsyncClient:
     global _hop_client
     if _hop_client is None:
         # verify=False: see the module docstring -- Prebid presents a certificate it
-        # generated for itself at container start.
-        _hop_client = httpx.AsyncClient(verify=False, timeout=HOP_TIMEOUT_S)
+        # generated for itself at container start. The only target is PREBID_AUCTION_URL,
+        # https://prebid-server.<namespace>.svc.cluster.local/openrtb2/auction.
+        _hop_client = httpx.AsyncClient(verify=False, timeout=HOP_TIMEOUT_S)  # nosec B501  # self-signed cert on the in-cluster Prebid Server Service
     return _hop_client
 
 

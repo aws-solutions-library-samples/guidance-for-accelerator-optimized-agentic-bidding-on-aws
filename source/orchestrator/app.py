@@ -640,7 +640,7 @@ _HTTP_CLIENT: httpx.AsyncClient | None = None
 
 def _shared_http_client() -> httpx.AsyncClient:
     global _HTTP_CLIENT
-    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:  # nosemgrep: is-function-without-parentheses httpx.AsyncClient.is_closed is a property
         _HTTP_CLIENT = httpx.AsyncClient(
             limits=httpx.Limits(
                 max_connections=ARTF_HTTP_MAX_CONNECTIONS,
@@ -653,7 +653,7 @@ def _shared_http_client() -> httpx.AsyncClient:
 
 async def _close_shared_http_client() -> None:
     global _HTTP_CLIENT
-    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:
+    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:  # nosemgrep: is-function-without-parentheses httpx.AsyncClient.is_closed is a property
         await _HTTP_CLIENT.aclose()
     _HTTP_CLIENT = None
 
@@ -2024,7 +2024,7 @@ async def _lifespan(_app):
 
 
 app = Starlette(routes=routes, lifespan=_lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])  # nosemgrep: wildcard-cors browsers reach the orchestrator only through CloudFront and the UI/API proxy Lambda, and every non-health route requires a Cognito JWT
 
 # Cognito JWT auth — rejects unauthenticated requests on all non-health endpoints
 try:

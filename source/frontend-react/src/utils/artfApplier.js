@@ -60,7 +60,7 @@ function resolvePath(path) {
     if (parts.length === 4 && parts[2] === "bid" && parts[1] && parts[3]) {
       return { kind: "bid_price", seat: parts[1], bidId: parts[3] };
     }
-    throw new Reject(`path '${path}' addresses the auction response but does not name /seatbid/{seat}/bid/{bidId}`);
+    throw new Reject(`path '${path}' addresses the auction response but does not name /seatbid/{seat}/bid/{bidId}`); // nosemgrep: missing-template-string-indicator the braces are literal path placeholders in the message
   }
   if (parts[0] === "imp") {
     if (parts.length === 2 && parts[1]) return { kind: "imp_deals", impId: parts[1] };
@@ -313,7 +313,7 @@ export function stringifyWithPointers(value) {
     } else if (node !== null && typeof node === "object") {
       const keys = Object.keys(node).filter((k) => node[k] !== undefined && typeof node[k] !== "function");
       if (keys.length === 0) {
-        lines.push(`${pad}${prefix}{}${suffix}`);
+        lines.push(`${pad}${prefix}{}${suffix}`); // nosemgrep: missing-template-string-indicator the braces render an empty JSON object literal
       } else {
         lines.push(`${pad}${prefix}{`);
         keys.forEach((k, i) => {

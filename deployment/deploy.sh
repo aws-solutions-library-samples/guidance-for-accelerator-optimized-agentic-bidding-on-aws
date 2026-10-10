@@ -600,7 +600,7 @@ ORCHESTRATOR_INTERNAL_URL=""
 # is a failure, not a wait.
 resolve_orchestrator_internal_url() {
   local _phase="$1" deadline host
-  deadline=$(( $(date +%s) + 300 ))
+  deadline=$(( $(date +%s) + 300 ))  # nosemgrep: unquoted-command-substitution-in-command arithmetic context, not subject to word splitting
   while :; do
     host="$(kubectl get svc "${ORCHESTRATOR_INTERNAL_SVC}" \
       -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')"
@@ -624,7 +624,7 @@ resolve_orchestrator_internal_url() {
 # so every invoke failed locally and the deploy blamed the network. boto3 is already
 # a hard requirement of this script and behaves the same everywhere.
 _ui_api_proxy_probe() {
-  ${PYTHON} - "$1" "${AWS_REGION}" <<'PY'
+  "${PYTHON}" - "$1" "${AWS_REGION}" <<'PY'
 import json, sys
 import boto3
 fn, region = sys.argv[1], sys.argv[2]
@@ -654,7 +654,7 @@ PY
 # error) in the message.
 verify_ui_api_proxy() {
   local _phase="$1" deadline last
-  deadline=$(( $(date +%s) + 180 ))
+  deadline=$(( $(date +%s) + 180 ))  # nosemgrep: unquoted-command-substitution-in-command arithmetic context, not subject to word splitting
   while :; do
     if last="$(_ui_api_proxy_probe "${UI_API_PROXY_ARN}" 2>&1)"; then
       ok "UI API proxy reaches the orchestrator (GET /api/health/ready -> 200)"
@@ -851,11 +851,11 @@ fi
 # it's respected.
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
   PYTHON="${_BASE_PYTHON}"
-  log "Using the active virtualenv Python: $(${PYTHON} --version 2>&1) ($(command -v ${PYTHON}))"
+  log "Using the active virtualenv Python: $("${PYTHON}" --version 2>&1) ($(command -v "${PYTHON}"))"
 elif "${_BASE_PYTHON}" -c "import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)" 2>/dev/null; then
   # The resolved interpreter is itself a venv (not the system one) -- reuse it.
   PYTHON="${_BASE_PYTHON}"
-  log "Using virtualenv Python: $(${PYTHON} --version 2>&1) ($(command -v ${PYTHON}))"
+  log "Using virtualenv Python: $("${PYTHON}" --version 2>&1) ($(command -v "${PYTHON}"))"
 else
   DEPLOY_VENV="${SCRIPT_DIR}/.deploy-venv"
   if [[ ! -x "${DEPLOY_VENV}/bin/python" ]]; then
@@ -864,8 +864,8 @@ else
       || fail "could not create a virtualenv at ${DEPLOY_VENV} (need the stdlib 'venv' module for ${_BASE_PYTHON})"
   fi
   PYTHON="${DEPLOY_VENV}/bin/python"
-  ${PYTHON} -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-  log "Using deploy virtualenv: $(${PYTHON} --version 2>&1) (${PYTHON})"
+  "${PYTHON}" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+  log "Using deploy virtualenv: $("${PYTHON}" --version 2>&1) (${PYTHON})"  # nosemgrep: unquoted-variable-expansion-in-command the remaining expansion is inside the double-quoted message; semgrep bash parse artifact
 fi
 
 # Directory holding the resolved interpreter, prepended to PATH when invoking
@@ -883,7 +883,7 @@ REQUIRED_PY_PACKAGES="torch onnx onnxscript onnxruntime boto3"
 ONNXRUNTIME_PIN="onnxruntime==1.27.0"
 MISSING_PY_PACKAGES=""
 for pkg in ${REQUIRED_PY_PACKAGES}; do
-  if ! ${PYTHON} -c "import ${pkg}" 2>/dev/null; then
+  if ! "${PYTHON}" -c "import ${pkg}" 2>/dev/null; then
     case "${pkg}" in
       onnxruntime) MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${ONNXRUNTIME_PIN}" ;;
       *) MISSING_PY_PACKAGES="${MISSING_PY_PACKAGES} ${pkg}" ;;
@@ -892,7 +892,7 @@ for pkg in ${REQUIRED_PY_PACKAGES}; do
 done
 if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
   log "Installing missing Python packages:${MISSING_PY_PACKAGES}"
-  ${PYTHON} -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"
+  "${PYTHON}" -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"  # nosemgrep: unquoted-variable-expansion-in-command intentional word splitting of a space separated package list
 fi
 
 # sagemaker SDK: needed only for the Part 2 closed-loop path — resolving the
@@ -909,9 +909,9 @@ fi
 # register_genesis_models.py), so a python that has sagemaker v3 installed
 # would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
 # to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
-if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! ${PYTHON} -c "from sagemaker import image_uris" 2>/dev/null; then
+if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then
   log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
-  ${PYTHON} -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
+  "${PYTHON}" -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
 fi
 
 # step()/done_ok()/run_logged() and the status marks. Sourced before the gate so
@@ -1007,7 +1007,7 @@ force_phase() {
 
 # file_sha256 <path>: hex sha256 of the file's bytes (same digest as shasum -a 256).
 file_sha256() {
-  ${PYTHON} -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+  "${PYTHON}" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
 }
 
 # compute_phase_expectations: set DEPLOY_EXPECT_DEALS_SEED_SHA (sha256 of the
@@ -1023,7 +1023,7 @@ compute_phase_expectations() {
     warn "Could not hash ${seed}; running Phase 1 so Step 1.5 reports why."
     force_phase 1 "the local deals seed could not be hashed"
   fi
-  out="$(${PYTHON} "${SCRIPT_DIR}/../source/training/ncf_sample/build.py" --fingerprint-only 2>/dev/null || true)"
+  out="$("${PYTHON}" "${SCRIPT_DIR}/../source/training/ncf_sample/build.py" --fingerprint-only 2>/dev/null || true)"
   out="${out##*$'\n'}"
   if [[ "${out}" =~ ^[0-9a-f]{64}$ ]]; then
     DEPLOY_EXPECT_NCF_FINGERPRINT="${out}"
@@ -1273,7 +1273,7 @@ _DEGRADED_DETAIL=""
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 # Deterministic UID for resource naming
-STACK_UID="$(${PYTHON} -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
+STACK_UID="$("${PYTHON}" -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
 
 CLUSTER_NAME="${STACK_NAME}-triton"
 MODEL_BUCKET="${STACK_NAME}-triton-models-${STACK_UID}"
@@ -1323,7 +1323,7 @@ YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manag
 # silently swallowed (the old `except: pass` hid, e.g., "No module named
 # 'sagemaker'" when deploy ran with an interpreter that lacked the SDK).
 _XGB_ERR_FILE="$(mktemp)"
-XGBOOST_TRAINING_IMAGE_URI="$(SAGEMAKER_SUPPRESS_V2_WARNING=1 ${PYTHON} -c "
+XGBOOST_TRAINING_IMAGE_URI="$(SAGEMAKER_SUPPRESS_V2_WARNING=1 "${PYTHON}" -c "
 import contextlib, io, sys
 try:
     with contextlib.redirect_stdout(io.StringIO()):
@@ -1351,7 +1351,7 @@ fi
 if [[ "${WITH_RETRAINING}" -eq 1 && -z "${XGBOOST_TRAINING_IMAGE_URI}" ]]; then
   warn "Could not resolve the SageMaker built-in XGBoost training image URI${_XGB_ERR:+ (${_XGB_ERR})}; on-demand Yield Optimizer (floor/margin) training will report a 503 in the UI until this resolves. This does NOT block DLRM/NCF training or model registration."
   if [[ "${_XGB_ERR}" == *"No module named"* || "${_XGB_ERR}" == *"sagemaker"* ]]; then
-    warn "  The sagemaker SDK is not importable for ${PYTHON} ($(command -v ${PYTHON})). Install it there (e.g. activate the venv used at deploy time, or '${PYTHON} -m pip install sagemaker') and re-run."
+    warn "  The sagemaker SDK is not importable for ${PYTHON} ($(command -v "${PYTHON}")). Install it there (e.g. activate the venv used at deploy time, or '${PYTHON} -m pip install sagemaker') and re-run."  # nosemgrep: unquoted-variable-expansion-in-command the remaining expansion is inside the double-quoted message; semgrep bash parse artifact
   fi
 fi
 LOADTEST_TABLE="${STACK_NAME}-loadtest-history"
@@ -1512,12 +1512,12 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   aws dynamodb delete-table --table-name "${LOADTEST_TABLE}" --region "${AWS_REGION}" 2>/dev/null || true
 
   say "Deleting CloudFront + S3 frontend..."
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_frontend.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
   # deploy_frontend.py's destroy only disables the CloudFront distribution (AWS
   # requires Enabled=false to propagate before a distribution can be deleted) —
   # it does not delete the distribution or its S3 bucket. Nothing is retained
   # here, so remove both once the disable has propagated.
-  FRONTEND_UID="$(${PYTHON} -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
+  FRONTEND_UID="$("${PYTHON}" -c "import hashlib; print(hashlib.sha256('${STACK_NAME}:${ACCOUNT_ID}:${AWS_REGION}'.encode()).hexdigest()[:8])")"
   FRONTEND_BUCKET="${STACK_NAME}-frontend-${FRONTEND_UID}"
   say "  Emptying and deleting frontend bucket ${FRONTEND_BUCKET}..."
   aws s3 rb "s3://${FRONTEND_BUCKET}" --force 2>/dev/null || true
@@ -1534,10 +1534,10 @@ if [[ "${DESTROY}" -eq 1 ]]; then
 
   say "Deleting AgentCore MCP runtime..."
   AC_RUNTIME_NAME="$(echo "${STACK_NAME}_mcp" | tr '-' '_')"
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" --action destroy --runtime-name "${AC_RUNTIME_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
 
   say "Deleting Cognito User Pool..."
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" || true
 
   say "Deleting IAM policies..."
   TRITON_POLICY_NAME="${STACK_NAME}-triton-s3-policy-${STACK_UID}"
@@ -1730,7 +1730,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   aws s3 rb "s3://${CODEBUILD_SOURCE_BUCKET}" --force 2>/dev/null || true
 
   say "Deleting Cognito (user pool, identity pool, authenticated role)..."
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" --action destroy \
     --stack-name "${STACK_NAME}" --region "${AWS_REGION}" --profile "${AWS_PROFILE}" 2>/dev/null || true
 
   # --- ECR repositories: previously retained. Every repo deploy.sh/remote_build.sh
@@ -1811,7 +1811,7 @@ EOF
   log "  UI env: adaptive=${ADAPTIVE_BIDDING_RUNTIME_ARN:-<none>}  governance=${GOVERNANCE_RUNTIME_ARN:-<none>}  ui-api-proxy=${UI_API_PROXY_ARN}"
 
   # Primary distribution: React UI (fresh build embeds the env above)
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -1911,7 +1911,7 @@ NCF_MODEL_LABEL=""
 # ncf_manifest_field <manifest.json> <field>: print a non-empty string field, or
 # exit non-zero with the reason on stderr.
 ncf_manifest_field() {
-  ${PYTHON} - "$1" "$2" <<'PY'
+  "${PYTHON}" - "$1" "$2" <<'PY'
 import json
 import sys
 
@@ -1980,7 +1980,7 @@ write_phase1_marker() {
   [[ "${seed_sha}" =~ ^[0-9a-f]{64}$ ]] || fail 1 "Deals seed sha256 '${seed_sha}' is not 64 hex characters."
   [[ "${ncf_fp}" =~ ^[0-9a-f]{64}$ ]] || fail 1 "Deal Scorer fingerprint '${ncf_fp}' is not 64 hex characters."
   tmp="$(mktemp)"
-  ${PYTHON} - "${seed_sha}" "${ncf_fp}" > "${tmp}" <<'PY'
+  "${PYTHON}" - "${seed_sha}" "${ncf_fp}" > "${tmp}" <<'PY'
 import datetime
 import json
 import sys
@@ -2010,8 +2010,9 @@ register_ncf_build() {
     log "  Model Registry group ${group} does not exist yet; Phase 5 registers the Deal Scorer build"
     return 0
   fi
+  # nosemgrep: unquoted-variable-expansion-in-command intentional word splitting; the AWS_PROFILE:+ expansion below yields zero or two arguments
   quiet "register_genesis_models.py --only ncf_deal_manager" \
-    ${PYTHON} "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
+    "${PYTHON}" "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
       --model-bucket "${MODEL_BUCKET}" \
       --region "${AWS_REGION}" \
       ${AWS_PROFILE:+--profile "${AWS_PROFILE}"} \
@@ -2106,7 +2107,7 @@ ecr_image_digest() {
 # and Failed pods are not compared. imageID is the repo digest the runtime pulled
 # (<registry>/<repo>@sha256:<hex>, with a docker-pullable:// prefix on Docker).
 _stale_verdicts() {
-  ${PYTHON} - "$@" <<'PY'
+  "${PYTHON}" - "$@" <<'PY'
 import json
 import re
 import sys
@@ -2321,7 +2322,7 @@ prebid_fingerprint() {
   done <<PREBID_FILES
 ${files}
 PREBID_FILES
-  ${PYTHON} - "${root}" "${seed_sha}" ${list[@]+"${list[@]}"} <<'PY'
+  "${PYTHON}" - "${root}" "${seed_sha}" ${list[@]+"${list[@]}"} <<'PY'
 import hashlib
 import os
 import sys
@@ -2503,7 +2504,7 @@ fi
 DEALS_SEED_ROLE_ARN="$(_cfn_output "${DEALS_STACK}" DealsSeedRoleArn)"
 [[ -n "${DEALS_SEED_ROLE_ARN}" ]] || fail 1 "${DEALS_STACK} has no DealsSeedRoleArn output."
 log "  Deals table stack ready: ${DEALS_STACK} (table ${DEALS_TABLE})"
-${PYTHON} "${SCRIPT_DIR}/scripts/seed_deals_table.py" \
+"${PYTHON}" "${SCRIPT_DIR}/scripts/seed_deals_table.py" \
   --table "${DEALS_TABLE}" \
   --role-arn "${DEALS_SEED_ROLE_ARN}" \
   --seed "${SCRIPT_DIR}/seed/deals_and_campaigns.json" \
@@ -2523,7 +2524,7 @@ step "Step 2: Exporting PyTorch models to ONNX (source for the Model Optimizer)"
 ONNX_STAGING="${SCRIPT_DIR}/../source/triton/onnx_export"
 rm -rf "${ONNX_STAGING}"
 run_step "Exporting DLRM to ONNX; training, exporting and gating the Deal Scorer (NCF)" \
-  ${PYTHON} "${SCRIPT_DIR}/../source/triton/export_models.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/../source/triton/export_models.py" \
     --output-dir "${ONNX_STAGING}"
 
 # Step 2.5: Genesis XGBoost export for the Yield Optimizer (floor/margin).
@@ -2554,7 +2555,7 @@ run_step "Exporting DLRM to ONNX; training, exporting and gating the Deal Scorer
 # force-reinstall the pinned version rather than trusting the existing one.
 XGBOOST_PIN="xgboost==1.7.6"
 XGBOOST_OK=0
-if ${PYTHON} -c "
+if "${PYTHON}" -c "
 import sys
 try:
     import onnxmltools, xgboost
@@ -2568,8 +2569,8 @@ fi
 step "Step 2.5: Exporting genesis XGBoost models (Yield Optimizer floor/margin)"
 if [[ "${XGBOOST_OK}" -ne 1 ]]; then
   log "  Installing ${XGBOOST_PIN}/onnxmltools (best-effort, non-blocking)..."
-  quiet "pip install ${XGBOOST_PIN} onnxmltools" ${PYTHON} -m pip install --quiet "${XGBOOST_PIN}" onnxmltools || true
-  if ${PYTHON} -c "
+  quiet "pip install ${XGBOOST_PIN} onnxmltools" "${PYTHON}" -m pip install --quiet "${XGBOOST_PIN}" onnxmltools || true
+  if "${PYTHON}" -c "
 import sys
 try:
     import onnxmltools, xgboost
@@ -2583,7 +2584,7 @@ fi
 
 if [[ "${XGBOOST_OK}" -eq 1 ]]; then
   run_step "Exporting genesis XGBoost floor/margin models" \
-    ${PYTHON} "${SCRIPT_DIR}/../source/training/export_xgboost_genesis.py" \
+    "${PYTHON}" "${SCRIPT_DIR}/../source/training/export_xgboost_genesis.py" \
       --output-dir "${ONNX_STAGING}" \
     && log "  Genesis XGBoost artifacts exported to ${ONNX_STAGING}/" \
     || warn "  Genesis XGBoost export failed - deal_yield_manager_floor/margin genesis registration will be skipped honestly until this is re-run (see Step 3's register_genesis_models.py)."
@@ -2687,7 +2688,7 @@ log "  Triton served repo (routers + engine configs) uploaded; engines built at 
 # different version, or none at all -- an ONNX graph with the right input names and
 # widths is not evidence that the producer and the serving container agree on what
 # each position means.
-FEATURE_SPEC_VERSION="$(${PYTHON} -c "
+FEATURE_SPEC_VERSION="$("${PYTHON}" -c "
 import sys
 sys.path.insert(0, '${SCRIPT_DIR}/../source')
 from shared import dlrm_features
@@ -3546,7 +3547,7 @@ resolve_ncf_model_label
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
 run_step "Provisioning the Cognito user pool (orchestrator auth)" \
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -3560,7 +3561,7 @@ run_step "Provisioning the Cognito user pool (orchestrator auth)" \
 # theater whose captions never generate, with no error anywhere but the browser
 # console -- the fallback caption is correct, so nothing would look broken.
 quiet "deploy_cognito.py grant-caption-invoke" \
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
     --action grant-caption-invoke \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -3841,7 +3842,7 @@ deploy_ui_api_proxy 3 "${ORCHESTRATOR_INTERNAL_URL}"
 state_set "${STACK_PREFIX}" resolved "uiApiProxyArn=${UI_API_PROXY_ARN}"
 verify_ui_api_proxy 3
 quiet "deploy_cognito.py grant-ui-api-invoke" \
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
     --action grant-ui-api-invoke \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -3918,7 +3919,7 @@ EOF
 
 # React UI distribution (static-only CloudFront; API calls go browser -> ui-api-proxy)
 run_step "Building and publishing the frontend (S3 + CloudFront)" \
-  ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
+  "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_frontend.py" \
     --action deploy \
     --stack-name "${STACK_NAME}" \
     --region "${AWS_REGION}" \
@@ -3931,7 +3932,7 @@ state_set "${STACK_PREFIX}" resolved "cloudFrontDomain=${CF_DOMAIN}"
 # Update Cognito callback URLs now that we know the CF domain
 if [[ -n "${CF_DOMAIN}" && -n "${COGNITO_USER_POOL_ID}" ]]; then
   quiet "deploy_cognito.py: callback URLs for ${CF_DOMAIN}" \
-    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
+    "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_cognito.py" \
       --action deploy \
       --stack-name "${STACK_NAME}" \
       --region "${AWS_REGION}" \
@@ -3957,7 +3958,7 @@ if [[ -n "${COGNITO_USER_POOL_ID}" ]]; then
     # summary. The operator may instead supply one via DEMO_USER_PASSWORD.
     TEMP_PASS="${DEMO_USER_PASSWORD:-}"
     if [[ -z "${TEMP_PASS}" ]]; then
-      TEMP_PASS="$(${PYTHON} - <<'PY'
+      TEMP_PASS="$("${PYTHON}" - <<'PY'
 import secrets
 import string
 
@@ -4030,7 +4031,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # the registration succeeds (record_agentcore_digest).
   _AC_DIGEST="$(ecr_image_digest "${STACK_NAME}-agentcore" "${IMAGE_TAG}")"
   run_logged "${_AC_LOG}" "Registering MCP runtime ${AC_RUNTIME_NAME}" \
-    ${PYTHON} "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
+    "${PYTHON}" "${SCRIPT_DIR}/scripts/deploy_to_agentcore.py" \
       --action deploy \
       --runtime-name "${AC_RUNTIME_NAME}" \
       --role-arn "${ROLE_ARN}" \

@@ -35,7 +35,7 @@ _JWKS_TIMEOUT_S = 5
 
 
 def _fetch_jwks(url: str) -> dict:
-    with urlopen(url, timeout=_JWKS_TIMEOUT_S) as resp:  # noqa: S310 - fixed https URL
+    with urlopen(url, timeout=_JWKS_TIMEOUT_S) as resp:  # noqa: S310  # nosec B310  # fixed https JWKS URL from deploy-time config
         return json.loads(resp.read())
 
 

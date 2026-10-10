@@ -278,7 +278,7 @@ class GuardrailMonitor:
 
             result = await self.check_guardrails(model_name)
 
-            if result.is_violated:
+            if result.is_violated:  # nosemgrep: is-function-without-parentheses dataclass field, not a method
                 audit = await self.handle_violation(model_name, result)
                 return audit
 

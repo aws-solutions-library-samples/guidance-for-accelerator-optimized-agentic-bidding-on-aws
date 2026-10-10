@@ -41,7 +41,7 @@ afterEach(() => {
 });
 
 function render(props) {
-  act(() => { root.render(<ModelsView {...props} />); });
+  act(() => { root.render(<ModelsView {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */ />); });
 }
 
 describe('ModelsView', () => {

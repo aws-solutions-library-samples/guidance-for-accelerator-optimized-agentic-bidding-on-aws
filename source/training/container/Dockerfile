@@ -26,6 +26,7 @@
 #   Built and pushed to ECR, then referenced by source/training/pipeline.py
 #   which creates SageMaker training jobs using this image.
 
+# nosemgrep: dockerfile-source-not-pinned the NGC release tag is the pin this guidance documents; CodeBuild rebuilds on deploy
 FROM nvcr.io/nvidia/nemo:24.07
 
 LABEL maintainer="ARTF Bidding Platform"

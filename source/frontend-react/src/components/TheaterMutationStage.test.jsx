@@ -46,7 +46,7 @@ function mount(props = {}) {
         narration={NARRATION}
         stepLabel="Step 2 of 3"
         animate={false}
-        {...props}
+        {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */
       />,
     );
   });

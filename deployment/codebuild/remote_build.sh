@@ -551,7 +551,7 @@ while true; do
     --region "${AWS_REGION}" \
     --query 'builds[0].currentPhase' --output text 2>/dev/null || echo "UNKNOWN")
 
-  ELAPSED=$(( $(date +%s) - POLL_START ))
+  ELAPSED=$(( $(date +%s) - POLL_START ))  # nosemgrep: unquoted-command-substitution-in-command arithmetic context, not subject to word splitting
 
   case "${BUILD_STATUS}" in
     SUCCEEDED)

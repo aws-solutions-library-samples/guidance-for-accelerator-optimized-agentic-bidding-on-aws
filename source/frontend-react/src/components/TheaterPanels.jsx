@@ -140,7 +140,7 @@ function ViewIcon({ view }) {
   };
   if (view === CARD_VIEW.VISUAL) {
     return (
-      <svg {...common}>
+      <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
         <path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z" />
         <circle cx="8" cy="8" r="1.9" />
       </svg>
@@ -148,14 +148,14 @@ function ViewIcon({ view }) {
   }
   if (view === CARD_VIEW.CODE) {
     return (
-      <svg {...common}>
+      <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
         <path d="m5.5 5.5-3 2.5 3 2.5" />
         <path d="m10.5 5.5 3 2.5-3 2.5" />
       </svg>
     );
   }
   return (
-    <svg {...common}>
+    <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
       <circle cx="8" cy="8" r="6.3" />
       <path d="M8 7.2v4" />
       <path d="M8 4.9h.01" />

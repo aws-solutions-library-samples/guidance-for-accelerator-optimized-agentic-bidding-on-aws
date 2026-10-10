@@ -29,7 +29,7 @@ afterEach(() => {
 function render(props = {}) {
   act(() => {
     root.render(
-      <GovernanceStepper activeKey={GOVERNANCE_STEPS[0].key} onSelect={() => {}} {...props} />
+      <GovernanceStepper activeKey={GOVERNANCE_STEPS[0].key} onSelect={() => {}} {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */ />
     );
   });
 }

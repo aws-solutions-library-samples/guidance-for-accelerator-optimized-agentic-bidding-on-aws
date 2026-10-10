@@ -480,13 +480,13 @@ export default function ScenarioCard({
   onSend,
   onOpenTheater,
 }) {
-  const [bidFloor, setBidFloor] = useState(() => initialTunerValue(scenario, "bidFloor"));
-  const [ageRange, setAgeRange] = useState(() => initialTunerValue(scenario, "ageRange"));
-  const [numDeals, setNumDeals] = useState(() => initialTunerValue(scenario, "numDeals"));
-  const [shadeFactor, setShadeFactor] = useState(() => initialTunerValue(scenario, "shadeFactor"));
-  const [convValue, setConvValue] = useState(() => initialTunerValue(scenario, "convValue"));
-  const [segThreshold, setSegThreshold] = useState(() => initialTunerValue(scenario, "segThreshold"));
-  const [explore, setExplore] = useState(() => initialTunerValue(scenario, "explore"));
+  const [bidFloor, setBidFloor] = useState(() => initialTunerValue(scenario, "bidFloor")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [ageRange, setAgeRange] = useState(() => initialTunerValue(scenario, "ageRange")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [numDeals, setNumDeals] = useState(() => initialTunerValue(scenario, "numDeals")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [shadeFactor, setShadeFactor] = useState(() => initialTunerValue(scenario, "shadeFactor")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [convValue, setConvValue] = useState(() => initialTunerValue(scenario, "convValue")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [segThreshold, setSegThreshold] = useState(() => initialTunerValue(scenario, "segThreshold")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
+  const [explore, setExplore] = useState(() => initialTunerValue(scenario, "explore")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
 
   const controls = scenario.controls || [];
 

@@ -75,7 +75,7 @@ export default function Sidebar({
         </button>
       ) : null}
 
-      <div className="app-sidebar-body" {...(collapsed ? { hidden: true } : {})}>
+      <div className="app-sidebar-body" {...(collapsed ? { hidden: true } : {})} /* nosemgrep: react-props-spreading spreads a single known attribute, hidden, conditionally */>
         <ScenarioPicker
           activeScenarioId={activeScenario}
           runningScenarioId={runningScenario}

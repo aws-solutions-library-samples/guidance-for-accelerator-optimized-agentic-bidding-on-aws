@@ -9,6 +9,7 @@
 #   - MCP   :8081   JSON-RPC at /mcp (extend_rtb tool)
 #   - Health :8080   /health/live, /health/ready
 
+# nosemgrep: dockerfile-source-not-pinned deploy by tag; CodeBuild rebuilds the image on every deploy
 FROM python:3.12-slim AS base
 
 ARG CONTAINER
@@ -47,7 +48,7 @@ USER appuser
 EXPOSE 50051 8081 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')" || exit 1
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
 
 # Run the multi-protocol ARTF server
 CMD ["python", "-m", "container.app"]

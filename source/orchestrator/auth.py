@@ -283,7 +283,7 @@ def _get_jwks(region: str, pool_id: str) -> dict[str, Any]:
         return _jwks_cache
 
     url = f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/.well-known/jwks.json"
-    with urlopen(url) as resp:
+    with urlopen(url) as resp:  # nosec B310  # fixed https URL built from the deploy-time region and pool id
         _jwks_cache = json.loads(resp.read())
     _jwks_fetched_at = time.time()
     return _jwks_cache
@@ -341,7 +341,7 @@ def _verify_token(token: str, region: str, pool_id: str) -> dict | None:
     # Check token_use (accept both access and id tokens)
     token_use = payload.get("token_use", "")
     if token_use not in ("access", "id"):
-        logger.warning("JWT token_use invalid: %s", token_use)
+        logger.warning("JWT token_use invalid: %s", token_use)  # nosemgrep: python-logger-credential-disclosure logs the token_use claim value, not the token
         return None
 
     # Full signature verification. Everything above this line is a cheap pre-filter on

@@ -275,7 +275,7 @@ def train(rows: Sequence[gen.Row], params: Mapping[str, Any] = TRAIN_PARAMS):
         with torch.no_grad():
             scores = model(users, items)
             final_loss = float(loss_fn(scores, labels))
-            scenario = torch.tensor([bool(r.is_scenario_user) for r in rows])
+            scenario = torch.tensor([bool(r.is_scenario_user) for r in rows])  # nosemgrep: is-function-without-parentheses dataclass field, not a method
             scenario_loss = float(loss_fn(scores[scenario], labels[scenario])) if bool(scenario.any()) else None
     finally:
         torch._C._set_deterministic_algorithms(deterministic)

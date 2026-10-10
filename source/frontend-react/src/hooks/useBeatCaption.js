@@ -41,7 +41,7 @@ export const CAPTION_DEADLINE_MS = 2500;
 export function useBeatCaption({ beat, context, generate = generateCaption, deadlineMs = CAPTION_DEADLINE_MS }) {
   const beatIndex = beat?.index ?? null;
 
-  const [state, setState] = useState(() => ({
+  const [state, setState] = useState(() => ({ // nosemgrep: react-props-in-state seed value only; the effect below rewrites state on every beat change
     text: factualCaption(beat, context),
     beatIndex,
   }));

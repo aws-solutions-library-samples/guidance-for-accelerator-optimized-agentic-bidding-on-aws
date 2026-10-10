@@ -178,7 +178,7 @@ def _ensure_auth_role(iam, *, role_name: str, identity_pool_id: str) -> str:
         role_arn = resp["Role"]["Arn"]
         _LOG.info("Created authenticated role: %s", role_arn)
         # New IAM roles can be eventually consistent for set-identity-pool-roles.
-        time.sleep(8)
+        time.sleep(8)  # nosemgrep: arbitrary-sleep IAM eventual consistency wait before set-identity-pool-roles
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "EntityAlreadyExists":
             raise

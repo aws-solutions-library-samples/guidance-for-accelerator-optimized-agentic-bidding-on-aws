@@ -74,7 +74,7 @@ class Row:
 
     def as_csv(self) -> tuple:
         return (self.user_id, self.user_bucket, self.deal_id, self.item_bucket,
-                self.label, self.cohort, self.is_scenario_user, self.provenance)
+                self.label, self.cohort, self.is_scenario_user, self.provenance)  # nosemgrep: is-function-without-parentheses dataclass field, not a method
 
 
 def load_json(path: str) -> dict:
@@ -205,7 +205,7 @@ def generate(spec: Mapping, deal_ids: Sequence[str]) -> list[Row]:
 
 def to_csv_bytes(rows: Iterable[Row]) -> bytes:
     buffer = io.StringIO()
-    writer = csv.writer(buffer, lineterminator="\n")
+    writer = csv.writer(buffer, lineterminator="\n")  # nosemgrep: use-defusedcsv synthetic training rows consumed by the trainer, never opened in a spreadsheet
     writer.writerow(HEADER)
     for row in rows:
         writer.writerow(row.as_csv())
@@ -215,12 +215,12 @@ def to_csv_bytes(rows: Iterable[Row]) -> bytes:
 def stats(rows: Sequence[Row], spec: Mapping) -> dict:
     """Counts for the manifest, including how many generated labels were flipped."""
     by_id = {c["id"]: c for c in spec["cohorts"]}
-    generated = [r for r in rows if not r.is_scenario_user]
+    generated = [r for r in rows if not r.is_scenario_user]  # nosemgrep: is-function-without-parentheses dataclass field, not a method
     flipped = sum(1 for r in generated if r.label != (1 if r.deal_id in positives(by_id[r.cohort]) else 0))
     return {
         "rows": len(rows),
         "users": len({r.user_id for r in rows}),
-        "scenario_users": len({r.user_id for r in rows if r.is_scenario_user}),
+        "scenario_users": len({r.user_id for r in rows if r.is_scenario_user}),  # nosemgrep: is-function-without-parentheses dataclass field, not a method
         "generated_members": len({r.user_id for r in generated}),
         "deals": len({r.deal_id for r in rows}),
         "positive_rows": sum(r.label for r in rows),
