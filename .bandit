@@ -1,0 +1,14 @@
+# Bandit configuration for this guidance. Run with: bandit -r source -c .bandit
+# Each skipped test id carries the reason it is skipped. Findings not listed here are
+# handled inline with a per-line nosec comment that names the reason.
+exclude_dirs:
+  - source/tests
+skips:
+  - B311   # random: synthetic data generation, not cryptography
+  - B404   # subprocess import: fixed binaries invoked with validated arguments
+  - B603   # subprocess without shell: fixed binaries invoked with validated arguments
+  - B607   # partial executable path: fixed binaries invoked with validated arguments
+  - B110   # try/except/pass: best effort cleanup paths
+  - B112   # try/except/continue: best effort cleanup paths
+  - B104   # bind all interfaces: containers bind all interfaces behind a Kubernetes Service
+  - B108   # hardcoded tmp directory: test temp paths

@@ -1,0 +1,3 @@
+# package-dependencies-check: source/frontend-react/package-lock.json is committed, so the
+# unpinned ranges in package.json are resolved to exact versions at install time.
+source/frontend-react/package.json
