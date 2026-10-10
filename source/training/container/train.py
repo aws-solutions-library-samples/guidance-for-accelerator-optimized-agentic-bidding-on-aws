@@ -542,7 +542,7 @@ def load_hyperparameters() -> dict:
     for whatever it didn't specify.
     """
     if os.path.exists(SM_HP_FILE):
-        with open(SM_HP_FILE) as f:
+        with open(SM_HP_FILE, encoding="utf-8") as f:
             raw = {k: _parse_hp_value(v) for k, v in json.load(f).items()}
         return {**_HP_DEFAULTS, **raw}
     # Fallback: read from environment (SM_HP_* prefix)
@@ -1204,7 +1204,7 @@ def main():
     # right width is not evidence that both sides agree on what position two means.
     if model_type == "dlrm_bid_shader":
         manifest_path = os.path.join(SM_MODEL_DIR, dlrm_features.MANIFEST_FILENAME)
-        with open(manifest_path, "w") as f:
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
                 dlrm_features.manifest(
                     model_type,
@@ -1241,7 +1241,7 @@ def main():
         logger.info("Wrote %s", manifest_path)
     elif model_type == NCF_MODEL_TYPE:
         manifest_path = os.path.join(SM_MODEL_DIR, dlrm_features.MANIFEST_FILENAME)
-        with open(manifest_path, "w") as f:
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
                 ncf_manifest(hp, dataset_report, supervised_metrics, calibration),
                 f,
@@ -1265,7 +1265,7 @@ def main():
         "calibration": calibration.get("calibration"),
     }
     metrics_path = os.path.join(SM_MODEL_DIR, "metrics.json")
-    with open(metrics_path, "w") as f:
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)
 
     duration = time.time() - start_time

@@ -459,7 +459,7 @@ class Probe:
         if missing:
             return [self._check("container images", MISSING,
                                 f"{len(expected) - len(missing)}/{len(expected)} repos; "
-                                f"absent: {', '.join(missing)}")]
+                                + f"absent: {', '.join(missing)}")]
         if empty:
             return [self._check("container images", MISSING,
                                 f"repos exist but hold no image: {', '.join(empty)}")]
@@ -1203,7 +1203,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="local Deal Scorer fingerprint; Phase 1 and the Phase 3 engine are stale when it differs")
     args = ap.parse_args(argv)
 
-    if boto3 is None:
+    # boto3 is None only when the import at the top of this file failed. Semgrep
+    # constant-propagates that except-branch sentinel into "None is None".
+    if boto3 is None:  # nosemgrep: identical-is-comparison
         sys.stderr.write("deploy_status: boto3 is required\n")
         return 1
 

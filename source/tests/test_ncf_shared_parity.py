@@ -61,7 +61,7 @@ def app():
 
 
 def _reference_md5_bucket(value: str, n: int) -> int:
-    return int(hashlib.md5(value.encode()).hexdigest(), 16) % n
+    return int(hashlib.md5(value.encode(), usedforsecurity=False).hexdigest(), 16) % n
 
 
 # --------------------------------------------------------------- hash parity

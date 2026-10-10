@@ -417,8 +417,8 @@ def ceiling_remedy(missing: tuple[str, ...] | list[str], config_key: str) -> str
         return ""
     lines = [
         "These intents are not in the Prebid hook's configured list, so the hook "
-        "will never ask for them and this container will never be called on the "
-        "Prebid path:",
+        + "will never ask for them and this container will never be called on the "
+        + "Prebid path:",
         "",
     ]
     lines += [f"  - {i}" for i in missing]
@@ -432,7 +432,7 @@ def ceiling_remedy(missing: tuple[str, ...] | list[str], config_key: str) -> str
         "  kubectl rollout restart deployment/prebid-server",
         "",
         "The config is read at container start, so the restart is required — "
-        "editing the object alone changes nothing.",
+        + "editing the object alone changes nothing.",
     ]
     return "\n".join(lines)
 

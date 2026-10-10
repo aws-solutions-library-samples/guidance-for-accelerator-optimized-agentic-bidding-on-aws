@@ -109,7 +109,9 @@ async def _drive(url: str, token: str, payload: dict, n: int, concurrency: int, 
     sem = asyncio.Semaphore(concurrency)
     records: list[dict] = []
 
-    async def one(i: int, client: httpx.AsyncClient) -> None:
+    # Used by both gather() calls in the `async with` block below; semgrep does not
+    # see usages inside `async with` and reports the function as unused.
+    async def one(i: int, client: httpx.AsyncClient) -> None:  # nosemgrep: useless-inner-function
         body = dict(payload, id=f"{payload.get('id', 'measure')}-{i}")
         async with sem:
             start = time.perf_counter()

@@ -289,8 +289,8 @@ class Scenario:
                 **self.ab_samples.sample_outcomes(n=n),
                 "note": (
                     "First N values of the deterministic control/treatment lists "
-                    "actually fed to the real ABEvaluator (Welch's t-test + SPRT) "
-                    "for this scenario."
+                    + "actually fed to the real ABEvaluator (Welch's t-test + SPRT) "
+                    + "for this scenario."
                 ),
             }
         return {"loop": self.loop, "kind": "none", "records": [], "note": "No sample data for this scenario."}

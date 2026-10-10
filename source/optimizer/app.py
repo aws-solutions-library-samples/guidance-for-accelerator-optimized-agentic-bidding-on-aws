@@ -174,7 +174,7 @@ def _resolve_onnx(source_model_uri: str, workdir: str) -> str:
                 member_path = os.path.realpath(os.path.join(extract_dir, member.name))
                 if not member_path.startswith(os.path.realpath(extract_dir) + os.sep):
                     raise ValueError(f"Unsafe path in archive: {member.name}")
-            tar.extractall(extract_dir)  # nosemgrep: tarfile-extractall — members validated above
+            tar.extractall(extract_dir, filter="data")  # nosemgrep: tarfile-extractall — members validated above
         for root, _dirs, files in os.walk(extract_dir):
             for fname in files:
                 if fname.endswith(".onnx"):
@@ -252,7 +252,7 @@ def _read_manifest(onnx_path: str, source_model_uri: str) -> dict[str, Any] | No
         else:
             return None
     try:
-        with open(candidate) as handle:
+        with open(candidate, encoding="utf-8") as handle:
             loaded = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise OptimizeRequestError(

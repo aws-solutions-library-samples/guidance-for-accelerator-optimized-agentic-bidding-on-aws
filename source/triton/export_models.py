@@ -184,7 +184,7 @@ def export_dlrm(output_dir: str) -> str:
     # These weights are seeded initialisation, not a trained checkpoint. Saying so
     # here means a reader of the manifest does not have to infer it from the path.
     manifest_path = os.path.join(model_dir, dlrm_features.MANIFEST_FILENAME)
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(
             dlrm_features.manifest(
                 "dlrm_bid_shader",

@@ -41,7 +41,13 @@ _CfnLoader.add_multi_constructor("!", _cfn_tag)
 
 
 def _load_template():
-    return yaml.load(TEMPLATE.read_text(), Loader=_CfnLoader)
+    # yaml.safe_load would reject the CloudFormation tags; _CfnLoader is a SafeLoader
+    # with those tags registered, so drive it directly instead of via yaml.load.
+    loader = _CfnLoader(TEMPLATE.read_text())
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def _load_handler_module(monkeypatch, env=None):

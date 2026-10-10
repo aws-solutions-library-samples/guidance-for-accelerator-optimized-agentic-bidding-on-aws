@@ -311,7 +311,7 @@ class GuardrailCheckAdapter:
         if reason == "latency_regression":
             return [
                 f"latency_regression: canary p99 {result.canary_latency_p99:.2f}ms "
-                f"vs stable {result.stable_latency_p99:.2f}ms"
+                + f"vs stable {result.stable_latency_p99:.2f}ms"
             ]
         if reason == "error_rate_breach":
             return [f"error_rate_breach: canary error rate {result.canary_error_rate:.4f}"]

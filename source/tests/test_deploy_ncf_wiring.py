@@ -53,7 +53,13 @@ def deploy_sh():
 
 @pytest.fixture(scope="module")
 def prebid_cfn():
-    return yaml.load(PREBID_CFN.read_text(), Loader=_CfnLoader)
+    # yaml.safe_load would reject the CloudFormation tags; _CfnLoader is a SafeLoader
+    # with those tags registered, so drive it directly instead of via yaml.load.
+    loader = _CfnLoader(PREBID_CFN.read_text())
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def _sed_placeholders(script):
