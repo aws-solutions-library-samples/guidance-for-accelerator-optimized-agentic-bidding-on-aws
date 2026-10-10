@@ -174,6 +174,7 @@ def test_an_absent_incoming_value_is_not_a_conflict():
     (["--ngc-key", "SECRET"], ["--ngc-key", REDACTED]),
     (["--ngc-key=SECRET"], [f"--ngc-key={REDACTED}"]),
     (["--ngc-key"], ["--ngc-key"]),                          # flag with no value
+    (["--ngc-key", "--ngc-key"], ["--ngc-key", REDACTED]),   # value that looks like the flag
     (["--prefix", "stg"], ["--prefix", "stg"]),
     ([], []),
 ])
@@ -334,4 +335,6 @@ def test_redact_preserves_argv_length(argv):
 @settings(max_examples=100, deadline=None)
 @given(st.text(min_size=1, max_size=30).filter(lambda s: s.strip() != ""))
 def test_no_ngc_key_value_survives_redaction(secret):
-    assert secret not in redact(["--ngc-key", secret]) or secret == REDACTED
+    # Check the value slot directly: a membership test on the whole argv is
+    # trivially true when the generated secret equals the flag name itself.
+    assert redact(["--ngc-key", secret]) == ["--ngc-key", REDACTED]
