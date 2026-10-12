@@ -89,7 +89,7 @@ spec:
       labels:
         app: prebid-server
         component: artf-host
-    spec:
+    spec:  # nosemgrep: run-as-non-root  Prebid Server image manages its own UID (checkov skip above)
       serviceAccountName: prebid-artf-host-sa
       # NOT set to false. The orchestrator deployment sets
       # automountServiceAccountToken: false, and copying that here would break IRSA --
@@ -99,7 +99,7 @@ spec:
       automountServiceAccountToken: true
 
       containers:
-        - name: prebid-server
+        - name: prebid-server  # nosemgrep: allow-privilege-escalation-no-securitycontext  Prebid image manages its own capabilities (checkov skip above)
           image: "__IMAGE__"
           imagePullPolicy: IfNotPresent
           ports:

@@ -283,7 +283,7 @@ def _get_jwks(region: str, pool_id: str) -> dict[str, Any]:
         return _jwks_cache
 
     url = f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/.well-known/jwks.json"
-    with urlopen(url) as resp:  # nosec B310  # fixed https URL built from the deploy-time region and pool id
+    with urlopen(url) as resp:  # nosec B310  # nosemgrep: dynamic-urllib-use-detected  fixed https URL built from the deploy-time region and pool id
         _jwks_cache = json.loads(resp.read())
     _jwks_fetched_at = time.time()
     return _jwks_cache

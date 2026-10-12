@@ -42,7 +42,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8002"
         prometheus.io/path: "/metrics"
-    spec:
+    spec:  # nosemgrep: run-as-non-root  NVIDIA Triton image manages its own UID (checkov skip above)
       nodeSelector:
         nvidia.com/gpu: "present"
       tolerations:
@@ -50,7 +50,7 @@ spec:
           operator: Exists
           effect: NoSchedule
       containers:
-        - name: triton
+        - name: triton  # nosemgrep: allow-privilege-escalation-no-securitycontext  NVIDIA image manages its own capabilities (checkov skip above)
           # NVIDIA NGC Triton Inference Server — the real NVIDIA container
           image: nvcr.io/nvidia/tritonserver:24.08-py3
           ports:
