@@ -60,8 +60,7 @@ export const SCENARIOS = [
   //
   // A card's demand line is at most two short sentences: the baseline winner and
   // the with-ARTF winner, with prices. Those prices come from what the code, the
-  // seed and the cohort spec fix (and agree with the live run in
-  // .agents/tasks/ncf-scenario-training-2026-10-07/report.md):
+  // seed and the cohort spec fix:
   //   - which deals the publisher offers on the request (only its open/remnant
   //     deals, see below) and which campaign holds each
   //   - which deals the Deal Scorer activates from its publisher deal library

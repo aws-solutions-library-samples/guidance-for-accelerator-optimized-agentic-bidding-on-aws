@@ -137,8 +137,8 @@ def test_every_deal_stores_the_origin_template(seeder, seed):
 
 
 def test_the_origin_is_rendered_from_the_deploy_prefix(seeder):
-    assert seeder.render_origin("tr3") == "tr3-prebid.example"
-    assert seeder.render_origin("TR3") == "tr3-prebid.example"
+    assert seeder.render_origin("ex7") == "ex7-prebid.example"
+    assert seeder.render_origin("EX7") == "ex7-prebid.example"
     assert seeder.render_origin("") == "prebid.example"
 
 
@@ -238,13 +238,13 @@ def test_only_the_midday_deals_carry_a_minimum_of_five(seed):
 
 
 def test_items_add_record_type_and_seq_and_render_the_origin(seeder, seed):
-    rows = list(seeder.items(seed, "tr3-prebid.example"))
+    rows = list(seeder.items(seed, "ex7-prebid.example"))
     assert len(rows) == len(seed["deals"]) + len(seed["campaigns"])
     deals = [r for r in rows if r["record_type"] == "deal"]
     campaigns = [r for r in rows if r["record_type"] == "campaign"]
     assert [r["seq"] for r in deals] == list(range(len(seed["deals"])))
     assert [r["seq"] for r in campaigns] == list(range(len(seed["campaigns"])))
-    assert {r["origin"] for r in deals} == {"tr3-prebid.example"}
+    assert {r["origin"] for r in deals} == {"ex7-prebid.example"}
     assert all(r["id"] == r["campaign_id"] for r in campaigns)
     assert deals[0]["terms"]["dealfloor"] == Decimal("3.4")
     # The seed itself is not mutated.

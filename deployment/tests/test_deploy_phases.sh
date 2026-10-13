@@ -1786,14 +1786,14 @@ test_k8s_rollout() {
   out="$( (
     set -u
     source "${lib}"
-    aws() { [[ "$*" == *"describe-images --repository-name tr3-prebid-server --image-ids imageTag=v1-abc"* ]] \
+    aws() { [[ "$*" == *"describe-images --repository-name ex7-prebid-server --image-ids imageTag=v1-abc"* ]] \
               && echo "sha256:$(printf 'a%.0s' $(seq 1 64))"; }
     pin_image_in_manifest "${tmp}" "__IMAGE__" "1.dkr.ecr.us-east-1.amazonaws.com" \
-      "tr3-prebid-server" "v1-abc" "us-east-1" && echo "pinned ${PINNED_IMAGE_REF}"
+      "ex7-prebid-server" "v1-abc" "us-east-1" && echo "pinned ${PINNED_IMAGE_REF}"
   ) 2>&1)"
-  assert_contains "$(cat "${tmp}")" "tr3-prebid-server@sha256:aaaaaaaa" "the rendered Prebid image is digest-pinned"
+  assert_contains "$(cat "${tmp}")" "ex7-prebid-server@sha256:aaaaaaaa" "the rendered Prebid image is digest-pinned"
   assert_not_contains "$(cat "${tmp}")" ":v1-abc" "the rendered image does not name the tag"
-  assert_contains "${out}" "pinned 1.dkr.ecr.us-east-1.amazonaws.com/tr3-prebid-server@sha256:" "PINNED_IMAGE_REF is set"
+  assert_contains "${out}" "pinned 1.dkr.ecr.us-east-1.amazonaws.com/ex7-prebid-server@sha256:" "PINNED_IMAGE_REF is set"
 
   # No readable digest: the render fails instead of falling back to the tag.
   printf 'image: "__IMAGE__"\n' >"${tmp}"
