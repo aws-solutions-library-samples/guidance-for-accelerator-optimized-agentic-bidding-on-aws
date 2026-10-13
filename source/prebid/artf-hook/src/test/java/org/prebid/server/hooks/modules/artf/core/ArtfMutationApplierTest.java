@@ -113,12 +113,9 @@ class ArtfMutationApplierTest {
     // ---------------------------------------------------------------- examples
 
     /**
-     * The gate's finding, pinned: a floor is always written with its currency.
-     *
-     * <p>Prebid drops an impression from its floor-enforcement map unless
-     * {@code bidfloorcur} is non-blank ({@code ExchangeService.java:766-770}). A floor without
-     * a currency therefore applies and changes nothing -- the mutation is visible in the
-     * request and cannot reject a single bid.
+     * A deal floor is always written with its currency, on the deal, and the impression is
+     * not written. The same vector as {@code tests/test_artf_applier.py}
+     * {@code test_a_deal_floor_mutation_writes_both_the_floor_and_the_currency}.
      */
     @Test
     void aDealFloorMutationWritesBothTheFloorAndTheCurrency() {
@@ -132,32 +129,38 @@ class ArtfMutationApplierTest {
         final Deal deal = imp.getPmp().getDeals().get(0);
 
         assertThat(deal.getBidfloor()).isEqualByComparingTo("2.50");
-        assertThat(deal.getBidfloorcur()).isNotBlank();
+        assertThat(deal.getBidfloorcur()).isEqualTo("USD");
 
-        // And the IMPRESSION floor too, because that is the value Prebid's enforcer compares.
-        assertThat(imp.getBidfloor()).isEqualByComparingTo("2.50");
-        assertThat(imp.getBidfloorcur()).isNotBlank();
+        // The impression carried no floor and still carries none.
+        assertThat(imp.getBidfloor()).isNull();
+        assertThat(imp.getBidfloorcur()).isNull();
     }
 
     /**
-     * A mutation never lowers a floor the publisher already set.
-     *
-     * <p>Lowering one would let the enrichment weaken the publisher's own protection, which is
-     * not a decision an agent gets to make.
+     * A deal floor above the impression floor leaves the impression floor alone, so non-deal
+     * bids keep the publisher's floor. Same vector as the Python and JS appliers: imp 2.50
+     * USD, deal 1.00, mutation 4.00.
      */
     @Test
-    void anImpressionFloorIsNeverLoweredByAMutation() {
-        final BidRequest base = requestWithDeal("imp-1", "deal-1", BigDecimal.valueOf(1.00));
-        final Imp withPublisherFloor = base.getImp().get(0).toBuilder()
-                .bidfloor(BigDecimal.valueOf(5.00))
-                .bidfloorcur("USD")
-                .build();
-        final BidRequest request = base.toBuilder().imp(List.of(withPublisherFloor)).build();
+    void aDealFloorAboveTheImpressionFloorLeavesTheImpressionFloorAlone() {
+        final BidRequest request = requestWithPublisherFloor(BigDecimal.valueOf(2.50));
+
+        final ApplicationResult result = applier.apply(request, List.of(dealFloor("imp-1", "deal-1", 4.00)));
+
+        assertThat(result.dispositions().get(0).applied()).isTrue();
+        final Imp imp = result.bidRequest().getImp().get(0);
+        assertThat(imp.getPmp().getDeals().get(0).getBidfloor()).isEqualByComparingTo("4.00");
+        assertThat(imp.getBidfloor()).isEqualByComparingTo("2.50");
+        assertThat(imp.getBidfloorcur()).isEqualTo("USD");
+    }
+
+    /** A deal floor below the impression floor leaves the impression floor alone too. */
+    @Test
+    void aDealFloorBelowTheImpressionFloorLeavesTheImpressionFloorAlone() {
+        final BidRequest request = requestWithPublisherFloor(BigDecimal.valueOf(5.00));
 
         final ApplicationResult result = applier.apply(request, List.of(dealFloor("imp-1", "deal-1", 2.50)));
 
-        // The deal's own floor takes the mutation's value; the impression floor holds at the
-        // publisher's higher one.
         assertThat(result.bidRequest().getImp().get(0).getPmp().getDeals().get(0).getBidfloor())
                 .isEqualByComparingTo("2.50");
         assertThat(result.bidRequest().getImp().get(0).getBidfloor()).isEqualByComparingTo("5.00");
@@ -339,6 +342,15 @@ class ArtfMutationApplierTest {
                                 .build())
                         .build()))
                 .build();
+    }
+
+    private static BidRequest requestWithPublisherFloor(BigDecimal impFloor) {
+        final BidRequest base = requestWithDeal("imp-1", "deal-1", BigDecimal.valueOf(1.00));
+        final Imp withPublisherFloor = base.getImp().get(0).toBuilder()
+                .bidfloor(impFloor)
+                .bidfloorcur("USD")
+                .build();
+        return base.toBuilder().imp(List.of(withPublisherFloor)).build();
     }
 
     private static ArtfMutation dealFloor(String impId, String dealId, double floor) {

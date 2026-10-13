@@ -80,7 +80,7 @@ describe('ApprovalReason rendering', () => {
     container.remove();
   });
 
-  const render = (props) => act(() => root.render(<ApprovalReason {...props} />));
+  const render = (props) => act(() => root.render(<ApprovalReason {...props} /> /* nosemgrep: react-props-spreading test helper forwards per-test props */));
 
   it('puts the FULL reason on the title attribute for hover', () => {
     render({ status: 'Rejected', reason: REAL_OPTIMIZATION_FAILURE });

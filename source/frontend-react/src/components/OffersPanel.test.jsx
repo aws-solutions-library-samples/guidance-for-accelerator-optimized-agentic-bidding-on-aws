@@ -58,7 +58,8 @@ describe("OffersPanel", () => {
     expect(winner).not.toBeNull();
     expect(winner.textContent).toMatch(/deal-home-premium/);
     expect(winner.textContent).toMatch(/Cedar & Co Furnishings/);
-    expect(winner.textContent).toMatch(/cleared at \$6\.35/);
+    const price = capturedBidResponse.seatbid[0].bid[0].price.toFixed(2);
+    expect(winner.textContent).toContain(`cleared at $${price}`);
     expect(q("offers-panel-unsold")).toBeNull();
   });
 

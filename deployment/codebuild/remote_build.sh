@@ -16,6 +16,9 @@
 #   --target TARGET     Build target: all|part1|nemo|agents|optimizer (default: all)
 #   --tag TAG           Docker image tag (default: git short SHA)
 #   --nemo-src-tag TAG  Extra content-hash tag for the NeMo image (src-<hash>)
+#   --src-tags LIST     Space-separated REPO=src-<hash> pairs; after every image
+#                       in the build is pushed, CodeBuild adds each src tag to
+#                       REPO:TAG (deploy.sh's content-hash cache)
 #   --ngc-secret NAME   Secrets Manager secret name for NGC API key
 #   --no-wait           Start build and exit without waiting for completion
 #   --region REGION     AWS region (default: $AWS_REGION or us-east-1)
@@ -70,6 +73,9 @@ IMAGE_TAG=""
 # deploy_closed_loop.sh. Pushed alongside dlrm/ncf so a later run can tell
 # whether the image matches source/training/container/ as it stands now.
 NEMO_SRC_TAG=""
+# REPO=src-<hash> pairs from deploy.sh build_images(). Tagged inside CodeBuild so
+# the cache survives a deploy.sh that is killed while waiting for the build.
+SRC_TAGS=""
 NGC_SECRET=""
 NGC_KEY=""
 NO_WAIT=0
@@ -87,6 +93,8 @@ for arg in "$@"; do
     --tag)          ;; # value in next arg
     --nemo-src-tag=*) NEMO_SRC_TAG="${arg#--nemo-src-tag=}" ;;
     --nemo-src-tag) ;; # value in next arg
+    --src-tags=*)   SRC_TAGS="${arg#--src-tags=}" ;;
+    --src-tags)     ;; # value in next arg
     --ngc-secret=*) NGC_SECRET="${arg#--ngc-secret=}" ;;
     --ngc-secret)   ;; # value in next arg
     --ngc-key=*)    NGC_KEY="${arg#--ngc-key=}" ;;
@@ -102,6 +110,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--only" ]]; then BUILD_ONLY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--tag" ]]; then IMAGE_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--nemo-src-tag" ]]; then NEMO_SRC_TAG="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--src-tags" ]]; then SRC_TAGS="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-secret" ]]; then NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then NGC_KEY="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--region" ]]; then AWS_REGION="${arg}"
@@ -123,7 +132,7 @@ for arg in "$@"; do
 done
 # A flag that takes a value must not be the last argument.
 case "${_PREV_ARG:-}" in
-  --stack-name|--target|--only|--tag|--nemo-src-tag|--ngc-secret|--ngc-key|--region|--profile)
+  --stack-name|--target|--only|--tag|--nemo-src-tag|--src-tags|--ngc-secret|--ngc-key|--region|--profile)
     printf '\033[0;31m[fail]\033[0m %s requires a value\n' "${_PREV_ARG}" >&2; exit 1 ;;
 esac
 unset _PREV_ARG
@@ -387,7 +396,8 @@ ENV_OVERRIDES="[
   {\"name\":\"STACK_NAME\",\"value\":\"${STACK_NAME}\",\"type\":\"PLAINTEXT\"},
   {\"name\":\"AWS_ACCOUNT_ID\",\"value\":\"${ACCOUNT_ID}\",\"type\":\"PLAINTEXT\"},
   {\"name\":\"AWS_DEFAULT_REGION\",\"value\":\"${AWS_REGION}\",\"type\":\"PLAINTEXT\"},
-  {\"name\":\"NEMO_SRC_TAG\",\"value\":\"${NEMO_SRC_TAG}\",\"type\":\"PLAINTEXT\"}
+  {\"name\":\"NEMO_SRC_TAG\",\"value\":\"${NEMO_SRC_TAG}\",\"type\":\"PLAINTEXT\"},
+  {\"name\":\"SRC_TAGS\",\"value\":\"${SRC_TAGS}\",\"type\":\"PLAINTEXT\"}
 ]"
 
 if [[ -n "${NGC_SECRET}" ]]; then
@@ -541,7 +551,7 @@ while true; do
     --region "${AWS_REGION}" \
     --query 'builds[0].currentPhase' --output text 2>/dev/null || echo "UNKNOWN")
 
-  ELAPSED=$(( $(date +%s) - POLL_START ))
+  ELAPSED=$(( $(date +%s) - POLL_START ))  # nosemgrep: unquoted-command-substitution-in-command arithmetic context, not subject to word splitting
 
   case "${BUILD_STATUS}" in
     SUCCEEDED)

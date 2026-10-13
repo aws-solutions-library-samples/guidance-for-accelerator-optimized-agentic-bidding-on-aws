@@ -10,10 +10,11 @@
 # It exists because two defects in this feature were invisible to both unit tests
 # and live inspection:
 #
-#   - the demand Lambda's S3 key was derived from the Prebid Java build-context
-#     hash, so a Python-only change produced the same key, CloudFormation saw no
-#     change, and the function kept serving the previous package. The fix looked
-#     like it worked only because it had been applied by hand;
+#   - the demand package's key was derived from the Prebid Java build-context
+#     hash, so a Python-only change produced the same key and the previous package
+#     kept serving. The fix looked like it worked only because it had been applied
+#     by hand. (The demand service is now an in-cluster image tagged by its own
+#     sources and deployed by digest.)
 #   - the configuration overlay was uploaded only when absent, so a template
 #     change reached a fresh account and silently never reached a cluster that had
 #     already been deployed.
@@ -83,14 +84,18 @@ PY
 RESTORED="$(demand_hash)"
 
 [[ "${BEFORE}" != "${CHANGED}" ]] \
-  && ok "a one-line source change moves the demand key (${BEFORE} -> ${CHANGED})" \
-  || bad "the demand key did not move, so a source change would not redeploy"
+  && ok "a one-line source change moves the demand image tag (${BEFORE} -> ${CHANGED})" \
+  || bad "the demand image tag did not move, so a source change would not redeploy"
 [[ "${BEFORE}" == "${RESTORED}" ]] \
   && ok "the key returns when the change is reverted" \
   || bad "the key did not return (${BEFORE} vs ${RESTORED})"
-grep -q 'DEMAND_KEY="prebid-lambda/demand-\${DEMAND_HASH}' deployment/deploy_prebid.sh \
-  && ok "DEMAND_KEY is derived from the source hash" \
-  || bad "DEMAND_KEY is not derived from the source hash"
+grep -q 'DEMAND_IMAGE_TAG="demand-' deployment/deploy_prebid.sh \
+  && ok "the demand image tag is derived from the source hash" \
+  || bad "the demand image tag is not derived from the source hash"
+grep -q 'pin_image_in_manifest "${processed}" "__DEMAND_IMAGE__"' deployment/deploy_prebid.sh \
+  && grep -q 'pin_image_in_manifest "${PROCESSED}" "__IMAGE__"' deployment/deploy_prebid.sh \
+  && ok "both images are deployed by digest" \
+  || bad "an image is deployed by tag, so a re-pushed tag would not roll out"
 grep -q 'rendered-sha' deployment/deploy_prebid.sh \
   && ok "the config overlay is compared against its own recorded render" \
   || bad "the config overlay has no render stamp, so template changes may not apply"

@@ -15,6 +15,7 @@
 // Pure. No I/O, no clock, no randomness.
 
 import { effectiveFloor, publisherTake } from "./sellSideKpis.js";
+import { isAppliedValue } from "./theaterBeats.js";
 
 /** Rows shown in the left column at the recap: the headline set. */
 export const SHORT_ROWS = Object.freeze(["mutations", "outcome", "cleared", "deal", "offers"]);
@@ -77,6 +78,20 @@ function hopMs(bidResponse) {
   const ms = bidResponse?.artf_meta?.hop_ms;
   return isNum(ms) ? ms : null;
 }
+/**
+ * Prebid's own per-seat bidder times (`ext.responsetimemillis`), as
+ * "artfhouse 85 ms, amt 2 ms". Most of the round trip is these calls, so the row
+ * names them. Null when the response does not carry them.
+ */
+function seatTimes(bidResponse) {
+  const times = bidResponse?.ext?.responsetimemillis;
+  if (!times || typeof times !== "object") return null;
+  const parts = Object.entries(times)
+    .filter(([, ms]) => isNum(ms))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([seat, ms]) => `${seat} ${ms} ms`);
+  return parts.length ? parts.join(", ") : null;
+}
 
 /**
  * What the orchestrator says it asked the ARTF extension point to do for this
@@ -97,6 +112,9 @@ function mutationMode(bidResponse) {
 function containersApplied(values) {
   const names = new Set();
   for (const v of values) {
+    // A rejected or superseded value is on screen, marked, but did not change the
+    // auction, so its container is not counted as having applied anything.
+    if (!isAppliedValue(v)) continue;
     const name = v?.displayLabel ?? v?.containerName;
     if (typeof name === "string" && name) names.add(name);
   }
@@ -224,13 +242,16 @@ export function compareOutcomes({
 
   const wHop = hopMs(baselineResponse);
   const aHop = hopMs(artfResponse);
+  const bidders = seatTimes(artfResponse) ?? seatTimes(baselineResponse);
   push(
     "roundtrip",
     "Auction round trip",
     isNum(wHop) ? `${wHop} ms` : (without ? NOT_REPORTED : null),
     isNum(aHop) ? `${aHop} ms` : (withArtf ? NOT_REPORTED : null),
     isNum(wHop) && isNum(aHop) ? signed(aHop - wHop, (n) => `${n} ms`) : null,
-    "orchestrator to Prebid and back, including the ARTF hook on the with side",
+    bidders
+      ? `orchestrator to Prebid and back; bidder calls inside it: ${bidders}; the with side also runs the ARTF hook`
+      : "orchestrator to Prebid and back, including the bidder calls and, on the with side, the ARTF hook",
   );
 
   // Floor and margin exist only on the with-ARTF side: pass 1 consulted no

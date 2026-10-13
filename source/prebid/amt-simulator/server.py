@@ -84,6 +84,10 @@ for _name, _default in _REQUIRED_DEFAULTS.items():
 
 class SimulatorHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # TCP_NODELAY. The headers and the body go out as two writes; on a kept-alive
+    # connection Nagle held the body until the client's delayed ACK, which measured
+    # as 47 to 50 ms per bid instead of 2 to 4.
+    disable_nagle_algorithm = True
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)

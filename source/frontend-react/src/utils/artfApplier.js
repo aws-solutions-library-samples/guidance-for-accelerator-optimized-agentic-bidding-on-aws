@@ -6,10 +6,11 @@
 // the other two assert.
 //
 //   /user/data/segment          ACTIVATE_SEGMENTS   append { name: "artf", segment: [...] } to user.data
-//   /imp/{imp}                  ACTIVATE_DEALS      add { id } to imp.pmp.deals (no duplicate)
+//   /imp/{imp}                  ACTIVATE_DEALS      add { id } to imp.pmp.deals (no duplicate);
+//                                                   with options.dealLookup, also { at }
 //                               SUPPRESS_DEALS      set deal.ext.artf.suppressed = true
-//   /imp/{imp}/deals/{deal}     ADJUST_DEAL_FLOOR   deal.bidfloor (+bidfloorcur), imp.bidfloor = max(existing, new)
-//                               ADJUST_DEAL_MARGIN  (PERCENT value is a fraction)
+//   /imp/{imp}/deals/{deal}     ADJUST_DEAL_FLOOR   deal.bidfloor (+bidfloorcur); imp.bidfloor untouched
+//                               ADJUST_DEAL_MARGIN  same target (PERCENT value is a fraction)
 //   /imp/{imp}/metric           ADD_METRICS/ADD_CIDS append to imp.metric, value in [0, 1]
 //   /seatbid/{seat}/bid/{bid}   BID_SHADE           bid.price on bid_response
 //
@@ -24,6 +25,11 @@
 //
 // Each mutation is all-or-nothing: applied on a copy, adopted only on success.
 // Inputs are never mutated. Pure.
+//
+// options.dealLookup (deal id -> OpenRTB `at`, or null) mirrors deal_lookup in
+// shared/artf_applier.py: an activated deal then carries its auction type. A
+// lookup that throws leaves the insert id-only and never rejects the mutation.
+// No frontend caller has a deal book today, so the shared vectors run without it.
 
 const DEFAULT_CURRENCY = "USD";
 const METRIC_MIN = 0;
@@ -54,7 +60,7 @@ function resolvePath(path) {
     if (parts.length === 4 && parts[2] === "bid" && parts[1] && parts[3]) {
       return { kind: "bid_price", seat: parts[1], bidId: parts[3] };
     }
-    throw new Reject(`path '${path}' addresses the auction response but does not name /seatbid/{seat}/bid/{bidId}`);
+    throw new Reject(`path '${path}' addresses the auction response but does not name /seatbid/{seat}/bid/{bidId}`); // nosemgrep: missing-template-string-indicator the braces are literal path placeholders in the message
   }
   if (parts[0] === "imp") {
     if (parts.length === 2 && parts[1]) return { kind: "imp_deals", impId: parts[1] };
@@ -96,7 +102,19 @@ function applyUserSegments(req, intent, payload) {
   return [`/bid_request/user/data/${req.user.data.length - 1}`];
 }
 
-function applyImpDeals(req, intent, payload, impId) {
+function activatedDeal(id, dealLookup) {
+  const deal = { id };
+  if (typeof dealLookup !== "function") return deal;
+  let at;
+  try {
+    at = dealLookup(id);
+  } catch {
+    return deal;
+  }
+  if (Number.isInteger(at) && at > 0) deal.at = at;
+  return deal;
+}
+function applyImpDeals(req, intent, payload, impId, dealLookup) {
   const idx = impIndex(req, impId);
   if (idx < 0) throw new Reject(`no impression with id '${impId}'`);
   const ids = idsOf(payload);
@@ -110,7 +128,7 @@ function applyImpDeals(req, intent, payload, impId) {
     const present = new Set(deals.map((d) => d?.id));
     for (const id of ids) {
       if (!present.has(id)) {
-        deals.push({ id });
+        deals.push(activatedDeal(id, dealLookup));
         present.add(id);
         written.push(`/bid_request/imp/${idx}/pmp/deals/${deals.length - 1}`);
       }
@@ -158,11 +176,10 @@ function applyDealFloor(req, intent, payload, impId, dealId) {
   if (newFloor === null) throw new Reject("mutation supplied no usable floor or margin value");
   if (newFloor <= 0) throw new Reject(`resulting floor ${newFloor} is not greater than zero, which Prebid ignores`);
   const currency = currencyFor(req, deal, imp);
+  // The deal floor binds deal bids only; imp.bidfloor stays the publisher's.
   deal.bidfloor = newFloor;
   deal.bidfloorcur = currency;
-  imp.bidfloor = isNum(imp.bidfloor) ? Math.max(imp.bidfloor, newFloor) : newFloor;
-  imp.bidfloorcur = currency;
-  return [`/bid_request/imp/${idx}/pmp/deals/${di}/bidfloor`, `/bid_request/imp/${idx}/bidfloor`];
+  return [`/bid_request/imp/${idx}/pmp/deals/${di}/bidfloor`];
 }
 
 function applyImpMetrics(req, intent, payload, impId) {
@@ -217,10 +234,12 @@ function applyBidPrice(resp, intent, payload, seat, bidId) {
 
 /**
  * Apply `mutations` in order to an ARTF envelope `{ bid_request, bid_response? }`.
+ * `options.dealLookup` gives an activated deal its auction type (see the header).
  *
  * @returns {{ envelope: object, dispositions: {intent, path, applied, reason, written}[] }}
  */
-export function applyMutationsToEnvelope(envelope, mutations) {
+export function applyMutationsToEnvelope(envelope, mutations, options = {}) {
+  const dealLookup = options?.dealLookup;
   let current = clone(envelope && typeof envelope === "object" ? envelope : {});
   if (!current.bid_request || typeof current.bid_request !== "object") current.bid_request = {};
   const dispositions = [];
@@ -241,7 +260,7 @@ export function applyMutationsToEnvelope(envelope, mutations) {
           written = applyUserSegments(candidate.bid_request, intent, m.payload);
           break;
         case "imp_deals":
-          written = applyImpDeals(candidate.bid_request, intent, m.payload, target.impId);
+          written = applyImpDeals(candidate.bid_request, intent, m.payload, target.impId, dealLookup);
           break;
         case "deal_floor":
           written = applyDealFloor(candidate.bid_request, intent, m.payload, target.impId, target.dealId);
@@ -294,7 +313,7 @@ export function stringifyWithPointers(value) {
     } else if (node !== null && typeof node === "object") {
       const keys = Object.keys(node).filter((k) => node[k] !== undefined && typeof node[k] !== "function");
       if (keys.length === 0) {
-        lines.push(`${pad}${prefix}{}${suffix}`);
+        lines.push(`${pad}${prefix}{}${suffix}`); // nosemgrep: missing-template-string-indicator the braces render an empty JSON object literal
       } else {
         lines.push(`${pad}${prefix}{`);
         keys.forEach((k, i) => {

@@ -128,6 +128,13 @@ spec:
             # trade toggle responsiveness against DynamoDB read volume.
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
+            # Deals table (base stack, Step 1.5), read-only (Step 7.5 DealsBook
+            # statement). The orchestrator reads each activated deal's auction type
+            # from it (shared/deal_library.py snapshot, refreshed every 30 s) so the
+            # working request carries OpenRTB `at`. Unreachable means activated
+            # deals are inserted id-only and a warning is logged; auctions continue.
+            - name: DEALS_TABLE
+              value: "__STACK_NAME__-deals"
             # A running load test lives in one replica's memory. A replica that
             # does not know a test id asks its siblings, found through the
             # headless orchestrator-grpc Service below, and skips its own address

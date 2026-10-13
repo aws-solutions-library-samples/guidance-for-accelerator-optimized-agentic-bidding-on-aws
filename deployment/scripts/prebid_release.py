@@ -203,12 +203,6 @@ def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostD
                 basis="per build-minute, not a standing cost",
                 source="charged per build; zero when idle",
             ),
-            CostComponent(
-                name="API Gateway + Lambda (demand endpoint)",
-                monthly_usd=0.0,
-                basis="per request; no standing charge",
-                source="charged per request; zero when idle",
-            ),
         )
     )
 
@@ -234,7 +228,7 @@ def format_cost_disclosure(disclosure: CostDisclosure) -> str:
     lines.append("")
     lines.append(f"  Known standing total: ${disclosure.known_total:.2f}/month")
 
-    if not disclosure.is_complete:
+    if not disclosure.is_complete:  # nosemgrep: is-function-without-parentheses is_complete is a property
         lines.append("")
         lines.append("  INCOMPLETE. These components have no figure yet:")
         for component in disclosure.unknown_components:

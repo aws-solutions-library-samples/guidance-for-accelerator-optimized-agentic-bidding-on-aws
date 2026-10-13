@@ -77,7 +77,7 @@ export default function GpuControl() {
       const data = await resp.json();
       if (data.error) {
         setStatus("error");
-        alert("Failed to start GPUs: " + data.error);
+        alert("Failed to start GPUs: " + data.error); // nosemgrep: javascript-alert operator-facing GPU control; a native dialog is the intended error surface
       }
     } catch (_) {
       setStatus("error");
@@ -87,7 +87,7 @@ export default function GpuControl() {
   }, []);
 
   const handleStop = useCallback(async () => {
-    if (!confirm("Stop GPU nodes? Triton inference will be unavailable until you start them again.")) return;
+    if (!confirm("Stop GPU nodes? Triton inference will be unavailable until you start them again.")) return; // nosemgrep: javascript-confirm operator-facing GPU control; a native dialog is the intended confirmation for scaling down
     setBusy(true);
     setStatus("scaling-down");
     try {
@@ -95,7 +95,7 @@ export default function GpuControl() {
       const data = await resp.json();
       if (data.error) {
         setStatus("error");
-        alert("Failed to stop GPUs: " + data.error);
+        alert("Failed to stop GPUs: " + data.error); // nosemgrep: javascript-alert operator-facing GPU control; a native dialog is the intended error surface
       }
     } catch (_) {
       setStatus("error");

@@ -49,7 +49,7 @@ function render(visible, extra = {}) {
         cardState="idle"
         contributors={null}
         view={CARD_VIEW.VISUAL}
-        {...extra}
+        {...extra} /* nosemgrep: react-props-spreading test helper forwards per-test props */
       />,
     );
   });

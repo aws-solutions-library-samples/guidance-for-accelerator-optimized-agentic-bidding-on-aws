@@ -15,7 +15,7 @@ function envelope() {
           banner: { w: 300, h: 250 },
           bidfloor: 2.5,
           bidfloorcur: "USD",
-          pmp: { deals: [{ id: "deal-remnant-open", bidfloor: 1.0, at: 3 }] },
+          pmp: { deals: [{ id: "deal-remnant-open-hearth", bidfloor: 1.0, at: 3 }] },
         },
       ],
       user: { id: "user-1", data: [{ id: "dmp", segment: [{ id: "seg-1" }] }] },
@@ -33,14 +33,14 @@ describe("ACTIVATE_DEALS lands on imp.pmp.deals", () => {
   it("adds the activated deal and reports where it wrote", () => {
     const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [activate(["deal-home-premium"])]);
     expect(dispositions[0].applied).toBe(true);
-    expect(out.bid_request.imp[0].pmp.deals.map((d) => d.id)).toEqual(["deal-remnant-open", "deal-home-premium"]);
+    expect(out.bid_request.imp[0].pmp.deals.map((d) => d.id)).toEqual(["deal-remnant-open-hearth", "deal-home-premium"]);
     expect(dispositions[0].written).toEqual(["/bid_request/imp/0/pmp/deals/1"]);
     // The defect this replaces: the activated deal survives serialisation.
     expect(JSON.stringify(out)).toContain("deal-home-premium");
   });
 
   it("does not duplicate a deal already offered", () => {
-    const { envelope: out } = applyMutationsToEnvelope(envelope(), [activate(["deal-remnant-open"])]);
+    const { envelope: out } = applyMutationsToEnvelope(envelope(), [activate(["deal-remnant-open-hearth"])]);
     expect(out.bid_request.imp[0].pmp.deals).toHaveLength(1);
   });
 
@@ -58,7 +58,7 @@ describe("ACTIVATE_DEALS lands on imp.pmp.deals", () => {
     ]);
     expect(dispositions.every((d) => d.applied)).toBe(true);
     expect(out.bid_request.imp[0].pmp.deals[1]).toEqual({ id: "deal-home-premium", bidfloor: 3.0, bidfloorcur: "USD" });
-    expect(out.bid_request.imp[0].bidfloor).toBe(3.0);
+    expect(out.bid_request.imp[0].bidfloor).toBe(2.5);
   });
 
   it("a floor before its activation is rejected with a reason", () => {
@@ -69,32 +69,70 @@ describe("ACTIVATE_DEALS lands on imp.pmp.deals", () => {
   });
 });
 
+// Mirrors deal_lookup in shared/artf_applier.py. Not part of the shared vectors,
+// which run without a lookup.
+describe("ACTIVATE_DEALS with a deal lookup", () => {
+  const lookup = (id) => ({ "deal-home-premium": 2, "deal-premium-auto": 1 })[id] ?? null;
+  it("gives the activated deal its auction type", () => {
+    const { envelope: out, dispositions } = applyMutationsToEnvelope(
+      envelope(), [activate(["deal-home-premium", "deal-premium-auto"])], { dealLookup: lookup },
+    );
+    expect(dispositions[0].applied).toBe(true);
+    expect(out.bid_request.imp[0].pmp.deals.slice(1)).toEqual([
+      { id: "deal-home-premium", at: 2 },
+      { id: "deal-premium-auto", at: 1 },
+    ]);
+  });
+  it("inserts a deal the book does not hold id-only", () => {
+    const { envelope: out } = applyMutationsToEnvelope(envelope(), [activate(["deal-x"])], { dealLookup: lookup });
+    expect(out.bid_request.imp[0].pmp.deals[1]).toEqual({ id: "deal-x" });
+  });
+  it("inserts id-only and still applies when the lookup throws", () => {
+    const throwing = () => {
+      throw new Error("deal book not loaded");
+    };
+    const { envelope: out, dispositions } = applyMutationsToEnvelope(
+      envelope(), [activate(["deal-home-premium"])], { dealLookup: throwing },
+    );
+    expect(dispositions[0].applied).toBe(true);
+    expect(out.bid_request.imp[0].pmp.deals[1]).toEqual({ id: "deal-home-premium" });
+  });
+});
 describe("Java vectors", () => {
   it("a deal floor mutation writes both the floor and the currency", () => {
     const env = envelope();
     delete env.bid_request.imp[0].bidfloorcur;
-    const { envelope: out } = applyMutationsToEnvelope(env, [floor("deal-remnant-open", 4.0)]);
+    const { envelope: out } = applyMutationsToEnvelope(env, [floor("deal-remnant-open-hearth", 4.0)]);
     const deal = out.bid_request.imp[0].pmp.deals[0];
     expect(deal.bidfloor).toBe(4.0);
     expect(deal.bidfloorcur).toBe("USD");
-    expect(out.bid_request.imp[0].bidfloorcur).toBe("USD");
+    expect(out.bid_request.imp[0].bidfloorcur).toBeUndefined();
   });
 
-  it("an impression floor is never lowered by a mutation", () => {
-    const { envelope: out } = applyMutationsToEnvelope(envelope(), [floor("deal-remnant-open", 1.5)]);
+  it("a deal floor above the impression floor leaves the impression floor alone", () => {
+    const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [floor("deal-remnant-open-hearth", 4.0)]);
+    expect(dispositions[0].applied).toBe(true);
+    expect(out.bid_request.imp[0].pmp.deals[0].bidfloor).toBe(4.0);
+    expect(out.bid_request.imp[0].bidfloor).toBe(2.5);
+    expect(out.bid_request.imp[0].bidfloorcur).toBe("USD");
+    expect(dispositions[0].written).toEqual(["/bid_request/imp/0/pmp/deals/0/bidfloor"]);
+  });
+
+  it("a deal floor below the impression floor leaves the impression floor alone", () => {
+    const { envelope: out } = applyMutationsToEnvelope(envelope(), [floor("deal-remnant-open-hearth", 1.5)]);
     expect(out.bid_request.imp[0].pmp.deals[0].bidfloor).toBe(1.5);
     expect(out.bid_request.imp[0].bidfloor).toBe(2.5);
   });
 
   it("a non-positive floor is rejected rather than written and ignored", () => {
-    const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [floor("deal-remnant-open", 0)]);
+    const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [floor("deal-remnant-open-hearth", 0)]);
     expect(dispositions[0].applied).toBe(false);
     expect(dispositions[0].reason).toContain("not greater than zero");
     expect(out).toEqual(envelope());
   });
 
   it("suppression marks the deal rather than removing it", () => {
-    const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [suppress(["deal-remnant-open"])]);
+    const { envelope: out, dispositions } = applyMutationsToEnvelope(envelope(), [suppress(["deal-remnant-open-hearth"])]);
     expect(out.bid_request.imp[0].pmp.deals).toHaveLength(1);
     expect(out.bid_request.imp[0].pmp.deals[0].ext.artf.suppressed).toBe(true);
     expect(dispositions[0].written).toEqual(["/bid_request/imp/0/pmp/deals/0/ext"]);
@@ -152,12 +190,12 @@ describe("margins", () => {
   });
 
   it("a PERCENT margin scales the deal floor by the fraction", () => {
-    const { envelope: out } = applyMutationsToEnvelope(envelope(), [margin("deal-remnant-open", 0.5, 1)]);
+    const { envelope: out } = applyMutationsToEnvelope(envelope(), [margin("deal-remnant-open-hearth", 0.5, 1)]);
     expect(out.bid_request.imp[0].pmp.deals[0].bidfloor).toBeCloseTo(1.5);
   });
 
   it("a CPM margin adds to the deal floor", () => {
-    const { envelope: out } = applyMutationsToEnvelope(envelope(), [margin("deal-remnant-open", 0.75, 0)]);
+    const { envelope: out } = applyMutationsToEnvelope(envelope(), [margin("deal-remnant-open-hearth", 0.75, 0)]);
     expect(out.bid_request.imp[0].pmp.deals[0].bidfloor).toBeCloseTo(1.75);
   });
 });

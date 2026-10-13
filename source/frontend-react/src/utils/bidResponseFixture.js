@@ -30,7 +30,7 @@ export const capturedBidResponse = Object.freeze({
         {
           id: "bid-1",
           impid: "imp-1",
-          price: 6.35,
+          price: 6.8,
           dealid: "deal-home-premium",
           adomain: ["cedarandco.example"],
           crid: "cr-cedar-300x250",
@@ -38,7 +38,7 @@ export const capturedBidResponse = Object.freeze({
           h: 250,
           ext: {
             prebid: {
-              targeting: { hb_pb: "6.30", hb_bidder: "artfhouse" },
+              targeting: { hb_pb: "6.80", hb_bidder: "artfhouse" },
               artf: {
                 campaignId: "camp-cedar",
                 campaignName: "Cedar & Co Furnishings",

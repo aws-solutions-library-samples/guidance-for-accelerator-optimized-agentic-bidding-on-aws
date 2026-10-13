@@ -218,6 +218,12 @@ class TestTriggerTraining:
         assert hp["eta"] == "0.1"
         assert "reward_function" not in hp
         assert "rl_learning_rate" not in hp
+        # The built-in container rejects any key outside XGBoost's own list.
+        assert set(hp) == {"max_depth", "eta", "num_round", "objective"}
+        # It also reads SM_CHANNEL_TRAIN, so the channel must be "train".
+        assert call_kwargs["InputDataConfig"][0]["ChannelName"] == "train"
+        tags = {t["Key"]: t["Value"] for t in call_kwargs["Tags"]}
+        assert tags["base_model_version"] == "v1.0.0"
 
     def test_raises_runtime_error_on_job_failure(self):
         client = _make_mock_sagemaker_client(training_status="Failed")

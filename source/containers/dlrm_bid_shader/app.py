@@ -209,6 +209,36 @@ else:
 # ARTF mutate
 # ---------------------------------------------------------------------------
 
+def _floor_for_bid(bid_request: dict, bid: dict) -> float:
+    """The lowest price a shaded bid may take.
+
+    The impression floor for every bid. A bid with a ``dealid`` is also held to the
+    floor of the request deal with that id, because a deal floor mutation writes
+    the deal's floor only and leaves ``imp.bidfloor`` at the publisher's value.
+    The max does not convert currencies: it assumes ``imp.bidfloorcur`` and the
+    deal's ``bidfloorcur`` agree, as they do in the deals seed and the scenario
+    samples (USD).
+    """
+    imp_id = bid.get("impid", "")
+    for imp in bid_request.get("imp", []):
+        if imp.get("id") != imp_id:
+            continue
+        floor = imp.get("bidfloor", 0.0)
+        dealid = bid.get("dealid")
+        if not dealid:
+            return floor
+        pmp = imp.get("pmp")
+        deals = pmp.get("deals") if isinstance(pmp, dict) else None
+        for deal in deals if isinstance(deals, list) else []:
+            if isinstance(deal, dict) and deal.get("id") == dealid:
+                deal_floor = deal.get("bidfloor")
+                if isinstance(deal_floor, (int, float)) and not isinstance(deal_floor, bool):
+                    return max(floor or 0.0, float(deal_floor))
+                break
+        return floor
+    return 0.0
+
+
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations — BID_SHADE via DLRM CTR prediction."""
     if not intent_applicable(Intent.BID_SHADE, req.applicable_intents):
@@ -276,12 +306,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
             if original_price <= 0:
                 continue
             ev = predicted_ctr * conversion_value
-            imp_id = bid.get("impid", "")
-            floor = 0.0
-            for imp in req.bid_request.get("imp", []):
-                if imp.get("id") == imp_id:
-                    floor = imp.get("bidfloor", 0.0)
-                    break
+            floor = _floor_for_bid(req.bid_request, bid)
             # One place computes a price. The clamp to [floor, original_price] lives
             # inside the policy, so the ordering of the floor and the cap cannot
             # differ between here and anything else that prices a bid.
@@ -310,6 +335,50 @@ def mutate(req: RTBRequest) -> RTBResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Readiness warm-up (shared.server.WarmupGate)
+# ---------------------------------------------------------------------------
+
+#: Shaped like the response-shade-headroom scenario: one banner impression and
+#: one open-market bid well above the floor, so mutate() predicts a CTR through
+#: Triton and prices the bid. Run inside the pod only; nothing is emitted.
+WARMUP_REQUEST: dict = {
+    "id": "artf-warmup-dlrm-bid-shader",
+    "tmax": 120,
+    "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+    "applicable_intents": ["BID_SHADE"],
+    "bid_request": {
+        "id": "artf-warmup-auction",
+        "imp": [{
+            "id": "imp-1",
+            "banner": {"w": 728, "h": 90, "pos": 1},
+            "bidfloor": 0.10,
+            "bidfloorcur": "USD",
+        }],
+        "site": {"id": "artf-warmup-site", "domain": "the-morning-brief.example", "cat": ["IAB12"]},
+        "user": {"id": "artf-warmup-user"},
+        "device": {"ua": "Mozilla/5.0", "geo": {"country": "USA", "region": "NY"}},
+    },
+    "bid_response": {
+        "id": "artf-warmup-auction",
+        "seatbid": [{
+            "seat": "artf-warmup-seat",
+            "bid": [{"id": "artf-warmup-bid", "impid": "imp-1", "price": 25.00}],
+        }],
+    },
+}
+
+
+def warmup_check(resp: RTBResponse) -> None:
+    """Reject a warm-up the shader abstained on: no prediction was made."""
+    reason = resp.metadata.abstained_reason if resp.metadata else None
+    if reason:
+        raise RuntimeError(f"BID_SHADE abstained: {reason}")
+
+
 if __name__ == "__main__":
-    from shared.server import run_artf_server
-    run_artf_server(mutate, agent_name="dlrm-bid-shader", grpc_port=50051, mcp_port=8081, health_port=8080)
+    from shared.server import run_artf_server, warmup_from_request
+    run_artf_server(
+        mutate, agent_name="dlrm-bid-shader", grpc_port=50051, mcp_port=8081, health_port=8080,
+        warmup=warmup_from_request(mutate, WARMUP_REQUEST, require_triton=USE_TRITON, check=warmup_check),
+    )

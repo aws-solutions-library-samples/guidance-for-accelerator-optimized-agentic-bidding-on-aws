@@ -18,6 +18,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useTypewriter } from "../hooks/useTypewriter.js";
+import { DEAL_SCORER_TRAINING_DISCLOSURE } from "../utils/dealScorerTraining.js";
 
 /**
  * How long the completed card stays before it begins to fade. Measured from the
@@ -36,7 +37,7 @@ const PHASE_GONE = "gone";
 
 /**
  * @param narration  from mutationNarration(beat, context)
- * @param stepLabel  "Step 3 of 6" or "Preparing"
+ * @param stepLabel  the pass name, or "Preparing"
  * @param animate    false while the reader is scrubbing rather than watching
  */
 export function TheaterMutationStage({ narration, stepLabel, animate = true }) {
@@ -79,7 +80,10 @@ export function TheaterMutationStage({ narration, stepLabel, animate = true }) {
 
   if (!text || phase === PHASE_GONE) return null;
 
-  const { containerLabel, intent, latencyMs, explored } = narration;
+  const {
+    containerLabel, intent, latencyMs, explored, sampleTrained, disposition, dispositionReason,
+  } = narration;
+  const notApplied = typeof disposition === "string" && disposition !== "applied";
 
   return (
     <div
@@ -128,6 +132,22 @@ export function TheaterMutationStage({ narration, stepLabel, animate = true }) {
           <span className="th-mstage-pending" aria-hidden="true">{text.slice(shown.length)}</span>
         </p>
 
+        {/* The exchange's own reason for not applying the mutation. Kept out of
+            the sentence above: it can carry numbers no beat value accounts for,
+            and the sentence is what the caption validator checks (BR3-13). */}
+        {notApplied && dispositionReason ? (
+          <p className="th-mstage-disposition" data-testid="theater-mutation-disposition">
+            <span className="th-mstage-disposition-kind">{disposition}</span>
+            {dispositionReason}
+          </p>
+        ) : null}
+        {/* How the model behind this decision was trained, under every Deal Scorer
+            beat. Outside the sentence for the same reason as the disposition. */}
+        {sampleTrained ? (
+          <p className="th-mstage-sample" data-testid="theater-deal-scorer-disclosure">
+            {DEAL_SCORER_TRAINING_DISCLOSURE}
+          </p>
+        ) : null}
         {done && (latencyMs != null || explored) ? (
           <div className="th-mstage-foot">
             {latencyMs != null ? (

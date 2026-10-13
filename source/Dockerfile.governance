@@ -29,6 +29,12 @@ COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/governance/ /app/agents/governance/
 COPY deployment/ /app/deployment/
 
+# The build context keeps the host's file modes, so a source file that is not
+# world-readable there would be unreadable to appuser. Normalize before USER.
+# Same non-root user as Dockerfile.agentcore, which already runs under AgentCore.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home appuser
+USER appuser
+
 # AgentCore runs the container as an HTTP server on port 8080
 EXPOSE 8080
 

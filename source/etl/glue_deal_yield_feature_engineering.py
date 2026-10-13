@@ -350,7 +350,7 @@ def main():
             logger.info("No won ADJUST_DEAL_MARGIN rows in window -- skipping margin write.")
 
     except Exception:
-        logger.exception("ETL job failed")
+        logger.exception("ETL job failed")  # nosemgrep: logging-error-without-handling re-raised on the next line so the Glue run fails
         raise
     finally:
         job.commit()

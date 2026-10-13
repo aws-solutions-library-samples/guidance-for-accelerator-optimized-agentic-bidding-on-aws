@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  *
  * The picker's job is to make the two ARTF surfaces navigable without showing
- * eleven cards at once. The surface split is real — `orchestrator/app.py` gives
+ * every card at once. The surface split is real: `orchestrator/app.py` gives
  * exactly one container a response-side intent — so filtering by it has to be
  * driven by the declared `surface` field and nothing else.
  */
@@ -17,6 +17,8 @@ import {
   SURFACE_REQUEST,
   SURFACE_RESPONSE,
 } from "./ScenarioCard.jsx";
+import midday from "../../public/samples/ridesharer-suburban-midday.json";
+import airport from "../../public/samples/ridesharer-airport-evening.json";
 
 let host;
 let root;
@@ -41,7 +43,7 @@ function render(props = {}) {
         onSelect={() => {}}
         onSend={() => {}}
         onOpenTheater={() => {}}
-        {...props}
+        {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */
       />
     );
   });
@@ -388,5 +390,56 @@ describe("per-scenario tuner defaults", () => {
     const convRow = rows.find((r) => r.querySelector("label")?.textContent === "Conv Value");
     expect(convRow).toBeTruthy();
     expect(Number(convRow.querySelector("input").value)).toBe(target.defaults.convValue);
+  });
+});
+
+describe("RideSharer scenarios", () => {
+  const ids = ["ridesharer-airport", "ridesharer-midday"];
+
+  it("lists both on the request surface only", () => {
+    render();
+    const requestIds = optionValues();
+    for (const id of ids) expect(requestIds).toContain(id);
+    for (const id of ids) {
+      expect(scenariosOnSurface(SURFACE_RESPONSE).map((s) => s.id)).not.toContain(id);
+    }
+  });
+
+  it("names both with the RideSharer prefix", () => {
+    for (const id of ids) {
+      expect(SCENARIOS.find((s) => s.id === id).name.startsWith("RideSharer: ")).toBe(true);
+    }
+  });
+
+  it("renders the midday card with the Bid Floor slider at its default", () => {
+    render({ activeScenarioId: "ridesharer-midday" });
+    const rows = Array.from(host.querySelectorAll(".tuner-row"));
+    const floorRow = rows.find((r) => r.querySelector("label")?.textContent === "Bid Floor");
+    expect(floorRow).toBeTruthy();
+    expect(Number(floorRow.querySelector("input").value)).toBe(5);
+  });
+
+  it("ships a midday payload whose deals carry the $5.00 minimum under a $12.00 floor", () => {
+    const imp = midday.bid_request.imp[0];
+    expect(imp.bidfloor).toBe(5);
+    for (const deal of imp.pmp.deals) {
+      expect(deal.bidfloor).toBe(12);
+      expect(deal.ext.mindealfloor).toBe(5);
+    }
+  });
+
+  it("ships an airport payload with $12.00 deal floors and no minimum", () => {
+    for (const deal of airport.bid_request.imp[0].pmp.deals) {
+      expect(deal.bidfloor).toBe(12);
+      expect(deal.ext).toBeUndefined();
+    }
+  });
+
+  it("defaults each card's floor to its payload's impression floor", () => {
+    const pairs = [["ridesharer-airport", airport], ["ridesharer-midday", midday]];
+    for (const [id, payload] of pairs) {
+      const card = SCENARIOS.find((s) => s.id === id);
+      expect(card.defaults.bidFloor).toBe(payload.bid_request.imp[0].bidfloor);
+    }
   });
 });

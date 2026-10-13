@@ -32,7 +32,7 @@ class FocusAreaRegistry {
         return '([^}]+)';
       });
       this._patterns.push({
-        pattern: new RegExp(`^${regexStr}$`),
+        pattern: new RegExp(`^${regexStr}$`), // nosemgrep: detect-non-literal-regexp built from focus-area ids registered in source, not from user input
         template: { selector, containerSelector, type },
         paramNames,
       });

@@ -1,5 +1,6 @@
 package org.prebid.server.hooks.modules.artf.client;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
@@ -126,9 +127,13 @@ public class ArtfExtensionPointClient implements ExtensionPointClient {
                     "orchestrator returned HTTP %d%s".formatted(response.getStatusCode(), hint), latency);
         }
 
+        final JsonNode tree;
         final RtbResponse decoded;
         try {
-            decoded = mapper.readValue(response.getBody(), RtbResponse.class);
+            tree = mapper.readTree(response.getBody());
+            decoded = tree == null || tree.isMissingNode() || tree.isNull()
+                    ? null
+                    : mapper.treeToValue(tree, RtbResponse.class);
         } catch (Exception e) {
             return new ExtensionPointOutcome.TransportFailure(
                     "orchestrator response could not be parsed: " + e.getClass().getSimpleName(), latency);
@@ -141,9 +146,9 @@ public class ArtfExtensionPointClient implements ExtensionPointClient {
         // proposed nothing, which is a different fact from being unreachable, and the report
         // has to say so (BR-6).
         return decoded.mutationsOrEmpty().isEmpty()
-                ? new ExtensionPointOutcome.NoMutations(latency, decoded.metadata())
+                ? new ExtensionPointOutcome.NoMutations(latency, decoded.metadata(), tree)
                 : new ExtensionPointOutcome.MutationsReturned(
-                        decoded.mutationsOrEmpty(), latency, decoded.metadata());
+                        decoded.mutationsOrEmpty(), latency, decoded.metadata(), tree);
     }
 
     /**

@@ -7,6 +7,26 @@ import { useRef } from "react";
 
 import { ValueVisual, UNKNOWN } from "./theaterVisualisers.jsx";
 import { useScrollToFoot } from "../hooks/useScrollToFoot.js";
+import { isAppliedValue } from "../utils/theaterBeats.js";
+import { DEAL_SCORER_TRAINING_DISCLOSURE } from "../utils/dealScorerTraining.js";
+
+/**
+ * The marker for a value the exchange did not apply: "rejected", "superseded" or
+ * "unknown". Rendered beside the value so a declined mutation stays visible
+ * without reading as a change to the auction. Nothing for an applied value.
+ */
+export function ValueDisposition({ value }) {
+  if (isAppliedValue(value)) return null;
+  return (
+    <span
+      className="th-val-disposition"
+      data-testid="value-disposition"
+      title={value.dispositionReason ?? undefined}
+    >
+      {value.disposition === "unknown" ? "not confirmed" : `not applied: ${value.disposition}`}
+    </span>
+  );
+}
 
 /* ------------------------------------------------------------------ ribbon */
 
@@ -120,7 +140,7 @@ function ViewIcon({ view }) {
   };
   if (view === CARD_VIEW.VISUAL) {
     return (
-      <svg {...common}>
+      <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
         <path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z" />
         <circle cx="8" cy="8" r="1.9" />
       </svg>
@@ -128,14 +148,14 @@ function ViewIcon({ view }) {
   }
   if (view === CARD_VIEW.CODE) {
     return (
-      <svg {...common}>
+      <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
         <path d="m5.5 5.5-3 2.5 3 2.5" />
         <path d="m10.5 5.5 3 2.5-3 2.5" />
       </svg>
     );
   }
   return (
-    <svg {...common}>
+    <svg {...common} /* nosemgrep: react-props-spreading common is a fixed set of SVG presentation attributes defined above */>
       <circle cx="8" cy="8" r="6.3" />
       <path d="M8 7.2v4" />
       <path d="M8 4.9h.01" />
@@ -273,14 +293,23 @@ export function TheaterRequestCard({
             <div className="th-empty">Nothing yet</div>
           ) : (
             <div className="th-values">
-              {visible.map((value, i) => (
+              {visible.map((value, i) => (isAppliedValue(value) ? (
                 <ValueVisual
                   key={`${value.kind}-${i}`}
                   value={value}
                   landing={landingValues.includes(value)}
                   taxonomyNames={taxonomyNames}
                 />
-              ))}
+              ) : (
+                <div key={`${value.kind}-${i}`} className="th-val-not-applied">
+                  <ValueVisual
+                    value={value}
+                    landing={landingValues.includes(value)}
+                    taxonomyNames={taxonomyNames}
+                  />
+                  <ValueDisposition value={value} />
+                </div>
+              )))}
             </div>
           )}
         </div>
@@ -316,6 +345,7 @@ export function TheaterSellSidePanel({ values, revealed }) {
   const activated = values.filter((v) => v.kind === "ids" && v.role === "deals-activated");
   const suppressed = values.filter((v) => v.kind === "ids" && v.role === "deals-suppressed");
   const nothingYet = floors.length + margins.length + activated.length + suppressed.length === 0;
+  const dealScorerDisclosure = [...activated, ...suppressed].some((v) => v.sampleTrained === true);
 
   return (
     <div className={`th-col th-col-sell${revealed ? " is-live" : ""}`}>
@@ -329,37 +359,44 @@ export function TheaterSellSidePanel({ values, revealed }) {
       ) : (
         <div className="th-rows">
           {floors.map((v, i) => (
-            <div key={`floor-${i}`} className="th-row">
+            <div key={`floor-${i}`} className={`th-row${isAppliedValue(v) ? "" : " th-val-not-applied"}`}>
               <span className="th-row-key">Floor · {v.dealId ?? "unknown deal"}</span>
               <span className="th-row-val">
                 {v.before != null ? `$${v.before.toFixed(2)}` : UNKNOWN}
                 <span className="th-row-to">to</span>
                 {`$${v.after.toFixed(2)}`}
+                <ValueDisposition value={v} />
               </span>
             </div>
           ))}
           {margins.map((v, i) => (
-            <div key={`margin-${i}`} className="th-row">
+            <div key={`margin-${i}`} className={`th-row${isAppliedValue(v) ? "" : " th-val-not-applied"}`}>
               <span className="th-row-key">Margin · {v.dealId ?? "unknown deal"}</span>
               <span className="th-row-val">
                 {v.calculationType === "PERCENT"
                   ? `${(v.value * 100).toFixed(1)}%`
                   : `$${v.value.toFixed(2)} CPM`}
+                <ValueDisposition value={v} />
               </span>
             </div>
           ))}
           {activated.map((v, i) => (
-            <div key={`act-${i}`} className="th-row">
+            <div key={`act-${i}`} className={`th-row${isAppliedValue(v) ? "" : " th-val-not-applied"}`}>
               <span className="th-row-key">Deals activated</span>
-              <span className="th-row-val">{v.ids.join(", ")}</span>
+              <span className="th-row-val">{v.ids.join(", ")}<ValueDisposition value={v} /></span>
             </div>
           ))}
           {suppressed.map((v, i) => (
-            <div key={`sup-${i}`} className="th-row">
+            <div key={`sup-${i}`} className={`th-row${isAppliedValue(v) ? "" : " th-val-not-applied"}`}>
               <span className="th-row-key">Deals suppressed</span>
-              <span className="th-row-val">{v.ids.join(", ")}</span>
+              <span className="th-row-val">{v.ids.join(", ")}<ValueDisposition value={v} /></span>
             </div>
           ))}
+          {dealScorerDisclosure ? (
+            <div className="th-row-note" data-testid="sell-side-deal-scorer-disclosure">
+              {DEAL_SCORER_TRAINING_DISCLOSURE}
+            </div>
+          ) : null}
         </div>
       )}
     </div>
@@ -391,17 +428,20 @@ export function TheaterSeamArrow({ movement, active }) {
 
 /* ---------------------------------------------------------------- controls */
 
+/**
+ * No step counter: the number of with-ARTF beats is whatever the auction
+ * returned, so a "Step N of M" readout and a dot per step would only restate a
+ * count the reader does not need. The ribbon names the pass instead.
+ */
 export function TheaterControls({
-  index, total, isIndeterminate, isPlaying, canGoBack, canGoNext,
+  isIndeterminate, isPlaying, canGoBack, canGoNext,
   onNext, onBack, onRestart, onTogglePlay, onExit,
 }) {
   return (
     <div className="th-controls">
-      <span className="th-controls-status">
-        {isIndeterminate
-          ? "Preparing"
-          : `Step ${index + 1} of ${total}`}
-      </span>
+      {isIndeterminate ? (
+        <span className="th-controls-status">Preparing</span>
+      ) : null}
       <button type="button" className="th-btn th-btn-ghost" onClick={onBack}
         disabled={!canGoBack} data-testid="theater-back">Back</button>
       <button type="button" className="th-btn th-btn-primary" onClick={onTogglePlay}
@@ -412,13 +452,6 @@ export function TheaterControls({
         disabled={!canGoNext} data-testid="theater-next">Next</button>
       <button type="button" className="th-btn th-btn-ghost" onClick={onRestart}
         disabled={isIndeterminate} data-testid="theater-restart">Restart</button>
-      <span className="th-progress" data-testid="theater-progress" aria-hidden="true">
-        {isIndeterminate
-          ? <i className="is-indeterminate" />
-          : Array.from({ length: total }, (_, i) => (
-            <i key={i} className={i < index ? "is-done" : i === index ? "is-current" : ""} />
-          ))}
-      </span>
       <button type="button" className="th-btn th-btn-ghost" onClick={onExit}
         data-testid="theater-exit">Exit</button>
     </div>

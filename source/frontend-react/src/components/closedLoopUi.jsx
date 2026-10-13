@@ -586,7 +586,7 @@ export const ARTF_MUTATION_INFO = {
       serving:
         "Triton tensorrt_plan backend (source/triton/model_repository/ncf_deal_manager_stable), dynamic batching preferred sizes [16, 32, 64], 500\u03bcs max queue delay, 2 GPU instances.",
       decisionLogic:
-        "relevance \u2265 0.499 \u2192 emit ACTIVATE_DEALS; relevance < 0.497 \u2192 emit SUPPRESS_DEALS (source/containers/ncf_deal_manager/app.py thresholds).",
+        "relevance \u2265 0.60 \u2192 emit ACTIVATE_DEALS; relevance < 0.30 \u2192 emit SUPPRESS_DEALS (source/shared/ncf_ids.py thresholds).",
       canary:
         "The ncf_deal_manager Triton router forwards each request to _stable or _canary based on an in-memory traffic-percentage parameter.",
       training:
@@ -848,7 +848,21 @@ export function ModelsView({ versions, error, modelLabel, trainingJobs, training
             ))}
             {(versions || []).map((v, i) => (
               <tr key={i}>
-                <td>{v.version}</td>
+                <td>
+                  {v.version}
+                  {/* training_data as the registration recorded it. "sample" is
+                      the Deal Scorer trained at deploy time on interactions
+                      generated from the deal book. */}
+                  {v.training_data === "sample" ? (
+                    <span
+                      className="cl-sample-badge"
+                      title={v.description || undefined}
+                      data-testid="model-version-sample-badge"
+                    >
+                      sample
+                    </span>
+                  ) : null}
+                </td>
                 <td><ApprovalBadge status={v.approval_status} /></td>
                 <td><ApprovalReason status={v.approval_status} reason={v.approval_description} /></td>
                 <td style={SUBTLE}>{v.status}</td>

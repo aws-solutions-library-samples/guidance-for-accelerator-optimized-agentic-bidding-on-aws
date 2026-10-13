@@ -305,13 +305,13 @@ class GuardrailCheckAdapter:
 
     async def check(self, model_name: str) -> list[str]:
         result = await self._monitor.check_guardrails(model_name)
-        if not result.is_violated:
+        if not result.is_violated:  # nosemgrep: is-function-without-parentheses GuardrailCheckResult dataclass field, not a method
             return []
         reason = result.violation_reason or "guardrail_violation"
         if reason == "latency_regression":
             return [
                 f"latency_regression: canary p99 {result.canary_latency_p99:.2f}ms "
-                f"vs stable {result.stable_latency_p99:.2f}ms"
+                + f"vs stable {result.stable_latency_p99:.2f}ms"
             ]
         if reason == "error_rate_breach":
             return [f"error_rate_breach: canary error rate {result.canary_error_rate:.4f}"]

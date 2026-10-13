@@ -29,7 +29,7 @@ afterEach(() => {
 function render(props = {}) {
   act(() => {
     root.render(
-      <GovernanceStepper activeKey={GOVERNANCE_STEPS[0].key} onSelect={() => {}} {...props} />
+      <GovernanceStepper activeKey={GOVERNANCE_STEPS[0].key} onSelect={() => {}} {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */ />
     );
   });
 }
@@ -37,9 +37,11 @@ function render(props = {}) {
 const buttons = () => Array.from(host.querySelectorAll(".gov-step"));
 
 describe("GovernanceStepper", () => {
-  it("has four steps, numbered 1 to 4", () => {
-    // Four, not five: Model Registry sits outside the stepper as a reference view.
-    expect(GOVERNANCE_STEPS.map((s) => s.number)).toEqual([1, 2, 3, 4]);
+  it("has three steps, numbered 1 to 3", () => {
+    // Model Registry sits outside the stepper as a reference view, and the
+    // outcome pipeline is part of the Train step rather than a step of its own.
+    expect(GOVERNANCE_STEPS.map((s) => s.number)).toEqual([1, 2, 3]);
+    expect(GOVERNANCE_STEPS.map((s) => s.key)).toEqual(["load-test", "train", "test-versions"]);
   });
 
   it("ends on Test Model Versions", () => {

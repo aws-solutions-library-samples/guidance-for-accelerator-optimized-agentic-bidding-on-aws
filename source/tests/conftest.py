@@ -27,6 +27,15 @@ import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+# The demand catalog and the Deal Scorer read campaigns and deals from the deals
+# table in a deployed stack. Unit tests read the same records from the seed file
+# through the same loaders (DEALS_SEED_FILE), so no test reaches DynamoDB.
+os.environ.setdefault(
+    "DEALS_SEED_FILE",
+    os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "deployment", "seed", "deals_and_campaigns.json",
+    )),
+)
 
 # Resolve a JDK for the PySpark-backed ETL tests before any SparkSession is built.
 # Homebrew's openjdk is keg-only, so a machine with Java installed commonly has

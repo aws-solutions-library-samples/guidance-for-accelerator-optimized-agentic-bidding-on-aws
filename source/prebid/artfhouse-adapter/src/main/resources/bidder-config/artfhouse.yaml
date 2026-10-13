@@ -3,13 +3,13 @@ adapters:
     # Resolved from the container's environment, NOT substituted at build time.
     #
     # This file is baked into the image by copy-bidder-files.sh, which runs inside
-    # CodeBuild and does not know the demand endpoint's URL -- the API Gateway that
-    # serves it is created by the CloudFormation stack, after the build. A
+    # CodeBuild and does not know the demand endpoint's URL -- the in-cluster
+    # artfhouse-demand Service is deployed after the build. A
     # __DEMAND_ENDPOINT__ placeholder here would therefore survive verbatim into the
     # image and every bid call would go to a literal "__DEMAND_ENDPOINT__".
     #
     # ARTFHOUSE_DEMAND_ENDPOINT is set on the pod by
-    # eks/prebid-server-deployment.yaml, from the stack output.
+    # eks/prebid-server-deployment.yaml (deploy_prebid.sh DEMAND_ENDPOINT).
     #
     # NO DEFAULT, deliberately. An unset variable fails startup with "could not
     # resolve placeholder ARTFHOUSE_DEMAND_ENDPOINT", which names the problem. An

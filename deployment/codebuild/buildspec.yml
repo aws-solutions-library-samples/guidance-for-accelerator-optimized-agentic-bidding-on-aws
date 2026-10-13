@@ -35,6 +35,9 @@ env:
     # display_name() helper below and RENAME_MAP.md).
     BUILD_ONLY: ""
     IMAGE_TAG: "latest"
+    # SRC_TAGS: optional space-separated REPO=src-<hash> pairs from deploy.sh's
+    # content-hash cache. Applied by the last build command below.
+    SRC_TAGS: ""
     DOCKER_BUILDKIT: "1"
 
 phases:
@@ -400,6 +403,37 @@ phases:
             -t "${OPTIMIZER_IMAGE}" --push "${SOURCE_DIR}"
           echo "  Pushed ${OPTIMIZER_IMAGE}"
         fi
+
+      # -----------------------------------------------------------------------
+      # Content-hash cache tags (deploy.sh build_images)
+      # -----------------------------------------------------------------------
+      # Points REPO:src-<hash> at the REPO:${IMAGE_TAG} image pushed above.
+      # deploy.sh used to add these tags itself after waiting for this build, so a
+      # deploy.sh killed during the wait left the images untagged and the next run
+      # rebuilt them all. This is the last build command, so it runs only when
+      # every requested image was built; post_build would also run after a
+      # failure and could tag an older image left at ${IMAGE_TAG}.
+      # Best-effort: deploy.sh still re-checks and adds any tag missing here.
+      - |
+        for kv in ${SRC_TAGS}; do
+          R="${kv%%=*}"; T="${kv#*=}"
+          M="$(aws ecr batch-get-image --repository-name "${R}" --image-ids imageTag="${IMAGE_TAG}" \
+                --region "${AWS_DEFAULT_REGION}" --query 'images[0].imageManifest' --output text 2>/dev/null || true)"
+          MT="$(aws ecr batch-get-image --repository-name "${R}" --image-ids imageTag="${IMAGE_TAG}" \
+                --region "${AWS_DEFAULT_REGION}" --query 'images[0].imageManifestMediaType' --output text 2>/dev/null || true)"
+          if [ -z "${M}" ] || [ "${M}" = "None" ]; then
+            echo "  WARNING: ${R}:${IMAGE_TAG} not found; ${T} not tagged"; continue
+          fi
+          if [ -n "${MT}" ] && [ "${MT}" != "None" ]; then
+            aws ecr put-image --repository-name "${R}" --image-tag "${T}" --image-manifest "${M}" \
+              --image-manifest-media-type "${MT}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 \
+              && echo "  Tagged ${R}:${IMAGE_TAG} as ${T}" || echo "  WARNING: could not tag ${R} as ${T}"
+          else
+            aws ecr put-image --repository-name "${R}" --image-tag "${T}" --image-manifest "${M}" \
+              --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 \
+              && echo "  Tagged ${R}:${IMAGE_TAG} as ${T}" || echo "  WARNING: could not tag ${R} as ${T}"
+          fi
+        done
 
   post_build:
     commands:

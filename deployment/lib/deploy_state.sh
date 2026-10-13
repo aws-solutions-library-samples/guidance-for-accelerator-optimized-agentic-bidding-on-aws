@@ -11,6 +11,13 @@
 # was GIVEN. The NGC secret name is the case that justifies the file existing at
 # all -- pass --ngc-key once and later runs find the stored secret on their own.
 #
+# Two `resolved` values record what a deploy shipped where AWS keeps no comparable
+# trace: agentcoreImageDigest (the AgentCore image digest the MCP runtime was
+# registered with in Step 10; the runtime itself records only a tag) and
+# prebidFingerprint (the Prebid host sources and deals seed of the last successful
+# Step 12). deploy.sh compares both at the next run; a missing value makes it run
+# the step again, so deleting the file costs a redeploy, never a skipped one.
+#
 # Two rules every function here obeys:
 #
 #   1. ALWAYS return 0. Callers run under `set -euo pipefail`; a non-zero return

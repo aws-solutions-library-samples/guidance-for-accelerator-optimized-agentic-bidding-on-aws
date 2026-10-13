@@ -59,6 +59,18 @@ spec:
         - name: model-optimizer-bootstrap
           image: __REGISTRY__/__STACK_NAME__-model-optimizer:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # matches the UID Dockerfile.optimizer gives appuser; the kubelet
+          # refuses runAsNonRoot against a non-numeric image user. trtexec
+          # writes only under /tmp (tempfile.mkdtemp in optimizer/app.py).
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           args: ["--bootstrap"]
           env:
             - name: AWS_DEFAULT_REGION

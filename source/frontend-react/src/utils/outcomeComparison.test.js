@@ -72,6 +72,15 @@ describe("compareOutcomes — the rows a reader sees", () => {
     expect(rows.margin.without).toBe("none");
   });
 
+  it("the round-trip row names Prebid's per-seat bidder times", () => {
+    const c = compareOutcomes({
+      baselineVM: vm(), baselineResponse: response(100),
+      artfVM: vm(),
+      artfResponse: { artf_meta: { hop_ms: 125 }, ext: { responsetimemillis: { artfhouse: 87, amt: 2 } } },
+    });
+    expect(byId(c).roundtrip.detail).toContain("amt 2 ms, artfhouse 87 ms");
+  });
+
   it("a lower price with ARTF is a negative delta, not an error", () => {
     const c = compareOutcomes({ baselineVM: vm({ price: 5 }), artfVM: vm({ price: 4.5 }) });
     expect(byId(c).cleared.delta).toBe("−$0.50");

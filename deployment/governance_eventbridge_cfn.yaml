@@ -3,7 +3,7 @@ Description: >-
   Invocation paths for the closed-loop AgentCore runtimes. EventBridge Rules and
   Scheduler cannot target AgentCore runtimes directly, so both go through a Lambda
   that calls bedrock-agentcore:InvokeAgentRuntime:
-    - EventBridge Scheduler (every 5 min) -> Adaptive Bidding invoker Lambda -> runtime
+    - EventBridge Scheduler (AdaptiveBiddingScheduleRate, default every 24 hours) -> Adaptive Bidding invoker Lambda -> runtime
     - EventBridge Rule (ModelPackageGroupChanged) -> Governance shim Lambda -> runtime
   Each Lambda's role is scoped to invoke only its specific runtime ARN. No Lambda
   Function URLs and no wildcard resource policies.
@@ -158,6 +158,13 @@ Resources:
 
   AdaptiveBiddingInvokerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Properties:
       FunctionName: !Sub '${StackPrefix}-adaptive-bidding-invoker'
       Description: Invokes the Adaptive Bidding Strategy Agent runtime (from Scheduler).
@@ -191,6 +198,11 @@ Resources:
 
   AdaptiveBiddingInvokerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !Sub '${StackPrefix}-adaptive-bidding-invoker-role'
       AssumeRolePolicyDocument:
@@ -216,6 +228,11 @@ Resources:
 
   AdaptiveBiddingSchedulerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !Sub '${StackPrefix}-scheduler-invoke-adaptive-bidding'
       AssumeRolePolicyDocument:
@@ -266,6 +283,13 @@ Resources:
 
   GovernanceInvokerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Properties:
       FunctionName: !Sub '${StackPrefix}-governance-invoker'
       Description: >-
@@ -312,6 +336,13 @@ Resources:
 
   GovernanceInvokerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: cloudwatch:PutMetricData does not support resource-level permissions and is scoped by a cloudwatch:namespace condition
     Properties:
       RoleName: !Sub '${StackPrefix}-governance-invoker-role'
       AssumeRolePolicyDocument:
@@ -385,11 +416,18 @@ Resources:
 
   RetrainingTriggerFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Condition: HasRetrainingConfig
     Properties:
       FunctionName: !Sub '${StackPrefix}-retraining-trigger'
       Description: >-
-        Scheduled (6h default): resolves the latest Approved model version per
+        Scheduled (RetrainingScheduleRate, default 24h): resolves the latest Approved model version per
         model type and starts a SageMaker training job (fire-and-forget, no polling).
       Runtime: python3.12
       Handler: index.handler
@@ -495,16 +533,23 @@ Resources:
                           # job with an empty image; DLRM/NCF are unaffected.
                           skipped[model_type] = 'xgboost_image_uri_not_configured'
                           continue
+                      # The built-in algorithm reads SM_CHANNEL_TRAIN in
+                      # algorithm mode, so the channel must be named "train".
+                      # It also rejects hyperparameters outside XGBoost's own
+                      # list ("Extraneous hyperparameter found"), so
+                      # base_model_version travels as a Tag below instead.
+                      channel_name = 'train'
                       hyperparameters = {
-                          'base_model_version': base_version,
                           'max_depth': '6',
                           'eta': '0.3',
                           'num_round': '100',
                           'objective': 'reg:squarederror',
                       }
                   else:
-                      # nemo-rl shape (dlrm_bid_shader, ncf_deal_manager).
+                      # nemo-rl shape (dlrm_bid_shader, ncf_deal_manager). The
+                      # custom container reads SM_CHANNEL_TRAINING.
                       training_image = f"{registry}/artf-nemo-rl-training:{image_tag}"
+                      channel_name = 'training'
                       hyperparameters = {
                           'model_type': model_type,
                           'base_model_version': base_version,
@@ -520,7 +565,7 @@ Resources:
                       },
                       RoleArn=role_arn,
                       InputDataConfig=[{
-                          'ChannelName': 'training',
+                          'ChannelName': channel_name,
                           'DataSource': {'S3DataSource': {
                               'S3DataType': 'S3Prefix',
                               'S3Uri': f"s3://{training_data_bucket}/{training_data_prefix}/",
@@ -536,6 +581,9 @@ Resources:
                       },
                       StoppingCondition={'MaxRuntimeInSeconds': 14400},
                       HyperParameters=hyperparameters,
+                      # Provenance read back by RetrainingRegistrationFunction
+                      # (hyperparameters first, then ListTags).
+                      Tags=[{'Key': 'base_model_version', 'Value': base_version}],
                   )
                   started[model_type] = job_name
 
@@ -543,6 +591,11 @@ Resources:
 
   RetrainingTriggerFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-retraining-trigger-role'
@@ -563,6 +616,8 @@ Resources:
               - Effect: Allow
                 Action:
                   - 'sagemaker:CreateTrainingJob'
+                  # CreateTrainingJob with Tags (provenance) is authorized as AddTags.
+                  - 'sagemaker:AddTags'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
@@ -586,6 +641,11 @@ Resources:
 
   RetrainingSchedulerRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-scheduler-invoke-retraining-trigger'
@@ -635,6 +695,13 @@ Resources:
 
   RetrainingRegistrationFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Lambda calls only AWS control plane APIs over public endpoints and has no VPC resources to reach
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume scheduled and event driven invocations are never throttled
     Condition: HasRetrainingConfig
     Properties:
       FunctionName: !Sub '${StackPrefix}-retraining-registration'
@@ -711,18 +778,30 @@ Resources:
                   if 'MetricName' in m and 'Value' in m
               }
               hyperparams = job.get('HyperParameters', {})
+              # Provenance lives in hyperparameters for the NeMo-RL shape and
+              # ONLY in Tags for the built-in XGBoost shape (that container
+              # rejects hyperparameters outside XGBoost's own list). Read
+              # hyperparameters first, then the job's tags.
+              tags = {
+                  t['Key']: t['Value']
+                  for t in sm.list_tags(ResourceArn=job['TrainingJobArn']).get('Tags', [])
+                  if 'Key' in t and 'Value' in t
+              }
+
+              def _provenance(key):
+                  return hyperparams.get(key) or tags.get(key) or ''
 
               customer_metadata = {
                   'training_job_name': job_name,
                   'model_artifact_uri': model_artifact_uri,
-                  'base_model_version': hyperparams.get('base_model_version', ''),
+                  'base_model_version': _provenance('base_model_version'),
                   'window_days': hyperparams.get('window_days', ''),
                   # Which load-test run the operator selected when triggering
                   # this training job, so a later comparison can use that run as
                   # the control. Empty for scheduled retraining, which has no
                   # originating run. NOT a claim that the job trained only on
                   # that run: the input is the whole training-data prefix.
-                  'load_test_run_id': hyperparams.get('load_test_run_id', ''),
+                  'load_test_run_id': _provenance('load_test_run_id'),
               }
               for metric_name, value in metrics.items():
                   customer_metadata[f'metric_{metric_name}'] = str(value)
@@ -774,6 +853,13 @@ Resources:
 
   RetrainingRegistrationFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: ecr:GetAuthorizationToken does not support resource-level permissions
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Condition: HasRetrainingConfig
     Properties:
       RoleName: !Sub '${StackPrefix}-retraining-registration-role'
@@ -794,6 +880,8 @@ Resources:
               - Effect: Allow
                 Action:
                   - 'sagemaker:DescribeTrainingJob'
+                  # Provenance tags (base_model_version, load_test_run_id).
+                  - 'sagemaker:ListTags'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/dlrm-bid-shader-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'

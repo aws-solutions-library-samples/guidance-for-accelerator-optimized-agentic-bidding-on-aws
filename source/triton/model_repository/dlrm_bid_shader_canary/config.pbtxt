@@ -60,3 +60,82 @@ instance_group [
     kind: KIND_GPU
   }
 ]
+# Warm-up: Triton runs these requests on each instance at load and reports the
+# model not ready until they complete (Triton r24.08 model_configuration.md,
+# "Model Warmup"; ModelWarmup in common/protobuf/model_config.proto). dims are
+# the declared input dims (before reshape), without the batch dimension. Batch 1
+# and 8, the opt batch of this engine's profile in deployment/optimizer-bootstrap.json.
+model_warmup [
+  {
+    name: "zero_batch1"
+    batch_size: 1
+    inputs {
+      key: "dense_features"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 4 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_site_domain"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_device_type"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_geo_country"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  },
+  {
+    name: "zero_batch8"
+    batch_size: 8
+    inputs {
+      key: "dense_features"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 4 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_site_domain"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_device_type"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_geo_country"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  }
+]

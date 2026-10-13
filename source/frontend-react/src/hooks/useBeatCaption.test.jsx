@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 function render(props) {
-  act(() => root.render(<Probe {...props} />));
+  act(() => root.render(<Probe {...props} /* nosemgrep: react-props-spreading test helper forwards per-test props */ />));
 }
 
 /** Let queued microtasks and promise callbacks run. */

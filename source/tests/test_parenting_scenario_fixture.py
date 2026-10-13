@@ -83,15 +83,16 @@ class TestFixtureShape:
         # Theater's with-ARTF pass differ from its baseline pass. Offering them
         # here would hand the with-ARTF outcome to the baseline.
         deals = payload["bid_request"]["imp"][0]["pmp"]["deals"]
-        assert [(d["id"], d["bidfloor"], d["at"]) for d in deals] == [("deal-remnant-open", 0.85, 3)]
+        assert [(d["id"], d["bidfloor"], d["at"]) for d in deals] == [("deal-remnant-open-parenting", 0.85, 3)]
 
     def test_the_deals_the_scorer_can_activate_come_from_its_library(self, payload):
         import importlib.util
-        path = os.path.join(_ROOT, "containers", "ncf_deal_manager", "deal_library.py")
+        path = os.path.join(_ROOT, "shared", "deal_library.py")
         spec = importlib.util.spec_from_file_location("ncf_deal_library_for_fixture", path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+        module.load()
         library = module.deals_for(payload["bid_request"])
         offered = payload["bid_request"]["imp"][0]["pmp"]["deals"]
         activatable = module.not_on_request(library, offered)

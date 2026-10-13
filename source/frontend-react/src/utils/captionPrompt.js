@@ -24,6 +24,7 @@
 // not from an expectation of it.
 
 import { BEAT_ORIGIN, BEAT_RECAP } from "./theaterBeats.js";
+import { hookReportSentence } from "./theaterCaptions.js";
 
 export const MAX_TOKENS = 120;      // NFR3-10: roughly double the measured 46-61
 export const TEMPERATURE = 0.3;     // NFR3-9: measured to be largely stable
@@ -169,6 +170,10 @@ export function buildCaptionPrompt(beat, context, deps = {}) {
     step = omitEmpty({
       stage: "summary of what changed",
       services_that_changed_the_request: (beat.contributors ?? []).map((c) => c.displayLabel ?? c.containerName),
+      // Why the with-ARTF auction shows no change, when the hook's report says.
+      artf_hook_report: (beat.contributors ?? []).length === 0
+        ? hookReportSentence(beat.artfReport)
+        : null,
     });
   } else {
     step = omitEmpty({
@@ -177,6 +182,9 @@ export function buildCaptionPrompt(beat, context, deps = {}) {
       ...describeValues(beat.values, resolveSegmentLabel),
       responded_in_ms: beat.latencyMs,
       from_exploration_arm: beat.explored === true ? true : undefined,
+      // The exchange did not apply this mutation. The reason is withheld: it can
+      // carry numbers that trace to no beat value (BR3-13).
+      not_applied: beat.disposition && beat.disposition !== "applied" ? beat.disposition : undefined,
     });
   }
 

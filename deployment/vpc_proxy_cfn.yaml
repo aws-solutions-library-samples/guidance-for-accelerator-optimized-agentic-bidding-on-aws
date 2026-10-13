@@ -55,6 +55,11 @@ Conditions:
 Resources:
   ProxyFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts and EKS RBAC bindings reference this role by its predictable prefixed name
     Properties:
       RoleName: !Join
         - '-'
@@ -85,6 +90,13 @@ Resources:
 
   ProxyFunction:
     Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W92
+            reason: Reserved concurrency is left unset so low volume request driven invocations from the Governance AgentCore runtime are never throttled
+          - id: W58
+            reason: CloudWatch Logs permissions come from the managed AWSLambdaVPCAccessExecutionRole policy on the role
     Properties:
       FunctionName: !If [HasStackPrefix, !Sub '${StackPrefix}-vpc-optimizer-proxy', 'vpc-optimizer-proxy']
       Description: >-

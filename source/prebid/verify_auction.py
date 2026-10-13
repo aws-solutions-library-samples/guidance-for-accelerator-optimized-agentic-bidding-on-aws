@@ -52,7 +52,7 @@ class CheckFailed(Exception):
 
 
 def run(cmd: list[str], stdin: Optional[str] = None) -> str:
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit dev tooling, fixed argv list, no shell
         cmd, input=stdin, capture_output=True, text=True, timeout=60
     )
     if proc.returncode != 0:

@@ -8,7 +8,11 @@ Creates the Triton model repository structure:
             1/model.onnx
         ncf_deal_manager/
             config.pbtxt
-            1/model.onnx
+            1/model.onnx, manifest.json, interactions.csv
+
+The DLRM export is seeded initialisation. The NCF (Deal Scorer) export is trained
+on sample interactions and must pass the scenario acceptance gate
+(training/ncf_sample/build.py); a gate failure exits 1 and writes no NCF model.
 
 NOTE: Wide & Deep (segment activation) is NOT exported here. It was replaced
 by deterministic rule-based logic in
@@ -21,6 +25,7 @@ Usage:
     python triton/export_models.py                    # export all
     python triton/export_models.py --model dlrm       # export one
     python triton/export_models.py --output-dir /tmp   # custom output
+    python triton/export_models.py --model ncf --ncf-cohorts /tmp/cohorts.json --output-dir /tmp/x
 """
 
 from __future__ import annotations
@@ -179,7 +184,7 @@ def export_dlrm(output_dir: str) -> str:
     # These weights are seeded initialisation, not a trained checkpoint. Saying so
     # here means a reader of the manifest does not have to infer it from the path.
     manifest_path = os.path.join(model_dir, dlrm_features.MANIFEST_FILENAME)
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(
             dlrm_features.manifest(
                 "dlrm_bid_shader",
@@ -197,86 +202,24 @@ def export_dlrm(output_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NCF / NeuMF Model (matches containers/ncf_deal_manager/app.py)
+# NCF / NeuMF (Deal Scorer): trained on sample interactions and gated
 # ---------------------------------------------------------------------------
 
-class NeuMF(nn.Module):
-    """NeuMF following NVIDIA DeepLearningExamples NCF architecture."""
-
-    def __init__(self, nb_users=2000, nb_items=2000, mf_dim=64, mlp_layer_sizes=None):
-        super().__init__()
-        if mlp_layer_sizes is None:
-            mlp_layer_sizes = [256, 128, 64]
-
-        self.mf_user_embed = nn.Embedding(nb_users, mf_dim)
-        self.mf_item_embed = nn.Embedding(nb_items, mf_dim)
-
-        mlp_embed_dim = mlp_layer_sizes[0] // 2
-        self.mlp_user_embed = nn.Embedding(nb_users, mlp_embed_dim)
-        self.mlp_item_embed = nn.Embedding(nb_items, mlp_embed_dim)
-
-        mlp_layers = []
-        input_size = mlp_layer_sizes[0]
-        for output_size in mlp_layer_sizes[1:]:
-            mlp_layers.append(nn.Linear(input_size, output_size))
-            mlp_layers.append(nn.ReLU())
-            input_size = output_size
-        self.mlp = nn.Sequential(*mlp_layers)
-
-        self.final = nn.Sequential(
-            nn.Linear(mf_dim + mlp_layer_sizes[-1], 1),
-            nn.Sigmoid(),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.01)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, user_ids, item_ids):
-        mf_user = self.mf_user_embed(user_ids)
-        mf_item = self.mf_item_embed(item_ids)
-        gmf_out = mf_user * mf_item
-
-        mlp_user = self.mlp_user_embed(user_ids)
-        mlp_item = self.mlp_item_embed(item_ids)
-        mlp_in = torch.cat([mlp_user, mlp_item], dim=-1)
-        mlp_out = self.mlp(mlp_in)
-
-        concat = torch.cat([gmf_out, mlp_out], dim=-1)
-        return self.final(concat).squeeze(-1)
+from training.ncf_sample import build as ncf_build  # noqa: E402
 
 
-def export_ncf(output_dir: str) -> str:
-    """Export NCF/NeuMF to ONNX."""
-    model = NeuMF()
-    model.eval()
+def export_ncf(output_dir: str, cohorts_path: str = ncf_build.DEFAULT_COHORTS,
+               cache_dir: str = ncf_build.DEFAULT_CACHE) -> str:
+    """Train, export and gate the Deal Scorer (training/ncf_sample/build.py).
 
-    users = torch.tensor([42])
-    items = torch.tensor([7])
-
+    Writes model.onnx, manifest.json and interactions.csv to
+    <output_dir>/ncf_deal_manager/1/. Raises ncf_build.GateFailed when the model
+    does not reproduce every scenario target; nothing is written then.
+    """
     model_dir = os.path.join(output_dir, "ncf_deal_manager", "1")
-    os.makedirs(model_dir, exist_ok=True)
-    onnx_path = os.path.join(model_dir, "model.onnx")
-
-    torch.onnx.export(
-        model, (users, items), onnx_path,
-        input_names=["user_ids", "item_ids"],
-        output_names=["relevance_scores"],
-        dynamic_axes={
-            "user_ids": {0: "batch"},
-            "item_ids": {0: "batch"},
-            "relevance_scores": {0: "batch"},
-        },
-        opset_version=17,
-        **onnx_compat.onnx_export_kwargs(dynamo=False),
-    )
-    print(f"  Exported NCF → {onnx_path}")
+    result = ncf_build.build(model_dir, cohorts_path=cohorts_path, cache_dir=cache_dir)
+    onnx_path = os.path.join(model_dir, ncf_build.MODEL_FILE)
+    print(f"  Exported NCF ({result.model_version}) to {onnx_path}")
     return onnx_path
 
 
@@ -284,11 +227,15 @@ def export_ncf(output_dir: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Export ARTF models to ONNX for Triton")
     parser.add_argument("--model", choices=["dlrm", "ncf", "all"], default="all")
     parser.add_argument("--output-dir", default=os.path.join(REPO_ROOT, "triton", "model_repository"))
-    args = parser.parse_args()
+    parser.add_argument("--ncf-cohorts", default=ncf_build.DEFAULT_COHORTS,
+                        help="cohort spec the Deal Scorer is trained and gated on")
+    parser.add_argument("--ncf-cache-dir", default=ncf_build.DEFAULT_CACHE,
+                        help="Deal Scorer build cache (default deployment/.ncf-cache)")
+    args = parser.parse_args(argv)
 
     print(f"Exporting models to {args.output_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -296,10 +243,18 @@ def main():
     if args.model in ("dlrm", "all"):
         export_dlrm(args.output_dir)
     if args.model in ("ncf", "all"):
-        export_ncf(args.output_dir)
+        try:
+            export_ncf(args.output_dir, cohorts_path=args.ncf_cohorts, cache_dir=args.ncf_cache_dir)
+        except ncf_build.GateFailed as exc:
+            print(f"NCF export failed: {exc}; no NCF model written", file=sys.stderr)
+            return 1
+        except ncf_build.gen.SpecError as exc:
+            print(f"NCF export failed: cohort spec error: {exc}", file=sys.stderr)
+            return 1
 
     print("Done. Model repository ready for Triton Inference Server.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -24,8 +24,8 @@ vi.mock("../auth.js", () => ({
   getAccessToken: async () => "test-access-token",
 }));
 
-// The mutations call is not under test; it has to succeed for the auction leg to
-// run at all, so it is stubbed at the client boundary.
+// The /v1/mutations call is stubbed at the client boundary. It is made only when
+// Prebid is not deployed; the tests below count its calls.
 const submit = vi.fn(async () => ({ mutations: [], containers: [] }));
 vi.mock("./useOrchestratorClientWithBase.js", () => ({
   useOrchestratorClientWithBase: () => ({ submit }),
@@ -36,7 +36,7 @@ vi.mock("../utils/theaterBeats.js", () => ({
   buildScenarioContext: () => ({}),
 }));
 
-const { useTheaterRun, AUCTION_NOT_DEPLOYED, AUCTION_FAILED, RUN_READY } =
+const { useTheaterRun, AUCTION_NOT_DEPLOYED, AUCTION_FAILED, RUN_READY, RUN_FAILED } =
   await import("./useTheaterRun.js");
 
 const SCENARIO = { id: "s1", file: "s1.json", name: "S1" };
@@ -119,7 +119,7 @@ async function run() {
   await act(async () => {
     await latest.start(SCENARIO);
   });
-  // The auction is fired without being awaited by start(), so let it settle.
+  // The baseline auction is fired without being awaited by start(), so let it settle.
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
@@ -144,6 +144,9 @@ describe("useTheaterRun auction leg", () => {
     expect(latest.status).toBe(RUN_READY);
     expect(latest.bidResponse).toEqual(LIVE_RESPONSE);
     expect(latest.auctionFault).toBeNull();
+    // An orchestrator that predates the report: still the run, still no browser call.
+    expect(submit).not.toHaveBeenCalled();
+    expect(latest.result.artfReport.available).toBe(false);
   });
 
   /* ------------------------------------------------------ the two passes */
@@ -264,12 +267,74 @@ describe("useTheaterRun auction leg", () => {
     expect(latest.auctionFault.kind).toBe(AUCTION_FAILED);
   });
 
-  it("does not fail the run when the auction fails — the mutations still happened", async () => {
-    installFetch({ auctionStatus: 502, auctionBody: { error: "prebid_unreachable" } });
+  it("a with-ARTF auction fault fails the run with the auction's own fault, and never substitutes /v1/mutations", async () => {
+    installFetch({ auctionStatus: 502, auctionBody: { error: "prebid_unreachable", detail: "connection refused" } });
     await run();
-
-    expect(latest.status).toBe(RUN_READY);
-    expect(latest.beats).toHaveLength(1);
+    expect(latest.status).toBe(RUN_FAILED);
+    expect(latest.beats).toBeNull();
+    expect(latest.error.message).toMatch(/with-ARTF auction could not be read: connection refused/);
     expect(latest.auctionFault.kind).toBe(AUCTION_FAILED);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  /* ------------------------------------- pass 2 built from the auction report */
+
+  it("builds the with-ARTF beats from the auction's report and makes zero /v1/mutations calls", async () => {
+    const auctionBody = {
+      ...LIVE_RESPONSE,
+      artf_meta: {
+        ...LIVE_RESPONSE.artf_meta,
+        extension_point: {
+          available: true,
+          outcome: "mutations_returned",
+          response: {
+            id: "tid-1",
+            mutations: [{ intent: 1, op: 1, path: "/user/data", ids: { id: ["seg-1"] }, disposition: "applied" }],
+            metadata: {
+              containers: [{
+                name: "widedeep-segment-activator", status: "ok", latency_ms: 3,
+                mutations: [{ intent: 1, op: 1, path: "/user/data", ids: { id: ["seg-1"] }, disposition: "applied" }],
+              }],
+            },
+          },
+        },
+      },
+    };
+    const calls = installFetch({ auctionBody });
+    await run();
+    expect(latest.status).toBe(RUN_READY);
+    expect(submit).not.toHaveBeenCalled();
+    expect(auctionCalls(calls).filter((c) => c.url.includes("artf=on"))).toHaveLength(1);
+    expect(auctionCalls(calls).filter((c) => c.url.includes("artf=off"))).toHaveLength(1);
+    expect(calls.some((c) => c.url.includes("/v1/mutations"))).toBe(false);
+    expect(latest.result.artfReport).toMatchObject({ source: "auction", available: true, outcome: "mutations_returned" });
+    const stop = latest.result.stops.find((st) => st.mutations.length > 0);
+    expect(stop.mutations[0].disposition).toBe("applied");
+  });
+
+  it("a live auction whose report is unavailable is still the run, with no /v1/mutations call", async () => {
+    const auctionBody = {
+      ...LIVE_RESPONSE,
+      artf_meta: {
+        ...LIVE_RESPONSE.artf_meta,
+        extension_point: { available: false, reason: "Prebid returned no module trace" },
+      },
+    };
+    installFetch({ auctionBody });
+    await run();
+    expect(latest.status).toBe(RUN_READY);
+    expect(submit).not.toHaveBeenCalled();
+    expect(latest.result.artfReport).toMatchObject({ available: false, reason: "Prebid returned no module trace" });
+    expect(latest.result.stops.every((st) => st.mutations.length === 0)).toBe(true);
+  });
+
+  it("falls back to /v1/mutations only when Prebid is not deployed", async () => {
+    const body = { error: "prebid_not_deployed", detail: "Prebid Server is not deployed." };
+    installFetch({ auctionStatus: 501, auctionBody: body, baselineStatus: 501, baselineBody: body });
+    await run();
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(latest.status).toBe(RUN_READY);
+    expect(latest.auctionFault.kind).toBe(AUCTION_NOT_DEPLOYED);
+    expect(latest.bidResponse).toBeNull();
   });
 });

@@ -1,4 +1,4 @@
-# ARTF v1.0 — Intents & Mutations by Buy-Side vs. Sell-Side
+# ARTF v1.0: Intents & Mutations by Buy-Side vs. Sell-Side
 
 Based on the [IAB Tech Lab Agentic Real Time Framework v1.0](https://github.com/IABTechLab/agentic-real-time-framework/blob/main/Agentic_Real_Time_Framework_Version_1_0_FINAL.md), as implemented in this guidance.
 
@@ -33,12 +33,12 @@ The default deployment has **one ARTF host: the orchestrator, called directly** 
 +-----------------------------+       +----------------------+       +----------------------------------+
 |  Callers                    |       |  ARTF Orchestrator   |       |  ARTF containers (EKS)           |
 |  - Frontend / Theater       | ----> |  POST /v1/mutations  | ----> |  6 shipped + registry-attached   |
-|  - Load test, MCP runtime   | <---- |  fan-out, precedence | <---- |  gRPC :50051  REST/MCP :8081     |
+|  - Load test, MCP runtime   | <---- |  staged, precedence  | <---- |  gRPC :50051  REST/MCP :8081     |
 |  - Prebid Server (OPTIONAL) |       |  outcome events      |       |  4 of 6 call NVIDIA Triton (GPU) |
 +-----------------------------+       +----------------------+       +----------------------------------+
 ```
 
-- **Orchestrator** (`source/orchestrator/app.py`): fans out to every active container whose intents overlap `applicable_intents`, in parallel, within `tmax`. The container set is the six code-defined containers plus any records in the DynamoDB container registry (`${STACK_NAME}-container-registry`). Containers are called over REST `POST /mutate` with an MCP `extend_rtb` fallback; each container also serves the spec's gRPC `RTBExtensionPoint/GetMutations` on 50051.
+- **Orchestrator** (`source/orchestrator/app.py`): calls every active container whose intents overlap `applicable_intents` within `tmax`, as a staged pipeline (1 enrich, 2 deals, 3 yield, 4 price). Containers within a stage run in parallel, and each stage's mutations are applied to a working copy of the request before the next stage runs (`source/shared/artf_stages.py`, `source/shared/artf_applier.py`). The container set is the six code-defined containers plus any records in the DynamoDB container registry (`${STACK_NAME}-container-registry`). Containers are called over REST `POST /mutate` with an MCP `extend_rtb` fallback by default (`ARTF_CONTAINER_TRANSPORT=http`); with `ARTF_CONTAINER_TRANSPORT=grpc` the orchestrator tries gRPC first. Each container serves the spec's gRPC `RTBExtensionPoint/GetMutations` on 50051.
 - **Precedence**: two containers may claim the same intent and both are called. For each `(path, intent)` one mutation survives: highest `priority` on the registry record wins, then later registry order (store records follow the built-ins). With no priorities set this is last-write-wins. Losers are reported in `metadata.conflicts` and the losing container's `superseded` count, and its own `mutations` stay visible.
 - **Feedback**: after responding, the orchestrator emits a bid-outcome event and a deal-yield-outcome event for every request. Those feed the closed loop described in `CLOSED_LOOP.md`.
 
@@ -82,9 +82,9 @@ These intents enrich or modify the **bid request** before it reaches buyers, mak
 | **What it mutates** | Adds or removes deal IDs on impressions in-flight |
 | **Why it benefits SSPs/Publishers** | SSPs and publishers curate private marketplaces (PMPs) dynamically. A curation partner's container can activate deals for impressions that match buyer criteria, or suppress deals that are paused/expired, in real time and without platform code changes. This drives PMP fill rates and premium pricing. |
 | **Example** | A curation platform activates a `"holiday-travel-pmp"` deal on travel-content pages during Q4, then suppresses it automatically in January. |
-| **Implemented by** | **Deal Scorer** (`ncf-deal-manager`, `source/containers/ncf_deal_manager/`). NCF / NeuMF collaborative-filtering model served by Triton (`ncf-neumf-triton-v1`); scores the hashed user id against each `imp.pmp.deals[].id`, activation threshold 0.499. The two intents are gated independently, so a request that asks only for `SUPPRESS_DEALS` never receives an activation. Retrained on the slow loop (NeMo-RL on SageMaker, ONNX to TensorRT). |
+| **Implemented by** | **Deal Scorer** (`ncf-deal-manager`, `source/containers/ncf_deal_manager/`). NCF / NeuMF collaborative-filtering model served by Triton (`ncf-neumf-sample-<12 hex>`); scores the hashed user id against each offered deal and each library deal the deal book places on the impression, activates library deals scoring at least 0.60 and suppresses offered deals scoring below 0.30. The two intents are gated independently, so a request that asks only for `SUPPRESS_DEALS` never receives an activation. Trained by the deploy on sample interactions generated from the deal book, not observed outcomes, and gated on the scenario targets before export (ONNX, then TensorRT in the Model Optimizer). On-demand retraining is parked: outcome events carry no deal id. |
 | **Mutation** | `ACTIVATE_DEALS`: `op=ADD`, `path=/imp/{impId}`, `ids=[dealId...]`. `SUPPRESS_DEALS`: `op=REMOVE`, same path and payload. |
-| **Host write** | Activation appends `Deal{id}` to `imp.pmp.deals` if not already present. Suppression **marks** the deal with `deal.ext.artf.suppressed = true` rather than deleting it, so the auction record (and the Auction Theater) can show a deal was considered and suppressed instead of never offered. The `artfhouse` demand endpoint reads that marker and excludes the campaign with reason `deal_suppressed`. |
+| **Host write** | Activation appends `Deal{id}` to `imp.pmp.deals` if not already present; between stages the orchestrator also copies the deal's auction type (`at`, the deal book's `pricetype`) onto it, so the Yield Optimizer picks the right margin type. Suppression **marks** the deal with `deal.ext.artf.suppressed = true` rather than deleting it, so the auction record (and the Auction Theater) can show a deal was considered and suppressed instead of never offered. The `artfhouse` demand endpoint reads that marker and excludes the campaign with reason `deal_suppressed`. |
 
 ---
 
@@ -95,9 +95,9 @@ These intents enrich or modify the **bid request** before it reaches buyers, mak
 | **What it mutates** | Changes floor price or margin parameters on existing deals |
 | **Why it benefits SSPs/Publishers** | Yield optimization. A container can dynamically raise floors on high-demand inventory or lower them on remnant, maximizing publisher revenue without manual deal management. The SSP keeps control because it can reject any floor change that violates business rules. |
 | **Example** | A yield-optimization agent raises the floor on a sports-content deal during a live game when demand spikes. |
-| **Implemented by** | Two containers, one per intent, so a request asking for only one intent never fans out to the other model and each has its own health, load-test target and outcome attribution. **Yield Optimizer — Floor** (`yield-optimizer-floor`, `source/containers/yield_optimizer_floor/`): XGBoost on Triton's FIL backend (`deal_yield_manager_floor`, `deal-yield-floor-xgboost-v1`) predicts a floor multiplier; the CPU fallback returns 1.0, meaning no change. **Yield Optimizer — Margin** (`yield-optimizer-margin`, `source/containers/yield_optimizer_margin/`): XGBoost on FIL (`deal_yield_manager_margin`, `deal-yield-margin-xgboost-v1`) predicts a margin value. Both clamp their outputs and run bounded epsilon-greedy exploration during load tests to bootstrap training data. Retrained with SageMaker built-in XGBoost from a single Glue ETL job whose dedup key includes the intent. |
+| **Implemented by** | Two containers, one per intent, so a request asking for only one intent never calls the other model and each has its own health, load-test target and outcome attribution. **Yield Optimizer (Floor)** (`yield-optimizer-floor`, `source/containers/yield_optimizer_floor/`): XGBoost on Triton's FIL backend (`deal_yield_manager_floor`, `deal-yield-floor-xgboost-v1`) predicts a floor multiplier; the CPU fallback returns 1.0, meaning no change. **Yield Optimizer (Margin)** (`yield-optimizer-margin`, `source/containers/yield_optimizer_margin/`): XGBoost on FIL (`deal_yield_manager_margin`, `deal-yield-margin-xgboost-v1`) predicts a margin value. Both clamp their outputs and run bounded epsilon-greedy exploration during load tests to bootstrap training data. Retrained with SageMaker built-in XGBoost from a single Glue ETL job whose dedup key includes the intent. |
 | **Mutation** | `op=REPLACE`, `path=/imp/{impId}/deals/{dealId}`. Floor: `adjust_deal.bidfloor` (absolute, non-negative). Margin: `adjust_deal.margin={value, calculation_type}` where `CPM` (0) is absolute and `PERCENT` (1) is relative; the container picks `CPM` when `deal.at == 1`, else `PERCENT`. The payload carries no deal id and no currency; the deal is identified only by path. |
-| **Host write** | Resolves the new floor (absolute for FLOOR; `base + value` or `base + base*value/100` for MARGIN) and rejects an unknown calculation type, a missing imp or deal, or any result that is not strictly positive, because Prebid ignores non-positive floors. Writes `deal.bidfloor` and `deal.bidfloorcur` (currency from deal, then imp, then `request.cur[0]`, then `USD`), and **also** raises `imp.bidfloor` to `max(existing, new)`. A mutation never lowers a floor the publisher already set. Prebid's own price-floors module is disabled so the hook is the single floor authority. |
+| **Host write** | Resolves the new floor (absolute for FLOOR; `base + value` for a CPM margin, `base + base*value` for a PERCENT margin, where `value` is a fraction) and rejects an unknown calculation type, a missing imp or deal, or any result that is not strictly positive, because Prebid ignores non-positive floors. Writes `deal.bidfloor` and `deal.bidfloorcur` only (currency from deal, then imp, then `request.cur[0]`, then `USD`); `imp.bidfloor` stays as the publisher set it, so non-deal bids keep the impression floor. A deal bid is held to max(impression floor, deal floor): the `artfhouse` demand endpoint refuses to bid below it, the `artfhouse` adapter attaches it to each deal bid as `PriceFloorInfo`, and the orchestrator's auction route turns on Prebid's deal-floor enforcement (`ext.prebid.floors.enforcement.floorDeals`) with a floors rule that matches no impression. |
 | **Attachable** | An externally built container may claim `ADJUST_DEAL_FLOOR`; see [Attaching third-party containers](#attaching-third-party-containers). |
 
 ---
@@ -157,7 +157,7 @@ These intents modify the **bid response** or influence buying decisions, optimiz
 
 ---
 
-### `ADD_METRICS` (Buy-Side Use — Post-Bid Analytics)
+### `ADD_METRICS` (Buy-Side Use: Post-Bid Analytics)
 
 | | |
 |---|---|
@@ -168,7 +168,7 @@ These intents modify the **bid response** or influence buying decisions, optimiz
 
 ---
 
-## Both Sides — Shared Benefit
+## Both Sides: Shared Benefit
 
 | Intent | Sell-Side Benefit | Buy-Side Benefit |
 |--------|-------------------|------------------|
@@ -181,7 +181,7 @@ These intents modify the **bid response** or influence buying decisions, optimiz
 
 The registry table accepts containers this repository did not build, with no orchestrator code change and no Java change, because every host (the frontend, the MCP runtime, and the optional Prebid hook) calls the orchestrator and inherits whatever the registry resolves. `deployment/attach_artf_container.sh` validates the producer's `artf-registry-record.json`, copies the image into this account's ECR, renders the Kubernetes manifest, probes `POST /mutate`, and writes the record inactive; activation is a flip of `active` on the record or in the Container Health panel. The endpoint must be cluster-internal, `host:port` with no path and no IP.
 
-The worked example is `contextual-yield-agent` from Guidance for Containerized Advertising Context on AWS. It claims `ADJUST_DEAL_FLOOR`, so at the default priority it wins the floor decision over the built-in Yield Optimizer — Floor; `--priority -1` keeps the built-in. Built-ins are pinned at priority 0 and cannot be renamed, re-targeted or deactivated from the UI or the table, so priority on the attached record is the one lever. The cross-account ECR pull permission is the producer's to grant.
+The worked example is `contextual-yield-agent` from Guidance for Containerized Advertising Context on AWS. It claims `ADJUST_DEAL_FLOOR`, so at the default priority it wins the floor decision over the built-in Yield Optimizer (Floor); `--priority -1` keeps the built-in. Built-ins are pinned at priority 0 and cannot be renamed, re-targeted or deactivated from the UI or the table, so priority on the attached record is the one lever. The cross-account ECR pull permission is the producer's to grant.
 
 ---
 
@@ -192,8 +192,8 @@ The worked example is `contextual-yield-agent` from Guidance for Containerized A
 | `ACTIVATE_SEGMENTS` | **Both** (leans sell-side) | Audience enrichment / identity resolution | Audience Activator | Rule engine (CPU) | Yes → `user.data` |
 | `ACTIVATE_DEALS` | **SSP / Publisher** | Dynamic PMP activation | Deal Scorer | NCF / NeuMF on Triton | Yes → `imp.pmp.deals` |
 | `SUPPRESS_DEALS` | **SSP / Publisher** | Remove stale/paused deals in real time | Deal Scorer | NCF / NeuMF on Triton | Yes → `deal.ext.artf.suppressed` |
-| `ADJUST_DEAL_FLOOR` | **SSP / Publisher** | Dynamic yield optimization | Yield Optimizer — Floor | XGBoost on Triton FIL | Yes → `deal.bidfloor`, `imp.bidfloor` |
-| `ADJUST_DEAL_MARGIN` | **SSP / Publisher** | Margin management on curated deals | Yield Optimizer — Margin | XGBoost on Triton FIL | Yes → `deal.bidfloor`, `imp.bidfloor` |
+| `ADJUST_DEAL_FLOOR` | **SSP / Publisher** | Dynamic yield optimization | Yield Optimizer (Floor) | XGBoost on Triton FIL | Yes → `deal.bidfloor` (and `bidfloorcur`); `imp.bidfloor` is not changed |
+| `ADJUST_DEAL_MARGIN` | **SSP / Publisher** | Margin management on curated deals | Yield Optimizer (Margin) | XGBoost on Triton FIL | Yes → `deal.bidfloor` (and `bidfloorcur`); `imp.bidfloor` is not changed |
 | `ADD_CIDS` | **SSP / Publisher** | Contextual enrichment for cookieless targeting | Template only (partner slot) | None | Accepted → `imp.metric` |
 | `ADD_METRICS` | **Both** | Pre-bid verification (sell) / measurement (buy) | Signals Enricher | Rule engine (CPU) | Yes → `imp.metric` |
 | `BID_SHADE` | **DSP / Advertiser** | Spend efficiency in first-price auctions | Bid Pricer | DLRM on Triton | No (response-side; orchestrator path only) |

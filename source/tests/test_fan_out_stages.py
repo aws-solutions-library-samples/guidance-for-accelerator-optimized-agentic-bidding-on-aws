@@ -58,7 +58,7 @@ ENVELOPE = {
             "banner": {"w": 300, "h": 250},
             "bidfloor": 2.5,
             "bidfloorcur": "USD",
-            "pmp": {"private_auction": 0, "deals": [{"id": "deal-remnant-open", "bidfloor": 1.0, "at": 3}]},
+            "pmp": {"private_auction": 0, "deals": [{"id": "deal-remnant-open-hearth", "bidfloor": 1.0, "at": 3}]},
         }],
         "site": {"domain": "hearth-and-home.example", "cat": ["283"]},
         "user": {"id": "user-home-01", "data": [{"id": "dmp", "segment": [{"id": "seg-461"}]}]},
@@ -173,23 +173,47 @@ def test_the_yield_optimizer_sees_the_deal_the_deal_scorer_activated_at_its_libr
     result = _run(monkeypatch, rec)
     for name in ("yield-optimizer-floor", "yield-optimizer-margin"):
         deals = dict(rec.seen)[name]["bid_request"]["imp"][0]["pmp"]["deals"]
-        assert [d["id"] for d in deals] == ["deal-remnant-open", "deal-home-premium"]
+        assert [d["id"] for d in deals] == ["deal-remnant-open-hearth", "deal-home-premium"]
         assert deals[1]["bidfloor"] == 3.0 and deals[1]["bidfloorcur"] == "USD"
-        # imp.bidfloor was raised to the activated deal's floor, so the yield
-        # containers price against the floor the host will enforce.
-        assert dict(rec.seen)[name]["bid_request"]["imp"][0]["bidfloor"] == 3.0
+        # The deal floor binds the deal only; imp.bidfloor stays the publisher's.
+        assert dict(rec.seen)[name]["bid_request"]["imp"][0]["bidfloor"] == 2.5
     deals_stage = result.stages[1]
     assert deals_stage.name == "deals" and deals_stage.applied == 2 and deals_stage.rejected == []
     # The Deal Scorer itself saw the original request (one deal).
     assert len(dict(rec.seen)["ncf-deal-manager"]["bid_request"]["imp"][0]["pmp"]["deals"]) == 1
 
 
-def test_the_bid_pricer_sees_the_floor_the_yield_optimizer_raised(monkeypatch):
-    rec = Recorder({"yield-optimizer-floor": _floor("deal-remnant-open", 2.9)})
+def test_the_yield_optimizer_sees_the_activated_deals_auction_type_from_the_deal_book(monkeypatch):
+    # The orchestrator's deal book (shared/deal_library.py) gives the inserted deal
+    # its OpenRTB `at`, which the margin container reads to pick CPM or PERCENT.
+    monkeypatch.setattr(oapp, "_deal_lookup", {"deal-home-premium": 2}.get)
+    rec = Recorder({"ncf-deal-manager": _activate_with_floor("deal-home-premium", 3.0)})
+    _run(monkeypatch, rec)
+    for name in ("yield-optimizer-floor", "yield-optimizer-margin"):
+        deal = dict(rec.seen)[name]["bid_request"]["imp"][0]["pmp"]["deals"][1]
+        assert deal == {"id": "deal-home-premium", "at": 2, "bidfloor": 3.0, "bidfloorcur": "USD"}
+
+
+def test_an_unreadable_deal_book_leaves_the_activation_id_only_and_the_auction_running(monkeypatch):
+    def unreadable(_deal_id):
+        raise RuntimeError("deal book not loaded")
+
+    monkeypatch.setattr(oapp, "_deal_lookup", unreadable)
+    rec = Recorder({"ncf-deal-manager": _activate_with_floor("deal-home-premium", 3.0)})
+    result = _run(monkeypatch, rec)
+    deal = dict(rec.seen)["yield-optimizer-margin"]["bid_request"]["imp"][0]["pmp"]["deals"][1]
+    assert "at" not in deal and deal["id"] == "deal-home-premium"
+    assert result.stages[1].applied == 2 and result.stages[1].rejected == []
+    assert "dlrm-bid-shader" in [name for name, _ in rec.seen]
+
+
+def test_the_bid_pricer_sees_the_deal_floor_the_yield_optimizer_raised(monkeypatch):
+    rec = Recorder({"yield-optimizer-floor": _floor("deal-remnant-open-hearth", 2.9)})
     _run(monkeypatch, rec)
     shader_imp = dict(rec.seen)["dlrm-bid-shader"]["bid_request"]["imp"][0]
     assert shader_imp["pmp"]["deals"][0]["bidfloor"] == 2.9
-    assert shader_imp["bidfloor"] == 2.9, "raised from 2.5"
+    assert shader_imp["pmp"]["deals"][0]["bidfloorcur"] == "USD"
+    assert shader_imp["bidfloor"] == 2.5, "a deal floor never raises the impression floor"
 
 
 def test_a_mutation_the_orchestrator_cannot_apply_is_reported_on_the_stage_and_still_returned(monkeypatch):

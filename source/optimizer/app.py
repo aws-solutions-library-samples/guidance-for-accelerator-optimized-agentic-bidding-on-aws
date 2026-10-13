@@ -66,6 +66,17 @@ _VALID_PRECISIONS = {"fp32", "fp16", "int8"}
 # the two agree.
 MANIFEST_FILENAME = "manifest.json"
 
+# S3 user-defined metadata on every engine this service writes (S3 stores the keys
+# in lowercase and returns them without the x-amz-meta- prefix). source-fingerprint
+# is the `fingerprint` field of the source's manifest.json, absent when the manifest
+# has none; provisioned-by says which path wrote the engine. A bootstrap entry with
+# rebuild_on_source_change rebuilds its engine when the two fingerprints differ, and
+# never overwrites one a promotion wrote.
+META_SOURCE_FINGERPRINT = "source-fingerprint"
+META_PROVISIONED_BY = "provisioned-by"
+PROVISIONED_BY_BOOTSTRAP = "bootstrap"
+PROVISIONED_BY_PROMOTION = "promotion"
+
 
 def _valid_input_profiles(profiles: Any) -> bool:
     """Validate the input_profiles structure: {name: {min:[...],opt:[...],max:[...]}}."""
@@ -104,9 +115,40 @@ def _download(uri: str, dest_path: str) -> None:
     _s3().download_file(bucket, key, dest_path)
 
 
-def _upload(src_path: str, uri: str) -> None:
+def _upload(src_path: str, uri: str, metadata: dict[str, str] | None = None) -> None:
     bucket, key = _parse_s3(uri)
-    _s3().upload_file(src_path, bucket, key)
+    if metadata:
+        _s3().upload_file(src_path, bucket, key, ExtraArgs={"Metadata": metadata})
+    else:
+        _s3().upload_file(src_path, bucket, key)
+
+
+def _engine_metadata(
+    provisioned_by: str, source_fingerprint: str | None
+) -> dict[str, str]:
+    """The S3 metadata an engine is written with."""
+    meta = {META_PROVISIONED_BY: provisioned_by}
+    if source_fingerprint:
+        meta[META_SOURCE_FINGERPRINT] = source_fingerprint
+    return meta
+
+
+def _head_metadata(uri: str) -> dict[str, str] | None:
+    """User metadata of the object at `uri`, or None when the object does not exist.
+
+    Only a 404 means absent. Any other error is raised: reading AccessDenied as
+    "no engine" would rebuild over an engine whose provenance could not be read,
+    which may be a promoted one.
+    """
+    bucket, key = _parse_s3(uri)
+    try:
+        head = _s3().head_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless it is a plain 404
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    return {str(k).lower(): str(v) for k, v in (head.get("Metadata") or {}).items()}
 
 
 class OptimizeRequestError(ValueError):
@@ -132,7 +174,7 @@ def _resolve_onnx(source_model_uri: str, workdir: str) -> str:
                 member_path = os.path.realpath(os.path.join(extract_dir, member.name))
                 if not member_path.startswith(os.path.realpath(extract_dir) + os.sep):
                     raise ValueError(f"Unsafe path in archive: {member.name}")
-            tar.extractall(extract_dir)  # nosemgrep: tarfile-extractall — members validated above
+            tar.extractall(extract_dir, filter="data")  # nosemgrep: tarfile-extractall: members validated above
         for root, _dirs, files in os.walk(extract_dir):
             for fname in files:
                 if fname.endswith(".onnx"):
@@ -210,7 +252,7 @@ def _read_manifest(onnx_path: str, source_model_uri: str) -> dict[str, Any] | No
         else:
             return None
     try:
-        with open(candidate) as handle:
+        with open(candidate, encoding="utf-8") as handle:
             loaded = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise OptimizeRequestError(
@@ -317,8 +359,8 @@ def _build_engine(
     # fp32 => no precision flag (default).
 
     logger.info("Running: %s", " ".join(cmd))
-    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use — fixed binary, validated args
-        cmd,
+    proc = subprocess.run(  # nosemgrep: dangerous-subprocess-use-audit fixed trtexec binary, args built from validated fields
+        cmd,  # nosemgrep: dangerous-subprocess-use-tainted-env-args the only env input is TRTEXEC_PATH, set by the deployment manifest; the rest are paths this job created
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -431,7 +473,12 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
             input_profiles=input_profiles,
         )
 
-        _upload(engine_path, output_uri)
+        # Marked as a promotion so a later bootstrap never rebuilds over it.
+        _upload(
+            engine_path,
+            output_uri,
+            _engine_metadata(PROVISIONED_BY_PROMOTION, None),
+        )
         engine_bytes = os.path.getsize(engine_path)
 
         duration = time.time() - start
@@ -484,7 +531,10 @@ async def health(request: Request) -> JSONResponse:
 # must happen on this GPU node (the deploy host has no GPU and can't reach the
 # internal NLB). On startup, if OPTIMIZER_BOOTSTRAP_URI points at a spec, build any
 # base engine that is not already present in S3, then serve. Idempotent: existing
-# engines are skipped, so restarts and re-deploys are cheap.
+# engines are skipped, so restarts and re-deploys are cheap. The exception is an
+# entry with rebuild_on_source_change: its engine is rebuilt when the source
+# manifest's fingerprint no longer matches the engine's source-fingerprint, unless
+# a promotion wrote the engine (see _engine_is_current).
 
 OPTIMIZER_BOOTSTRAP_URI = os.environ.get("OPTIMIZER_BOOTSTRAP_URI", "")
 
@@ -498,6 +548,78 @@ def _s3_object_exists(uri: str) -> bool:
         return False
 
 
+def _manifest_fingerprint(manifest: dict[str, Any] | None) -> str | None:
+    """The `fingerprint` a manifest records, or None when it records none."""
+    value = (manifest or {}).get("fingerprint")
+    return value if isinstance(value, str) and value else None
+
+
+def _source_fingerprint(source_model_uri: str) -> str | None:
+    """The fingerprint in the manifest beside a raw-.onnx source, or None.
+
+    Reads only the sibling manifest.json (the optimizer image has no source/shared
+    to recompute it from), so deciding whether to rebuild costs no ONNX download.
+    """
+    workdir = tempfile.mkdtemp(prefix="trt-fingerprint-")
+    try:
+        _fetch_sibling_manifest(source_model_uri, workdir)
+        path = os.path.join(workdir, MANIFEST_FILENAME)
+        if not os.path.exists(path):
+            return None
+        return _manifest_fingerprint(_read_manifest(path, source_model_uri))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _engine_is_current(entry: dict) -> bool:
+    """Whether the bootstrap should leave the entry's engine as it is.
+
+    Without rebuild_on_source_change an existing engine is always kept. With it, an
+    existing engine is kept when a promotion wrote it (or any writer other than the
+    bootstrap), when the source records no fingerprint to compare, or when its
+    source-fingerprint equals the source's. An engine with no provisioned-by
+    metadata counts as a bootstrap engine: it predates the metadata, and only the
+    bootstrap wrote engines then.
+    """
+    model_name = entry["model_name"]
+    output_uri = entry["output_uri"]
+    if entry.get("rebuild_on_source_change") is not True:
+        if _s3_object_exists(output_uri):
+            logger.info("Bootstrap: engine already present for %s (%s); skipping", model_name, output_uri)
+            return True
+        return False
+
+    engine_meta = _head_metadata(output_uri)
+    if engine_meta is None:
+        return False
+    provisioned_by = engine_meta.get(META_PROVISIONED_BY, "")
+    if provisioned_by not in ("", PROVISIONED_BY_BOOTSTRAP):
+        logger.info(
+            "Bootstrap: %s engine at %s was provisioned by %s; not rebuilding it",
+            model_name, output_uri, provisioned_by,
+        )
+        return True
+    source_fp = _source_fingerprint(entry["source_model_uri"])
+    engine_fp = engine_meta.get(META_SOURCE_FINGERPRINT, "")
+    if source_fp is None:
+        logger.warning(
+            "Bootstrap: %s source %s records no fingerprint; keeping the engine at %s",
+            model_name, entry["source_model_uri"], output_uri,
+        )
+        return True
+    if engine_fp == source_fp:
+        logger.info(
+            "Bootstrap: %s engine matches source fingerprint %s; skipping",
+            model_name, source_fp[:12],
+        )
+        return True
+    logger.info(
+        "Bootstrap: %s engine fingerprint %s differs from source %s (provisioned-by %s); rebuilding",
+        model_name, engine_fp[:12] or "<none>", source_fp[:12], provisioned_by or "<none>",
+    )
+    return False
+
+
 def _bootstrap_one(entry: dict) -> None:
     model_name = entry["model_name"]
     source_model_uri = entry["source_model_uri"]
@@ -508,8 +630,7 @@ def _bootstrap_one(entry: dict) -> None:
 
     expected_feature_spec_version = entry.get("expected_feature_spec_version")
 
-    if _s3_object_exists(output_uri):
-        logger.info("Bootstrap: engine already present for %s (%s) — skipping", model_name, output_uri)
+    if _engine_is_current(entry):
         return
 
     workdir = tempfile.mkdtemp(prefix="trt-bootstrap-")
@@ -527,17 +648,24 @@ def _bootstrap_one(entry: dict) -> None:
             )
         engine_path = os.path.join(workdir, "model.plan")
         _build_engine(onnx_path, engine_path, precision, max_workspace_size, None, input_profiles=input_profiles)
-        _upload(engine_path, output_uri)
+        source_fp = _manifest_fingerprint(_read_manifest(onnx_path, source_model_uri))
+        _upload(
+            engine_path,
+            output_uri,
+            _engine_metadata(PROVISIONED_BY_BOOTSTRAP, source_fp),
+        )
         logger.info("Bootstrap: built base engine for %s -> %s", model_name, output_uri)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 def run_bootstrap() -> None:
-    """Build any missing base engines described by the bootstrap spec.
+    """Build any missing (or, for rebuild_on_source_change entries, out-of-date)
+    base engines described by the bootstrap spec.
 
     The spec is JSON at OPTIMIZER_BOOTSTRAP_URI: {"models": [ {model_name,
-    source_model_uri, output_uri, precision?, max_workspace_size?, input_profiles?}, ...]}.
+    source_model_uri, output_uri, precision?, max_workspace_size?, input_profiles?,
+    rebuild_on_source_change?}, ...]}.
     A failure to build one model is logged and re-raised (fail loudly — a missing
     base engine means Triton cannot serve that model; we do not hide it).
     """

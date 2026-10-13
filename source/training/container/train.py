@@ -6,18 +6,22 @@ Runs inside a SageMaker training job. Performs:
 3. ONNX export of the trained model
 
 Environment (SageMaker convention):
-    /opt/ml/input/data/training/  — Parquet training data
-    /opt/ml/input/config/hyperparameters.json — Job hyperparameters
-    /opt/ml/model/ — Output directory for trained ONNX model
+    /opt/ml/input/data/training/  : Parquet training data (CSV also read for NCF)
+    /opt/ml/input/config/hyperparameters.json : Job hyperparameters
+    /opt/ml/model/ : Output directory for trained ONNX model
 
-Supported model types: dlrm_bid_shader only. ncf_deal_manager is registered
-in MODEL_REGISTRY (matches the serving container split) but cannot be
-trained yet: NCFModel.forward() requires user_ids/item_ids (a per-deal
-identifier), and BidShadingOutcomeEvent/BidShadingOutcomeRecord
-(shared/feedback_models.py) never captures a deal_id anywhere in the
-schema. Adding NCF training support requires adding deal_id to that event
-schema and threading it through the Feedback Collector -> Glue ETL path
-first, not a change local to this file.
+Supported model types:
+
+- dlrm_bid_shader: bid outcome records from the Glue ETL (Parquet).
+- ncf_deal_manager: user-deal interactions with columns user_id, deal_id, a
+  binary label and a per-row provenance (the schema training/ncf_sample/generate.py
+  writes; Parquet or CSV). The manifest's training_data is the provenance value. Ids are hashed with shared/ncf_ids.bucket, the model is shared/ncf_model's
+  NeuMF and the export carries the Triton signature, so the serving container
+  scores exactly what was trained. The deploy trains this model on sample
+  interactions (training/ncf_sample/build.py). The live outcome feed
+  (BidShadingOutcomeEvent/Record, shared/feedback_models.py) records no deal_id,
+  so retraining on observed outcomes needs deal_id added to that schema and the
+  Feedback Collector to Glue ETL path first.
 """
 
 from __future__ import annotations
@@ -43,6 +47,9 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 # directly. One definition, two readers.
 from shared import dlrm_features
 from shared import onnx_compat
+# The Deal Scorer's id hash, thresholds and model, shared with the serving
+# container and the deploy-time sample trainer.
+from shared import ncf_ids, ncf_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,8 +64,16 @@ SM_HP_FILE = "/opt/ml/input/config/hyperparameters.json"
 # source/containers/widedeep_segment_activator/app.py.
 MODEL_REGISTRY = {
     "dlrm_bid_shader": "models.dlrm",
-    "ncf_deal_manager": "models.ncf",
+    "ncf_deal_manager": "shared.ncf_model",
 }
+
+NCF_MODEL_TYPE = "ncf_deal_manager"
+#: The NCF label: binary implicit engagement with a deal.
+NCF_OBJECTIVE = "implicit_engagement"
+NCF_LABEL_COLUMN = "label"
+#: The per-row provenance column of the interaction schema (training/ncf_sample/
+#: generate.py writes ``sample``). The manifest's training_data is read from it.
+NCF_PROVENANCE_COLUMN = "provenance"
 
 # DLRM dense/sparse feature columns, drawn from the real Glue ETL output
 # schema (glue_feature_engineering.py's engineer_features()/
@@ -127,13 +142,21 @@ class DatasetUnfitError(RuntimeError):
     """
 
 
-def resolve_label_column(hp: dict) -> tuple[str, str]:
+def resolve_label_column(hp: dict, model_type: str = "dlrm_bid_shader") -> tuple[str, str]:
     """(objective, label_column) for this run.
 
     An unrecognised objective is refused rather than defaulted: silently training
     on a different label than the caller asked for is the class of defect this work
-    exists to remove.
+    exists to remove. NCF has one objective, implicit engagement on ``label``.
     """
+    if model_type == NCF_MODEL_TYPE:
+        objective = str(hp.get("objective", NCF_OBJECTIVE)).strip().lower()
+        if objective != NCF_OBJECTIVE:
+            raise DatasetUnfitError(
+                f"objective '{objective}' does not apply to {NCF_MODEL_TYPE}, which is "
+                f"trained on '{NCF_OBJECTIVE}' (column '{NCF_LABEL_COLUMN}')."
+            )
+        return NCF_OBJECTIVE, NCF_LABEL_COLUMN
     objective = str(hp.get("objective", _DEFAULT_OBJECTIVE)).strip().lower()
     if objective not in _OBJECTIVE_LABELS:
         raise DatasetUnfitError(
@@ -160,7 +183,9 @@ def policy_parameters_of(model: nn.Module) -> list:
     return list(getter())
 
 
-def validate_dataset(df: pd.DataFrame, label_column: str, objective: str) -> dict:
+def validate_dataset(
+    df: pd.DataFrame, label_column: str, objective: str, model_type: str = "dlrm_bid_shader"
+) -> dict:
     """Refuse a dataset that cannot teach the model anything, before phase 1.
 
     Every check here corresponds to a state this pipeline has actually been in, and
@@ -182,6 +207,10 @@ def validate_dataset(df: pd.DataFrame, label_column: str, objective: str) -> dic
 
     Returns the measurements so they can be recorded in the manifest -- a run's
     diagnosis should be readable after the fact, not only when it fails.
+
+    For ``ncf_deal_manager`` the categorical checks are replaced by the NCF ones:
+    ``user_id`` and ``deal_id`` must be present with more than one distinct value
+    each. NCF learns one embedding per id, so an id seen once per deal is expected.
     """
     if label_column not in df.columns:
         raise DatasetUnfitError(
@@ -212,6 +241,16 @@ def validate_dataset(df: pd.DataFrame, label_column: str, objective: str) -> dic
             f"(positive rate {positive_rate:.3f}). A single-class label trains the model to "
             "predict a constant, at a loss that falls steadily and means nothing."
         )
+
+    if model_type == NCF_MODEL_TYPE:
+        return _validate_ncf_columns(df, {
+            "objective": objective,
+            "label_column": label_column,
+            "total_rows": total_rows,
+            "labelled_rows": n_labelled,
+            "unlabelled_rows": total_rows - n_labelled,
+            "positive_rate": round(positive_rate, 6),
+        })
 
     categorical_cardinality: dict = {}
     for column in dlrm_features.CATEGORICAL_COLUMNS:
@@ -270,6 +309,46 @@ def outcome_provenance_mix(df: pd.DataFrame) -> dict:
     return {str(label): int(count) for label, count in counts.items()}
 
 
+def ncf_training_data(df: pd.DataFrame) -> str:
+    """The dataset's provenance, read from its ``provenance`` column.
+
+    The column's value when every row carries the same one (``sample`` for the
+    generator's rows), ``mixed`` when rows differ, and ``unknown`` when the column is
+    absent or empty.
+    """
+    if NCF_PROVENANCE_COLUMN not in df.columns:
+        return "unknown"
+    values = {str(v) for v in df[NCF_PROVENANCE_COLUMN].dropna().unique()}
+    if not values:
+        return "unknown"
+    return values.pop() if len(values) == 1 else "mixed"
+
+
+def _validate_ncf_columns(df: pd.DataFrame, report: dict) -> dict:
+    """The NCF half of validate_dataset: the two id columns NeuMF embeds."""
+    cardinality: dict = {}
+    for column in ("user_id", "deal_id"):
+        if column not in df.columns:
+            raise DatasetUnfitError(
+                f"{NCF_MODEL_TYPE} trains on user_id and deal_id, and '{column}' is not in "
+                f"the dataset. Columns present: {sorted(df.columns)}."
+            )
+        distinct = int(df[column].nunique(dropna=False))
+        cardinality[column] = distinct
+        if distinct <= 1:
+            raise DatasetUnfitError(
+                f"'{column}' has {distinct} distinct value(s) across {len(df)} rows, so "
+                "there is nothing to tell one id from another."
+            )
+    report = {
+        **report,
+        "id_cardinality": cardinality,
+        "training_data": ncf_training_data(df),
+    }
+    logger.info("Dataset gate passed: %s", json.dumps(report))
+    return report
+
+
 def calibration_report(
     model: nn.Module, val_loader: DataLoader, n_bins: int = 10
 ) -> dict:
@@ -292,10 +371,11 @@ def calibration_report(
     with torch.no_grad():
         for batch in val_loader:
             features, labels = batch[0].to(device), batch[1].to(device)
-            # The training forward returns logits (BCEWithLogitsLoss); the served
+            # The DLRM training forward returns logits (BCEWithLogitsLoss); the served
             # graph applies the sigmoid. Apply it here so this measures the
-            # probability that is actually served.
-            probs = torch.sigmoid(model(features).squeeze(-1).reshape(-1))
+            # probability that is actually served. NCF already outputs one.
+            out = model(features).squeeze(-1).reshape(-1)
+            probs = out if getattr(model, "outputs_probability", False) else torch.sigmoid(out)
             probabilities.extend(probs.cpu().tolist())
             observed.extend(labels.float().reshape(-1).cpu().tolist())
 
@@ -365,16 +445,61 @@ def build_dlrm_features(df: pd.DataFrame) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.float32)
 
 
+def build_ncf_features(df: pd.DataFrame) -> torch.Tensor:
+    """Build the NCF input tensor: [user_bucket, item_bucket], INT64.
+
+    Buckets are ``ncf_ids.bucket`` of ``user_id`` and ``deal_id``, the hash the
+    serving container applies. A dataset that also carries ``user_bucket`` or
+    ``item_bucket`` must agree with it; a disagreement means the data was hashed
+    differently from how the model will be served, and is refused.
+    """
+    missing = [c for c in ("user_id", "deal_id") if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"ncf_deal_manager training needs columns user_id and deal_id; missing {missing}. "
+            "The live outcome feed (BidShadingOutcomeEvent/Record) records no deal_id; see "
+            "the module docstring."
+        )
+    users = [ncf_ids.bucket(str(v), ncf_ids.NB_USERS) for v in df["user_id"]]
+    items = [ncf_ids.bucket(str(v), ncf_ids.NB_ITEMS) for v in df["deal_id"]]
+    for column, computed in (("user_bucket", users), ("item_bucket", items)):
+        if column in df.columns:
+            given = [int(v) for v in df[column]]
+            mismatched = sum(1 for a, b in zip(given, computed) if a != b)
+            if mismatched:
+                raise ValueError(
+                    f"{mismatched} row(s) carry a {column} that differs from "
+                    "shared.ncf_ids.bucket of the id; the model would be trained on "
+                    "buckets the serving container never sends."
+                )
+    return torch.tensor(list(zip(users, items)), dtype=torch.int64).reshape(-1, 2)
+
+
 def build_features(df: pd.DataFrame, model_type: str) -> torch.Tensor:
     """Build the model-specific input feature tensor from real ETL columns."""
     if model_type == "dlrm_bid_shader":
         return build_dlrm_features(df)
-    raise ValueError(
-        f"No feature-building logic for model_type '{model_type}'. "
-        "ncf_deal_manager training requires a deal_id column that "
-        "BidShadingOutcomeEvent/Record does not currently capture — see "
-        "training/container/train.py module docstring."
-    )
+    if model_type == NCF_MODEL_TYPE:
+        return build_ncf_features(df)
+    raise ValueError(f"No feature-building logic for model_type '{model_type}'.")
+
+
+class NCFTrainingModel(nn.Module):
+    """shared.ncf_model.NeuMF behind this trainer's one-tensor interface.
+
+    ``forward(x)`` takes [batch, 2] INT64 (user bucket, item bucket) and returns
+    NeuMF's sigmoid score, so the loss is BCELoss and calibration reads the output
+    as a probability (``outputs_probability``). ``net`` is exported unchanged.
+    """
+
+    outputs_probability = True
+
+    def __init__(self):
+        super().__init__()
+        self.net = ncf_model.NeuMF()
+
+    def forward(self, x):
+        return self.net(x[:, 0].long(), x[:, 1].long())
 
 
 
@@ -417,7 +542,7 @@ def load_hyperparameters() -> dict:
     for whatever it didn't specify.
     """
     if os.path.exists(SM_HP_FILE):
-        with open(SM_HP_FILE) as f:
+        with open(SM_HP_FILE, encoding="utf-8") as f:
             raw = {k: _parse_hp_value(v) for k, v in json.load(f).items()}
         return {**_HP_DEFAULTS, **raw}
     # Fallback: read from environment (SM_HP_* prefix)
@@ -458,14 +583,22 @@ def load_training_data(data_dir: str, model_type: str) -> pd.DataFrame:
     directory structure when it downloads the S3 training-data prefix. A
     non-recursive glob therefore finds nothing even when the channel has
     real data, so this must search subdirectories.
+
+    For ncf_deal_manager, CSV files (the interactions.csv the sample generator
+    writes) are read as well, with the id columns kept as strings.
     """
     data_path = Path(data_dir)
     parquet_files = list(data_path.rglob("*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(f"No .parquet files found under {data_dir} (searched recursively)")
+    csv_files = sorted(data_path.rglob("*.csv")) if model_type == NCF_MODEL_TYPE else []
+    if not parquet_files and not csv_files:
+        kinds = ".parquet or .csv" if model_type == NCF_MODEL_TYPE else ".parquet"
+        raise FileNotFoundError(f"No {kinds} files found under {data_dir} (searched recursively)")
 
-    logger.info("Loading %d parquet files from %s", len(parquet_files), data_dir)
-    df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
+    logger.info("Loading %d parquet and %d csv files from %s", len(parquet_files), len(csv_files), data_dir)
+    frames = [pd.read_parquet(f) for f in parquet_files]
+    frames += [pd.read_csv(f, dtype={"user_id": str, "deal_id": str, "cohort": str, NCF_PROVENANCE_COLUMN: str})
+               for f in csv_files]
+    df = pd.concat(frames, ignore_index=True)
     logger.info("Loaded %d rows, columns: %s", len(df), list(df.columns))
     return df
 
@@ -475,9 +608,8 @@ def build_model(model_type: str, hp: dict) -> nn.Module:
     if model_type == "dlrm_bid_shader":
         from models.dlrm import DLRMModel
         return DLRMModel()
-    elif model_type == "ncf_deal_manager":
-        from models.ncf import NCFModel
-        return NCFModel()
+    elif model_type == NCF_MODEL_TYPE:
+        return NCFTrainingModel()
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -494,7 +626,9 @@ def supervised_train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=hp["learning_rate"])
-    criterion = nn.BCEWithLogitsLoss()
+    # NCF's forward ends in a sigmoid (the served graph is the trained graph), so it
+    # takes BCELoss; the DLRM forward returns logits.
+    criterion = nn.BCELoss() if getattr(model, "outputs_probability", False) else nn.BCEWithLogitsLoss()
 
     best_val_loss = float("inf")
 
@@ -908,17 +1042,12 @@ def export_to_onnx(model: nn.Module, model_type: str, output_dir: str) -> str:
             # a whole run thrown away for a keyword argument.
             **onnx_compat.onnx_export_kwargs(dynamo=False),
         )
-    elif model_type == "ncf_deal_manager":
-        dummy = torch.randn(1, 2)  # [user_id, item_id] as floats for export
-        torch.onnx.export(
-            model,
-            dummy,
-            output_path,
-            input_names=["features"],
-            output_names=["output"],
-            dynamic_axes={"features": {0: "batch_size"}},
-            opset_version=17,
-        )
+    elif model_type == NCF_MODEL_TYPE:
+        # The served signature (user_ids, item_ids INT64 -> relevance_scores FP32)
+        # from the shared exporter, the one the deploy-time trainer also uses and
+        # ncf_deal_manager_stable/config.pbtxt declares.
+        net = model.net if isinstance(model, NCFTrainingModel) else model
+        ncf_model.export_onnx(net, output_path)
     else:
         raise ValueError(f"Unknown model_type for ONNX export: {model_type}")
 
@@ -926,8 +1055,31 @@ def export_to_onnx(model: nn.Module, model_type: str, output_dir: str) -> str:
     return output_path
 
 
+def ncf_manifest(hp: dict, dataset_report: dict, supervised_metrics: dict, calibration: dict) -> dict:
+    """Provenance beside an NCF export, in the shape training/ncf_sample/build.py writes."""
+    training_data = dataset_report.get("training_data", "unknown")
+    return {
+        "model_type": NCF_MODEL_TYPE,
+        "producer": "train.py",
+        "training_data": training_data,
+        "target": "implicit-engagement-sample" if training_data == "sample" else "implicit-engagement",
+        "objective": NCF_OBJECTIVE,
+        "label_column": NCF_LABEL_COLUMN,
+        "base_model_version": hp.get("base_model_version", ""),
+        "nb_users": ncf_ids.NB_USERS,
+        "nb_items": ncf_ids.NB_ITEMS,
+        "triton_input_names": list(ncf_model.INPUT_NAMES),
+        "triton_output_names": [ncf_model.OUTPUT_NAME],
+        "thresholds": {"activate": ncf_ids.ACTIVATE_THRESHOLD, "suppress": ncf_ids.SUPPRESS_THRESHOLD},
+        "supervised": supervised_metrics,
+        "dataset": dataset_report,
+        "calibration": calibration,
+        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
 def main():
-    """Main training entrypoint — SageMaker compatible."""
+    """Main training entrypoint, SageMaker compatible."""
     start_time = time.time()
     logger.info("=" * 60)
     logger.info("NeMo-RL Training Job Starting")
@@ -949,9 +1101,9 @@ def main():
     # Which response this run is trained to predict, and the gate that refuses a
     # dataset which cannot teach it. Both run BEFORE any training, so an unfit
     # dataset ends the job with a named diagnosis rather than a trained artifact.
-    objective, label_column = resolve_label_column(hp)
+    objective, label_column = resolve_label_column(hp, model_type)
     logger.info("Objective: %s (label column '%s')", objective, label_column)
-    dataset_report = validate_dataset(df, label_column, objective)
+    dataset_report = validate_dataset(df, label_column, objective, model_type=model_type)
 
     # Unlabelled rows are dropped, not coerced to 0. A NULL label means no response
     # signal was recorded; reading it as a negative teaches the model that every
@@ -1052,7 +1204,7 @@ def main():
     # right width is not evidence that both sides agree on what position two means.
     if model_type == "dlrm_bid_shader":
         manifest_path = os.path.join(SM_MODEL_DIR, dlrm_features.MANIFEST_FILENAME)
-        with open(manifest_path, "w") as f:
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
                 dlrm_features.manifest(
                     model_type,
@@ -1087,6 +1239,15 @@ def main():
                 indent=2,
             )
         logger.info("Wrote %s", manifest_path)
+    elif model_type == NCF_MODEL_TYPE:
+        manifest_path = os.path.join(SM_MODEL_DIR, dlrm_features.MANIFEST_FILENAME)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                ncf_manifest(hp, dataset_report, supervised_metrics, calibration),
+                f,
+                indent=2,
+            )
+        logger.info("Wrote %s", manifest_path)
 
     # Write metrics file for SageMaker. The calibration error and the dataset shape
     # go in alongside the losses: a run that trained cleanly on a dataset with a
@@ -1104,7 +1265,7 @@ def main():
         "calibration": calibration.get("calibration"),
     }
     metrics_path = os.path.join(SM_MODEL_DIR, "metrics.json")
-    with open(metrics_path, "w") as f:
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)
 
     duration = time.time() - start_time

@@ -6,7 +6,8 @@
 #
 #   ok           -> skip it, and say why it was skipped
 #   in_progress  -> WAIT for the AWS-side operation to finish, then re-probe
-#   anything else-> run it
+#   anything else-> run it (including `stale`: present, but built from inputs
+#                   other than the ones this checkout deploys)
 #
 # This replaces the local progress file that recorded what the *script* had done.
 # The difference is not academic: that file reported "Phase 3 complete" for a
@@ -57,6 +58,12 @@ _gate_flags() {
   # would inherit it anyway; passing it explicitly keeps the probe's credentials
   # visible in the command line and identical to every other child's.
   [[ -n "${AWS_PROFILE:-}" ]] && out+=(--profile "${AWS_PROFILE}")
+  # What this checkout would deploy, computed by deploy.sh before the first probe
+  # (compute_phase_expectations). With them the probe reports Phase 1 stale when the
+  # bucket's deploy-markers/phase1.json records another deals seed or Deal Scorer
+  # build, and Phase 3 stale when the Deal Scorer engine was built from another one.
+  [[ -n "${DEPLOY_EXPECT_DEALS_SEED_SHA:-}" ]] && out+=(--expect-deals-seed-sha "${DEPLOY_EXPECT_DEALS_SEED_SHA}")
+  [[ -n "${DEPLOY_EXPECT_NCF_FINGERPRINT:-}" ]] && out+=(--expect-ncf-fingerprint "${DEPLOY_EXPECT_NCF_FINGERPRINT}")
   printf '%s\n' "${out[@]+"${out[@]}"}"
 }
 

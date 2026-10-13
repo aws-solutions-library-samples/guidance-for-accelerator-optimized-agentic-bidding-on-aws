@@ -134,6 +134,31 @@ afterEach(() => {
 });
 
 describe("AuctionTheater — two passes", () => {
+  it("shows no step counter on a ready run: the pass is named instead", () => {
+    render();
+    expect(container.textContent).not.toMatch(/Step \d+ of \d+/);
+    expect(q("theater-progress")).toBeNull();
+    expect(text("theater-progress-label")).toBe("Without ARTF");
+    clickNext(4); // pass-2 banner
+    expect(text("theater-progress-label")).toBe("With ARTF");
+  });
+  it("marks a declined value instead of presenting it as applied", () => {
+    const declined = { ...FLOOR_VALUE, disposition: "superseded", dispositionReason: "superseded by ncf-deal-manager" };
+    const saved = RUN.beats;
+    RUN.beats = BEATS.map((b) => (b.kind === BEAT_CONTAINER
+      ? { ...b, disposition: "superseded", values: [declined] }
+      : b));
+    try {
+      render();
+      clickNext(6); // the container beat
+      const markers = container.querySelectorAll('[data-testid="value-disposition"]');
+      expect(markers.length).toBeGreaterThan(0);
+      expect(markers[0].textContent).toBe("not applied: superseded");
+    } finally {
+      RUN.beats = saved;
+    }
+  });
+
   it("opens on the pass-1 banner, with no mutation stage over it", () => {
     render();
     expect(q("theater-pass-banner")).not.toBeNull();

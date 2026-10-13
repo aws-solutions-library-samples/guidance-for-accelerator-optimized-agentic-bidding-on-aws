@@ -129,7 +129,18 @@ export default function RawPanel({ result, payload, section }) {
   // panel (reading Prebid's response) showed it. Segments failed the same way.
   const mergedResult = useMemo(() => {
     if (!payload || mutations.length === 0) return null;
-    const { envelope, dispositions } = applyMutationsToEnvelope(payload, mutations);
+    // A mutation the exchange itself declined (a disposition lifted from the
+    // auction) is not merged: the document shows what the auction ran. Mutations
+    // without a disposition (a plain /v1/mutations answer) are applied as before.
+    const hostDeclined = (m) => m?.disposition != null && m.disposition !== "applied";
+    const { envelope, dispositions: appliedDispositions } = applyMutationsToEnvelope(
+      payload,
+      mutations.filter((m) => !hostDeclined(m)),
+    );
+    let next = 0;
+    const dispositions = mutations.map((m) => (hostDeclined(m)
+      ? { applied: false, written: [], reason: m.dispositionReason ?? m.disposition }
+      : appliedDispositions[next++]));
     const { text, ranges } = stringifyWithPointers(envelope);
 
     const insertions = []; // { path, agent, color, intent, applied, reason, lines: [start, end][] }

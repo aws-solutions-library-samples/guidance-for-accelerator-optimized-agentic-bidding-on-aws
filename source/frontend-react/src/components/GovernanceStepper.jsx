@@ -1,9 +1,12 @@
-// GovernanceStepper.jsx — the four-step journey bar on the Governance page.
+// GovernanceStepper.jsx — the three-step journey bar on the Governance page.
 //
 // The steps are NOT gated. Nothing here is truly sequential — a user who wants to
 // look at a past comparison should not have to run a load test first — and locking
 // later steps would turn a navigation aid into an obstacle. The numbers say what
 // order the journey runs in; they do not enforce it.
+//
+// The outcome pipeline (capture, Firehose flush, Glue sweep, trainable) is part of
+// the Train step: one run picker, with the pipeline for the selected run under it.
 
 export const GOVERNANCE_STEPS = [
   {
@@ -13,20 +16,14 @@ export const GOVERNANCE_STEPS = [
     blurb: "Send synthetic traffic through the containers and watch the result.",
   },
   {
-    key: "outcome-pipeline",
-    number: 2,
-    title: "Load Test Outcome Pipeline",
-    blurb: "Follow a run from capture through the Glue sweep into the training bucket.",
-  },
-  {
     key: "train",
-    number: 3,
+    number: 2,
     title: "Train from Load Test",
-    blurb: "Train a model on the outcomes one of those runs produced.",
+    blurb: "Pick a run, follow its outcomes into the training bucket, and train on them.",
   },
   {
     key: "test-versions",
-    number: 4,
+    number: 3,
     title: "Test Model Versions",
     blurb: "Compare two runs' outcomes and decide whether to promote.",
   },

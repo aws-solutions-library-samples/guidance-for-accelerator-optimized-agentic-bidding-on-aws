@@ -16,8 +16,9 @@ AWSTemplateFormatVersion: '2010-09-09'
 # Two parties, two scopes, deliberately NOT shared:
 #   artf-orchestrator/mutations:write   the Prebid host calling POST /v1/mutations
 #   artf-demand/bid:read                the artfhouse adapter calling the demand API
-# Sharing one credential across both would undo the seller/buyer separation that
-# placing the demand endpoint outside the cluster exists to preserve.
+# Sharing one credential across both would undo the seller/buyer separation. The
+# demand service runs in the cluster, so that separation is carried by the scope and
+# client checks it performs, not by network placement.
 #
 # Requirements: FR-38, FR-39; U1-NFR-10 ... 14; SECURITY-06, SECURITY-07,
 # SECURITY-08, SECURITY-12.
@@ -25,8 +26,8 @@ Description: >-
   Feature-owned resources for the optional Prebid Server ARTF orchestrator
   (deploy.sh --with-prebid): Cognito hosted domain, two resource servers and scopes, a
   machine-to-machine app client, the credential secret, an IRSA role scoped to one
-  ServiceAccount and one secret, an ECR repository, and the artfhouse demand endpoint
-  (API Gateway HTTP API with a Cognito JWT authorizer, plus its Lambda). All net-new
+  ServiceAccount and one secret, and an IRSA role for the in-cluster artfhouse demand
+  service, read-only on the deals table. All net-new
   and removable. The shared user pool is passed in and never deleted here.
 
 Parameters:
@@ -86,24 +87,21 @@ Parameters:
       /current/ at pod start and EXITS 1 if the default prefix cannot be read, so
       without this read grant the pod cannot start at all.
 
-  DemandLambdaS3Bucket:
+  DealsTableName:
     Type: String
-    Default: ''
     Description: >-
-      Bucket holding the packaged demand endpoint. Empty deploys a placeholder that
-      returns 501, so the API and its authorizer can be verified before the real
-      package exists.
-
-  DemandLambdaS3Key:
+      The deals table deploy.sh creates (<stack>-deals). The in-cluster demand
+      service loads its catalog from it at startup and every 30 s, never per bid;
+      its role gets read-only access on this one table.
+  DemandServiceAccountName:
     Type: String
-    Default: ''
-    Description: Object key for the packaged demand endpoint.
+    Default: artfhouse-demand-sa
+    Description: >-
+      The ServiceAccount the demand service runs as. Named exactly in the role's
+      trust policy.
 
 Conditions:
   HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
-  HasDemandPackage: !And
-    - !Not [!Equals [!Ref DemandLambdaS3Bucket, '']]
-    - !Not [!Equals [!Ref DemandLambdaS3Key, '']]
 
 Resources:
 
@@ -176,6 +174,11 @@ Resources:
   # template creates the container so teardown is a stack delete.
   PrebidCredentialSecret:
     Type: AWS::SecretsManager::Secret
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: Secret uses the default AWS managed Secrets Manager key which is the documented choice for this guidance
     Properties:
       Name: !If
         - HasStackPrefix
@@ -192,6 +195,11 @@ Resources:
   # The pod's identity. Trust is scoped to ONE ServiceAccount by exact match.
   PrebidHostRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts and EKS RBAC bindings reference this role by its predictable prefixed name
     Properties:
       RoleName: !If
         - HasStackPrefix
@@ -297,138 +305,55 @@ Resources:
   # moved with the repository, so the retention behaviour was not lost in the move.
   # Teardown deletes it in the --destroy path, since this stack no longer does.
 
-  # ------------------------------------------------- demand endpoint (buy side)
-  # Outside the seller's cluster on purpose: this represents the BUYER's demand, and
-  # placing it in the seller's cluster would collapse the party separation the
-  # demonstration exists to show.
-  DemandFunctionRole:
+  # ------------------------------------------------- demand service (buy side)
+  # The artfhouse demand service runs in the cluster next to Prebid Server
+  # (deployment/eks/artfhouse-demand-deployment.yaml). It moved there from a Lambda
+  # behind a public API Gateway with a JWT authorizer, which cost 70 to 90 ms per
+  # auction for 2 ms of work. The service checks the bearer token itself. This role
+  # is its identity: IRSA, trusted by exactly one ServiceAccount, read-only on the
+  # deals table.
+  DemandServiceRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts and EKS RBAC bindings reference this role by its predictable prefixed name
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      # Nothing beyond logs. The demand endpoint reads no external store: its catalog
-      # is in code, which is what makes its decision a pure function of the request.
-
-  DemandFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !If
+      RoleName: !If
         - HasStackPrefix
-        - !Sub '${StackPrefix}-artfhouse-demand'
-        - 'artfhouse-demand'
-      Runtime: python3.12
-      Handler: demand.artfhouse.handler.lambda_handler
-      Role: !GetAtt DemandFunctionRole.Arn
-      Timeout: 10
-      MemorySize: 512
-      Code: !If
-        - HasDemandPackage
-        - S3Bucket: !Ref DemandLambdaS3Bucket
-          S3Key: !Ref DemandLambdaS3Key
-        # Placeholder: an HONEST 501, not a fake bid response. It lets the API and its
-        # authorizer be verified before the real package exists, without ever
-        # returning a synthetic auction result that could be mistaken for real.
-        - ZipFile: |
-            import json
-
-            def lambda_handler(event, context=None):
-                return {
-                    "statusCode": 501,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({
-                        "error": "demand endpoint not deployed",
-                        "detail": "This is the placeholder created with the stack. "
-                                  "The real handler is packaged and deployed separately; "
-                                  "it returns no bids and no synthetic auction result.",
-                    }),
+        - !Sub '${StackPrefix}-artfhouse-demand-role'
+        - 'artfhouse-demand-role'
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Federated": "${ClusterOidcProviderArn}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${ClusterOidcIssuerHost}:sub": "system:serviceaccount:${Namespace}:${DemandServiceAccountName}",
+                  "${ClusterOidcIssuerHost}:aud": "sts.amazonaws.com"
                 }
-
-  DemandApi:
-    Type: AWS::ApiGatewayV2::Api
-    Properties:
-      Name: !If
-        - HasStackPrefix
-        - !Sub '${StackPrefix}-artfhouse-demand-api'
-        - 'artfhouse-demand-api'
-      ProtocolType: HTTP
-      Description: >-
-        The artfhouse demand endpoint. Authenticated at the gateway with a Cognito JWT
-        authorizer on its own scope. A Lambda Function URL with no auth is excluded
-        outright; IAM auth was rejected as disproportionate, since SigV4 signing from a
-        Prebid Java adapter is far heavier than presenting a bearer token.
-
-  DemandAuthorizer:
-    Type: AWS::ApiGatewayV2::Authorizer
-    Properties:
-      ApiId: !Ref DemandApi
-      AuthorizerType: JWT
-      IdentitySource:
-        - '$request.header.Authorization'
-      Name: cognito-jwt
-      JwtConfiguration:
-        # The audience for a client_credentials token is the app client id.
-        Audience:
-          - !Ref PrebidHostClient
-        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
-
-  DemandIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref DemandApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt DemandFunction.Arn
-      PayloadFormatVersion: '2.0'
-
-  DemandRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref DemandApi
-      RouteKey: 'POST /openrtb2/auction'
-      AuthorizationType: JWT
-      AuthorizerId: !Ref DemandAuthorizer
-      # The scope requirement is enforced here, not only in the token. Without it any
-      # valid pool token would be accepted and the separate scope would constrain
-      # nothing.
-      AuthorizationScopes:
-        - 'artf-demand/bid:read'
-      Target: !Sub 'integrations/${DemandIntegration}'
-
-  DemandStage:
-    Type: AWS::ApiGatewayV2::Stage
-    Properties:
-      ApiId: !Ref DemandApi
-      StageName: $default
-      AutoDeploy: true
-      AccessLogSettings:
-        DestinationArn: !GetAtt DemandAccessLogGroup.Arn
-        Format: >-
-          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","integrationStatus":"$context.integration.status","responseLatency":"$context.responseLatency","authorizerError":"$context.authorizer.error"}
-
-  DemandAccessLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !If
-        - HasStackPrefix
-        - !Sub '/aws/apigateway/${StackPrefix}-artfhouse-demand'
-        - '/aws/apigateway/artfhouse-demand'
-      RetentionInDays: 90
-
-  DemandInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref DemandFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      # Scoped to this API only. Never a wildcard principal, and never a wildcard
-      # source.
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DemandApi}/*/*/openrtb2/auction'
+              }
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: read-deals-table
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The catalog refresh issues Query by record_type. GetItem and Scan are
+              # read-only and kept so a diagnostic read does not need a new grant.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DealsTableName}'
 
 Outputs:
   UserPoolDomainName:
@@ -471,12 +396,6 @@ Outputs:
           - !Sub '${StackPrefix}-prebid-server'
           - 'prebid-server'
 
-  DemandEndpointUrl:
-    Description: >-
-      The artfhouse demand endpoint. Supplied to the adapter as deployment-time
-      configuration, not compiled in, so the address resolves at deploy time.
-    Value: !Sub 'https://${DemandApi}.execute-api.${AWS::Region}.amazonaws.com/openrtb2/auction'
-
-  DemandFunctionName:
-    Description: Demand Lambda function name, for updating the package after the stack exists
-    Value: !Ref DemandFunction
+  DemandServiceRoleArn:
+    Description: IRSA role ARN for the artfhouse demand ServiceAccount annotation
+    Value: !GetAtt DemandServiceRole.Arn

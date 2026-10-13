@@ -7,6 +7,7 @@
 
 import { DISPLAY_NAME_BY_STOP_ID, CONTAINER_NAME_TO_STOP_ID } from "./intentMapping.js";
 import { findOriginalDealBidfloor } from "./applyMutations.js";
+import { showsDealScorerDisclosure } from "./dealScorerTraining.js";
 
 /** Margin.calculation_type from the ARTF proto. */
 const CALC_TYPE = Object.freeze({ 0: "CPM", 1: "PERCENT" });
@@ -50,6 +51,24 @@ const MOVEMENT_BY_KIND = Object.freeze({
 
 function isFiniteNumber(n) {
   return typeof n === "number" && Number.isFinite(n);
+}
+
+/**
+ * Whether a beat or value describes a mutation that changed the auction.
+ *
+ * `disposition` is the exchange's decision, carried on mutations lifted from the
+ * auction report: "applied", "rejected", "superseded" or "unknown". null means the
+ * source carries no host decision (the /v1/mutations fallback), and is treated as
+ * applied, which is what that source has always meant. Every consumer that counts
+ * or acts on a value uses this one rule.
+ */
+export function isAppliedValue(v) {
+  return v?.disposition == null || v.disposition === "applied";
+}
+
+/** The values that changed the auction, in order. */
+export function appliedValues(values) {
+  return (values ?? []).filter(isAppliedValue);
 }
 
 /**
@@ -219,8 +238,12 @@ function makeBeat(index, kind, extra) {
     operation: null,
     modelVersion: null,
     explored: false,
+    // True on a Deal Scorer beat: the renderer adds the training disclosure.
+    sampleTrained: false,
     latencyMs: null,
     path: null,
+    disposition: null,
+    dispositionReason: null,
     values: [],
     ...extra,
   };
@@ -239,6 +262,11 @@ function makeBeat(index, kind, extra) {
  * the recap. A stop with no mutations contributes no beats, so a container that
  * was invoked and deliberately recommended no change is absent from the
  * walkthrough (BR-4). The total is therefore only knowable after the response.
+ *
+ * `normalizedResult` is normally the with-ARTF auction's own report
+ * (normalizeExtensionPoint), so each container beat carries the exchange's
+ * disposition for its mutation. A rejected or superseded mutation keeps its beat,
+ * marked with that disposition, and is not counted as a change.
  *
  * Every beat carries `pass`, and every pass-1 beat precedes every pass-2 beat.
  * Nothing in pass 1 carries values, so `visibleValues` is empty until the first
@@ -281,8 +309,12 @@ export function buildBeats(submittedPayload, normalizedResult) {
         operation: mutation?.op ?? null,
         modelVersion,
         explored: isExplored(modelVersion),
+        sampleTrained: showsDealScorerDisclosure(containerName, modelVersion),
         latencyMs: isFiniteNumber(stop?.latency?.ms) ? stop.latency.ms : null,
         path: typeof mutation?.path === "string" ? mutation.path : null,
+        disposition: typeof mutation?.disposition === "string" ? mutation.disposition : null,
+        dispositionReason:
+          typeof mutation?.dispositionReason === "string" ? mutation.dispositionReason : null,
         values: mutationToValues(mutation, submittedPayload),
       }));
       // Attribution travels WITH the value. visibleValues flattens the beat
@@ -295,6 +327,9 @@ export function buildBeats(submittedPayload, normalizedResult) {
         value.containerName = beat.containerName;
         value.displayLabel = beat.displayLabel;
         value.intent = beat.intent;
+        value.disposition = beat.disposition;
+        value.dispositionReason = beat.dispositionReason;
+        value.sampleTrained = beat.sampleTrained;
       }
     }
   }
@@ -302,13 +337,9 @@ export function buildBeats(submittedPayload, normalizedResult) {
   // The bids land between the last mutation and the recap, so the reader sees the
   // seats respond to the enriched request before anything names a winner.
   //
-  // Structural, like origin and recap — NOT derived from the bid response, and
-  // deliberately so. The auction is fired only after buildBeats returns (see
-  // useTheaterRun), so the bid count is unknowable here. Deriving this beat would
-  // mean rebuilding the sequence when the auction resolves, which would change the
-  // step total while the reader is partway through it. The beat is therefore always
-  // present and the offers column states whatever is actually true when it is
-  // reached: real bids, no bids, the fixture with its own notice, or a fault.
+  // Structural, like origin and recap: the offers column states what the auction
+  // returned when this beat is reached (real bids, no bids, the fixture with its
+  // own notice, or a fault), so the beat itself carries no bid count.
   beats.push(makeBeat(beats.length, BEAT_BIDS, { pass: PASS_ARTF }));
 
   // The recap restates what actually changed. A container that produced nothing
@@ -317,6 +348,9 @@ export function buildBeats(submittedPayload, normalizedResult) {
   const contributors = [];
   for (const beat of beats) {
     if (beat.kind !== BEAT_CONTAINER) continue;
+    // A rejected or superseded mutation did not change the request, so its
+    // container is not credited with changing it.
+    if (!isAppliedValue(beat)) continue;
     const existing = contributors.find((c) => c.containerName === beat.containerName);
     if (existing) existing.beatIndexes.push(beat.index);
     else contributors.push({
@@ -325,7 +359,13 @@ export function buildBeats(submittedPayload, normalizedResult) {
       beatIndexes: [beat.index],
     });
   }
-  beats.push(makeBeat(beats.length, BEAT_RECAP, { pass: PASS_ARTF, contributors }));
+  beats.push(makeBeat(beats.length, BEAT_RECAP, {
+    pass: PASS_ARTF,
+    contributors,
+    // Where the with-ARTF mutations came from, and whether the auction's own
+    // report was usable. null for the /v1/mutations fallback.
+    artfReport: normalizedResult?.artfReport ?? null,
+  }));
 
   return beats;
 }

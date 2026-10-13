@@ -1,7 +1,9 @@
 package org.prebid.server.bidder.artfhouse;
 
 import com.iab.openrtb.request.BidRequest;
+import com.iab.openrtb.request.Deal;
 import com.iab.openrtb.request.Imp;
+import com.iab.openrtb.request.Pmp;
 import com.iab.openrtb.response.Bid;
 import com.iab.openrtb.response.BidResponse;
 import com.iab.openrtb.response.SeatBid;
@@ -13,11 +15,13 @@ import org.prebid.server.bidder.model.BidderBid;
 import org.prebid.server.bidder.model.BidderCall;
 import org.prebid.server.bidder.model.BidderError;
 import org.prebid.server.bidder.model.HttpRequest;
+import org.prebid.server.bidder.model.PriceFloorInfo;
 import org.prebid.server.bidder.model.Result;
 import org.prebid.server.hooks.modules.artf.client.TokenCache;
 import org.prebid.server.json.JacksonMapper;
 import org.prebid.server.proto.openrtb.ext.response.BidType;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,6 +43,15 @@ import java.util.Set;
  * {@code deal.ext.artf.suppressed}) and {@code imp.ext.artf.categories[]}, and returns a
  * complete bid response with a single {@code seatbid} whose seat is {@code artfhouse} --
  * one bid per eligible campaign, no aliases (FR-11).
+ *
+ * <h2>Each deal bid carries the floor Prebid holds it to</h2>
+ *
+ * A bid with a {@code dealid} gets a {@code PriceFloorInfo} of max(impression floor, that
+ * deal's floor), read from the request this call sent ({@link #dealFloorInfo}). It is a
+ * fact copied from the request, not a demand decision: the endpoint already refuses to
+ * bid below the same floor. Prebid compares a deal bid with it when the request turns on
+ * {@code ext.prebid.floors.enforcement.floorDeals}, which the orchestrator's auction
+ * route does.
  *
  * <h2>Prices are NOT mirrored onto the request</h2>
  *
@@ -85,6 +98,9 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
      * either.
      */
     public static final String DEMAND_SCOPE = "artf-demand/bid:read";
+
+    /** Currency of an attached deal floor when neither the deal nor the impression names one. */
+    private static final String DEFAULT_FLOOR_CURRENCY = "USD";
 
     private final String endpointUrl;
     private final JacksonMapper mapper;
@@ -164,7 +180,99 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
             return Result.empty();
         }
 
-        return extractBids(bidResponse);
+        return extractBids(bidResponse, sentRequest(httpCall, bidRequest));
+    }
+
+    /**
+     * The request this call sent: the bidder request carried on the call, which holds the
+     * deals and deal floors the ARTF hook wrote, else the request Prebid passed in.
+     */
+    private static BidRequest sentRequest(BidderCall<BidRequest> httpCall, BidRequest bidRequest) {
+        final HttpRequest<BidRequest> sent = httpCall.getRequest();
+        final BidRequest payload = sent != null ? sent.getPayload() : null;
+        return payload != null ? payload : bidRequest;
+    }
+
+    /**
+     * The floor Prebid compares a deal bid with: max({@code imp.bidfloor}, {@code bidfloor}
+     * of the request deal whose id equals {@code bid.dealid}). It is the rule the demand
+     * endpoint applies before it bids ({@code source/demand/artfhouse/floors.py}), so a bid
+     * the endpoint made is never below it.
+     *
+     * <p>Prebid's enforcer reads this {@code PriceFloorInfo} for a bid when it is set, and
+     * enforces a floor on a deal bid only when the request turns on
+     * {@code ext.prebid.floors.enforcement.floorDeals}. A deal floor mutation writes the
+     * deal's floor only, so without this Prebid would hold a deal bid to the impression
+     * floor.
+     *
+     * <p>Null for a bid without a {@code dealid}, for a bid whose impression is not on the
+     * request, and when neither floor is set: Prebid then keeps its own impression floor.
+     * A missing deal, or a deal without a floor, leaves the impression floor. The currency
+     * is the deal's {@code bidfloorcur}, else the impression's, else USD.
+     *
+     * <p>The max compares the two amounts without currency conversion, so it assumes the
+     * impression and the deal floor share a currency. Every floor the deals seed and the
+     * scenario samples carry is USD.
+     */
+    static PriceFloorInfo dealFloorInfo(BidRequest request, Bid bid) {
+        final String dealId = bid.getDealid();
+        if (dealId == null || dealId.isBlank()) {
+            return null;
+        }
+        final Imp imp = findImp(request, bid.getImpid());
+        if (imp == null) {
+            return null;
+        }
+        final Deal deal = findDeal(imp, dealId);
+        final BigDecimal impFloor = imp.getBidfloor();
+        final BigDecimal dealFloor = deal != null ? deal.getBidfloor() : null;
+        final BigDecimal floor;
+        if (impFloor == null) {
+            floor = dealFloor;
+        } else if (dealFloor == null) {
+            floor = impFloor;
+        } else {
+            floor = impFloor.max(dealFloor);
+        }
+        if (floor == null) {
+            return null;
+        }
+        return PriceFloorInfo.of(floor, floorCurrency(deal, imp));
+    }
+
+    private static Imp findImp(BidRequest request, String impId) {
+        if (request == null || request.getImp() == null || impId == null) {
+            return null;
+        }
+        for (Imp imp : request.getImp()) {
+            if (imp != null && impId.equals(imp.getId())) {
+                return imp;
+            }
+        }
+        return null;
+    }
+
+    private static Deal findDeal(Imp imp, String dealId) {
+        final Pmp pmp = imp.getPmp();
+        if (pmp == null || pmp.getDeals() == null) {
+            return null;
+        }
+        for (Deal deal : pmp.getDeals()) {
+            if (deal != null && dealId.equals(deal.getId())) {
+                return deal;
+            }
+        }
+        return null;
+    }
+
+    private static String floorCurrency(Deal deal, Imp imp) {
+        if (deal != null && deal.getBidfloorcur() != null && !deal.getBidfloorcur().isBlank()) {
+            return deal.getBidfloorcur();
+        }
+        if (imp.getBidfloorcur() != null && !imp.getBidfloorcur().isBlank()) {
+            return imp.getBidfloorcur();
+        }
+        return DEFAULT_FLOOR_CURRENCY;
     }
 
     /**
@@ -201,7 +309,7 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
      * what it prices in and rejects a request asking for anything else, so silently
      * reinterpreting it here could only ever misreport a price.
      */
-    private Result<List<BidderBid>> extractBids(BidResponse bidResponse) {
+    private Result<List<BidderBid>> extractBids(BidResponse bidResponse, BidRequest request) {
         final List<BidderBid> bids = new ArrayList<>();
         final List<BidderError> errors = new ArrayList<>();
         final String currency = bidResponse.getCur();
@@ -223,6 +331,7 @@ public class ArtfhouseBidder implements Bidder<BidRequest> {
                         .seat(seatBid.getSeat())
                         .type(resolveBidType(bid))
                         .bidCurrency(currency)
+                        .priceFloorInfo(dealFloorInfo(request, bid))
                         .build());
             }
         }

@@ -26,7 +26,7 @@
         "pmp": {
           "private_auction": 0,
           "deals": [
-            {"id": "deal-remnant-open", "bidfloor": 1.00, "at": 3}
+            {"id": "deal-remnant-open-ledger", "bidfloor": 1.00, "at": 3}
           ]
         }
       }

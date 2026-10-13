@@ -19,7 +19,7 @@
         "pmp": {
           "private_auction": 0,
           "deals": [
-            {"id": "deal-remnant-open", "bidfloor": 1.50, "at": 3}
+            {"id": "deal-remnant-open-espn", "bidfloor": 1.50, "at": 3}
           ]
         }
       }

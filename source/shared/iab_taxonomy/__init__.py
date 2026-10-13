@@ -300,7 +300,7 @@ def resolve_taxonomy(cattax: object) -> str:
 def is_special_category_data(category_id: str) -> bool:
     """Whether this specific category carries the flag. Ancestors are not consulted."""
     entry = CONTENT_CATEGORIES.get(category_id)
-    return bool(entry and entry.is_special_category_data)
+    return bool(entry and entry.is_special_category_data)  # nosemgrep: is-function-without-parentheses dataclass field, not a method
 
 
 def segment_for_category(category_id: str) -> str | None:
@@ -437,6 +437,6 @@ def stats() -> dict[str, int | str]:
         "matchable_leaf_names": len(_AUDIENCE_BY_LEAF_NAME),
         "age_buckets": len(AGE_BUCKETS),
         "special_category_data_rows": sum(
-            1 for c in CONTENT_CATEGORIES.values() if c.is_special_category_data
+            1 for c in CONTENT_CATEGORIES.values() if c.is_special_category_data  # nosemgrep: is-function-without-parentheses dataclass field, not a method
         ),
     }

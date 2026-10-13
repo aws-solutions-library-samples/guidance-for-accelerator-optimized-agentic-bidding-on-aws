@@ -75,7 +75,7 @@ describe("buildOfferViewModel", () => {
   it("resolves the winner as deal plus campaign with price as detail", () => {
     const vm = buildOfferViewModel(capturedBidResponse);
     expect(vm.winner.dealId).toBe("deal-home-premium");
-    expect(vm.winner.clearedPrice).toBe(6.35);
+    expect(vm.winner.clearedPrice).toBe(capturedBidResponse.seatbid[0].bid[0].price);
   });
 
   it("returns a null winner for a response with no marked winner", () => {

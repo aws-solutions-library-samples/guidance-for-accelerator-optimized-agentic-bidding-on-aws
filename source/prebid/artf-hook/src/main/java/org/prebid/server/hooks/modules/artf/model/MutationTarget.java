@@ -3,8 +3,8 @@ package org.prebid.server.hooks.modules.artf.model;
 /**
  * Where on the SHARED bid request a mutation lands, resolved from its ARTF path.
  *
- * <p>Only four locations are permitted (FR-4, BR-11): {@code imp.pmp.deals},
- * {@code imp.bidfloor}, {@code user.data} and {@code imp.metric}. Sealed, so the permitted
+ * <p>Only three locations are permitted (FR-4, BR-11): {@code imp.pmp.deals} (including
+ * each deal's floor), {@code user.data} and {@code imp.metric}. Sealed, so the permitted
  * set is enforced by the type system rather than by a comment.
  *
  * <p>Nothing here can name a bidder. Mutations are NEVER applied to bidder-specific

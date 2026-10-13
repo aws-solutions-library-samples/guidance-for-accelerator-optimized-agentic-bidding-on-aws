@@ -39,6 +39,7 @@ origin, and ``slope`` is the old ``shade_factor``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
@@ -80,7 +81,7 @@ class ShadingPolicy:
             ("curvature", CURVATURE_BOUNDS),
         ):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or value != value:  # NaN
+            if not isinstance(value, (int, float)) or math.isnan(value):
                 raise PolicyParameterError(f"{name} must be a real number, got {value!r}")
             low, high = bounds
             if not low <= value <= high:

@@ -245,7 +245,7 @@ mcp_app = Starlette(routes=[
     Route("/mcp", mcp_endpoint, methods=["POST", "GET", "DELETE", "OPTIONS"]),
     Route("/ping", ping),
 ])
-mcp_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
+mcp_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])  # nosemgrep: wildcard-cors the MCP server is reached by AgentCore, not by browsers
 
 
 # ---------------------------------------------------------------------------

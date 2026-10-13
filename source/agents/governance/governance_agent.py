@@ -494,7 +494,7 @@ class ModelPromotionGovernanceAgent:
                 reason,
             )
         except Exception as e:
-            logger.error(
+            logger.error(  # nosemgrep: logging-error-without-handling the exception is re-raised after logging
                 "Failed to update model registry for %s: %s",
                 version_arn,
                 e,
@@ -537,7 +537,7 @@ class ModelPromotionGovernanceAgent:
                 decision,
             )
         except Exception as e:
-            logger.error(
+            logger.error(  # nosemgrep: logging-error-without-handling the exception is re-raised after logging
                 "Failed to write audit record for %s %s: %s",
                 model_type,
                 version_arn,

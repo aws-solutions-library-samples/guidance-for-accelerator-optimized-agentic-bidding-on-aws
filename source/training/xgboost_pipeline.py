@@ -209,14 +209,19 @@ class XGBoostTrainingPipeline:
 
     def _build_hyperparameters(self, config: XGBoostTrainingJobConfig) -> dict[str, str]:
         """Tree-model hyperparameters -- NOT the RL-shaped set
-        TrainingPipeline._build_hyperparameters() builds."""
+        TrainingPipeline._build_hyperparameters() builds.
+
+        XGBoost's own keys only. The built-in container validates every
+        hyperparameter against its list and fails the job with "Extraneous
+        hyperparameter found" for anything else, so base_model_version travels
+        as a training-job Tag (see trigger_training) and validation_split is
+        not sent at all (the container has no such parameter).
+        """
         return {
             "max_depth": str(config.max_depth),
             "num_round": str(config.num_round),
             "eta": str(config.eta),
             "objective": config.objective,
-            "base_model_version": config.base_model_version,
-            "validation_split": str(config.validation_split),
         }
 
     async def trigger_training(
@@ -246,7 +251,10 @@ class XGBoostTrainingPipeline:
             "RoleArn": self._sagemaker_role,
             "InputDataConfig": [
                 {
-                    "ChannelName": "training",
+                    # The built-in algorithm reads SM_CHANNEL_TRAIN in
+                    # algorithm mode (sagemaker_xgboost_container/training.py);
+                    # any other channel name fails the job at startup.
+                    "ChannelName": "train",
                     "DataSource": {
                         "S3DataSource": {
                             "S3DataType": "S3Prefix",
@@ -267,6 +275,8 @@ class XGBoostTrainingPipeline:
                 "MaxRuntimeInSeconds": config.max_runtime_seconds,
             },
             "HyperParameters": self._build_hyperparameters(config),
+            # Provenance for the registration Lambda (read via ListTags).
+            "Tags": [{"Key": "base_model_version", "Value": config.base_model_version}],
         }
 
         start_time = time.time()

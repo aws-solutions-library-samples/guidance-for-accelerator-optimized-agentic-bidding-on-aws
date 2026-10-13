@@ -129,15 +129,27 @@ def read_model_versions(
 def _version_detail(sagemaker_client, model_package_arn: Optional[str]) -> dict:
     """The per-version fields that require a DescribeModelPackage call.
 
-    Both of these are absent from ModelPackageSummaryList, so the list response
+    All of these are absent from ModelPackageSummaryList, so the list response
     alone cannot supply them. Fetched together in ONE describe per version --
     reading them with a call each doubled the API traffic for the same data.
     """
     if not model_package_arn:
-        return {"approval_description": None, "training_run_id": None}
+        return {
+            "approval_description": None,
+            "training_run_id": None,
+            "training_data": None,
+            "fingerprint": None,
+        }
     detail = _describe(sagemaker_client, model_package_arn)
     metadata = detail.get("CustomerMetadataProperties") or {}
     return {
+        # What the version was trained on, as registered: "sample" for the Deal
+        # Scorer trained at deploy time on interactions generated from the deal
+        # book (deployment/scripts/register_genesis_models.py). None when the
+        # registration did not record it.
+        "training_data": metadata.get("training_data") or None,
+        # The 12-hex build fingerprint of that deploy-time build, None otherwise.
+        "fingerprint": metadata.get("fingerprint") or None,
         # The governance agent's stated reason for the approval status.
         "approval_description": detail.get("ApprovalDescription") or None,
         # The load-test run this version's training job was triggered from,

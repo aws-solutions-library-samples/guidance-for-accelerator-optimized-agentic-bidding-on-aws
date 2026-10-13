@@ -57,7 +57,7 @@ export function factualRunSummary(beats, context, viewModel, baseline = null) {
   }
   if (names.length) {
     sentences.push(
-      `${names.join(", ")} ${names.length === 1 ? "changed" : "changed"} the request before it was auctioned.`
+      `${names.join(", ")} changed the request before it was auctioned.`
     );
   }
 

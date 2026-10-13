@@ -26,6 +26,7 @@
 #   Built and pushed to ECR, then referenced by source/training/pipeline.py
 #   which creates SageMaker training jobs using this image.
 
+# nosemgrep: dockerfile-source-not-pinned the NGC release tag is the pin this guidance documents; CodeBuild rebuilds on deploy
 FROM nvcr.io/nvidia/nemo:24.07
 
 LABEL maintainer="ARTF Bidding Platform"
@@ -59,4 +60,9 @@ WORKDIR /opt/ml/code
 # SageMaker expects the entrypoint to be the training script
 ENV SAGEMAKER_PROGRAM=train.py
 
+# No USER line on purpose: SageMaker mounts /opt/ml/model and /opt/ml/output as
+# root-owned volumes at job start, and train.py writes the ONNX export, the
+# feature manifest and metrics.json into /opt/ml/model. A non-root USER would
+# fail at the first of those writes.
+#checkov:skip=CKV_DOCKER_3: SageMaker training entrypoint writes /opt/ml as root
 ENTRYPOINT ["python", "/opt/ml/code/train.py"]

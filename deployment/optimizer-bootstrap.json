@@ -29,7 +29,9 @@
       }
     },
     {
+      "_comment": "rebuild_on_source_change: the Deal Scorer is retrained at deploy time from the deal book, so this engine is rebuilt when the fingerprint in onnx-source/ncf_deal_manager/manifest.json differs from the engine's source-fingerprint metadata. An engine a promotion wrote (provisioned-by promotion) is never rebuilt here.",
       "model_name": "ncf_deal_manager",
+      "rebuild_on_source_change": true,
       "source_model_uri": "s3://__MODEL_BUCKET__/onnx-source/ncf_deal_manager/model.onnx",
       "output_uri": "s3://__MODEL_BUCKET__/triton-models/ncf_deal_manager_stable/1/model.plan",
       "precision": "fp16",

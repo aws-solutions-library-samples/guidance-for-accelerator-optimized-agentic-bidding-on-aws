@@ -113,7 +113,7 @@ def _build_and_upload_react(s3, bucket_name: str, react_dir: Path) -> None:
     if not (react_dir / "node_modules").is_dir():
         install_cmd = ["npm", "ci"] if (react_dir / "package-lock.json").is_file() else ["npm", "install"]
         _LOG.info("Installing React dependencies (%s)...", " ".join(install_cmd))
-        ri = subprocess.run(install_cmd, cwd=str(react_dir), capture_output=True, text=True)
+        ri = subprocess.run(install_cmd, cwd=str(react_dir), capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-audit deploy tooling, fixed npm argv, no shell
         if ri.returncode != 0:
             raise RuntimeError(f"npm install failed: {ri.stderr}")
 

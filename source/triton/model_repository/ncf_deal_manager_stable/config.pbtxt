@@ -41,3 +41,50 @@ instance_group [
     kind: KIND_GPU
   }
 ]
+# Warm-up: Triton runs these requests on each instance at load and reports the
+# model not ready until they complete (Triton r24.08 model_configuration.md,
+# "Model Warmup"; ModelWarmup in common/protobuf/model_config.proto). dims are
+# the declared input dims (before reshape), without the batch dimension. Batch 1
+# and 16, the opt batch of this engine's profile in deployment/optimizer-bootstrap.json.
+model_warmup [
+  {
+    name: "zero_batch1"
+    batch_size: 1
+    inputs {
+      key: "user_ids"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "item_ids"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  },
+  {
+    name: "zero_batch16"
+    batch_size: 16
+    inputs {
+      key: "user_ids"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "item_ids"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  }
+]

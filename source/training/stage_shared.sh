@@ -41,7 +41,10 @@ STAGE_DIR="${SCRIPT_DIR}/container/shared"
 #   shading_policy.py -- the bid policy's three coefficients, which
 #                        search_policy_parameters() searches (stdlib only:
 #                        dataclasses, typing)
-STAGED_MODULES="__init__.py dlrm_features.py onnx_compat.py shading_policy.py"
+#   ncf_ids.py        -- the Deal Scorer's id hash and thresholds (stdlib only)
+#   ncf_model.py      -- the Deal Scorer's NeuMF and its served ONNX export
+#                        (torch, plus ncf_ids and onnx_compat above)
+STAGED_MODULES="__init__.py dlrm_features.py onnx_compat.py shading_policy.py ncf_ids.py ncf_model.py"
 
 # Guard: refuse to build if the trainer imports a `shared` module that is not
 # staged. Adding an import without adding it here produces an image that builds

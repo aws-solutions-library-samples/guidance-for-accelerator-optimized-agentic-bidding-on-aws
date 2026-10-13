@@ -20,7 +20,7 @@
 **/.idea
 cdk.out
 **/data/**.csv
-
+*.bkp
 .env
 
 # --- Python ---
@@ -61,6 +61,9 @@ source/triton/model_repository/**/*.onnx
 # ONNX staging dir: rm -rf'd and regenerated every deploy (deploy.sh Step 2),
 # uploaded to S3 as the Model Optimizer's source. Pure build output.
 source/triton/onnx_export/
+# Deal Scorer build cache, one directory per training fingerprint
+# (source/training/ncf_sample/build.py). Pure build output.
+deployment/.ncf-cache/
 
 # --- Amazon Ember (proprietary) brand fonts ---
 # Fetched at deploy time from an authorized source (AMAZON_EMBER_FONT_BASE_URL);
@@ -108,3 +111,12 @@ _bk_composability-documentation
 # Scratch Playwright capture script and MCP browser snapshots (contain a live stack URL).
 .cap2x.js
 .playwright-mcp/
+.agents
+.agents/tasks/ridesharer-preexisting-changes.txt
+assets/images/.$reference-architecture-slides.svg.dtmp
+assets/images/reference-architecture-slides-1 - Part 1: real-time ARTF bidstream path.drawio.svg
+assets/images/reference-architecture-slides-1 - Part 1.svg
+assets/images/reference-architecture-slides-2 - Part 2: closed-loop learning.drawio.svg
+assets/images/reference-architecture-slides.drawio
+assets/images/reference-architecture-slides.svg
+assets/images/reference-architecture-full.md

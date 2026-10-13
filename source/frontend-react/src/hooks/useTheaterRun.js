@@ -1,15 +1,28 @@
-// useTheaterRun.js — one scenario, submitted once, turned into a beat sequence.
+// useTheaterRun.js — one scenario, auctioned twice, turned into a beat sequence.
 //
 // Sequences the I/O around buildBeats; contains no beat logic itself.
 //
-// A failed submission yields NO beats. The surface reports the real failure and
-// offers a retry rather than presenting a walkthrough, because a walkthrough of
-// a request that was never processed would be fabricated output (BR-33).
+// Pass 1 is `/v1/auction/run?artf=off`, pass 2 is `?artf=on`. The with-ARTF beats
+// are built from that auction's own report of the mutations the Prebid hook ran
+// (`artf_meta.extension_point`), so what the walkthrough narrates is what the
+// auction did. No separate `/v1/mutations` call is made when Prebid is deployed.
+//
+// When Prebid is not deployed (501), there is no auction to read, and the beats
+// come from `/v1/mutations` as before; the offers column shows the captured
+// fixture with its own notice.
+//
+// A failed run yields NO beats. The surface reports the real failure and offers
+// a retry rather than presenting a walkthrough, because a walkthrough of a
+// request that was never processed would be fabricated output (BR-33). That
+// includes a with-ARTF auction that failed for any reason other than Prebid not
+// being deployed: substituting a separate call's mutations would narrate an
+// auction that did not run.
 
 import { useState, useCallback, useRef } from "react";
 import { useOrchestratorClientWithBase } from "./useOrchestratorClientWithBase.js";
 import { authFetch } from "../authFetch.js";
 import { buildBeats, buildScenarioContext } from "../utils/theaterBeats.js";
+import { normalizeExtensionPoint } from "../utils/normalizer.js";
 import { isLiveAuctionResponse } from "../utils/bidResponseFixture.js";
 import { loadScenarioPayload } from "../utils/scenarioPayload.js";
 
@@ -80,11 +93,11 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
   // Runs the scenario's OpenRTB request as a real auction, if one is available.
   //
-  // A failure here is not the run's failure — the mutations the beats describe did
-  // happen — so it never sets RUN_FAILED. But it is recorded rather than swallowed:
-  // the offers panel needs to distinguish "Prebid is not deployed" from "the
-  // auction could not be read", because both fall back to the same fixture and only
-  // one of them is expected.
+  // Records the response or the fault against its pass, and also RETURNS the
+  // outcome, `{ kind: "live", auction }` or the fault `{ kind, detail, status? }`,
+  // so start() can decide from the with-ARTF auction how to build the beats. The
+  // offers panel needs to distinguish "Prebid is not deployed" from "the auction
+  // could not be read", because only one of them is expected.
   //
   // authFetch, not fetch: `/v1/auction/run` is not in the orchestrator's
   // _PUBLIC_PATHS, so an unauthenticated call is rejected before it reaches the
@@ -101,11 +114,12 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
 
     const bidRequest = payload?.bid_request;
     if (!bidRequest?.imp?.length) {
-      setFault({
+      const fault = {
         kind: AUCTION_FAILED,
         detail: "the scenario carries no OpenRTB bid request to auction",
-      });
-      return;
+      };
+      setFault(fault);
+      return fault;
     }
 
     // The scenario's ARTF intents travel as a query parameter so the orchestrator
@@ -124,60 +138,67 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bidRequest),
       });
-      if (token !== runTokenRef.current) return;
-
+      if (token !== runTokenRef.current) return null;
       // 501 is the orchestrator saying Prebid is not deployed. Its own words are
       // used where it gives them, so the reason shown is the reason it reported.
       if (resp.status === 501) {
         const body = await resp.json().catch(() => null);
-        setFault({
+        if (token !== runTokenRef.current) return null;
+        const fault = {
           kind: AUCTION_NOT_DEPLOYED,
           detail: body?.detail ?? "Prebid Server is not deployed.",
-        });
-        return;
+        };
+        setFault(fault);
+        return fault;
       }
-
       if (!resp.ok) {
         const body = await resp.json().catch(() => null);
-        setFault({
+        if (token !== runTokenRef.current) return null;
+        const fault = {
           kind: AUCTION_FAILED,
           detail: body?.detail ?? body?.error ?? `the auction endpoint returned HTTP ${resp.status}`,
           status: resp.status,
-        });
-        return;
+        };
+        setFault(fault);
+        return fault;
       }
-
       const auction = await resp.json();
-      if (token !== runTokenRef.current) return;
-
+      if (token !== runTokenRef.current) return null;
       // Only a response that actually came from an exchange is used.
       if (!isLiveAuctionResponse(auction)) {
-        setFault({
+        const fault = {
           kind: AUCTION_FAILED,
           detail: "the response did not identify itself as coming from the exchange",
-        });
-        return;
+        };
+        setFault(fault);
+        return fault;
       }
-
       setResponse(auction);
       setFault(null);
+      return { kind: "live", auction };
     } catch (err) {
-      if (token !== runTokenRef.current) return;
-      setFault({
+      if (token !== runTokenRef.current) return null;
+      const fault = {
         kind: AUCTION_FAILED,
         detail: err instanceof Error ? err.message : String(err),
-      });
+      };
+      setFault(fault);
+      return fault;
     }
   }, [baseUrl]);
 
   /**
-   * Submit one scenario and turn the result into a beat sequence.
+   * Run one scenario and turn the with-ARTF auction into a beat sequence.
    *
    * `params` are the scenario card's tuner values. They are applied through the
-   * SAME `loadScenarioPayload` the `▶ Send` path uses, so stepping through a
-   * scenario in the Theater submits the identical bytes that sending it would —
-   * a second copy of the patching logic here is how the two would drift, and the
-   * drift would be invisible: the Theater would narrate a run nothing else made.
+   * SAME `loadScenarioPayload` the `▶ Send` path uses, so the Theater and the Send
+   * path start from identical bytes; a second copy of the patching logic here is
+   * how the two would drift.
+   *
+   * Both auctions are fired together: they are independent, and the baseline pass
+   * hits no container. The beats wait only for the with-ARTF auction, because its
+   * report is what they are built from. The baseline settles on its own; when it
+   * fails, the pass-1 column states the fault (it has no fixture).
    */
   const start = useCallback(async (scenario, params = {}) => {
     const token = ++runTokenRef.current;
@@ -194,45 +215,54 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
     setBaselineFault(null);
     setPayload(null);
     setResult(null);
-
+    const fail = (err) => {
+      setError(err instanceof Error ? err : new Error(String(err)));
+      setStatus(RUN_FAILED);
+      return null;
+    };
     try {
       const submitted = await loadScenarioPayload(scenario, params);
       if (token !== runTokenRef.current) return null;
-
       setContext(buildScenarioContext(submitted));
       setPayload(submitted);
 
-      const answered = await submit(submitted, "REST");
-      if (token !== runTokenRef.current) return null;
+      void runAuction(submitted, token, { artf: "off" });
+      const withArtf = await runAuction(submitted, token, { artf: "on" });
+      if (token !== runTokenRef.current || withArtf == null) return null;
 
-      // The orchestrator answered, but the response itself may report a
-      // pipeline error. That is a real failure, not a walkthrough.
-      if (answered?.error) {
-        setError(new Error(answered.error.message || "The orchestrator reported an error"));
-        setStatus(RUN_FAILED);
-        return null;
+      let answered;
+      if (withArtf.kind === "live") {
+        // The auction's own report. An orchestrator that predates the report, or
+        // a response without a usable one, yields a result with no container
+        // mutations and an artfReport saying so; the recap states it in words.
+        const ep = withArtf.auction?.artf_meta?.extension_point ?? {
+          available: false,
+          reason: "the orchestrator did not report the ARTF hook's mutations",
+        };
+        answered = normalizeExtensionPoint(ep, submitted);
+      } else if (withArtf.kind === AUCTION_NOT_DEPLOYED) {
+        // No exchange to read. The containers are asked directly, as before
+        // Prebid existed, and the offers column shows the fixture with its notice.
+        answered = await submit(submitted, "REST");
+        if (token !== runTokenRef.current) return null;
+        // The orchestrator answered, but the response itself may report a
+        // pipeline error. That is a real failure, not a walkthrough.
+        if (answered?.error) {
+          return fail(new Error(answered.error.message || "The orchestrator reported an error"));
+        }
+      } else {
+        // The with-ARTF auction failed. Its fault is the run's fault: narrating a
+        // separate call's mutations would describe an auction that did not run.
+        return fail(new Error(`The with-ARTF auction could not be read: ${withArtf.detail}`));
       }
 
       setResult(answered);
       setBeats(buildBeats(submitted, answered));
       setStatus(RUN_READY);
-
-      // Both auctions run AFTER the walkthrough is ready, and in parallel: they
-      // are independent, and the baseline pass hits no container, so firing them
-      // together costs nothing but saves a Prebid round trip of wall time. An
-      // unavailable with-ARTF auction leaves bidResponse null, and the offers
-      // panel then shows the captured fixture with its own notice rather than
-      // presenting a fixture as live. An unavailable baseline leaves
-      // baselineResponse null and has no fixture: the pass-1 column states the
-      // fault instead.
-      void runAuction(submitted, token, { artf: "off" });
-      void runAuction(submitted, token, { artf: "on" });
       return answered;
     } catch (err) {
       if (token !== runTokenRef.current) return null;
-      setError(err instanceof Error ? err : new Error(String(err)));
-      setStatus(RUN_FAILED);
-      return null;
+      return fail(err);
     }
   }, [submit, runAuction]);
 

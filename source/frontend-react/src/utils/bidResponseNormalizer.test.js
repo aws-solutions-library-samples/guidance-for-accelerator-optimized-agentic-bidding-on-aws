@@ -66,7 +66,7 @@ describe("resolveWinner", () => {
     expect(winner).not.toBeNull();
     expect(winner.dealId).toBe("deal-home-premium");
     expect(winner.campaignName).toBe("Cedar & Co Furnishings");
-    expect(winner.clearedPrice).toBe(6.35);
+    expect(winner.clearedPrice).toBe(capturedBidResponse.seatbid[0].bid[0].price);
   });
 
   it("returns null, not an empty object, when nothing is marked as winner", () => {

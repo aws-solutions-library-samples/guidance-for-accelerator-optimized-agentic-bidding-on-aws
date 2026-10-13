@@ -332,7 +332,7 @@ function registerViolations(text, limits) {
   }
   const bannedChar = BANNED_CHARS.exec(text);
   if (bannedChar) {
-    out.push(violation("BR3-17", `banned character ${JSON.stringify(bannedChar[0])}`));
+    out.push(violation("BR3-17", `banned character ${JSON.stringify(bannedChar[0])}`)); // nosemgrep: no-stringify-keys bannedChar is a regex match array; [0] is the matched text
   }
   if (/!/.test(text)) out.push(violation("BR3-17", "exclamation mark"));
   if (/\?/.test(text)) out.push(violation("BR3-17", "question mark"));

@@ -25,7 +25,7 @@ const AGE_YOB_MAP = [
 export function applyTunerToPayload(payload, scenario, params = {}) {
   const patched = JSON.parse(JSON.stringify(payload));
   const br = patched.bid_request || patched;
-  const imp0 = br?.imp?.[0];
+  const imp0 = br?.imp?.[0]; // nosemgrep: no-stringify-keys array index into imp, not an object key
 
   if (imp0 && params.bidFloor != null) {
     imp0.bidfloor = params.bidFloor;

@@ -1,5 +1,7 @@
 package org.prebid.server.hooks.modules.artf.model;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
 import java.util.List;
 
 /**
@@ -48,7 +50,13 @@ public sealed interface ExtensionPointOutcome {
     /** Observed call latency in milliseconds, or null when no call was made. */
     Long latencyMs();
 
-    record MutationsReturned(List<ArtfMutation> mutations, Long latencyMs, RtbResponse.Metadata metadata)
+    /**
+     * @param response the orchestrator's answer as received, forwarded for reporting and
+     *                 never interpreted. The typed fields drop keys the hook does not act on
+     *                 (stages, conflicts, per-container mutations); this keeps them.
+     */
+    record MutationsReturned(
+            List<ArtfMutation> mutations, Long latencyMs, RtbResponse.Metadata metadata, JsonNode response)
             implements ExtensionPointOutcome {
 
         @Override
@@ -62,7 +70,9 @@ public sealed interface ExtensionPointOutcome {
         }
     }
 
-    record NoMutations(Long latencyMs, RtbResponse.Metadata metadata) implements ExtensionPointOutcome {
+    /** @param response the orchestrator's answer as received, forwarded for reporting only. */
+    record NoMutations(Long latencyMs, RtbResponse.Metadata metadata, JsonNode response)
+            implements ExtensionPointOutcome {
 
         @Override
         public String state() {

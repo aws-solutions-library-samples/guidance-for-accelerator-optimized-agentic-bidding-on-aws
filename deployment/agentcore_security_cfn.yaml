@@ -79,6 +79,13 @@ Resources:
   # ---------------------------------------------------------------------------
   AdaptiveBiddingAgentRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: cloudwatch:GetMetricData, cloudwatch:PutMetricData, ecr:GetAuthorizationToken, xray:PutTraceSegments and xray:PutTelemetryRecords do not support resource-level permissions
     Properties:
       RoleName: !Join
         - '-'
@@ -224,6 +231,13 @@ Resources:
   # ---------------------------------------------------------------------------
   ModelPromotionGovernanceAgentRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: cloudwatch:GetMetricData, cloudwatch:PutMetricData, ecr:GetAuthorizationToken, xray:PutTraceSegments and xray:PutTelemetryRecords do not support resource-level permissions
     Properties:
       RoleName: !Join
         - '-'
@@ -397,6 +411,11 @@ Resources:
   # ---------------------------------------------------------------------------
   ManualOverrideRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !Join
         - '-'
@@ -439,6 +458,11 @@ Resources:
 
   GovernanceApproveModelPolicy:
     Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts attach this policy by its predictable prefixed name
     Properties:
       ManagedPolicyName: !Join
         - '-'

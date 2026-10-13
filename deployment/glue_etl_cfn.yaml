@@ -105,6 +105,11 @@ Resources:
   # ---------------------------------------------------------------------------
   TrainingDataBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 access logging is not enabled for this demo data bucket which is the documented choice for this guidance
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -153,6 +158,11 @@ Resources:
   # ---------------------------------------------------------------------------
   GlueETLJobRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
     Properties:
       RoleName: !If
         - HasStackPrefix

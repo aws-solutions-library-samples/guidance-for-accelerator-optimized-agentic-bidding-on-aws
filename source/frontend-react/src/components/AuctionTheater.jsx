@@ -6,9 +6,10 @@
 // consulted. Pass 2 auctions it with the containers mutating it first. Each pass
 // opens with a banner, and the recap puts the two outcomes side by side.
 //
-// The beat sequence is DERIVED from the containers that actually mutated the
-// request, so a scenario with three applicable intents produces fewer steps than
-// one with six, with no code change.
+// The beat sequence is DERIVED from the containers that mutated the with-ARTF
+// auction, read from that auction's own report (artf_meta.extension_point), so a
+// scenario with three applicable intents produces fewer steps than one with six,
+// with no code change.
 //
 // Everything rendered is a function of (beats, index). Moving backwards produces
 // exactly the state that moving forwards to the same index produces, so there is
@@ -216,9 +217,11 @@ export default function AuctionTheater({ scenario, params, onExit }) {
     else setSummaryOpen(false);
   }, []);
 
-  const stepLabel = stepper.isIndeterminate
+  // The pass on screen, not a step count: the number of with-ARTF beats is
+  // whatever the auction returned, so a fixed "of M" would only restate it.
+  const stepLabel = stepper.isIndeterminate || currentPass == null
     ? "Preparing"
-    : `Step ${index + 1} of ${stepper.total}`;
+    : currentPass === PASS_BASELINE ? "Without ARTF" : "With ARTF";
 
   // The same merged JSON the default scenario view renders, through the same
   // component. A response-side scenario carries `bid_response` in its payload, so
@@ -260,10 +263,10 @@ export default function AuctionTheater({ scenario, params, onExit }) {
           firing. It is not a chooser any more — there is nothing to choose. */}
       {run.status === RUN_IDLE || run.status === RUN_SUBMITTING ? (
         <div className="th-chooser">
-          <h2 className="th-chooser-title">Submitting to the orchestrator</h2>
+          <h2 className="th-chooser-title">Running the auctions</h2>
           <p className="th-chooser-sub">
-            The number of steps is not known yet. It depends on how many mutations
-            the containers return.
+            The same request is auctioned without ARTF and with ARTF. The with-ARTF
+            steps are built from the mutations that auction ran.
           </p>
         </div>
       ) : null}
@@ -369,8 +372,6 @@ export default function AuctionTheater({ scenario, params, onExit }) {
           {/* A footer in flow, not a floating pill. It used to overlap the data it
               was controlling. */}
           <TheaterControls
-            index={index}
-            total={stepper.total}
             isIndeterminate={stepper.isIndeterminate}
             isPlaying={stepper.isPlaying}
             canGoBack={stepper.canGoBack}
