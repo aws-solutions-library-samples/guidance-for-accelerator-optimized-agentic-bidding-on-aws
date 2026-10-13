@@ -9,6 +9,7 @@
 #   - MCP   :8081   JSON-RPC at /mcp (extend_rtb tool)
 #   - Health :8080   /health/live, /health/ready
 
+# nosemgrep: dockerfile-source-not-pinned deploy by tag; CodeBuild rebuilds the image on every deploy
 FROM python:3.12-slim AS base
 
 ARG CONTAINER
@@ -38,14 +39,16 @@ WORKDIR /app
 COPY shared/ /app/shared/
 COPY ${CONTAINER}/ /app/container/
 
-RUN adduser --disabled-password --no-create-home appuser
+# The build context keeps the host's file modes, so a source file that is not
+# world-readable there would be unreadable to appuser. Normalize before USER.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home appuser
 USER appuser
 
 # gRPC + MCP + Health
 EXPOSE 50051 8081 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')" || exit 1
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready')"]
 
 # Run the multi-protocol ARTF server
 CMD ["python", "-m", "container.app"]

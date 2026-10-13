@@ -14,10 +14,10 @@ Server via tritonclient.http.  Otherwise, PyTorch runs inline (CPU).
 
 from __future__ import annotations
 
-import hashlib
+import logging
 import os
 import sys
-import time
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -26,14 +26,67 @@ from shared.artf_types import (
     RTBRequest, RTBResponse, intent_applicable,
 )
 
+logger = logging.getLogger(__name__)
+
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 
+from shared import dlrm_features as features
+from shared.shading_policy import ShadingPolicy
+
 EMBEDDING_DIM = 16
-NUM_DENSE = 4
-NUM_SPARSE = 3
-VOCAB_SIZE = 1000
+#: Shape comes from the feature spec rather than from constants declared here,
+#: so the model cannot be built for a width the spec does not produce.
+NUM_DENSE = features.DENSE_WIDTH
+NUM_SPARSE = features.CATEGORICAL_WIDTH
 SHADE_FACTOR = 0.65
 EST_CONVERSION_VALUE = 12.0
+
+# ---------------------------------------------------------------------------
+# Parameter Cache — lazy initialization controlled by PARAMETER_STORE_TABLE
+# ---------------------------------------------------------------------------
+
+_parameter_cache: Optional["ParameterCache"] = None  # noqa: F821
+_parameter_cache_initialized: bool = False
+
+
+def _get_parameter_cache():
+    """Lazily initialize the ParameterCache if PARAMETER_STORE_TABLE is set.
+
+    Returns the cache instance or None if the env var is not configured
+    (backward-compatible: falls back to module-level constants).
+    """
+    global _parameter_cache, _parameter_cache_initialized
+
+    if _parameter_cache_initialized:
+        return _parameter_cache
+
+    table_name = os.environ.get("PARAMETER_STORE_TABLE")
+    if table_name:
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        from shared.parameter_cache import ParameterCache
+
+        _parameter_cache = ParameterCache(
+            table_name=table_name,
+            region=region,
+            ttl_seconds=float(os.environ.get("PARAMETER_CACHE_TTL", "60")),
+            model_type="dlrm_bid_shader",
+        )
+        logger.info(
+            "ParameterCache initialized: table=%s region=%s",
+            table_name,
+            region,
+        )
+    else:
+        _parameter_cache = None
+        logger.info(
+            "PARAMETER_STORE_TABLE not set — using static defaults "
+            "(shade_factor=%s, conversion_value=%s)",
+            SHADE_FACTOR,
+            EST_CONVERSION_VALUE,
+        )
+
+    _parameter_cache_initialized = True
+    return _parameter_cache
 
 
 # ---------------------------------------------------------------------------
@@ -42,36 +95,37 @@ EST_CONVERSION_VALUE = 12.0
 
 if USE_TRITON:
     import numpy as np
-    from container.triton_inference import predict_ctr as _triton_predict_ctr
+    from container.triton_inference import (
+        InferenceUnavailable,
+        predict_ctr as _triton_predict_ctr,
+    )
 
+    # Static placeholder — used ONLY as a fallback when the Triton router
+    # hasn't returned a resolved served_model_version (e.g. router config
+    # predates this field, or CanaryDeployer hasn't written a version-ARN
+    # yet). The per-request accurate value now comes from
+    # _predict_ctr_from_request's third return value; see FR-2 / Q1=A in
+    # the load-test-outcome-capture unit's functional design.
     MODEL_VERSION = "dlrm-nvidia-triton-v1"
 
-    def _predict_ctr_from_request(bid_request: dict) -> float:
-        dense, s_user, s_domain, s_device = _extract_features_np(bid_request)
+    def _predict_ctr_from_request(bid_request: dict) -> tuple[float, str, str]:
+        """Returns (ctr, served_variant, served_model_version).
+
+        served_variant/served_model_version are the router's real per-request
+        resolution ("" if unavailable — a real "unknown", not fabricated).
+        Reads the load-test-only target-variant override from
+        shared.load_test_context, which is None for all live traffic.
+        """
+        from shared.load_test_context import get_target_variant
+
+        dense, categorical = features.build_from_bid_request(bid_request)
         return _triton_predict_ctr(
-            dense_features=dense,
-            sparse_user=s_user,
-            sparse_domain=s_domain,
-            sparse_device=s_device,
+            dense=np.array([dense], dtype=np.float32),
+            categorical=[
+                np.array([[index]], dtype=np.int64) for index in categorical
+            ],
+            target_variant=get_target_variant(),
         )
-
-    def _extract_features_np(bid_request: dict):
-        imps = bid_request.get("imp", [{}])
-        imp = imps[0] if imps else {}
-        user = bid_request.get("user", {})
-        site = bid_request.get("site", {})
-        device = bid_request.get("device", {})
-
-        bidfloor = float(imp.get("bidfloor", 1.0))
-        hour = time.localtime().tm_hour / 24.0
-        age_norm = max(0.0, min(1.0, (2025 - user.get("yob", 1990)) / 80.0))
-        has_video = 1.0 if imp.get("video") else 0.0
-
-        dense = np.array([[bidfloor, hour, age_norm, has_video]], dtype=np.float32)
-        s_user = np.array([[_hash_to_idx(user.get("id", "unknown"))]], dtype=np.int64)
-        s_domain = np.array([[_hash_to_idx(site.get("domain", "unknown"))]], dtype=np.int64)
-        s_device = np.array([[_hash_to_idx(device.get("ua", "unknown")[:20])]], dtype=np.int64)
-        return dense, s_user, s_domain, s_device
 
 else:
     import torch
@@ -82,9 +136,15 @@ else:
 
         def __init__(self):
             super().__init__()
+            # One table per categorical, each sized to that feature's own
+            # cardinality (features.VOCAB_SIZES). A single shared size would
+            # either waste table on the small features or collide heavily on
+            # the large one.
             self.embeddings = nn.ModuleList([
-                nn.EmbeddingBag(VOCAB_SIZE, EMBEDDING_DIM, mode="sum")
-                for _ in range(NUM_SPARSE)
+                nn.EmbeddingBag(
+                    features.VOCAB_SIZES[column], EMBEDDING_DIM, mode="sum"
+                )
+                for column in features.CATEGORICAL_COLUMNS
             ])
             self.bottom_mlp = nn.Sequential(
                 nn.Linear(NUM_DENSE, 32), nn.ReLU(),
@@ -124,43 +184,60 @@ else:
     _model.eval()
     MODEL_VERSION = "dlrm-nvidia-arch-v1"
 
-    def _predict_ctr_from_request(bid_request: dict) -> float:
-        dense, sparse = _extract_features_torch(bid_request)
+    class InferenceUnavailable(RuntimeError):
+        """Never raised on this path — the model is in-process.
+
+        Declared so `mutate` can catch one name regardless of which backend is
+        compiled in, rather than branching on USE_TRITON at the call site.
+        """
+
+    def _predict_ctr_from_request(bid_request: dict) -> tuple[float, str, str]:
+        """Returns (ctr, served_variant, served_model_version).
+
+        The non-Triton (inline PyTorch) path has no canary/variant concept —
+        served_variant/served_model_version are always "" (a real "unknown",
+        not fabricated), matching this container's static MODEL_VERSION.
+        """
+        dense_values, categorical = features.build_from_bid_request(bid_request)
+        dense = torch.tensor([dense_values], dtype=torch.float32)
+        sparse = [torch.tensor([index]) for index in categorical]
         with torch.no_grad():
-            return _model(dense, sparse).item()
-
-    def _extract_features_torch(bid_request: dict):
-        imps = bid_request.get("imp", [{}])
-        imp = imps[0] if imps else {}
-        user = bid_request.get("user", {})
-        site = bid_request.get("site", {})
-        device = bid_request.get("device", {})
-
-        bidfloor = float(imp.get("bidfloor", 1.0))
-        hour = time.localtime().tm_hour / 24.0
-        age_norm = max(0.0, min(1.0, (2025 - user.get("yob", 1990)) / 80.0))
-        has_video = 1.0 if imp.get("video") else 0.0
-
-        dense = torch.tensor([[bidfloor, hour, age_norm, has_video]], dtype=torch.float32)
-        sparse = [
-            torch.tensor([_hash_to_idx(user.get("id", "unknown"))]),
-            torch.tensor([_hash_to_idx(site.get("domain", "unknown"))]),
-            torch.tensor([_hash_to_idx(device.get("ua", "unknown")[:20])]),
-        ]
-        return dense, sparse
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-def _hash_to_idx(value: str, vocab: int = VOCAB_SIZE) -> int:
-    return int(hashlib.md5(value.encode(), usedforsecurity=False).hexdigest(), 16) % vocab  # nosec B324
+            return _model(dense, sparse).item(), "", ""
 
 
 # ---------------------------------------------------------------------------
 # ARTF mutate
 # ---------------------------------------------------------------------------
+
+def _floor_for_bid(bid_request: dict, bid: dict) -> float:
+    """The lowest price a shaded bid may take.
+
+    The impression floor for every bid. A bid with a ``dealid`` is also held to the
+    floor of the request deal with that id, because a deal floor mutation writes
+    the deal's floor only and leaves ``imp.bidfloor`` at the publisher's value.
+    The max does not convert currencies: it assumes ``imp.bidfloorcur`` and the
+    deal's ``bidfloorcur`` agree, as they do in the deals seed and the scenario
+    samples (USD).
+    """
+    imp_id = bid.get("impid", "")
+    for imp in bid_request.get("imp", []):
+        if imp.get("id") != imp_id:
+            continue
+        floor = imp.get("bidfloor", 0.0)
+        dealid = bid.get("dealid")
+        if not dealid:
+            return floor
+        pmp = imp.get("pmp")
+        deals = pmp.get("deals") if isinstance(pmp, dict) else None
+        for deal in deals if isinstance(deals, list) else []:
+            if isinstance(deal, dict) and deal.get("id") == dealid:
+                deal_floor = deal.get("bidfloor")
+                if isinstance(deal_floor, (int, float)) and not isinstance(deal_floor, bool):
+                    return max(floor or 0.0, float(deal_floor))
+                break
+        return floor
+    return 0.0
+
 
 def mutate(req: RTBRequest) -> RTBResponse:
     """ARTF GetMutations — BID_SHADE via DLRM CTR prediction."""
@@ -171,12 +248,55 @@ def mutate(req: RTBRequest) -> RTBResponse:
     if not bid_response:
         return RTBResponse(id=req.id, metadata=Metadata(model_version=MODEL_VERSION))
 
-    # Read model parameter overrides from the request (frontend sliders)
+    # Read model parameter overrides from the request (frontend sliders take priority)
     params = req.model_params or {}
-    shade_factor = params.get('shade_factor', SHADE_FACTOR)
-    conversion_value = params.get('conversion_value', EST_CONVERSION_VALUE)
 
-    predicted_ctr = _predict_ctr_from_request(req.bid_request)
+    # Determine shade_factor: frontend override > cache > static default
+    if 'shade_factor' in params:
+        shade_factor = params['shade_factor']
+    else:
+        cache = _get_parameter_cache()
+        shade_factor = cache.get_shade_factor() if cache else SHADE_FACTOR
+
+    # The shading policy. `shade_factor` remains the slope, so the existing frontend
+    # slider and parameter-store record keep working unchanged and a model that
+    # publishes no policy prices exactly as before. `base` and `curvature` come from
+    # the request when supplied, which is what lets phase 2's tuned parameters reach
+    # the serving path through the channel that already exists.
+    policy = ShadingPolicy.from_mapping(
+        {k: params[k] for k in ("base", "curvature") if k in params}
+        or None,
+        default=ShadingPolicy(slope=float(shade_factor)),
+    )
+
+    # Determine conversion_value: frontend override > cache > static default
+    if 'conversion_value' in params:
+        conversion_value = params['conversion_value']
+    else:
+        cache = _get_parameter_cache()
+        conversion_value = cache.get_conversion_value() if cache else EST_CONVERSION_VALUE
+
+    # Abstain when there is no prediction. A shaded price needs a probability; with
+    # no probability there is nothing to compute one from, and the bid proceeds at
+    # its original price. Emitting a mutation derived from a placeholder CTR is how a
+    # broken inference path came to look like a working one — the response said
+    # `status: ok` and Triton's counter said `success=0`.
+    try:
+        predicted_ctr, served_variant, served_model_version = _predict_ctr_from_request(
+            req.bid_request
+        )
+    except InferenceUnavailable as exc:
+        logger.warning("BID_SHADE abstained — no prediction available: %s", exc)
+        return RTBResponse(
+            id=req.id,
+            metadata=Metadata(
+                api_version="1.0",
+                model_version=MODEL_VERSION,
+                # Says why there is no mutation, so "the model saw no reason to
+                # shade" and "the model could not be reached" are distinguishable.
+                abstained_reason=f"inference_unavailable: {exc}",
+            ),
+        )
 
     mutations: list[Mutation] = []
     for seatbid in bid_response.get("seatbid", []):
@@ -186,14 +306,11 @@ def mutate(req: RTBRequest) -> RTBResponse:
             if original_price <= 0:
                 continue
             ev = predicted_ctr * conversion_value
-            shaded = min(original_price, ev * shade_factor)
-            imp_id = bid.get("impid", "")
-            floor = 0.0
-            for imp in req.bid_request.get("imp", []):
-                if imp.get("id") == imp_id:
-                    floor = imp.get("bidfloor", 0.0)
-                    break
-            shaded = max(shaded, floor)
+            floor = _floor_for_bid(req.bid_request, bid)
+            # One place computes a price. The clamp to [floor, original_price] lives
+            # inside the policy, so the ordering of the floor and the cap cannot
+            # differ between here and anything else that prices a bid.
+            shaded = policy.price(ev, floor=floor, original_bid=original_price)
             if abs(shaded - original_price) > 0.01:
                 mutations.append(Mutation(
                     intent=Intent.BID_SHADE, op=Operation.REPLACE,
@@ -201,9 +318,67 @@ def mutate(req: RTBRequest) -> RTBResponse:
                     adjust_bid=AdjustBidPayload(price=round(shaded, 4)),
                 ))
 
-    return RTBResponse(id=req.id, mutations=mutations, metadata=Metadata(api_version="1.0", model_version=MODEL_VERSION))
+    # Per-request resolved model_version replaces the static MODEL_VERSION
+    # constant whenever the Triton router returned a real one (this applies
+    # to ALL traffic, live and load-test alike — see Q1=A in the
+    # load-test-outcome-capture unit's functional design). Falls back to the
+    # static constant when the router hasn't resolved a version yet (e.g.
+    # no version-ARN written by CanaryDeployer) — never blocks the response.
+    resolved_model_version = served_model_version or MODEL_VERSION
+    return RTBResponse(
+        id=req.id,
+        mutations=mutations,
+        metadata=Metadata(
+            api_version="1.0",
+            model_version=resolved_model_version,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Readiness warm-up (shared.server.WarmupGate)
+# ---------------------------------------------------------------------------
+
+#: Shaped like the response-shade-headroom scenario: one banner impression and
+#: one open-market bid well above the floor, so mutate() predicts a CTR through
+#: Triton and prices the bid. Run inside the pod only; nothing is emitted.
+WARMUP_REQUEST: dict = {
+    "id": "artf-warmup-dlrm-bid-shader",
+    "tmax": 120,
+    "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+    "applicable_intents": ["BID_SHADE"],
+    "bid_request": {
+        "id": "artf-warmup-auction",
+        "imp": [{
+            "id": "imp-1",
+            "banner": {"w": 728, "h": 90, "pos": 1},
+            "bidfloor": 0.10,
+            "bidfloorcur": "USD",
+        }],
+        "site": {"id": "artf-warmup-site", "domain": "the-morning-brief.example", "cat": ["IAB12"]},
+        "user": {"id": "artf-warmup-user"},
+        "device": {"ua": "Mozilla/5.0", "geo": {"country": "USA", "region": "NY"}},
+    },
+    "bid_response": {
+        "id": "artf-warmup-auction",
+        "seatbid": [{
+            "seat": "artf-warmup-seat",
+            "bid": [{"id": "artf-warmup-bid", "impid": "imp-1", "price": 25.00}],
+        }],
+    },
+}
+
+
+def warmup_check(resp: RTBResponse) -> None:
+    """Reject a warm-up the shader abstained on: no prediction was made."""
+    reason = resp.metadata.abstained_reason if resp.metadata else None
+    if reason:
+        raise RuntimeError(f"BID_SHADE abstained: {reason}")
 
 
 if __name__ == "__main__":
-    from shared.server import run_artf_server
-    run_artf_server(mutate, agent_name="dlrm-bid-shader", grpc_port=50051, mcp_port=8081, health_port=8080)
+    from shared.server import run_artf_server, warmup_from_request
+    run_artf_server(
+        mutate, agent_name="dlrm-bid-shader", grpc_port=50051, mcp_port=8081, health_port=8080,
+        warmup=warmup_from_request(mutate, WARMUP_REQUEST, require_triton=USE_TRITON, check=warmup_check),
+    )

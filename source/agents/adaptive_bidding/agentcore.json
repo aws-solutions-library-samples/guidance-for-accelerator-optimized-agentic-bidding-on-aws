@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "name": "AdaptiveBiddingStrategyAgent",
+      "language": "Python",
+      "framework": "Custom",
+      "type": "create",
+      "codeLocation": "agents/adaptive_bidding",
+      "entrypoint": "handler.py",
+      "build": "Container",
+      "protocol": "HTTP",
+      "networkMode": "PUBLIC",
+      "memory": "none"
+    }
+  ]
+}

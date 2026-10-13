@@ -1,25 +1,44 @@
 # ARTF container deployments.
 #
-# This guidance has four NVIDIA containers. The three GPU-backed model
-# containers (DLRM, Wide&Deep, NCF) run on GPU nodes alongside Triton for
-# minimal inference latency. The fourth container, the Metrics Enricher, is
-# rule-based and runs on CPU nodes (no GPU dependency).
+# This guidance has four NVIDIA containers. Two model containers (Bid Pricer, Deal
+# Scorer) delegate inference to Triton over the cluster network and hold NO GPU
+# themselves, so their node placement is parameterized via __ARTF_NODE_ROLE__
+# (set by deploy.sh --artf-node-role):
+#   - services (DEFAULT): run on CPU nodes — keeps load-test scale-out off the
+#     scarce GPU nodes; they reach Triton via its ClusterIP Service DNS.
+#   - inference: co-locate on the GPU node (role=inference) for minimal hop.
+# The GPU toleration is kept in both cases (harmless on CPU nodes, required on the
+# GPU node). The other two containers, the Audience Activator and the
+# Signals Enricher, are rule-based and always run on CPU nodes (role=services, no
+# GPU dependency, no Triton call). Audience activation was switched from a Triton
+# Wide & Deep model to deterministic rules (its ONNX graph could not be compiled
+# to a TensorRT engine, and it is slated to be replaced by a partner ISV
+# implementation) — see source/containers/widedeep_segment_activator/app.py.
+#
+# See RENAME_MAP.md for the display-name -> internal-identifier mapping (these
+# resource names are the new job-oriented display names; the container source
+# directories, Triton model names, and orchestrator internal keys are unchanged).
 #
 # Architecture:
-#   [GPU model container (GPU node)] --tritonclient.http--> [Triton Server (same node)]
-#   [Metrics Enricher (CPU node)] -- rule-based, no Triton -->
+#   [Bid Pricer / Deal Scorer] --tritonclient.http--> [Triton Server (GPU node)]
+#   [Audience Activator / Signals Enricher] (CPU node) -- rule-based, no Triton -->
 
 ---
-# DLRM Bid Shader — runs on GPU node for co-location with Triton
+# Bid Pricer — runs on GPU node for co-location with Triton
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dlrm-bid-shader
+  name: bid-pricer
   labels:
     app: artf
     model: dlrm
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -31,15 +50,27 @@ spec:
         model: dlrm
     spec:
       nodeSelector:
-        role: inference
+        role: __ARTF_NODE_ROLE__
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
       containers:
         - name: dlrm
-          image: __REGISTRY__/__STACK_NAME__-dlrm-bid-shader:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-bid-pricer:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -50,15 +81,28 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -76,7 +120,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: dlrm-bid-shader
+  name: bid-pricer
 spec:
   type: ClusterIP
   ports:
@@ -94,16 +138,24 @@ spec:
     model: dlrm
 
 ---
-# Wide & Deep Segment Activator — runs on GPU node for co-location with Triton
+# Audience Activator — rule-based (no Triton, no GPU); always runs
+# on CPU nodes. Audience activation was switched from a Triton Wide & Deep model
+# to deterministic rules — see
+# source/containers/widedeep_segment_activator/app.py.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: widedeep-segment-activator
+  name: audience-activator
   labels:
     app: artf
     model: widedeep
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -115,15 +167,23 @@ spec:
         model: widedeep
     spec:
       nodeSelector:
-        role: inference
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
+        role: services
       containers:
         - name: widedeep
-          image: __REGISTRY__/__STACK_NAME__-widedeep-segment-activator:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-audience-activator:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -131,18 +191,22 @@ spec:
               name: health
             - containerPort: 50051
               name: grpc
-          env:
-            - name: TRITON_URL
-              value: "triton-inference-server:8000"
-            - name: USE_TRITON
-              value: "true"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -154,7 +218,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: widedeep-segment-activator
+  name: audience-activator
 spec:
   type: ClusterIP
   ports:
@@ -172,16 +236,21 @@ spec:
     model: widedeep
 
 ---
-# NCF Deal Manager — runs on GPU node for co-location with Triton
+# Deal Scorer — runs on GPU node for co-location with Triton
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ncf-deal-manager
+  name: deal-scorer
   labels:
     app: artf
     model: ncf
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -192,16 +261,31 @@ spec:
         app: artf
         model: ncf
     spec:
+      # IRSA (deploy.sh Step 7.2): read-only access to the deals table, used to
+      # prime the deal book at startup and refresh it every 30 seconds.
+      serviceAccountName: deal-scorer-sa
       nodeSelector:
-        role: inference
+        role: __ARTF_NODE_ROLE__
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
       containers:
         - name: ncf
-          image: __REGISTRY__/__STACK_NAME__-ncf-deal-manager:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-deal-scorer:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -212,15 +296,39 @@ spec:
           env:
             - name: TRITON_URL
               value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
+            # The served build's label, ncf-neumf-sample-<12 hex>, from the
+            # manifest Step 2 writes (deploy.sh substitutes it). Reported as
+            # model_version; the container refuses to start without it.
+            - name: NCF_MODEL_LABEL
+              value: "__NCF_MODEL_LABEL__"
+            - name: DEALS_TABLE
+              value: "__STACK_NAME__-deals"
+            # botocore reads AWS_DEFAULT_REGION, not AWS_REGION; without it the
+            # deal book prime fails with "You must specify a region".
+            - name: AWS_DEFAULT_REGION
+              value: "__REGION__"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -232,7 +340,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ncf-deal-manager
+  name: deal-scorer
 spec:
   type: ClusterIP
   ports:
@@ -250,16 +358,21 @@ spec:
     model: ncf
 
 ---
-# Metrics Enricher (no Triton — rule-based, CPU only)
+# Signals Enricher (no Triton — rule-based, CPU only)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: metrics-enricher
+  name: signals-enricher
   labels:
     app: artf
     model: metrics
 spec:
-  replicas: 1
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
   selector:
     matchLabels:
       app: artf
@@ -274,8 +387,20 @@ spec:
         role: services
       containers:
         - name: metrics
-          image: __REGISTRY__/__STACK_NAME__-metrics-enricher:__IMAGE_TAG__
+          image: __REGISTRY__/__STACK_NAME__-signals-enricher:__IMAGE_TAG__
           imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8081
               name: mcp
@@ -283,13 +408,22 @@ spec:
               name: health
             - containerPort: 50051
               name: grpc
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
           resources:
             requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -301,7 +435,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: metrics-enricher
+  name: signals-enricher
 spec:
   type: ClusterIP
   ports:
@@ -328,8 +462,14 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: dlrm-bid-shader
-  minReplicas: 1
+    name: bid-pricer
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -348,8 +488,14 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: widedeep-segment-activator
-  minReplicas: 1
+    name: audience-activator
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -368,8 +514,14 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: ncf-deal-manager
-  minReplicas: 1
+    name: deal-scorer
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -388,8 +540,14 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: metrics-enricher
-  minReplicas: 1
+    name: signals-enricher
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
   maxReplicas: 5
   metrics:
     - type: Resource
@@ -399,3 +557,607 @@ spec:
           type: Utilization
           averageUtilization: 70
 
+---
+# Yield Optimizer (Floor) — runs on GPU node for co-location with Triton
+# (ADJUST_DEAL_FLOOR via the deal_yield_manager_floor Triton FIL XGBoost model)
+#
+# Two Deployments, not one: Triton's FIL backend cannot serve a two-output tree
+# model, so the floor and margin predictions were always two separate models.
+# Separate Deployments stop one model's rollout or crashloop from taking the
+# other's intent offline (BR-5 -- the two intents are independent and atomic).
+#
+# NOTE the label is `model: yield-floor`, not `model: yield`. Both Deployments
+# sharing `model: yield` would make each Service select BOTH models' pods and
+# round-robin ADJUST_DEAL_FLOOR calls into the margin container half the time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yield-optimizer-floor
+  labels:
+    app: artf
+    model: yield-floor
+spec:
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: artf
+      model: yield-floor
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: yield-floor
+    spec:
+      nodeSelector:
+        role: __ARTF_NODE_ROLE__
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: yield-floor
+          image: __REGISTRY__/__STACK_NAME__-yield-optimizer-floor:__IMAGE_TAG__
+          imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: TRITON_URL
+              value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
+            - name: USE_TRITON
+              value: "true"
+            # Bounded epsilon-greedy exploration (breaks the genesis model's
+            # cold-start deadlock -- see shared/yield_exploration.py and
+            # CLOSED_LOOP.md's "Yield Optimizer" section). Structurally scoped
+            # to load-test-originated calls and explicit
+            # ext.model_params.explore opt-ins only (see
+            # shared/load_test_context.py's get_is_load_test()) -- this value
+            # has no effect on real auction traffic regardless of what it is
+            # set to.
+            - name: YIELD_EXPLORATION_EPSILON
+              value: "0.1"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-floor
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-floor
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yield-floor-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yield-optimizer-floor
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Yield Optimizer (Margin) — runs on GPU node for co-location with Triton
+# (ADJUST_DEAL_MARGIN via the deal_yield_manager_margin Triton FIL XGBoost model)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yield-optimizer-margin
+  labels:
+    app: artf
+    model: yield-margin
+spec:
+  # Matches the HPA's minReplicas so a fresh apply starts at the warm floor
+  # instead of creating one pod and waiting for the HPA to reconcile. Kept
+  # equal to minReplicas (not higher) because kubectl apply rewrites this
+  # field on every deploy, which would otherwise fight an HPA that had already
+  # scaled out.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: artf
+      model: yield-margin
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: yield-margin
+    spec:
+      nodeSelector:
+        role: __ARTF_NODE_ROLE__
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: yield-margin
+          image: __REGISTRY__/__STACK_NAME__-yield-optimizer-margin:__IMAGE_TAG__
+          imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: TRITON_URL
+              value: "triton-inference-server:8000"
+            - name: TRITON_PROTOCOL
+              value: "http"
+            - name: TRITON_GRPC_URL
+              value: "triton-inference-server:8001"
+            - name: USE_TRITON
+              value: "true"
+            # See the floor Deployment above for what this gates and why it is
+            # safe to enable by default.
+            - name: YIELD_EXPLORATION_EPSILON
+              value: "0.1"
+          # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
+          # request exhausts it the pod is throttled until the next period,
+          # adding latency in 100ms multiples. That compounded with the
+          # blocking-mutate() serialisation (see shared/server.py's
+          # _await_mutate) to produce hundreds-of-ms container latencies in
+          # load tests. The limit is raised well above the request so bursts
+          # (JSON parse + pydantic validation + numpy + Triton round trip
+          # across ARTF_MUTATE_WORKERS threads) are not clipped; the request
+          # is what the scheduler and the HPA's 70% target both work from.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-margin
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-margin
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yield-margin-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: yield-optimizer-margin
+  # minReplicas 2, not 1: the HPA owns the replica count, so a Deployment
+  # replicas: 2 would be scaled straight back to 1 while idle. Load tests were
+  # therefore starting cold against a single pod per container and waiting on
+  # reactive scaling (metrics-server observation, then a ~15s HPA sync, then
+  # scheduling and readiness) for much of a short run. loadtest.py's
+  # _scale_containers() is a documented no-op, so this is the only pre-warm.
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+
+---
+# ARTF Template — the starting point for a repo user's own container.
+#
+# Deployed and wired like the six above, but ships INACTIVE: its `active` flag
+# lives in the container-registry DynamoDB table (seeded false by deploy.sh) and
+# the orchestrator does not call it until it is switched on in the Container
+# Health panel. That is why it can be activated without a redeploy.
+#
+# No Triton dependency and no GPU: it ships as a pass-through returning no
+# mutations. A user who adds a model should move its key into
+# deploy.sh's tritonclient build case and register it in the orchestrator's
+# container_to_model map so the health panel probes the model too.
+#
+# See source/containers/artf_template/README.md for the implement-your-own
+# walkthrough. The rebuild-one-image + rollout-restart-one-deployment step
+# matters: deploy.sh reuses the previous image tag when the registry already has
+# it, so `kubectl apply` alone leaves the old pod serving old code.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: artf-template
+  labels:
+    app: artf
+    model: template
+spec:
+  # Matches the HPA's minReplicas, which is 1 here rather than the 2 the model
+  # containers use: this container is inactive by default and does no work until
+  # a user implements it, and the cpu-services node group has little headroom at
+  # full HPA scale-out across the other six.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artf
+      model: template
+  template:
+    metadata:
+      labels:
+        app: artf
+        model: template
+    spec:
+      nodeSelector:
+        role: services
+      containers:
+        - name: template
+          image: __REGISTRY__/__STACK_NAME__-artf-template:__IMAGE_TAG__
+          imagePullPolicy: Always
+          # Same container hardening as orchestrator-deployment.yaml. runAsUser
+          # is pinned because the image sets USER by name (appuser, UID 1000 in
+          # source/Dockerfile) and the kubelet refuses runAsNonRoot against a
+          # non-numeric image user.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 8081
+              name: mcp
+            - containerPort: 8080
+              name: health
+            - containerPort: 50051
+              name: grpc
+          env:
+            # The intent this container's own intent_applicable() guard checks,
+            # for callers that reach it directly. The AUTHORITATIVE filter is the
+            # `intents` list on its container-registry record, which is what the
+            # orchestrator matches against applicable_intents — change both, or
+            # the orchestrator keeps filtering on the old intent and never calls
+            # this container at all.
+            #
+            # ADD_CIDS is the default because it is the one intent in the ARTF
+            # enum that no container in this repo implements, so the template
+            # fills a gap rather than shadowing working code.
+            - name: ARTF_TEMPLATE_INTENT
+              value: "ADD_CIDS"
+          # Same CPU request/limit split as the other containers: the limit is
+          # well above the request so a burst is not clipped by CFS throttling
+          # (see the Bid Pricer comment above), while the request is what the
+          # scheduler and the HPA's 70% target work from. Memory is lower than
+          # the model containers' because there is no numpy/torch/tritonclient
+          # working set here.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artf-template
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: mcp
+    - port: 8080
+      targetPort: 8080
+      name: health
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: template
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: artf-template-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: artf-template
+  # minReplicas 1, unlike the other six. Their 2 is a load-test pre-warm (see
+  # the comments on the HPAs above); this container is inactive by default and
+  # is not part of a load test until a user activates it, so a warm floor of two
+  # would consume cpu-services capacity for no benefit. Raise it to 2 to match
+  # the others once your implementation is on the load-test path.
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# ---------------------------------------------------------------------------
+# Headless gRPC Services (gRPC transport plan, P2.4).
+#
+# A gRPC channel is one long-lived HTTP/2 connection. Through a ClusterIP
+# Service kube-proxy picks ONE pod when that connection opens and every call
+# then lands on it, so a two-replica container would serve all gRPC traffic
+# from one pod while the HPA reads half the load. A headless Service
+# (clusterIP: None) makes the name resolve to every pod IP instead, and the
+# orchestrator's channel (grpc.lb_policy_name=round_robin on a dns:/// target)
+# spreads calls across them and re-resolves as pods come and go.
+#
+# One per container, same selector as its ClusterIP Service, gRPC port only.
+# The orchestrator reaches these through the *_GRPC env vars in
+# orchestrator-deployment.yaml; the ClusterIP Services above stay as they are
+# for the REST/MCP transports and the health probes.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: bid-pricer-grpc
+  labels:
+    app: artf
+    model: dlrm
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: dlrm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audience-activator-grpc
+  labels:
+    app: artf
+    model: widedeep
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: widedeep
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deal-scorer-grpc
+  labels:
+    app: artf
+    model: ncf
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: ncf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signals-enricher-grpc
+  labels:
+    app: artf
+    model: metrics
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-floor-grpc
+  labels:
+    app: artf
+    model: yield-floor
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-floor
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yield-optimizer-margin-grpc
+  labels:
+    app: artf
+    model: yield-margin
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: yield-margin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artf-template-grpc
+  labels:
+    app: artf
+    model: template
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  # Pods that are not yet Ready are left out of the DNS answer, so a rolling
+  # restart never routes a bid to a pod whose model is still loading.
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: grpc
+  selector:
+    app: artf
+    model: template

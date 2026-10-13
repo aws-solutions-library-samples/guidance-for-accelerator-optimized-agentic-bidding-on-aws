@@ -1,9 +1,8 @@
 # EKS cluster configuration for Accelerator-optimized Agentic Bidding with Triton Inference Server.
-# Uses g5.xlarge instances (1x NVIDIA A10G GPU, 4 vCPU, 16 GiB) for cost-effective
+# The GPU node group uses the g5 family (all 1x NVIDIA A10G GPU) for cost-effective
 # GPU inference of recommendation models (DLRM, Wide & Deep, NCF).
 #
 # For production with larger models, upgrade to:
-#   g5.2xlarge (1x A10G, 8 vCPU, 32 GiB) or
 #   p4d.24xlarge (8x A100, 96 vCPU, 1152 GiB) for multi-model serving
 #
 # Usage:
@@ -18,10 +17,61 @@ metadata:
   region: __REGION__
   version: "1.31"
 
+# Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
+# On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
+# two-AZ VPC is one capacity event away from a nodegroup that cannot launch at
+# all: g5.xlarge can have no capacity in the two AZs eksctl chose while other AZs
+# in the region have it, and a two-AZ VPC has no subnets there to use.
+# Spreading the VPC across AZs is the lever that buys
+# capacity resilience; see the note on instanceTypes below for what does not.
+availabilityZones: ["__REGION__a", "__REGION__b", "__REGION__c"]
+
+# Nodes are PRIVATE (privateNetworking: true on every nodegroup below), so all node
+# egress -- ECR pulls, S3 model traffic, STS, nvcr.io, the GitHub-hosted device-plugin
+# and CRD manifests -- leaves through NAT gateways. One per AZ rather than eksctl's
+# default of one in total: with a single gateway, that AZ's loss takes every node's
+# outbound path with it, and the three-AZ spread above exists precisely so one AZ is
+# not load-bearing. Cost: three NAT gateway hours plus per-GB processing instead of
+# one; see the README cost table.
+vpc:
+  nat:
+    gateway: HighlyAvailable
+
 managedNodeGroups:
-  # GPU node group for Triton Inference Server
+  # GPU node group for Triton Inference Server.
+  #
+  # All three types carry a SINGLE NVIDIA A10G GPU (4 / 8 / 16 vCPU). The list is
+  # a PREFERENCE ORDER, not a capacity fallback. EKS backs a managed nodegroup with
+  # an Auto Scaling group whose On-Demand allocation strategy is `prioritized`,
+  # which fulfils capacity from the first type in the list, then the second, then
+  # the third — and on InsufficientInstanceCapacity it retries the first type, it
+  # does not descend: every launch attempt is g5.xlarge and the larger types are
+  # never tried. Keeping the
+  # larger types listed costs nothing and lets an operator reorder them, but do not
+  # expect them to rescue a stuck nodegroup. AZ spread (above) is what does that.
+  # Reference: EC2 Auto Scaling "Allocation strategies for multiple instance types",
+  # On-Demand `prioritized`.
+  #
+  # IMPORTANT — keep every type in this list on the A10G (Ampere, sm_86)
+  # architecture. Triton serves pre-built TensorRT engines (platform:
+  # tensorrt_plan) compiled by the Model Optimizer for A10G; a plan built for one
+  # GPU arch will NOT load on another. Do NOT add g4dn (T4, sm_75) or g6 (L4,
+  # sm_89) here — it would silently break Triton engine loading.
+  #
+  # privateNetworking: true -- nodes launch in the private subnets with no public IP.
+  # eksctl's default places managed nodes in the PUBLIC subnets, which does not
+  # work in an account running VPC Block Public Access in block-ingress mode:
+  # only NAT-gateway traffic is allowed, so nodes routing via the internet gateway
+  # cannot reach the EKS endpoint or ECR and never join ("NodeCreationFailure:
+  # Instances failed to join the kubernetes cluster", CPU and GPU nodes alike).
+  # Nothing reaches a node directly, and
+  # nothing in the cluster is internet-facing: the orchestrator is a ClusterIP
+  # Service reached by the ui-api-proxy Lambda inside the VPC, Triton is behind
+  # an internal NLB, Prebid Server is in-cluster over service DNS, and the VPC
+  # proxy Lambda sits inside the VPC.
   - name: gpu-inference
-    instanceType: g5.xlarge
+    instanceTypes: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+    privateNetworking: true
     desiredCapacity: 1
     minSize: 1
     maxSize: __MAX_GPUS__
@@ -37,12 +87,20 @@ managedNodeGroups:
         autoScaler: true
         cloudWatch: true
 
-  # CPU node group for orchestrator, ALB ingress controller, monitoring
+  # CPU node group for orchestrator, ARTF containers (default node placement —
+  # see deploy.sh --artf-node-role), ALB ingress controller, monitoring.
+  # Sized for load-test throughput: at c5.xlarge x2 (8 vCPU total), the ARTF
+  # container HPAs (dlrm/widedeep/ncf/metrics/yield, each maxReplicas 5) plus
+  # the orchestrator HPA (maxReplicas 10) have nowhere to schedule their scaled-up
+  # pods once CPU pressure hits — they sit Pending instead of actually serving
+  # load, which is what makes load tests crawl. c5.2xlarge x3 (24 vCPU total)
+  # gives real headroom for those HPAs to scale into.
   - name: cpu-services
-    instanceType: c5.xlarge
-    desiredCapacity: 2
-    minSize: 1
-    maxSize: 4
+    instanceType: c5.2xlarge
+    privateNetworking: true   # see gpu-inference above
+    desiredCapacity: 3
+    minSize: 2
+    maxSize: 8
     volumeSize: 50
     labels:
       role: services
