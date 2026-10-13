@@ -20,7 +20,7 @@
 **/.idea
 cdk.out
 **/data/**.csv
-
+*.bkp
 .env
 
 # --- Python ---
@@ -113,3 +113,10 @@ _bk_composability-documentation
 .playwright-mcp/
 .agents
 .agents/tasks/ridesharer-preexisting-changes.txt
+assets/images/.$reference-architecture-slides.svg.dtmp
+assets/images/reference-architecture-slides-1 - Part 1: real-time ARTF bidstream path.drawio.svg
+assets/images/reference-architecture-slides-1 - Part 1.svg
+assets/images/reference-architecture-slides-2 - Part 2: closed-loop learning.drawio.svg
+assets/images/reference-architecture-slides.drawio
+assets/images/reference-architecture-slides.svg
+assets/images/reference-architecture-full.md

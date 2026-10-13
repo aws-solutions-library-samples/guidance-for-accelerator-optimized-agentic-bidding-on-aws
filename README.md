@@ -1,37 +1,61 @@
 # Guidance for Accelerator-Optimized Agentic Bidding on AWS
 
-Run AI models that price bids, activate audience segments, and manage private marketplace deals in real time, accelerated by NVIDIA GPUs and deployed on Amazon EKS.
+Run AI models that price bids, activate audience segments, and manage private marketplace deals in real time on NVIDIA GPUs on Amazon EKS, and keep those models improving from the outcomes of their own decisions. One `deploy.sh` run deploys the complete system: the real-time bidding path, and the closed-loop learning system that records bid outcomes, retrains and validates new model versions, promotes them through a governed canary, and tunes bidding parameters with an AI agent, without touching the real-time path.
 
-> **Full guidance documents:** This Guidance is published in two parts. [GUIDANCE.md](GUIDANCE.md) covers **Part 1**: the real-time, GPU-accelerated bidding pipeline. [GUIDANCE-part2.md](GUIDANCE-part2.md) covers **Part 2**: the closed-loop learning system, with bid-outcome capture, retraining (including the Yield Optimizer's XGBoost floor and margin models), and model-promotion governance. Each includes architecture details, model specifications, scaling scenarios, and Well-Architected analysis.
+> **Full guidance documents:** This Guidance is documented in two parts, and the default deployment includes both. [GUIDANCE-part2.md](GUIDANCE-part2.md) covers the closed-loop learning system: bid-outcome capture, retraining (including the Yield Optimizer's XGBoost floor and margin models), and model-promotion governance. [GUIDANCE.md](GUIDANCE.md) covers **Part 1**, the real-time GPU-accelerated bidding path that the closed loop learns from and feeds. Each includes architecture details, model specifications, scaling scenarios, and Well-Architected analysis. To deploy the real-time path on its own, see [Part 1: the real-time ARTF bidding path](#part-1-the-real-time-artf-bidding-path).
 
 ## Table of Contents
 
-1. [Quick start](#quick-start)
-2. [What just happened?](#what-just-happened)
-    - [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)
-3. [Try it](#try-it)
+1. [Architecture](#architecture)
+2. [Quick start](#quick-start)
+3. [What you deployed](#what-you-deployed)
+    - [The 5 deployment phases](#the-5-deployment-phases)
+4. [Try it](#try-it)
     - [Demo credentials](#demo-credentials)
-4. [Go deeper](#go-deeper)
-    - [Architecture](#architecture)
+5. [Part 2: closed-loop learning](#part-2-closed-loop-learning)
+    - [Testing the governance flow end to end](#testing-the-governance-flow-end-to-end)
+6. [Go deeper](#go-deeper)
     - [Cost](#cost)
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
     - [Deals and campaigns: the deals table](#deals-and-campaigns-the-deals-table)
     - [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings)
     - [Network layout: nothing in the VPC is internet-facing](#network-layout-nothing-in-the-vpc-is-internet-facing)
-    - [Building your own ARTF container](#building-your-own-artf-container)
-    - [Part 2: closed-loop learning](#part-2-closed-loop-learning)
-    - [Variant: Prebid Server as a second ARTF host (sell side)](#variant-prebid-server-as-a-second-artf-host-sell-side)
     - [Next steps](#next-steps)
-5. [Cleanup](#cleanup)
+7. [Part 1: the real-time ARTF bidding path](#part-1-the-real-time-artf-bidding-path)
+    - [Deploying Part 1 on its own](#deploying-part-1-on-its-own)
+    - [How the orchestrator sequences the containers](#how-the-orchestrator-sequences-the-containers)
+    - [Which models exist, and how each one is served](#which-models-exist-and-how-each-one-is-served)
+    - [Building your own ARTF container](#building-your-own-artf-container)
+    - [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)
+    - [Variant: Prebid Server as a second ARTF host (sell side)](#variant-prebid-server-as-a-second-artf-host-sell-side)
+8. [Cleanup](#cleanup)
     - [Stopping a deployment in progress](#stopping-a-deployment-in-progress)
-6. [Notices](#notices)
+9. [Notices](#notices)
+
+## Architecture
+
+![Reference architecture: the real-time ARTF bidstream path in the cluster VPC, and the three closed-loop learning loops in the band below it](assets/images/reference-architecture-full.drawio.png)
+
+The default deployment is one Amazon EKS cluster and the managed services around it, in one Region (`us-east-1` by default). Solid edges in the diagram are the real-time request path; dashed edges are control plane, batch, asynchronous and startup loads.
+
+**The real-time path (cluster VPC, top).** The EKS cluster runs a `gpu-inference` node group with NVIDIA Triton Inference Server on an NVIDIA A10G and a `cpu-services` node group with the orchestrator and six ARTF containers. The orchestrator runs every bid request through the containers in four stages (enrich, deals, yield, price), and the four model-backed containers call Triton for GPU inference. Amazon CloudFront and Amazon S3 serve the React frontend, Amazon Cognito authenticates users, a VPC-attached `ui-api-proxy` Lambda carries the browser's API calls to the orchestrator (which has no public address), and an Amazon Bedrock AgentCore runtime exposes the same pipeline over MCP. [Part 1: the real-time ARTF bidding path](#part-1-the-real-time-artf-bidding-path) describes this half in detail.
+
+**The closed-loop learning system (bottom band).** Three loops run beside the real-time path and never sit on it:
+
+- **Batch retraining.** The orchestrator emits bid-outcome and deal-yield-outcome events to Amazon Kinesis Data Streams. Amazon Data Firehose lands them in Amazon S3, two AWS Glue ETL jobs label them every 6 hours, and a daily Amazon EventBridge Scheduler trigger starts Amazon SageMaker training jobs: a PyTorch trainer on the NVIDIA NeMo Framework image for the Bid Pricer, and SageMaker's built-in XGBoost for the two Yield Optimizer models. Each completed job registers a new version in the SageMaker Model Registry.
+- **Governance.** A registered version invokes the Model Promotion Governance Agent, an AgentCore runtime. It compiles a neural-network version to a TensorRT engine with the in-cluster Model Optimizer, stages it as a canary behind the Triton router the containers already call, evaluates it with an A/B test, and promotes, rejects or rolls back. Every decision is written to an append-only Amazon DynamoDB audit trail.
+- **Agentic parameter tuning.** Once every 24 hours by default, the Adaptive Bidding Strategy Agent, a second AgentCore runtime, reads win rate and ROI from Amazon CloudWatch, reasons with an Amazon Bedrock model, and writes bid-shading parameter changes to a DynamoDB parameter store that enforces hard bounds on every write.
+
+Per-part diagrams: [Part 2, closed-loop learning](assets/images/architecture-part2-closed-loop.svg) and [Part 1, real-time path](assets/images/architecture.svg). Component-by-component detail: [assets/images/reference-architecture-full.md](assets/images/reference-architecture-full.md) for the full workload (editable source [reference-architecture-full.drawio](assets/images/reference-architecture-full.drawio)) and [assets/images/architecture.md](assets/images/architecture.md) for the real-time path. Container-naming history: [RENAME_MAP.md](RENAME_MAP.md).
+
+**One architectural variant ships with this Guidance.** The default topology has a single ARTF host: the orchestrator, called directly. Adding `--with-prebid` deploys **Prebid Server into the same cluster as a second, independent host**, which calls that same orchestrator from inside a real auction and then resolves the auction itself. It is opt-in and additive: without the flag, nothing above changes. It runs a **contested** auction: two independent seats bid, so there is a real winner and real losers. See [Variant: Prebid Server as a second ARTF host](#variant-prebid-server-as-a-second-artf-host-sell-side) for the architecture, a full page-load walkthrough, and what is and is not real about it.
 
 ## Quick start
 
 Before you start, you'll need an AWS account with permission to create Amazon EKS, EC2 (including `g5` GPU instances), S3, ECR, CloudFront, Cognito, and IAM resources, and a `g5.xlarge` GPU quota in your target Region. `deploy.sh` checks for the required CLI tools at startup and tells you exactly what's missing. See [Prerequisites](#prerequisites) for the full list if you want to check ahead of time.
 
-You'll also need an **NVIDIA NGC API key**. `deploy.sh` deploys the closed-loop retraining stack by default ([Part 2](#part-2-closed-loop-learning)), which builds an NVIDIA NeMo-RL training container from a gated NGC image, and the key authenticates that pull. Get a free one:
+You'll also need an **NVIDIA NGC API key**. The default deployment includes the closed-loop learning stack ([Part 2](#part-2-closed-loop-learning)), which builds an NVIDIA NeMo-RL training container from a gated NGC image, and the key authenticates that pull. Get a free one:
 
 1. Create an account (or sign in) at [ngc.nvidia.com/signin](https://ngc.nvidia.com/signin).
 2. Click your account icon (top right) → **Setup** → **Generate Personal Key** (older accounts: **Account Settings** → **Generate API Key**).
@@ -47,11 +71,7 @@ cd guidance-for-accelerator-optimized-agentic-bidding-on-aws/deployment
 
 `deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix, so you only need to pass `--ngc-key` once. With no other flags it provisions, in `us-east-1`: an EKS cluster with one `g5.xlarge` GPU node and three `c5.2xlarge` CPU nodes in private subnets, NVIDIA Triton Inference Server, the six bidding containers, the orchestrator, a React frontend behind CloudFront with Cognito sign-in, an Amazon Bedrock AgentCore MCP runtime, and the Part 2 closed-loop learning stack (feedback pipeline, Glue ETL, SageMaker Model Registry, two Bedrock-backed agent runtimes and their schedules). Container images build on AWS CodeBuild, so Docker is not needed on your machine. It takes roughly 30 to 40 minutes. When it finishes, it prints a URL and a demo login. Open the URL in your browser.
 
-Don't want the closed-loop stack (and don't want to create an NGC account)? Skip it. The core real-time bidding pipeline doesn't need NGC credentials:
-
-```bash
-./deploy.sh --prefix dv1 --no-retraining
-```
+To deploy only the real-time bidding path, which needs no NGC key, see [Deploying Part 1 on its own](#deploying-part-1-on-its-own).
 
 Deploying with a named AWS CLI profile rather than your shell's default? Pass it once; it is remembered for the prefix:
 
@@ -61,7 +81,7 @@ Deploying with a named AWS CLI profile rather than your shell's default? Pass it
 
 Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable, then the profile remembered for that prefix, then `default`. The result is exported and passed explicitly to every script the deploy branches into, and written into the kubeconfig it fetches, so `kubectl` from your own shell authenticates the same way. Once a prefix has been deployed with one profile, a later run that names a different one stops before touching AWS and tells you which profile the prefix belongs to, so the same prefix never lands in two accounts by accident. To move a prefix deliberately, remove its record from `deployment/.deploy-state.json` first.
 
-## What just happened?
+## What you deployed
 
 ![How a request travels from the browser to the GPU](docs/infographics/request-path.svg)
 
@@ -76,104 +96,9 @@ Credentials resolve as `--profile`, then the `AWS_PROFILE` environment variable,
 | **Yield Optimizer (Floor)** | Publisher/SSP-side: adjusts the floor price on private marketplace deals |
 | **Yield Optimizer (Margin)** | Publisher/SSP-side: adjusts the margin taken on private marketplace deals |
 
-The orchestrator runs every incoming bid request through the six containers in four sequential stages (enrich, deals, yield, price), applying each stage's mutations to a working copy of the request before the next stage runs, and returns a single stage-ordered response. Both yield containers run in stage 3, so each is exercised whenever a deal with the matching floor- or margin-adjustable intent is in the request by then, including deals the Deal Scorer activated in stage 2. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results. That's the "Try it" step below.
+The orchestrator runs every incoming bid request through the six containers in four sequential stages (enrich, deals, yield, price), applying each stage's mutations to a working copy of the request before the next stage runs, and returns a single stage-ordered response ([how the stages are sequenced](#how-the-orchestrator-sequences-the-containers)). Both yield containers run in stage 3, so each is exercised whenever a deal with the matching floor- or margin-adjustable intent is in the request by then, including deals the Deal Scorer activated in stage 2. A React frontend, served through CloudFront and authenticated by Cognito, lets you submit sample payloads and inspect the results. That's the "Try it" step below.
 
-The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents (neither is gated on the other), so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
-
-### How the orchestrator sequences the containers
-
-Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
-
-| Stage | Containers | Intents | What the next stage sees |
-|-------|------------|---------|--------------------------|
-| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ADD_CIDS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
-| 2 deals | Deal Scorer | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | matched deals added to `imp.pmp.deals`, poor-fit deals marked suppressed |
-| 3 yield | Yield Optimizer Floor, Yield Optimizer Margin | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | deal floors adjusted, only for deals now in the request; `imp.bidfloor` is left as the publisher set it |
-| 4 price | Bid Pricer | `BID_SHADE` | `seatbid[].bid[].price` shaded; runs only when the request carries a `bid_response` |
-
-Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
-
-With Prebid Server as the host, the hook calls the orchestrator at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
-
-![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
-
-When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The endpoint, envelope and stage order are the same; only the caller's lifecycle and documents differ:
-
-![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
-
-The Auction Theater's two-pass run is unchanged by the staging. Pass 1 sends `ext.artf.bypass: true` and the orchestrator returns before stage 1 (so `metadata.stages` is absent and the UI shows the single parallel ceiling); pass 2 runs all stages. The comparison between the two passes is the baseline the Theater reports on, and it is not something to look for in the diagrams above.
-
-### Which models exist, and how each one is served
-
-Containers and models are not 1:1. Four of the six containers run a real model on
-the GPU; two are deterministic rule engines with no model at all. Every model that
-exists has exactly one container, and every model is a fully separate unit, with its own
-Triton model name, its own config, its own SageMaker Model Package Group, its own
-training job, and its own promotion lifecycle.
-
-
-| Model | Container | Type | Artifact served | Triton backend | GPU |
-|---|---|---|---|---|---|
-| `dlrm_bid_shader` | Bid Pricer | DLRM (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
-| `ncf_deal_manager` | Deal Scorer | NCF/NeuMF (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
-| `deal_yield_manager_floor` | Yield Optimizer (Floor) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
-| `deal_yield_manager_margin` | Yield Optimizer (Margin) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
-| *(none: rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
-| *(none: rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
-
-The two yield models share one thing by design: the **7-element feature vector** both
-consume. That derivation lives in shared code rather than being duplicated per
-container, because the Glue ETL job reconstructs the same vector when building
-training data. If the two containers computed it differently, or drifted from the
-ETL job, training data would silently stop matching what the models see at inference
-time.
-
-**Two different serving paths, and why.** ONNX and FIL are not alternatives to each
-other: one is a file format, the other is an inference engine:
-
-- **Neural networks (DLRM, NCF).** PyTorch → **ONNX** (a portable file format for
-  neural networks) → NVIDIA **TensorRT** compiles that ONNX into a `.plan` engine
-  tuned for the specific GPU → Triton serves the `.plan`. The compile step is what
-  TensorRT is for.
-- **Tree models (floor, margin).** XGBoost → native `xgboost.json` → NVIDIA's
-  **FIL** (Forest Inference Library, from RAPIDS/cuML, bundled in Triton) reads that
-  format directly on the GPU. **There is no ONNX and no compile step in this path**:
-  FIL loads the tree model as-is.
-
-Both paths run inside the same Triton server on the same GPU node. Note that
-`dlrm_bid_shader` and `ncf_deal_manager` are each fronted by a small Python-backend
-router on CPU that splits traffic between `*_stable` and `*_canary` versions; the two
-yield models are currently single-version and loaded directly, with no router.
-
-> **On the XGBoost version pin.** `xgboost` is pinned to `1.7.6` deliberately. Newer
-> versions write a `"cats"` field into the saved JSON that Triton 24.08's bundled FIL
-> backend rejects outright (`Error: key "cats" is not recognized!`), which would take
-> both yield models down. The pin matches the SageMaker training-side version.
-
-> **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
-> each yield model in two formats: the native `xgboost.json` that FIL actually loads,
-> and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
-> registration script can treat all four models identically instead of branching on
-> format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
-> If you're tracing artifacts through S3, that's why an ONNX file appears for a model
-> that is not served from ONNX.
-
-> **Note on the two yield containers.** Earlier releases served both yield models from
-> a single container. They are now split, so each model has its own container, image,
-> Kubernetes Deployment, HPA, and load-test target, matching how every other model in
-> this guidance is deployed. The Triton model names (`deal_yield_manager_floor` /
-> `deal_yield_manager_margin`) and their SageMaker Model Package Groups are unchanged
-> from before the split, so existing registered model versions and promotion history
-> carry over.
->
-> **If you are upgrading from a pre-split deployment:** load-test runs recorded before
-> the split were tagged with a single combined target and are **not** eligible as
-> training data for either model afterward. Re-run a load test against each new target
-> to regenerate training data. Registered model versions are unaffected.
-
-> **Note on the models.** The bundled DLRM and both XGBoost models ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data (see [Next steps](#next-steps)). The Deal Scorer (NCF) is trained by the deploy on **sample interactions generated from the deal book, not observed outcomes**: it reproduces the scenario decisions and scores a user it has not seen below the 0.30 suppress threshold on every deal, so for that user it activates nothing and suppresses every deal the request offers. Load tests send random user ids, and about 73 percent of them fall in a user bucket no sample row trained, so most load-test requests that offer deals have them suppressed. The audience activator and signals enricher are deterministic rule engines, not models.
-
-> **How the yield models break their own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change", and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Both yield containers run an exploration step after the model returns its prediction, which nudges the recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`, settable independently per container) but **structurally scoped to load-test and demo traffic only**: live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what produces the variation each model's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
+Beside that path, Phase 5 deployed the closed-loop learning system: the bid-outcome and deal-yield feedback pipelines, the two Glue ETL jobs, the SageMaker Model Registry seeded with a genesis version of each model, the NeMo-RL training image, and the Adaptive Bidding and Model Promotion Governance agent runtimes with their EventBridge schedules. The bid path never waits on any of it: the orchestrator emits outcome events fire-and-forget, and a promoted Bid Pricer or Deal Scorer version reaches the containers through the Triton stable/canary router they already call. [Part 2: closed-loop learning](#part-2-closed-loop-learning) walks through the loop from a load test to a promoted model.
 
 ### The 5 deployment phases
 
@@ -252,7 +177,7 @@ Triton and the model-optimizer bootstrap Job may take a few minutes to finish lo
 | **Password** | A 16-character temporary password, generated locally and **printed only once**, in the summary |
 | **First login** | Cognito requires you to set a permanent password. The user is created with a *temporary* one, so the password change is forced, not optional |
 
-**If you missed the password, or it has scrolled past.** It cannot be recovered. Cognito stores passwords hashed, `admin-get-user` returns no credential, and `admin-create-user` does not return the temporary password it set, so the only option is to set a new one. The deployment summary prints this command with your real User Pool ID already filled in; if you no longer have the summary, find the ID first:
+**If you missed the password, or it has scrolled past.** It cannot be recovered. Cognito stores passwords hashed, `admin-get-user` returns no credential, and `admin-create-user` does not return the temporary password it set, so the only option is to set a new one. The deployment summary prints this command with your real User Pool ID already filled in; if the summary is gone, find the ID first:
 
 ```bash
 # Find your User Pool ID (look for <prefix->nvidia-artf-recommenders)
@@ -269,17 +194,124 @@ It is also recorded locally: `jq -r '.deployments["dv1"].resolved.cognitoUserPoo
 
 **If you have deployed before, your old login will not work.** Each deployment creates its own user pool, and `--prefix` creates a separate one per prefix. A user in a pool from an earlier deployment has no relationship to the new pool, and `--destroy` deletes the pool along with its users. Sign in with the credentials from the **current** deployment's summary, or reset the password in the current pool using the commands above.
 
+## Part 2: closed-loop learning
+
+The real-time path's models start from fixed weights (see the note below). The closed-loop learning system watches real bid outcomes, retrains and validates new model versions, and tunes bidding parameters continuously, all without touching the real-time bidding path. It is part of the default deployment (`--with-retraining` is the default).
+
+> **Note on the models.** The bundled DLRM and both XGBoost models ship with **seeded, untrained weights**. They exercise the real GPU inference path but don't make meaningful predictions until you train them on your own data (see [Next steps](#next-steps)). The Deal Scorer (NCF) is trained by the deploy on **sample interactions generated from the deal book, not observed outcomes**: it reproduces the scenario decisions and scores a user it has not seen below the 0.30 suppress threshold on every deal, so for that user it activates nothing and suppresses every deal the request offers. Load tests send random user ids, and about 73 percent of them fall in a user bucket no sample row trained, so most load-test requests that offer deals have them suppressed. The audience activator and signals enricher are deterministic rule engines, not models.
+
+> **How the yield models break their own cold start.** A freshly seeded XGBoost model has no reason to recommend anything other than "no change", and "no change" never produces a mutation, so it never generates an outcome for itself to learn from. Both yield containers run an exploration step after the model returns its prediction, which nudges the recommendation by a small, bounded random amount instead of always returning the same answer. It is **on by default** (`YIELD_EXPLORATION_EPSILON=0.1`, settable independently per container) but **structurally scoped to load-test and demo traffic only**: live auction bids are never perturbed, regardless of how that value is set. Every nudged response is disclosed with a `:explore` suffix on `model_version`, so training data never mistakes an exploratory probe for a real recommendation. That's what produces the variation each model's [training pipeline](CLOSED_LOOP.md#yield-optimizer-bootstrapping-training-data-without-a-live-signal-path-yet) needs to have something to learn from.
+
+**How each model is retrained.** The two [serving paths](#which-models-exist-and-how-each-one-is-served) carry through to
+two different retraining paths, one per model type:
+
+| Model | Trained by | Training data | Result loaded as | Compile step? |
+|---|---|---|---|---|
+| `dlrm_bid_shader` | PyTorch trainer in the `artf-nemo-rl-training` image (NVIDIA NeMo Framework base) on SageMaker: supervised fit, then shading-policy search | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
+| `ncf_deal_manager` | Same image; trained at deploy time on sample interactions. The scheduled job stops at the dataset gate, because `training-data/` has no `user_id` or `deal_id` columns | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
+| `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
+| `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
+| Audience Activator, Signals Enricher | *not applicable*: rule engines | n/a | n/a | n/a |
+
+Each model has its own SageMaker Model Package Group, so versions, approval status,
+and promotions are tracked independently. The two yield models train from two
+separately labeled datasets produced by a **single** Glue ETL job. One job is
+sufficient because its dedup key includes the ARTF intent, which is what separates
+floor rows from margin rows. Tree models skip TensorRT entirely: FIL loads the
+retrained `xgboost.json` directly, so there is no engine-compile stage in that path.
+
+Because each yield model is its own load-test target, you can also
+bootstrap training data for one model without generating traffic for the other.
+
+### Testing the governance flow end to end
+
+The **Governance** page drives the whole loop from a load test. Each step gates on
+the previous one finishing, so the order matters:
+
+1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
+   outcomes for* (e.g. **Bid Pricer**; the list shows only models that have a
+   training pipeline), leave the variant on **Current (stable)**, optionally pick a
+   **Traffic scenario** to shape the sample requests, and run a batch. Only the
+   selected target's responses are captured as outcomes.
+2. **Wait for the sweep, about 6 minutes.** Outcomes reach S3 through Kinesis
+   Firehose, which buffers up to 300s by default
+   (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into
+   `training-data/`. A completed load test schedules that sweep itself, waiting
+   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first;
+   sweeping earlier would mark the run ready with no data behind it. If you raise
+   the Firehose interval, raise this too. The Glue schedule (every 6 hours by
+   default, `ScheduleIntervalHours`) remains as a backstop. The **Load test
+   outcome pipeline** card shows which stage your run is on.
+3. **Train.** Under **Train from load test**, pick the run, review the cost
+   estimate, and confirm. This starts a real SageMaker training job. Note the
+   picker only lists runs a sweep has already covered, so the run you just
+   finished appears a few minutes later, so check the timestamp so you aren't
+   retraining on an older test.
+
+   The trainer checks the dataset before it trains and **refuses** a run it cannot
+   learn anything from, rather than producing a model whose loss falls convincingly
+   and means nothing. The common refusal is a single-class label: bid shading needs
+   both responses and non-responses, and a non-response cannot be observed directly:
+   nothing emits a "no click" event. The Bid Pricer therefore needs the optional
+   **outcome simulator** enabled and a `CONVERSION_LAG_HOURS` set, which is what
+   turns "no conversion reported, and its attribution window has closed" into a real
+   negative. See [where the bid shader's labels come
+   from](CLOSED_LOOP.md#bid-pricer-where-the-bid-shaders-labels-come-from).
+4. **Let governance run.** When training completes, the new version registers in
+   its SageMaker Model Package Group automatically, which triggers the Model
+   Promotion Governance Agent. For a Bid Pricer version trained from a load test,
+   the agent compiles it to TensorRT and stages it as the challenger canary at 0%
+   live traffic, then stops; you compare and promote it yourself. A yield model
+   version needs no compile step and is staged as a FIL canary from the
+   Governance page. Scheduled retraining
+   versions go through the full path: compile, canary, live A/B test, then
+   promote, reject, or roll back. The **Model registry versions** table shows the
+   resulting approval status and the agent's stated reason, with the full text on
+   hover.
+5. **Compare a challenger.** Once a canary is staged, re-run the load test with
+   **Challenger (canary)** selected, then use **Compare load-test outcomes**.
+   Re-use the same preset and seed as your baseline run: requests are generated
+   from the seed, so replaying it puts both variants under identical market
+   conditions and leaves the model as the only difference.
+
+If something isn't selectable, the panel says why rather than showing an
+empty list:
+
+| What you see | What it means |
+|---|---|
+| *"N runs … waiting for the next ETL sweep"* | Normal. The outcomes are recorded; the sweep hasn't covered them yet. |
+| *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
+| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now. A challenger-targeted test is refused rather than quietly run against the stable model. |
+| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail). This is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
+| Training job failed with *"a single-class label trains the model to predict a constant"* | The dataset gate working as intended. Every labelled row has the same outcome, so there is nothing to learn. Enable the outcome simulator and set `CONVERSION_LAG_HOURS`; see [step 3](#testing-the-governance-flow-end-to-end). |
+| Training job failed with *"all N rows have a NULL label"* | No response signal reached the dataset at all for the chosen objective. The outcome simulator is off, or no win notice / pixel path is wired in. |
+
+**Reading the comparison.** The primary metric is advertiser surplus: the
+impression's value to the advertiser minus what was actually paid, and zero on a
+loss. Higher is better, and it has an interior optimum: bidding too low forfeits
+winnable impressions and bidding too high overpays for them, so it rewards what
+bid shading is actually for rather than simply winning more.
+
+**Caveats on what a comparison can prove.** Two of them, and both are about
+whether the outcome depends on the decision being compared.
+
+*The yield models.* Floor and margin load-test outcomes are not yet a function of
+those models' own floor/margin decisions, so a yield canary-vs-stable comparison
+should not be read as a verdict on the model.
+
+*The Bid Pricer, when the outcome simulator is supplying the labels.* The simulator
+derives each outcome from the request ID alone (deliberately, because that is what
+makes a training run reproducible), so the same request yields the same
+win/impression/click/conversion no matter what price was bid. A simulated dataset
+therefore contains no relationship between price and winning, which has two
+consequences worth being explicit about: the model cannot learn one from it, and a
+canary-vs-stable comparison over simulated outcomes is not evidence about pricing,
+because both variants meet identical outcomes. Wire in real win notices and
+conversion pixels and both limitations go away. Deal Scorer is unaffected.
+
+See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to add it to an existing Part 1 stack, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
+
 ## Go deeper
-
-### Architecture
-
-![Architecture](assets/images/architecture.svg)
-
-An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in private subnets) runs two node groups: a `gpu-inference` node group of NVIDIA A10G instances (`g5.xlarge` by default, with `g5.2xlarge` and `g5.4xlarge` accepted as capacity fallbacks; the TensorRT engines are compiled for the A10G, so the group is pinned to the `g5` family) running NVIDIA Triton Inference Server, and a `cpu-services` node group of three `c5.2xlarge` instances running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference: the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; a `ui-api-proxy` Lambda inside the VPC carries the browser's API calls to the orchestrator, which has no public address; and an Amazon Bedrock AgentCore runtime, deployed by default and skippable with `--skip-agentcore`, exposes the same pipeline over MCP.
-
-Full component-by-component detail, model specifications, and a request-flow diagram: [assets/images/architecture.md](assets/images/architecture.md). Container-naming history (what changed, what didn't, and why): [RENAME_MAP.md](RENAME_MAP.md).
-
-**One architectural variant ships with this Guidance.** The topology above has a single ARTF host: the orchestrator, called directly. Adding `--with-prebid` deploys **Prebid Server into the same cluster as a second, independent host**, which calls that same orchestrator from inside a real auction and then resolves the auction itself. It is opt-in and additive: without the flag, nothing above changes. It runs a **contested** auction: two independent seats bid, so there is a real winner and real losers. See [Variant: Prebid Server as a second ARTF host](#variant-prebid-server-as-a-second-artf-host-sell-side) for the architecture, a full page-load walkthrough, and what is and is not real about it.
 
 ### Cost
 
@@ -342,7 +374,7 @@ docker buildx version                            # only needed for --local-build
 
 ### Customizing your deployment
 
-Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys Part 1, the MCP runtime and Part 2 with remote CodeBuild image builds, in `us-east-1`, and does not deploy Prebid Server.
+Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the complete system (the real-time path, the MCP runtime and the closed-loop learning stack) with remote CodeBuild image builds, in `us-east-1`, and does not deploy Prebid Server.
 
 ```bash
 ./deploy.sh --prefix dv1                   # REQUIRED on every run: exactly 3 chars, a letter then letters/digits (names resources dv1-nvidia-artf-*)
@@ -384,7 +416,7 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ./check_builds.sh --prefix stg --watch  # refresh every 30s
 ```
 
-**Breaking change:** `deploy.sh --start-at` now takes a phase number 1 to 5 instead of the old internal step numbers. If you have scripts referencing the old numbering, see the old-step-to-new-phase mapping table in [RENAME_MAP.md](RENAME_MAP.md).
+**`--start-at` takes a phase number, 1 to 5.** The step numbers this README cites (for example Step 1.5 or Step 7.5) are steps inside those phases and are not valid `--start-at` values. The step-to-phase table in [RENAME_MAP.md](RENAME_MAP.md) shows which phase each step belongs to.
 ### Deals and campaigns: the deals table
 Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-deals` (for example `stg-nvidia-artf-recommenders-deals`). Nothing is defined in code: `source/demand/artfhouse/catalog.py` and `source/shared/deal_library.py` (read by the Deal Scorer and the orchestrator) build their objects from the table's records.
 
@@ -398,9 +430,9 @@ Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-
 - **Bid requests carry OpenRTB 2.6 deals built from the records:** `bidfloor` from `terms.dealfloor`, `bidfloorcur` from `terms.cur`, `at` from `terms.pricetype`, `guar` from `terms.guar`, `wseat`, and `ext.mindealfloor` from `terms.ext.mindealfloor`.
 - **A deal's minimum floor.** `terms.ext.mindealfloor` is the lowest floor the seller's own optimizer may set for the deal. The Yield Optimizer floor container clamps its adjusted floor to `max(mindealfloor, bidfloor x multiplier)`, reading `imp.pmp.deals[].ext.mindealfloor` from the request. A library deal the Deal Scorer activates reaches the floor container through `ADJUST_DEAL_FLOOR`, whose payload carries `bidfloor` only, so the clamp applies to deals the request itself offers with the field.
 
-**Adding or changing a campaign** means editing the seed file and running `./deploy.sh --prefix <prefix>` again (add `--with-prebid` on a stack that has the Prebid host). A changed seed makes that run seed the table even on a healthy stack, because the seed's sha256 no longer matches the one the model bucket's Phase 1 marker recorded. The Deal Scorer picks up the change within one 30 second refresh. The demand service picks it up within one 30 second refresh as well, without a restart.
+**Adding or changing a campaign** means editing the seed file and running `./deploy.sh --prefix <prefix>` again (add `--with-prebid` on a stack that has the Prebid host). A changed seed makes that run seed the table even on a healthy stack, because the seed's sha256 differs from the one the model bucket's Phase 1 marker recorded. The Deal Scorer picks up the change within one 30 second refresh. The demand service picks it up within one 30 second refresh as well, without a restart.
 
-**Deal ids.** Two deal ids used to be shared across publishers. They are now one deal per publisher: `deal-remnant-open` became `deal-remnant-open-parenting`, `-ledger`, `-hearth` and `-espn`, and market-ledger.example's copy of `deal-home-premium` became `deal-home-premium-ledger` (hearth-and-home.example keeps `deal-home-premium`). Each keeps its publisher's floor and auction type.
+**Deal ids.** Every deal id belongs to exactly one publisher, so a deal id always resolves to one floor and one auction type. Where several publishers offer the same kind of deal, each has its own id: the open remnant deal is `deal-remnant-open-parenting`, `-ledger`, `-hearth` and `-espn`, and the home premium deal is `deal-home-premium` on hearth-and-home.example and `deal-home-premium-ledger` on market-ledger.example.
 
 **AgentCore local mode.** The optional local mode of the AgentCore MCP runtime imports the Deal Scorer's code in-process and has no table access, so its NCF step reports "deal book not loaded" as a container error. The EKS Deal Scorer is unaffected.
 
@@ -463,9 +495,9 @@ It probes AWS first, prints the table above, then does only what is missing:
 - If AWS is **mid-operation** (a stack creating, a CodeBuild build running), it **waits for that** rather than starting a competing one. Two terminals running this at once is therefore safe, and useful, instead of a race.
 - A phase whose state **cannot be verified** is run, not skipped. Every phase is idempotent, so re-running one costs time; skipping one would ship a deployment that claims to be complete and is not.
 - Some changes leave everything present and ready, so a phase would otherwise skip: pods still running an older image digest than ECR holds for their tag (Phase 3), an AgentCore runtime registered with an older AgentCore image (Phase 5), or, with `--with-prebid`, Prebid host sources (`source/prebid/`, `source/demand/`, the Prebid template, script and manifests) or a deals seed that changed since the last successful `deploy_prebid.sh` (Step 12 alone). Each is checked with read-only calls before the phases run, makes its phase or step run, and prints why. Phase 3 restarts only the Deployments whose pods do not run ECR's digest; a digest that cannot be read counts as different.
-- `--start-at N` still forces a starting phase, for when you know something the probe cannot, such as "rebuild my container even though an image exists".
+- `--start-at N` forces a starting phase, for when you know something the probe cannot, such as "rebuild my container even though an image exists".
 
-There is no resume prompt, because there is no longer a question to ask. `--resume` is accepted as a no-op so older scripts and notes keep working.
+There is no resume prompt, because the probe already decides what to run. `--resume` is accepted and does nothing, so a script that passes it still runs.
 
 If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, and the output prints the exact `aws eks update-kubeconfig` command. It will never report another cluster's pods as yours. That matters because every deploy rewrites the shared `~/.kube/config`.
 
@@ -492,7 +524,7 @@ Three things worth knowing about the record:
 
 - It is keyed on `--prefix`, so `./deploy.sh --prefix dv1` and `./deploy.sh --prefix stg` never read each other's values. If the record's account or stack name disagrees with the current invocation, nothing is reused and the script says why.
 - It is local, gitignored, safe to delete (you lose the remembered flags and nothing else), and removed by `--destroy`. It never contains your NGC key or the demo password, only the *name* of the Secrets Manager secret.
-- It records **no progress**. That was tried and removed: a file describing what the script had done disagreed with what the account actually contained, and reported a phase complete for a workload that had never started. Progress comes from `--status`. Two values describe what was shipped where AWS keeps nothing to compare: the AgentCore image digest the MCP runtime was last registered with, and the fingerprint of the Prebid host sources and deals seed of the last successful Step 12. A missing value makes the next run register or deploy again, so deleting the file never skips work.
+- It records **no progress**, because a local record of what the script did can disagree with what the account contains and report a phase complete for a workload that never started. Progress comes from `--status`, which reads AWS. Two values describe what was shipped where AWS keeps nothing to compare: the AgentCore image digest the MCP runtime was last registered with, and the fingerprint of the Prebid host sources and deals seed of the last successful Step 12. A missing value makes the next run register or deploy again, so deleting the file never skips work.
 
 **What the terminal shows, and where the rest went.** The terminal prints phases and steps only. Everything a step runs (the ONNX export, S3 copies, `eksctl`, every `kubectl apply`, CodeBuild polling, the AgentCore SDK's logging, and the `deploy_prebid.sh` and `deploy_closed_loop.sh` children) goes to one file per run, `deployment/.deploy-<prefix>.log` (the previous run is kept as `.deploy-<prefix>.prev.log`). The path is printed at the start of every run and again by every failure, and a failure also prints the last 15 lines of it inline. Pass `--verbose` to stream everything to the terminal instead.
 
@@ -511,9 +543,122 @@ The **orchestrator has no public address.** In-cluster callers use its `ClusterI
 
 The load-test panel's live stream is the one feature this changes: a synchronous invoke cannot carry server-sent events, so the proxy answers `406 streaming_not_supported` immediately and the panel uses its existing 500 ms polling path instead.
 
-Why this shape: an account running [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) in `block-ingress` mode drops inbound traffic at the internet gateway for every VPC in the account, commonly as an organisation-level control the operator cannot change. Private nodes behind NAT are unaffected, because `block-ingress` permits NAT-gateway egress; an internet-facing load balancer (and a CloudFront VPC origin) would be created and then accept no traffic. A VPC-attached Lambda ENI is not an internet path, so the stack deploys and the UI works in such an account with no exclusion, no override, and no change to the bidstream hot path (Prebid Server → orchestrator → containers → Triton never leaves the cluster). Earlier releases created a public load balancer and stopped the deploy with a "create an exclusion" instruction; that gate no longer exists because nothing needs public ingress.
+Why this shape: an account running [VPC Block Public Access](https://docs.aws.amazon.com/vpc/latest/userguide/security-vpc-bpa.html) in `block-ingress` mode drops inbound traffic at the internet gateway for every VPC in the account, commonly as an organisation-level control the operator cannot change. Private nodes behind NAT are unaffected, because `block-ingress` permits NAT-gateway egress; an internet-facing load balancer (and a CloudFront VPC origin) would be created and then accept no traffic. A VPC-attached Lambda ENI is not an internet path, so the stack deploys and the UI works in such an account with no exclusion, no override, and no change to the bidstream hot path (Prebid Server → orchestrator → containers → Triton never leaves the cluster). Nothing in the deployment needs public ingress, so the deploy has no Block Public Access check to pass.
 
 To reach the orchestrator from your own machine for debugging: `kubectl port-forward svc/orchestrator 8080:80`, then `curl http://localhost:8080/health/ready`.
+
+### Next steps
+
+- **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data. There's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
+- **Add or swap containers.** Use the containers under `source/containers/` as reference implementations for additional ARTF intents, then register each one in the matching stage of the orchestrator's staged pipeline (1 enrich, 2 deals, 3 yield, 4 price).
+- **Scale for production traffic.** The included Horizontal Pod Autoscalers add container and orchestrator replicas with load inside the node capacity you have provisioned; no Cluster Autoscaler is installed, so node counts are set by `deployment/eks/cluster-config.yaml` (`cpu-services` desired 3, min 2, max 8) and `--maxGPUs` (GPU maximum, default 3), and change only when you scale the node groups. See [GUIDANCE.md](GUIDANCE.md#scaling-scenarios) for reference sizing at different QPS levels.
+- **Connect to a live DSP.** Route real OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream. See [GUIDANCE.md](GUIDANCE.md#integration-with-a-dsp) for the integration steps.
+
+## Part 1: the real-time ARTF bidding path
+
+Part 1 is the real-time half of the system: the six ARTF containers, the orchestrator's staged pipeline, and NVIDIA Triton Inference Server on the GPU node. Every bid request travels this path. The closed loop learns from its outcomes and delivers new model versions to Triton, without modifying the containers. [GUIDANCE.md](GUIDANCE.md) documents Part 1 in full: container and model specifications, scaling scenarios, DSP integration, AgentCore MCP usage, and the Well-Architected analysis.
+
+![Part 1 architecture: the real-time ARTF bidding path](assets/images/architecture.svg)
+
+An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in private subnets) runs two node groups: a `gpu-inference` node group of NVIDIA A10G instances (`g5.xlarge` by default, with `g5.2xlarge` and `g5.4xlarge` accepted as capacity fallbacks; the TensorRT engines are compiled for the A10G, so the group is pinned to the `g5` family) running NVIDIA Triton Inference Server, and a `cpu-services` node group of three `c5.2xlarge` instances running the orchestrator and the bidding containers. Four containers call Triton for GPU-accelerated inference: the bid pricer and deal scorer (TensorRT-compiled neural networks) plus the two yield optimizers, floor and margin (XGBoost models served through Triton's Forest Inference Library backend); the audience activator and signals enricher are deterministic rule engines on CPU. Amazon CloudFront + S3 serve the React frontend; Amazon Cognito authenticates users; a `ui-api-proxy` Lambda inside the VPC carries the browser's API calls to the orchestrator, which has no public address; and an Amazon Bedrock AgentCore runtime, deployed by default and skippable with `--skip-agentcore`, exposes the same pipeline over MCP.
+
+### Deploying Part 1 on its own
+
+The real-time path deploys without the closed-loop stack, and without an NGC key, when you pass `--no-retraining`:
+
+```bash
+./deploy.sh --prefix dv1 --no-retraining
+```
+
+All five phases still run; Phase 5 registers the MCP runtime and skips the closed-loop stack. The choice is remembered for the prefix, so later runs of the same prefix stay Part 1 only. To add the closed loop afterwards, re-run with `--with-retraining` (plus `--ngc-key` once), or run `./deploy_closed_loop.sh --prefix dv1` against the existing stack as described in [GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps). Part 1 alone costs about $1,225/month on the nightly GPU schedule; see [Cost](#cost).
+
+### How the orchestrator sequences the containers
+
+Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
+
+| Stage | Containers | Intents | What the next stage sees |
+|-------|------------|---------|--------------------------|
+| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ADD_CIDS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
+| 2 deals | Deal Scorer | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | matched deals added to `imp.pmp.deals`, poor-fit deals marked suppressed |
+| 3 yield | Yield Optimizer Floor, Yield Optimizer Margin | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | deal floors adjusted, only for deals now in the request; `imp.bidfloor` is left as the publisher set it |
+| 4 price | Bid Pricer | `BID_SHADE` | `seatbid[].bid[].price` shaded; runs only when the request carries a `bid_response` |
+
+Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
+
+With Prebid Server as the host, the hook calls the orchestrator at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
+
+![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
+
+When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The endpoint, envelope and stage order are the same; only the caller's lifecycle and documents differ:
+
+![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
+
+The Auction Theater's two-pass run is unchanged by the staging. Pass 1 sends `ext.artf.bypass: true` and the orchestrator returns before stage 1 (so `metadata.stages` is absent and the UI shows the single parallel ceiling); pass 2 runs all stages. The comparison between the two passes is the baseline the Theater reports on, and it is not something to look for in the diagrams above.
+
+The two yield containers are deliberately separate. `ADJUST_DEAL_FLOOR` and `ADJUST_DEAL_MARGIN` are independent, atomic ARTF intents (neither is gated on the other), so each gets its own model, its own container, and its own scaling and failure boundary. A failure in one cannot affect the other's request path.
+
+### Which models exist, and how each one is served
+
+Containers and models are not 1:1. Four of the six containers run a real model on
+the GPU; two are deterministic rule engines with no model at all. Every model that
+exists has exactly one container, and every model is a fully separate unit, with its own
+Triton model name, its own config, its own SageMaker Model Package Group, its own
+training job, and its own promotion lifecycle.
+
+
+| Model | Container | Type | Artifact served | Triton backend | GPU |
+|---|---|---|---|---|---|
+| `dlrm_bid_shader` | Bid Pricer | DLRM (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `ncf_deal_manager` | Deal Scorer | NCF/NeuMF (PyTorch) | TensorRT `.plan`, compiled from ONNX | `tensorrt_plan` | Yes |
+| `deal_yield_manager_floor` | Yield Optimizer (Floor) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| `deal_yield_manager_margin` | Yield Optimizer (Margin) | XGBoost regressor | native `xgboost.json` | `fil` | Yes |
+| *(none: rules)* | Audience Activator | deterministic rules | n/a | n/a | No |
+| *(none: rules)* | Signals Enricher | deterministic rules | n/a | n/a | No |
+
+The two yield models share one thing by design: the **7-element feature vector** both
+consume. That derivation lives in shared code rather than being duplicated per
+container, because the Glue ETL job reconstructs the same vector when building
+training data. If the two containers computed it differently, or drifted from the
+ETL job, training data would silently stop matching what the models see at inference
+time.
+
+**Two different serving paths, and why.** ONNX and FIL are not alternatives to each
+other: one is a file format, the other is an inference engine:
+
+- **Neural networks (DLRM, NCF).** PyTorch → **ONNX** (a portable file format for
+  neural networks) → NVIDIA **TensorRT** compiles that ONNX into a `.plan` engine
+  tuned for the specific GPU → Triton serves the `.plan`. The compile step is what
+  TensorRT is for.
+- **Tree models (floor, margin).** XGBoost → native `xgboost.json` → NVIDIA's
+  **FIL** (Forest Inference Library, from RAPIDS/cuML, bundled in Triton) reads that
+  format directly on the GPU. **There is no ONNX and no compile step in this path**:
+  FIL loads the tree model as-is.
+
+Both paths run inside the same Triton server on the same GPU node. Note that
+`dlrm_bid_shader` and `ncf_deal_manager` are each fronted by a small Python-backend
+router on CPU that splits traffic between `*_stable` and `*_canary` versions; the two
+yield models are currently single-version and loaded directly, with no router.
+
+> **On the XGBoost version pin.** `xgboost` is pinned to `1.7.6` deliberately. Newer
+> versions write a `"cats"` field into the saved JSON that Triton 24.08's bundled FIL
+> backend rejects outright (`Error: key "cats" is not recognized!`), which would take
+> both yield models down. The pin matches the SageMaker training-side version.
+
+> **The yield models also produce an ONNX file. Nothing serves it.** `deploy.sh` exports
+> each yield model in two formats: the native `xgboost.json` that FIL actually loads,
+> and an ONNX copy uploaded to `onnx-source/`. The ONNX copy exists only so the model
+> registration script can treat all four models identically instead of branching on
+> format; **FIL never reads it, and there is no TensorRT compile step for tree models.**
+> If you're tracing artifacts through S3, that's why an ONNX file appears for a model
+> that is not served from ONNX.
+
+> **Each yield model is its own unit.** The floor and margin models each have their own
+> container, image, Kubernetes Deployment, HPA, and load-test target, matching how every
+> other model in this guidance is deployed. Their Triton model names are
+> `deal_yield_manager_floor` and `deal_yield_manager_margin`, each with its own SageMaker
+> Model Package Group. Load-test runs recorded under a single combined yield target are
+> not eligible as training data for either model; run a load test against each target
+> to produce training data for it.
 
 ### Building your own ARTF container
 
@@ -617,9 +762,9 @@ Both containers are called. For any given `(path, intent)` only one mutation is 
 1. **Higher `priority` wins.** It is an integer on the registry record, defaulting to `0`.
 2. **Equal priority falls back to registry order**, where code-defined containers come first and store-defined ones follow.
 
-Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent, and the built-in's mutation is computed and then discarded. That is not new behaviour: it is what a consumer applying an unresolved mutation list already did, since the last write to a path is the one that sticks. What is new is that it is now decided in one place, reported, and controllable.
+Because store containers sort *after* built-ins, an attached container at the default priority **wins** against a built-in claiming the same intent, and the built-in's mutation is computed and then discarded. A consumer applying an unresolved mutation list would reach the same result, since the last write to a path is the one that sticks; the orchestrator makes the decision in one place, reports it, and lets you control it with priority.
 
-If an attached container claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer** also claims, attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
+If an attached container claims `ADJUST_DEAL_FLOOR`, which the built-in **Yield Optimizer (Floor)** container also claims, attaching and activating it hands the floor decision to the external model. To keep the built-in's floor instead, give the external container a negative priority:
 
 ```bash
 ./attach_artf_container.sh --record ... --stack "${STACK_NAME}" --priority -1
@@ -642,119 +787,6 @@ The losing mutation is not hidden. `metadata.conflicts` names the path, the inte
 | Registry table | `--table`, else `${STACK_NAME}-container-registry` | derived from the stack |
 
 **Not verified.** The GPU variant is implemented and guarded but **untested**: no producer image advertising a GPU serving mode has been attached to this cluster yet. The guard refuses `--variant gpu` for an image whose `serving_modes` does not include `gpu`, rather than rendering a manifest for a shape the image cannot serve. An image built for `sm_86` would match this cluster's `g5` (A10G) nodes, but that is a static compatibility check, not a run.
-
-### Part 2: closed-loop learning
-
-The models above ship with static weights: untrained, except the Deal Scorer, which the deploy trains on sample interactions from the deal book. Part 2 closes the loop: it watches real bid outcomes, retrains and validates new model versions, and tunes bidding parameters continuously, all without touching the real-time bidding path. It's deployed by default (`--with-retraining`) alongside Part 1.
-
-**How each model is retrained.** The two serving paths from Part 1 carry through to
-two different retraining paths, one per model type:
-
-| Model | Trained by | Training data | Result loaded as | Compile step? |
-|---|---|---|---|---|
-| `dlrm_bid_shader` | PyTorch trainer in the `artf-nemo-rl-training` image (NVIDIA NeMo Framework base) on SageMaker: supervised fit, then shading-policy search | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
-| `ncf_deal_manager` | Same image; trained at deploy time on sample interactions. The scheduled job stops at the dataset gate, because `training-data/` has no `user_id` or `deal_id` columns | `training-data/` | ONNX, compiled to a TensorRT `.plan` | Yes (`trtexec`) |
-| `deal_yield_manager_floor` | SageMaker **built-in XGBoost** | `training-data-deal-yield-floor/` | native `xgboost.json` | **No** |
-| `deal_yield_manager_margin` | SageMaker **built-in XGBoost** | `training-data-deal-yield-margin/` | native `xgboost.json` | **No** |
-| Audience Activator, Signals Enricher | *not applicable*: rule engines | n/a | n/a | n/a |
-
-Each model has its own SageMaker Model Package Group, so versions, approval status,
-and promotions are tracked independently. The two yield models train from two
-separately labeled datasets produced by a **single** Glue ETL job. One job is
-sufficient because its dedup key includes the ARTF intent, which is what separates
-floor rows from margin rows. Tree models skip TensorRT entirely: FIL loads the
-retrained `xgboost.json` directly, so there is no engine-compile stage in that path.
-
-Because the two yield containers are now separate load-test targets, you can also
-bootstrap training data for one model without generating traffic for the other.
-
-#### Testing the governance flow end to end
-
-The **Governance** page drives the whole loop from a load test. Each step gates on
-the previous one finishing, so the order matters:
-
-1. **Generate outcomes.** On the **Load Test** page pick a target under *Capture
-   outcomes for* (e.g. **Bid Pricer**; the list shows only models that have a
-   training pipeline), leave the variant on **Current (stable)**, optionally pick a
-   **Traffic scenario** to shape the sample requests, and run a batch. Only the
-   selected target's responses are captured as outcomes.
-2. **Wait for the sweep, about 6 minutes.** Outcomes reach S3 through Kinesis
-   Firehose, which buffers up to 300s by default
-   (`FirehoseBufferIntervalSeconds`), and a Glue ETL job then labels them into
-   `training-data/`. A completed load test schedules that sweep itself, waiting
-   `ETL_SWEEP_DELAY_SECONDS` (default 360s) so Firehose has flushed first;
-   sweeping earlier would mark the run ready with no data behind it. If you raise
-   the Firehose interval, raise this too. The Glue schedule (every 6 hours by
-   default, `ScheduleIntervalHours`) remains as a backstop. The **Load test
-   outcome pipeline** card shows which stage your run is on.
-3. **Train.** Under **Train from load test**, pick the run, review the cost
-   estimate, and confirm. This starts a real SageMaker training job. Note the
-   picker only lists runs a sweep has already covered, so the run you just
-   finished appears a few minutes later, so check the timestamp so you aren't
-   retraining on an older test.
-
-   The trainer checks the dataset before it trains and **refuses** a run it cannot
-   learn anything from, rather than producing a model whose loss falls convincingly
-   and means nothing. The common refusal is a single-class label: bid shading needs
-   both responses and non-responses, and a non-response cannot be observed directly:
-   nothing emits a "no click" event. The Bid Pricer therefore needs the optional
-   **outcome simulator** enabled and a `CONVERSION_LAG_HOURS` set, which is what
-   turns "no conversion reported, and its attribution window has closed" into a real
-   negative. See [where the bid shader's labels come
-   from](CLOSED_LOOP.md#bid-pricer-where-the-bid-shaders-labels-come-from).
-4. **Let governance run.** When training completes, the new version registers in
-   its SageMaker Model Package Group automatically, which triggers the Model
-   Promotion Governance Agent. For a Bid Pricer version trained from a load test,
-   the agent compiles it to TensorRT and stages it as the challenger canary at 0%
-   live traffic, then stops; you compare and promote it yourself. A yield model
-   version needs no compile step and is staged as a FIL canary from the
-   Governance page. Scheduled retraining
-   versions go through the full path: compile, canary, live A/B test, then
-   promote, reject, or roll back. The **Model registry versions** table shows the
-   resulting approval status and the agent's stated reason, with the full text on
-   hover.
-5. **Compare a challenger.** Once a canary is staged, re-run the load test with
-   **Challenger (canary)** selected, then use **Compare load-test outcomes**.
-   Re-use the same preset and seed as your baseline run: requests are generated
-   from the seed, so replaying it puts both variants under identical market
-   conditions and leaves the model as the only difference.
-
-If something isn't selectable, the panel now says why rather than showing an
-empty list:
-
-| What you see | What it means |
-|---|---|
-| *"N runs … waiting for the next ETL sweep"* | Normal. The outcomes are recorded; the sweep hasn't covered them yet. |
-| *"The ETL job for … has never completed successfully"* | The Glue job is failing every run, so waiting will not help. The latest Spark error is shown (hover for the full text). |
-| *"No canary is currently staged for model type …"* | Expected until step 4 produces one. Use **Current (stable)** to run now. A challenger-targeted test is refused rather than quietly run against the stable model. |
-| **Rejected** with a *pipeline failure* tag | A governance step failed (compile, canary deploy, guardrail). This is **not** a verdict on the model, and the A/B test never ran. Hover for the failure. |
-| Training job failed with *"a single-class label trains the model to predict a constant"* | The dataset gate working as intended. Every labelled row has the same outcome, so there is nothing to learn. Enable the outcome simulator and set `CONVERSION_LAG_HOURS`; see [step 3](#testing-the-governance-flow-end-to-end). |
-| Training job failed with *"all N rows have a NULL label"* | No response signal reached the dataset at all for the chosen objective. The outcome simulator is off, or no win notice / pixel path is wired in. |
-
-**Reading the comparison.** The primary metric is advertiser surplus: the
-impression's value to the advertiser minus what was actually paid, and zero on a
-loss. Higher is better, and it has an interior optimum: bidding too low forfeits
-winnable impressions and bidding too high overpays for them, so it rewards what
-bid shading is actually for rather than simply winning more.
-
-**Caveats on what a comparison can prove.** Two of them, and both are about
-whether the outcome depends on the decision being compared.
-
-*The yield models.* Floor and margin load-test outcomes are not yet a function of
-those models' own floor/margin decisions, so a yield canary-vs-stable comparison
-should not be read as a verdict on the model.
-
-*The Bid Pricer, when the outcome simulator is supplying the labels.* The simulator
-derives each outcome from the request ID alone (deliberately, because that is what
-makes a training run reproducible), so the same request yields the same
-win/impression/click/conversion no matter what price was bid. A simulated dataset
-therefore contains no relationship between price and winning, which has two
-consequences worth being explicit about: the model cannot learn one from it, and a
-canary-vs-stable comparison over simulated outcomes is not evidence about pricing,
-because both variants meet identical outcomes. Wire in real win notices and
-conversion pixels and both limitations go away. Deal Scorer is unaffected.
-
-See [CLOSED_LOOP.md](CLOSED_LOOP.md) for how to deploy it separately, try the Adaptive Bidding and Governance demos, disable the scheduled components to control cost, and its own cost breakdown. For the full architecture and Well-Architected analysis, see [GUIDANCE-part2.md](GUIDANCE-part2.md).
 
 ### Variant: Prebid Server as a second ARTF host (sell side)
 
@@ -951,20 +983,13 @@ cd deployment
 ./deploy_prebid.sh --prefix <prefix> --destroy
 ```
 
-Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to its pre-variant authorization behaviour. Leaving it set would keep an existing component altered by a feature that is no longer installed. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
+Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to the authorization behaviour it has when the variant is not installed. Leaving it set would keep an existing component altered by a feature that has been uninstalled. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
 
 #### Alternative: the upstream stack, standalone
 
 If you want Prebid Server in its own isolated VPC on ECS Fargate, with the upstream bidder simulator supplying competing demand and its Glue/Athena/QuickSight analytics pipeline, deploy [the upstream guidance](https://github.com/aws-solutions-library-samples/prebid-server-deployment-on-aws) separately with its own scripts. It is a self-contained CDK app; nothing here forks or vendors it. You would then need a network path between the two VPCs (VPC peering or an [AWS RTB Fabric](https://aws.amazon.com/rtb-fabric/) link. The orchestrator already records `network_path: "rtb-fabric"` when an `x-rtb-fabric-link-id` header is present) and service-to-service auth, which is the work this variant does for you in-cluster.
 
 **Licensing.** Prebid Server and the upstream AWS guidance are Apache-2.0; this Guidance is MIT-0. This variant copies no upstream source (it fetches a pinned release at deploy time and adds files to it), so the distinction stays a documentation matter. Vendor any of their source into this repo and Apache-2.0 attribution applies, including carrying forward their `NOTICE.txt`.
-
-### Next steps
-
-- **Bring your own models.** The bundled models exercise the inference path but aren't trained on real data. There's no portable "pretrained" checkpoint to drop in, since the embedding tables are keyed to a particular feature vocabulary. Train real weights on a representative dataset, align each container's feature-engineering (`source/containers/<name>/app.py`) and Triton `config.pbtxt` to the new ONNX signature, then re-run `deploy.sh --export-only` to regenerate and upload the models.
-- **Add or swap containers.** Use the containers under `source/containers/` as reference implementations for additional ARTF intents, then register each one in the matching stage of the orchestrator's staged pipeline (1 enrich, 2 deals, 3 yield, 4 price).
-- **Scale for production traffic.** The included Horizontal Pod Autoscalers add container and orchestrator replicas with load inside the node capacity you have provisioned; no Cluster Autoscaler is installed, so node counts are set by `deployment/eks/cluster-config.yaml` (`cpu-services` desired 3, min 2, max 8) and `--maxGPUs` (GPU maximum, default 3), and change only when you scale the node groups. See [GUIDANCE.md](GUIDANCE.md#scaling-scenarios) for reference sizing at different QPS levels.
-- **Connect to a live DSP.** Route real OpenRTB bid requests through the orchestrator before auction execution, and apply the returned mutations to your bidstream. See [GUIDANCE.md](GUIDANCE.md#integration-with-a-dsp) for the integration steps.
 
 ## Cleanup
 
