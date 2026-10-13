@@ -3,7 +3,7 @@
   "tmax": 150,
   "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
   "originator": {"type": "TYPE_EXCHANGE", "id": "exchange-video-001"},
-  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "SUPPRESS_DEALS", "ADJUST_DEAL_FLOOR", "ADD_METRICS"],
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "SUPPRESS_DEALS", "ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN", "ADD_METRICS"],
   "bid_request": {
     "id": "auction-456",
     "imp": [

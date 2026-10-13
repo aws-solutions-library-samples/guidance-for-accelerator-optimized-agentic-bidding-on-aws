@@ -1,0 +1,108 @@
+{
+  "id": "sample-ridesharer-airport-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {
+    "type": "TYPE_SSP",
+    "id": "ssp-ridesharer-001"
+  },
+  "applicable_intents": [
+    "ACTIVATE_SEGMENTS",
+    "ADD_METRICS",
+    "ACTIVATE_DEALS",
+    "ADJUST_DEAL_FLOOR",
+    "ADJUST_DEAL_MARGIN"
+  ],
+  "bid_request": {
+    "id": "auction-ridesharer-airport-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "instl": 1,
+        "banner": {
+          "w": 320,
+          "h": 480,
+          "pos": 7
+        },
+        "bidfloor": 5.0,
+        "bidfloorcur": "USD",
+        "ext": {
+          "artf": {
+            "categories": [
+              "travel",
+              "airport"
+            ]
+          },
+          "data": {
+            "ridesharer": {
+              "local_time": "Thursday 17:40",
+              "trip_minutes": 45,
+              "origin": "downtown business district",
+              "destination": "airport"
+            }
+          }
+        },
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {
+              "id": "deal-ridesharer-airport-open-travel",
+              "bidfloor": 12.0,
+              "bidfloorcur": "USD",
+              "at": 1,
+              "guar": 0
+            },
+            {
+              "id": "deal-ridesharer-airport-open-luggage",
+              "bidfloor": 12.0,
+              "bidfloorcur": "USD",
+              "at": 1,
+              "guar": 0
+            }
+          ]
+        }
+      }
+    ],
+    "app": {
+      "id": "app-ridesharer",
+      "name": "RideSharer",
+      "bundle": "com.ridesharer.app",
+      "domain": "ridesharer.example",
+      "cat": [
+        "653"
+      ],
+      "cattax": 9
+    },
+    "user": {
+      "id": "user-ridesharer-airport-01",
+      "yob": 1983,
+      "data": [
+        {
+          "id": "data-provider-1",
+          "name": "RideSharer audience data",
+          "segment": [
+            {
+              "id": "seg-rs-outbound-air",
+              "name": "outbound air traveler, weekday evening, business district origin"
+            },
+            {
+              "id": "seg-rs-business",
+              "name": "Business"
+            }
+          ]
+        }
+      ]
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+      "os": "iOS",
+      "devicetype": 4,
+      "ip": "203.0.113.71",
+      "geo": {
+        "country": "USA",
+        "region": "IL",
+        "type": 2
+      }
+    }
+  }
+}

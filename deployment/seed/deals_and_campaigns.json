@@ -1,0 +1,1165 @@
+{
+  "format": "artf-deals-seed/1",
+  "dealsapi": "1.0",
+  "deals": [
+    {
+      "id": "deal-parenting-premium",
+      "name": "Brightstart Family on parenting-weekly.example",
+      "desc": "Brightstart Family buys banner on parenting-weekly.example at a 3.40 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "parenting-weekly.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.4,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "parenting-weekly.example"
+        ],
+        "cat": [
+          "192"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-family-network",
+      "name": "Family Network Collective on parenting-weekly.example",
+      "desc": "Family Network Collective buys banner on parenting-weekly.example at a 2.10 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "parenting-weekly.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 2.1,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "parenting-weekly.example"
+        ],
+        "cat": [
+          "192"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-remnant-open-parenting",
+      "name": "Remnant Open Exchange on parenting-weekly.example",
+      "desc": "Remnant Open Exchange buys banner on parenting-weekly.example at a 0.85 USD deal floor, fixed price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "parenting-weekly.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 0.85,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 3
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "parenting-weekly.example"
+        ],
+        "cat": [
+          "192"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-finance-pmp",
+      "name": "Harbour Financial on market-ledger.example",
+      "desc": "Harbour Financial buys banner on market-ledger.example at a 3.50 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "market-ledger.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.5,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "market-ledger.example"
+        ],
+        "cat": [
+          "410"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-home-premium-ledger",
+      "name": "Cedar & Co Furnishings on market-ledger.example",
+      "desc": "Cedar & Co Furnishings buys banner on market-ledger.example at a 3.00 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "market-ledger.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "market-ledger.example"
+        ],
+        "cat": [
+          "410"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-remnant-open-ledger",
+      "name": "Remnant Open Exchange on market-ledger.example",
+      "desc": "Remnant Open Exchange buys banner on market-ledger.example at a 1.00 USD deal floor, fixed price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "market-ledger.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 1.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 3
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "market-ledger.example"
+        ],
+        "cat": [
+          "410"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-home-premium",
+      "name": "Cedar & Co Furnishings on hearth-and-home.example",
+      "desc": "Cedar & Co Furnishings buys banner on hearth-and-home.example at a 3.00 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "hearth-and-home.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "hearth-and-home.example"
+        ],
+        "cat": [
+          "283"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-retail-run",
+      "name": "Northlake Home Goods on hearth-and-home.example",
+      "desc": "Northlake Home Goods buys banner on hearth-and-home.example at a 2.60 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "hearth-and-home.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 2.6,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "hearth-and-home.example"
+        ],
+        "cat": [
+          "283"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-auto-brand",
+      "name": "Vantage Motorsport on hearth-and-home.example",
+      "desc": "Vantage Motorsport buys banner on hearth-and-home.example at a 1.50 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "hearth-and-home.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 1.5,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "hearth-and-home.example"
+        ],
+        "cat": [
+          "283"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-remnant-open-hearth",
+      "name": "Remnant Open Exchange on hearth-and-home.example",
+      "desc": "Remnant Open Exchange buys banner on hearth-and-home.example at a 1.00 USD deal floor, fixed price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "hearth-and-home.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 1.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 3
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "hearth-and-home.example"
+        ],
+        "cat": [
+          "283"
+        ],
+        "cattax": 9
+      }
+    },
+    {
+      "id": "deal-premium-auto",
+      "name": "Autoline Premium on cnn.com",
+      "desc": "Autoline Premium buys banner on cnn.com at a 6.00 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "cnn.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 6.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "cnn.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-standard-auto",
+      "name": "Autoline Standard on cnn.com",
+      "desc": "Autoline Standard buys banner on cnn.com at a 3.50 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "cnn.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.5,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "cnn.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-sports-premium-espn",
+      "name": "Courtside Outfitters on espn.com",
+      "desc": "Courtside Outfitters buys banner on espn.com at a 2.40 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "espn.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 2.4,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "espn.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-remnant-open-espn",
+      "name": "Remnant Open Exchange on espn.com",
+      "desc": "Remnant Open Exchange buys banner on espn.com at a 1.50 USD deal floor, fixed price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "espn.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 1.5,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 3
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "espn.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-premium-video",
+      "name": "Skyline Premium Video on streaming.example.com",
+      "desc": "Skyline Premium Video buys video on streaming.example.com at an 8.75 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "streaming.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 8.75,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "streaming.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-standard-video",
+      "name": "Skyline Standard Video on streaming.example.com",
+      "desc": "Skyline Standard Video buys video on streaming.example.com at a 5.00 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "streaming.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 5.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "streaming.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-remnant",
+      "name": "Video Remnant Pool on streaming.example.com",
+      "desc": "Video Remnant Pool buys video on streaming.example.com at a 0.50 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "streaming.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 0.5,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "streaming.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-guaranteed-premium",
+      "name": "Meridian Guaranteed on sportsnetwork.example.com",
+      "desc": "Meridian Guaranteed buys video on sportsnetwork.example.com at an 8.50 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "sportsnetwork.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 8.5,
+        "cur": "USD",
+        "guar": 1,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "sportsnetwork.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-open-midtier",
+      "name": "Meridian Mid-tier on sportsnetwork.example.com",
+      "desc": "Meridian Mid-tier buys video on sportsnetwork.example.com at a 3.25 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "sportsnetwork.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 3.25,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "sportsnetwork.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-open-remnant",
+      "name": "Meridian Remnant on sportsnetwork.example.com",
+      "desc": "Meridian Remnant buys video on sportsnetwork.example.com at a 0.75 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "sportsnetwork.example.com",
+      "sellerstatus": 0,
+      "adtypes": [
+        2
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 0.75,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2
+      },
+      "inventory": {
+        "inclinventory": [
+          1
+        ],
+        "sitedomains": [
+          "sportsnetwork.example.com"
+        ]
+      }
+    },
+    {
+      "id": "deal-ridesharer-airport-open-travel",
+      "name": "Altimara Travel on ridesharer.example",
+      "desc": "Altimara Travel buys banner on ridesharer.example at a 12.00 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "ridesharer.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 12.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          2
+        ],
+        "appbundles": [
+          "com.ridesharer.app"
+        ]
+      }
+    },
+    {
+      "id": "deal-ridesharer-airport-open-luggage",
+      "name": "Ivory Row Luggage on ridesharer.example",
+      "desc": "Ivory Row Luggage buys banner on ridesharer.example at a 12.00 USD deal floor, first price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "ridesharer.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 12.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 1
+      },
+      "inventory": {
+        "inclinventory": [
+          2
+        ],
+        "appbundles": [
+          "com.ridesharer.app"
+        ]
+      }
+    },
+    {
+      "id": "deal-ridesharer-eats-open-kitchen",
+      "name": "Basil & Brine Kitchen on ridesharer.example",
+      "desc": "Basil & Brine Kitchen buys banner on ridesharer.example at a 12.00 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "ridesharer.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 12.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2,
+        "ext": {
+          "mindealfloor": 5.0
+        }
+      },
+      "inventory": {
+        "inclinventory": [
+          2
+        ],
+        "appbundles": [
+          "com.ridesharer.app"
+        ]
+      }
+    },
+    {
+      "id": "deal-ridesharer-eats-open-noodles",
+      "name": "Maple Corner Noodle House on ridesharer.example",
+      "desc": "Maple Corner Noodle House buys banner on ridesharer.example at a 12.00 USD deal floor, second price.",
+      "origin": "{stackprefix}-prebid.example",
+      "seller": "ridesharer.example",
+      "sellerstatus": 0,
+      "adtypes": [
+        1
+      ],
+      "pubcount": 1,
+      "dinventory": 1,
+      "auxdata": 3,
+      "terms": {
+        "dealfloor": 12.0,
+        "cur": "USD",
+        "guar": 0,
+        "pricetype": 2,
+        "ext": {
+          "mindealfloor": 5.0
+        }
+      },
+      "inventory": {
+        "inclinventory": [
+          2
+        ],
+        "appbundles": [
+          "com.ridesharer.app"
+        ]
+      }
+    }
+  ],
+  "campaigns": [
+    {
+      "campaign_id": "camp-cedar",
+      "campaign_name": "Cedar & Co Furnishings",
+      "adomain": "cedarandco.example",
+      "creative_id": "cr-cedar-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 6.8,
+      "deal_ids": [
+        "deal-home-premium",
+        "deal-home-premium-ledger"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "home",
+        "lifestyle"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-northlake",
+      "campaign_name": "Northlake Home Goods",
+      "adomain": "northlakehome.example",
+      "creative_id": "cr-northlake-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 3.1,
+      "deal_ids": [
+        "deal-retail-run"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "home",
+        "retail"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-vantage",
+      "campaign_name": "Vantage Motorsport",
+      "adomain": "vantagemotorsport.example",
+      "creative_id": "cr-vantage-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 1.8,
+      "deal_ids": [
+        "deal-auto-brand"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "automotive"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-harbour",
+      "campaign_name": "Harbour Financial",
+      "adomain": "harbourfinancial.example",
+      "creative_id": "cr-harbour-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 5.8,
+      "deal_ids": [
+        "deal-finance-pmp"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "finance"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-openfield",
+      "campaign_name": "Openfield Marketplace",
+      "adomain": "openfield.example",
+      "creative_id": "cr-openfield-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 2.05,
+      "deal_ids": [],
+      "open_market": true,
+      "target_categories": [],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-autoline-premium",
+      "campaign_name": "Autoline Premium",
+      "adomain": "autoline.example",
+      "creative_id": "cr-autoline-970x250",
+      "width": 970,
+      "height": 250,
+      "declared_cpm": 9.55,
+      "deal_ids": [
+        "deal-premium-auto"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "automotive"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null,
+      "note": "isv-ecosystem: banner 970x250, imp floor 4.00. Deal floor 6.00 binds."
+    },
+    {
+      "campaign_id": "camp-autoline-standard",
+      "campaign_name": "Autoline Standard",
+      "adomain": "autoline.example",
+      "creative_id": "cr-autoline-standard-970x250",
+      "width": 970,
+      "height": 250,
+      "declared_cpm": 4.6,
+      "deal_ids": [
+        "deal-standard-auto"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "automotive"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null,
+      "note": "isv-ecosystem: banner 970x250, imp floor 4.00. Imp floor 4.00 binds, above the 3.50 deal floor."
+    },
+    {
+      "campaign_id": "camp-brightstart",
+      "campaign_name": "Brightstart Family",
+      "adomain": "brightstart.example",
+      "creative_id": "cr-brightstart-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 5.65,
+      "deal_ids": [
+        "deal-parenting-premium"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "parenting",
+        "family"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "350",
+          "354"
+        ],
+        "cpm": 0.4
+      },
+      "note": "parenting-narrative: banner 300x250, imp floor 2.60. Deal floor 3.40 binds. Pays more for Parenting (350) or Parenting > Babies and Toddlers (354). 6.05 when matched."
+    },
+    {
+      "campaign_id": "camp-familynet",
+      "campaign_name": "Family Network Collective",
+      "adomain": "familynetwork.example",
+      "creative_id": "cr-familynet-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 3.05,
+      "deal_ids": [
+        "deal-family-network"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "parenting",
+        "family"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "98"
+        ],
+        "cpm": 0.25
+      },
+      "note": "parenting-narrative: banner 300x250, imp floor 2.60. Imp floor 2.60 binds, above the 2.10 deal floor. Pays more for Parents with Children (98). 3.30 when matched."
+    },
+    {
+      "campaign_id": "camp-courtside",
+      "campaign_name": "Courtside Outfitters",
+      "adomain": "courtside.example",
+      "creative_id": "cr-courtside-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 4.25,
+      "deal_ids": [
+        "deal-sports-premium-espn"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "sports"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null
+    },
+    {
+      "campaign_id": "camp-remnant-open",
+      "campaign_name": "Remnant Open Exchange",
+      "adomain": "remnantopen.example",
+      "creative_id": "cr-remnant-300x250",
+      "width": 300,
+      "height": 250,
+      "declared_cpm": 2.75,
+      "deal_ids": [
+        "deal-remnant-open-parenting",
+        "deal-remnant-open-ledger",
+        "deal-remnant-open-hearth",
+        "deal-remnant-open-espn"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": null,
+      "note": "Imp floor binds on every scenario that offers its deals, far above each deal floor. Holds one remnant deal per publisher."
+    },
+    {
+      "campaign_id": "camp-skyline-video",
+      "campaign_name": "Skyline Premium Video",
+      "adomain": "skylinevideo.example",
+      "creative_id": "cr-skyline-640x480",
+      "width": 640,
+      "height": 480,
+      "declared_cpm": 13.75,
+      "deal_ids": [
+        "deal-premium-video"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 30,
+      "audience_uplift": null,
+      "note": "video-deals: video 640x480, 15 to 30s, imp floor 8.00. Deal floor 8.75 binds."
+    },
+    {
+      "campaign_id": "camp-skyline-standard",
+      "campaign_name": "Skyline Standard Video",
+      "adomain": "skylinevideo.example",
+      "creative_id": "cr-skyline-standard-640x480",
+      "width": 640,
+      "height": 480,
+      "declared_cpm": 8.75,
+      "deal_ids": [
+        "deal-standard-video"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 15,
+      "audience_uplift": null,
+      "note": "video-deals: video 640x480, 15 to 30s, imp floor 8.00. Imp floor 8.00 binds, above the 5.00 deal floor."
+    },
+    {
+      "campaign_id": "camp-video-remnant",
+      "campaign_name": "Video Remnant Pool",
+      "adomain": "videoremnant.example",
+      "creative_id": "cr-video-remnant-640x480",
+      "width": 640,
+      "height": 480,
+      "declared_cpm": 8.1,
+      "deal_ids": [
+        "deal-remnant"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 15,
+      "audience_uplift": null,
+      "note": "video-deals: video 640x480, 15 to 30s, imp floor 8.00. Imp floor 8.00 binds, far above the 0.50 deal floor."
+    },
+    {
+      "campaign_id": "camp-meridian-guaranteed",
+      "campaign_name": "Meridian Guaranteed",
+      "adomain": "meridianmedia.example",
+      "creative_id": "cr-meridian-1280x720",
+      "width": 1280,
+      "height": 720,
+      "declared_cpm": 13.4,
+      "deal_ids": [
+        "deal-guaranteed-premium"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 30,
+      "audience_uplift": null,
+      "note": "yield-optimizer: video 1280x720, 15 to 30s, imp floor 6.00. Deal floor 8.50 binds."
+    },
+    {
+      "campaign_id": "camp-meridian-midtier",
+      "campaign_name": "Meridian Mid-tier",
+      "adomain": "meridianmedia.example",
+      "creative_id": "cr-meridian-midtier-1280x720",
+      "width": 1280,
+      "height": 720,
+      "declared_cpm": 6.8,
+      "deal_ids": [
+        "deal-open-midtier"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 15,
+      "audience_uplift": null,
+      "note": "yield-optimizer: video 1280x720, 15 to 30s, imp floor 6.00. Imp floor 6.00 binds, above the 3.25 deal floor."
+    },
+    {
+      "campaign_id": "camp-meridian-remnant",
+      "campaign_name": "Meridian Remnant",
+      "adomain": "meridianmedia.example",
+      "creative_id": "cr-meridian-remnant-1280x720",
+      "width": 1280,
+      "height": 720,
+      "declared_cpm": 6.2,
+      "deal_ids": [
+        "deal-open-remnant"
+      ],
+      "open_market": false,
+      "target_categories": [],
+      "media_type": "video",
+      "duration": 15,
+      "audience_uplift": null,
+      "note": "yield-optimizer: video 1280x720, 15 to 30s, imp floor 6.00. Imp floor 6.00 binds, far above the 0.75 deal floor."
+    },
+    {
+      "campaign_id": "camp-altimara-travel",
+      "campaign_name": "Altimara Travel",
+      "adomain": "altimara-travel.example",
+      "creative_id": "cr-altimara-320x480",
+      "width": 320,
+      "height": 480,
+      "declared_cpm": 12.7,
+      "deal_ids": [
+        "deal-ridesharer-airport-open-travel"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "travel",
+        "airport"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "719"
+        ],
+        "cpm": 0.6
+      },
+      "note": "ridesharer-airport-evening: banner 320x480, imp floor 5.00. Deal floor 12.00 binds. Pays more for Travel (719). 13.30 when matched."
+    },
+    {
+      "campaign_id": "camp-ivoryrow-luggage",
+      "campaign_name": "Ivory Row Luggage",
+      "adomain": "ivoryrow.example",
+      "creative_id": "cr-ivoryrow-320x480",
+      "width": 320,
+      "height": 480,
+      "declared_cpm": 12.25,
+      "deal_ids": [
+        "deal-ridesharer-airport-open-luggage"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "travel",
+        "retail"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "269"
+        ],
+        "cpm": 0.3
+      },
+      "note": "ridesharer-airport-evening: banner 320x480, imp floor 5.00. Deal floor 12.00 binds. Pays more for Business (269). 12.55 when matched."
+    },
+    {
+      "campaign_id": "camp-basilbrine-kitchen",
+      "campaign_name": "Basil & Brine Kitchen",
+      "adomain": "basilandbrine.example",
+      "creative_id": "cr-basilbrine-320x480",
+      "width": 320,
+      "height": 480,
+      "declared_cpm": 11.1,
+      "deal_ids": [
+        "deal-ridesharer-eats-open-kitchen"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "dining",
+        "local"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "373"
+        ],
+        "cpm": 0.4
+      },
+      "note": "ridesharer-suburban-midday: banner 320x480, imp floor 5.00. Under the 12.00 deal floor by design; clears once the floor comes down, never under the 5.00 minimum. Pays more for Dining Out (373). 11.50 when matched."
+    },
+    {
+      "campaign_id": "camp-maplecorner-noodles",
+      "campaign_name": "Maple Corner Noodle House",
+      "adomain": "maplecorner.example",
+      "creative_id": "cr-maplecorner-320x480",
+      "width": 320,
+      "height": 480,
+      "declared_cpm": 6.1,
+      "deal_ids": [
+        "deal-ridesharer-eats-open-noodles"
+      ],
+      "open_market": false,
+      "target_categories": [
+        "dining",
+        "local"
+      ],
+      "media_type": "banner",
+      "duration": null,
+      "audience_uplift": {
+        "segment_ids": [
+          "373"
+        ],
+        "cpm": 0.3
+      },
+      "note": "ridesharer-suburban-midday: banner 320x480, imp floor 5.00. Under the 12.00 deal floor by design; clears once the floor comes down, never under the 5.00 minimum. Pays more for Dining Out (373). 6.40 when matched."
+    }
+  ]
+}

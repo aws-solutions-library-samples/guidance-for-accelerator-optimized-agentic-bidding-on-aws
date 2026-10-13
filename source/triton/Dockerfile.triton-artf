@@ -31,7 +31,7 @@ LABEL agent-manifest="{ \
 # Install tritonclient (the real NVIDIA dependency) + ARTF server deps
 # No torch needed — Triton handles inference
 RUN pip install --no-cache-dir \
-    tritonclient[http] \
+    tritonclient[http,grpc] \
     numpy \
     fastapi uvicorn[standard] starlette httpx pydantic \
     grpcio protobuf
@@ -39,8 +39,14 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 COPY shared/ /app/shared/
 COPY ${CONTAINER}/ /app/container/
+# Per-container extras. Only the Deal Scorer ships a requirements.txt (boto3, to
+# prime and refresh its deal book off the request path); the floor, margin and
+# DLRM images install nothing here and so cannot reach DynamoDB at all.
+RUN if [ -f /app/container/requirements.txt ]; then pip install --no-cache-dir -r /app/container/requirements.txt; fi
 
-RUN adduser --disabled-password --no-create-home appuser
+# The build context keeps the host's file modes, so a source file that is not
+# world-readable there would be unreadable to appuser. Normalize before USER.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home appuser
 USER appuser
 
 # gRPC + MCP + Health

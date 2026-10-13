@@ -9,12 +9,12 @@ notices below apply only to the third-party files identified in each section.
 
 ---
 
-## 1. IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 schema — CC BY 3.0
+## 1. IAB Tech Lab Agentic Real Time Framework (ARTF) v1.0 schema — CC BY 3.0
 
 - **Files:**
   - `source/proto/agenticrtbframework.proto`
   - `source/proto/agenticrtbframeworkservices.proto`
-- **Title:** IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 — Protocol Buffers schema
+- **Title:** IAB Tech Lab Agentic Real Time Framework (ARTF) v1.0 — Protocol Buffers schema
 - **Author:** IAB Tech Lab (Interactive Advertising Bureau Technology Laboratory)
 - **Source:** https://github.com/IABTechLab/agentic-realtime-framework
 - **License:** Creative Commons Attribution 3.0 (CC BY 3.0) —
@@ -31,7 +31,7 @@ notices below apply only to the third-party files identified in each section.
   The message, service, field numbers, and enum definitions are otherwise
   unmodified.
 
-> "Agentic RTB Framework" and the ARTF schema are © IAB Tech Lab, licensed under
+> "Agentic Real Time Framework" and the ARTF schema are © IAB Tech Lab, licensed under
 > CC BY 3.0. Changes: attribution header added; one type-path correction in
 > `AddMetricsPayload` (`BidRequest.Metric` → `BidRequest.Imp.Metric`).
 

@@ -1,0 +1,149 @@
+# =============================================================================
+# amt-simulator -- the second auction seat's demand, in-cluster
+#
+# WHAT THIS IS FOR
+#
+# Prebid's `amt` adapter needs something to bid. The AWS Prebid guidance release
+# provides exactly that: a bidder simulator returning static creatives at fixed
+# CPMs. With it, the auction is CONTESTED -- two seats submitting independently,
+# compared against the same floor, one winner and one reported loser. The
+# competition is real; the prices are not market data.
+#
+# WHY IT IS NOT AN API GATEWAY ENDPOINT
+#
+# The `amt` adapter is used UNMODIFIED, and it builds its call with
+# BidderUtil.defaultRequest(...) -- default headers, no bearer token, no API key,
+# no signature. A public endpoint for it could not authenticate its caller, so it
+# would have to accept unauthenticated bid requests from anyone. Behind a
+# ClusterIP Service there is nothing public to authenticate: only pods in this
+# cluster can reach it, and the only one that does is Prebid.
+#
+# NO ImagePullPolicy SURPRISE, NO BUILD
+#
+# The code is mounted from a ConfigMap that deploy_prebid.sh builds from the
+# fetched release plus our wrapper, and runs on a stock Python image. That is
+# deliberate: a simulator is not worth an ECR repository, a CodeBuild project and
+# a second image build on every deploy. Nothing here is on the ARTF request path.
+#
+# Placeholders substituted by deploy_prebid.sh:
+#   __NAMESPACE__   the namespace Prebid runs in
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amt-simulator
+  namespace: __NAMESPACE__
+  labels:
+    app: amt-simulator
+    app.kubernetes.io/part-of: prebid-artf
+    app.kubernetes.io/component: bid-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amt-simulator
+  template:
+    metadata:
+      labels:
+        app: amt-simulator
+        app.kubernetes.io/part-of: prebid-artf
+    spec:
+      # No AWS API is called from here: it answers bid requests from a static
+      # catalogue and talks to nothing. A projected token would be credentials
+      # this pod has no use for.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: simulator
+          # Stock upstream Python from AWS's public registry rather than Docker
+          # Hub, which avoids anonymous pull-rate limits. Pinned to a minor
+          # version so a rebuilt node does not silently change interpreter.
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "/opt/simulator/server.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: AMT_SIMULATOR_PATH
+              value: "/amt-exchange"
+            # The release's handler can inject artificial delays and timeouts.
+            # All four are ZERO: a demo that manufactures its own failures is
+            # showing something that did not happen. Raise them deliberately for
+            # load testing.
+            - name: BID_RESPONSES_DELAY_PERCENTAGE
+              value: "0"
+            - name: BID_RESPONSES_TIMEOUT_PERCENTAGE
+              value: "0"
+            - name: A_BID_RESPONSE_DELAY_PROBABILITY
+              value: "0"
+            - name: A_BID_RESPONSE_TIMEOUT_PROBABILITY
+              value: "0"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          volumeMounts:
+            - name: code
+              mountPath: /opt/simulator
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Small on purpose. This is a static responder, and it shares a node
+          # with Triton and the ARTF containers.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: code
+          configMap:
+            name: amt-simulator-code
+            # Mode 0444: the container runs read-only and never rewrites its own
+            # source.
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amt-simulator
+  namespace: __NAMESPACE__
+  labels:
+    app: amt-simulator
+    app.kubernetes.io/part-of: prebid-artf
+spec:
+  # ClusterIP, so this is reachable ONLY from inside the cluster. Making it a
+  # LoadBalancer or NodePort would publish an unauthenticated bid endpoint,
+  # because the adapter that calls it cannot authenticate.
+  type: ClusterIP
+  selector:
+    app: amt-simulator
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

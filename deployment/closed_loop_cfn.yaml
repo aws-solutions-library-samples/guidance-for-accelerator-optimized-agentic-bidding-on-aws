@@ -1,0 +1,580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Closed-Loop Learning System - DynamoDB tables (Parameter Store + Audit Trail),
+  DAX cluster for low-latency parameter reads, SageMaker Model Package Groups,
+  and SNS training alerts topic. All stores encrypted with KMS at rest.
+  Requirements: 3.1, 5.2, 9.1, 11.1, 12.1, 12.2, 12.3
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
+
+  KMSKeyArn:
+    Type: String
+    Description: >-
+      ARN of the KMS key (from feedback pipeline stack) for encrypting DynamoDB tables at rest.
+
+  AlertEmailEndpoint:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional email address for SNS training failure alerts.
+      If empty, no subscription is created (add manually after deployment).
+
+  TrainingDataBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the S3 bucket holding Glue-labeled training data (from
+      glue_etl_cfn.yaml). Used to scope the SageMaker training execution role's
+      read access. Leave empty to skip creating the training execution role
+      (e.g. a stack update before the Glue stack exists).
+
+  ModelBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the S3 Triton model-repository bucket. The training execution role
+      needs read (onnx-source/ genesis artifacts) and write (job output) access
+      here. Leave empty to skip creating the training execution role.
+
+  TrainingImageRepositoryName:
+    Type: String
+    Default: 'artf-nemo-rl-training'
+    Description: >-
+      ECR repository name for the NeMo-RL training container
+      (deploy_closed_loop.sh Step 4b). Used to scope the training role's ECR pull.
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmailEndpoint, '']]
+  HasTrainingBuckets: !And
+    - !Not [!Equals [!Ref TrainingDataBucketName, '']]
+    - !Not [!Equals [!Ref ModelBucketName, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # 1. DynamoDB Tables - Parameter Store and Audit Trail
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 1a. ParameterStoreTable
+  #
+  # Stores current bidding parameters (shade_factor, conversion_value) per model.
+  # Fronted by DAX for sub-5ms reads at inference time.
+  # Uses optimistic concurrency (version attribute) for conflict resolution.
+  # KMS encryption at rest (Req 12.3).
+  # ---------------------------------------------------------------------------
+  ParameterStoreTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-parameter-store'
+        - 'parameter-store'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_type
+          AttributeType: S
+        - AttributeName: parameter_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_type
+          KeyType: HASH
+        - AttributeName: parameter_name
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # 1b. AuditTrailTable
+  #
+  # Append-only record of every parameter change, model promotion, and rejection.
+  # Partition key: model_type; Sort key: timestamp_version (ISO timestamp + version).
+  # No TTL - records are never deleted (Req 10.2).
+  # KMS encryption at rest (Req 12.3).
+  # ---------------------------------------------------------------------------
+  AuditTrailTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-audit-trail'
+        - 'audit-trail'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: model_type
+          AttributeType: S
+        - AttributeName: timestamp_version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_type
+          KeyType: HASH
+        - AttributeName: timestamp_version
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ===========================================================================
+  # 3. SageMaker Model Package Groups - one per model type
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 3a. DLRM Bid Shader Model Package Group
+  # ---------------------------------------------------------------------------
+  DLRMBidShaderModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-dlrm-bid-shader'
+        - 'artf-dlrm-bid-shader'
+      ModelPackageGroupDescription: >-
+        Model versions for the DLRM Bid Shader - trained via NeMo-RL on bid outcomes.
+        Each version goes through A/B testing via the Governance Agent before promotion.
+
+  # ---------------------------------------------------------------------------
+  # 3b. NCF Deal Manager Model Package Group
+  # ---------------------------------------------------------------------------
+  NCFDealManagerModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-ncf-deal-manager'
+        - 'artf-ncf-deal-manager'
+      ModelPackageGroupDescription: >-
+        Model versions for the NCF Deal Manager - trained on deal activation outcomes.
+        Governed by the Model Governance Agent with A/B testing and guardrail checks.
+
+  # ---------------------------------------------------------------------------
+  # 3c. Deal Yield Manager (Yield Optimizer) Model Package Groups
+  #
+  # Trained via a SEPARATE path (XGBoost, source/training/xgboost_pipeline.py)
+  # from DLRM/NCF's NeMo-RL path. Registered through the same
+  # genesis-registration script/convention for cross-model-type consistency.
+  #
+  # CORRECTION (found during Unit 3 implementation): Triton's FIL backend
+  # does not support multi-output regression models (confirmed against
+  # NVIDIA's official FIL backend docs) and requires exactly one
+  # input__0/output__0 tensor pair per model. The originally-designed single
+  # "deal_yield_manager" model/Model Package Group has been split into two
+  # independent single-target models -- FLOOR and MARGIN -- each with its
+  # own Model Package Group, since ADJUST_DEAL_FLOOR and ADJUST_DEAL_MARGIN
+  # are genuinely distinct intents (business-rules.md BR-5).
+  # ---------------------------------------------------------------------------
+  DealYieldManagerFloorModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-deal-yield-manager-floor'
+        - 'artf-deal-yield-manager-floor'
+      ModelPackageGroupDescription: >-
+        Model versions for the Yield Optimizer's FLOOR sub-model - trained
+        via XGBoost (Triton FIL backend, single-target regression) on deal
+        floor-multiplier outcomes for ADJUST_DEAL_FLOOR. Governed by the
+        Model Governance Agent with A/B testing and guardrail checks, same
+        as DLRM/NCF.
+
+  DealYieldManagerMarginModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-deal-yield-manager-margin'
+        - 'artf-deal-yield-manager-margin'
+      ModelPackageGroupDescription: >-
+        Model versions for the Yield Optimizer's MARGIN sub-model - trained
+        via XGBoost (Triton FIL backend, single-target regression) on deal
+        margin-value outcomes for ADJUST_DEAL_MARGIN. Governed by the Model
+        Governance Agent with A/B testing and guardrail checks, same as
+        DLRM/NCF.
+
+  # NOTE: There is intentionally no Wide&Deep Segment Activator Model Package
+  # Group. Segment activation was switched from a Triton Wide & Deep model to
+  # deterministic rule-based logic (its ONNX graph could not be compiled to a
+  # TensorRT engine, and it is slated to be replaced by a partner ISV
+  # implementation) - see
+  # source/containers/widedeep_segment_activator/app.py. There is no
+  # retrainable model for this container, so no Model Registry group is needed.
+
+  # ===========================================================================
+  # 3c. SageMaker Training Execution Role
+  #
+  # Passed as RoleArn in sagemaker:CreateTrainingJob (see
+  # source/training/pipeline.py TrainingPipeline / the RetrainingTriggerFunction
+  # Lambda in governance_eventbridge_cfn.yaml). Scoped per the SageMaker
+  # CreateTrainingJob execution-role docs: S3 read on the training-data bucket,
+  # S3 read/write on the model bucket (job output + genesis onnx-source read),
+  # ECR pull on the NeMo-RL training repo, CloudWatch metrics, and Logs.
+  # ---------------------------------------------------------------------------
+  SageMakerTrainingExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+          - id: W11
+            reason: ecr:GetAuthorizationToken and cloudwatch:PutMetricData do not support resource-level permissions
+    Condition: HasTrainingBuckets
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-sagemaker-training-execution-role'
+        - 'sagemaker-training-execution-role'
+      Description: >-
+        Execution role SageMaker assumes to run NeMo-RL retraining jobs
+        (CreateTrainingJob RoleArn).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: TrainingDataReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data/*'
+                  # The Yield Optimizer's ETL job
+                  # (glue_deal_yield_feature_engineering.py) writes to two
+                  # SEPARATE prefixes -- not training-data/* -- since floor
+                  # and margin are independently-trained regression targets
+                  # (see governance_eventbridge_cfn.yaml's _MODEL_TYPES
+                  # comment). Without these, the floor/margin
+                  # CreateTrainingJob calls fail with S3 AccessDenied on
+                  # their input channel.
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-floor/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-margin/*'
+        # The training-data bucket is SSE-KMS encrypted with KMSKeyArn (see
+        # glue_etl_cfn.yaml). Without Decrypt on that key, CreateTrainingJob's
+        # input-channel download fails with a KMS AccessDenied ClientError
+        # before training ever starts. GenerateDataKey is included so the role
+        # can also write encrypted objects if a future output path uses this
+        # same key (the model bucket is currently SSE-S3, not SSE-KMS).
+        - PolicyName: TrainingDataKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !Ref KMSKeyArn
+        - PolicyName: ModelBucketReadWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/onnx-source/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ModelBucketName}/models/*'
+        - PolicyName: ECRTrainingImagePull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${TrainingImageRepositoryName}'
+        - PolicyName: CloudWatchMetricsAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
+
+  # ===========================================================================
+  # 4. SNS Topic - Training Alerts
+  # ===========================================================================
+
+  TrainingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-training-alerts'
+        - 'training-alerts'
+      DisplayName: ARTF Training Pipeline Alerts
+      KmsMasterKeyId: !Ref KMSKeyArn
+
+  TrainingAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref TrainingAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSameAccountPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sns:Publish'
+            Resource: !Ref TrainingAlertsTopic
+          - Sid: DenyNonTLSAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref TrainingAlertsTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  TrainingAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref TrainingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailEndpoint
+
+  # ---------------------------------------------------------------------------
+  # 4. User Feature Store Table (DynamoDB)
+  #
+  # Online feature store for real-time user feature serving in the bid path.
+  # Partition key: user_id (hashed). Populated by a Glue ETL materialization
+  # job that aggregates bid outcomes into per-user feature vectors.
+  #
+  # Features per user:
+  #   - bid_count_7d: total bids in last 7 days
+  #   - win_rate_7d: win rate over last 7 days
+  #   - avg_ctr_7d: average CTR
+  #   - avg_spend_7d: average spend per bid
+  #   - top_domain_hash: most-frequently-bid domain (hashed)
+  #   - device_preference: dominant device type
+  #   - last_updated: epoch timestamp of last materialization
+  #
+  # TTL enabled (feature_expiry_epoch) so stale features auto-expire after 14 days.
+  # DAX-compatible: ConsistentRead=false on all lookups.
+  # ---------------------------------------------------------------------------
+  UserFeatureTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-user-features'
+        - 'user-features'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: feature_expiry_epoch
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ParameterStoreTableArn:
+    Description: ARN of the DynamoDB Parameter Store table
+    Value: !GetAtt ParameterStoreTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-ParameterStoreTableArn'
+        - 'ParameterStoreTableArn'
+
+  ParameterStoreTableName:
+    Description: Name of the DynamoDB Parameter Store table
+    Value: !Ref ParameterStoreTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-ParameterStoreTableName'
+        - 'ParameterStoreTableName'
+
+  AuditTrailTableArn:
+    Description: ARN of the DynamoDB Audit Trail table
+    Value: !GetAtt AuditTrailTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-AuditTrailTableArn'
+        - 'AuditTrailTableArn'
+
+  AuditTrailTableName:
+    Description: Name of the DynamoDB Audit Trail table
+    Value: !Ref AuditTrailTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-AuditTrailTableName'
+        - 'AuditTrailTableName'
+
+  TrainingAlertsTopicArn:
+    Description: ARN of the SNS topic for training failure alerts
+    Value: !Ref TrainingAlertsTopic
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingAlertsTopicArn'
+        - 'TrainingAlertsTopicArn'
+
+  DLRMModelPackageGroupName:
+    Description: SageMaker Model Package Group for DLRM Bid Shader
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-dlrm-bid-shader'
+      - 'artf-dlrm-bid-shader'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DLRMModelPackageGroupName'
+        - 'DLRMModelPackageGroupName'
+
+  NCFModelPackageGroupName:
+    Description: SageMaker Model Package Group for NCF Deal Manager
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-ncf-deal-manager'
+      - 'artf-ncf-deal-manager'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-NCFModelPackageGroupName'
+        - 'NCFModelPackageGroupName'
+
+  DealYieldManagerFloorModelPackageGroupName:
+    Description: SageMaker Model Package Group for the Yield Optimizer's FLOOR sub-model (deal_yield_manager_floor)
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-deal-yield-manager-floor'
+      - 'artf-deal-yield-manager-floor'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldManagerFloorModelPackageGroupName'
+        - 'DealYieldManagerFloorModelPackageGroupName'
+
+  DealYieldManagerMarginModelPackageGroupName:
+    Description: SageMaker Model Package Group for the Yield Optimizer's MARGIN sub-model (deal_yield_manager_margin)
+    Value: !If
+      - HasStackPrefix
+      - !Sub '${StackPrefix}-artf-deal-yield-manager-margin'
+      - 'artf-deal-yield-manager-margin'
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldManagerMarginModelPackageGroupName'
+        - 'DealYieldManagerMarginModelPackageGroupName'
+
+  SageMakerTrainingExecutionRoleArn:
+    Description: >-
+      Execution role ARN for SageMaker training jobs (empty if
+      TrainingDataBucketName/ModelBucketName were not provided).
+    Value: !If
+      - HasTrainingBuckets
+      - !GetAtt SageMakerTrainingExecutionRole.Arn
+      - ''
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-SageMakerTrainingExecutionRoleArn'
+        - 'SageMakerTrainingExecutionRoleArn'
+
+  UserFeatureTableArn:
+    Description: ARN of the DynamoDB User Feature Store table
+    Value: !GetAtt UserFeatureTable.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-UserFeatureTableArn'
+        - 'UserFeatureTableArn'
+
+  UserFeatureTableName:
+    Description: Name of the DynamoDB User Feature Store table
+    Value: !Ref UserFeatureTable
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-UserFeatureTableName'
+        - 'UserFeatureTableName'

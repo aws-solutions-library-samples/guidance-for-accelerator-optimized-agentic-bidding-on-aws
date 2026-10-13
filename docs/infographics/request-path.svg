@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1120" viewBox="0 0 1500 1120" font-family="Amazon Ember, Amazon Ember Display, -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica Neue, Arial, sans-serif">
+<defs>
+<filter id="amb" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#000000" flood-opacity="0.02"/><feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#94A3B8" flood-opacity="0.10"/></filter>
+<filter id="ambIndigo" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#6366F1" flood-opacity="0.10"/><feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#6366F1" flood-opacity="0.12"/></filter>
+<linearGradient id="hdr" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#FFFFFF"/><stop offset="100%" stop-color="#EEF2FF"/></linearGradient>
+<marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#6366F1"/></marker>
+<marker id="arwBlue" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#1D4ED8"/></marker>
+<marker id="arwGrey" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#64748B"/></marker>
+<marker id="arwC" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#0891B2"/></marker>
+<marker id="arwA" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#D97706"/></marker>
+<marker id="arwG" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#16A34A"/></marker>
+<marker id="arwNv" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#76B900"/></marker>
+<symbol id="ic-browser" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></g></symbol>
+<symbol id="ic-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></g></symbol>
+<symbol id="ic-route" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M8.5 18h5a4 4 0 0 0 4-4v-5.5"/></g></symbol>
+<symbol id="ic-signal" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18a12 12 0 0 1 16 0M7.5 14.5a7 7 0 0 1 9 0"/><circle cx="12" cy="19" r="1.2"/></g></symbol>
+<symbol id="ic-users" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14a5 5 0 0 1 6 5"/></g></symbol>
+<symbol id="ic-handshake" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l4-4 5 3 5-3 4 4-4 4-2-1.5-3 2.5-3-2-2 1.5z"/><path d="M9 14l2 2M12 12.5l2 2"/></g></symbol>
+<symbol id="ic-scale" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M4 7h16M6 7l-3 7a3 3 0 0 0 6 0zM18 7l-3 7a3 3 0 0 0 6 0z"/></g></symbol>
+<symbol id="ic-tag" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9h9v9l-9 9z"/><circle cx="16.5" cy="7.5" r="1.3"/></g></symbol>
+<symbol id="ic-gpu" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><rect x="8" y="10" width="8" height="4" rx="1"/><path d="M7 3v3M12 3v3M17 3v3M7 18v3M12 18v3M17 18v3"/></g></symbol>
+<symbol id="ic-gavel" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l7-7M9 8l7 7M12 5l7 7M7 10l5-5 7 7-5 5z"/></g></symbol>
+<symbol id="ic-doc" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/></g></symbol>
+<symbol id="ic-hook" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9a4 4 0 0 0 8 0"/><circle cx="12" cy="3" r="1"/><path d="M6 10l3 3-3 3"/></g></symbol>
+<symbol id="ic-cloud" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18h10a4 4 0 0 0 .5-7.97A6 6 0 0 0 6 11a3.5 3.5 0 0 0 1 7z"/></g></symbol>
+<symbol id="ic-lock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/><path d="M12 15v3"/></g></symbol>
+<symbol id="ic-lambda" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h4l8 16h3M4 20l6-10"/></g></symbol>
+<symbol id="ic-layers" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5M3 17l9 5 9-5"/></g></symbol>
+<symbol id="ic-list" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></g></symbol>
+<symbol id="ic-catalog" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h6v16H4zM14 4h6v16h-6z"/><path d="M7 8h.01M17 8h.01"/></g></symbol>
+</defs>
+<rect width="1500" height="1120" fill="#F8FAFC"/>
+<g filter="url(#ambIndigo)"><rect x="40" y="36" width="1420" height="150" rx="18" fill="url(#hdr)" stroke="#E0E7FF"/></g>
+<rect x="40" y="36" width="7" height="150" rx="3.5" fill="#6366F1"/>
+<text x="74" y="78" font-size="13" font-weight="700" fill="#6366F1" letter-spacing="0.14em">WHAT DEPLOY.SH STOOD UP</text>
+<text x="74" y="116" font-size="28" font-weight="700" fill="#0F172A">How a request travels from the browser to the GPU</text>
+<text x="74" y="146" font-size="14" fill="#475569">The UI is static files on CloudFront. Its API calls ride a VPC-attached Lambda to the orchestrator, which has no public address.</text>
+<text x="74" y="166" font-size="14" fill="#475569">The orchestrator runs the six bidding containers in four stages; four of the six call NVIDIA Triton on the GPU node.</text>
+<g filter="url(#amb)"><rect x="40" y="230" width="250" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="40" y="230" width="6" height="112" rx="3" fill="#1D4ED8"/>
+<use href="#ic-browser" x="58" y="245" width="22" height="22" color="#1D4ED8"/>
+<text x="88" y="262" font-size="15" font-weight="700" fill="#0F172A">Browser (React UI)</text>
+<text x="58" y="284" font-size="12.5" fill="#334155">signs in with Cognito, loads the</text>
+<text x="58" y="302" font-size="12.5" fill="#334155">static app, exchanges the ID token</text>
+<text x="58" y="320" font-size="12.5" fill="#334155">for SigV4 credentials</text>
+<g filter="url(#amb)"><rect x="360" y="230" width="300" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="360" y="230" width="6" height="112" rx="3" fill="#64748B"/>
+<use href="#ic-cloud" x="378" y="245" width="22" height="22" color="#64748B"/>
+<text x="408" y="262" font-size="15" font-weight="700" fill="#0F172A">CloudFront + S3</text>
+<text x="378" y="284" font-size="12.5" fill="#334155">serves the frontend as static files;</text>
+<text x="378" y="302" font-size="12.5" fill="#334155">no API traffic passes through it</text>
+<g filter="url(#amb)"><rect x="730" y="230" width="330" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="730" y="230" width="6" height="112" rx="3" fill="#D97706"/>
+<use href="#ic-lambda" x="748" y="245" width="22" height="22" color="#D97706"/>
+<text x="778" y="262" font-size="15" font-weight="700" fill="#0F172A">ui-api-proxy (Lambda, in VPC)</text>
+<text x="748" y="284" font-size="12.5" fill="#334155">receives every /api/* call as a</text>
+<text x="748" y="302" font-size="12.5" fill="#334155">lambda:InvokeFunction event and</text>
+<text x="748" y="320" font-size="12.5" fill="#334155">forwards it into the cluster</text>
+<g filter="url(#amb)"><rect x="1130" y="230" width="330" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="1130" y="230" width="6" height="112" rx="3" fill="#BE185D"/>
+<use href="#ic-lock" x="1148" y="245" width="22" height="22" color="#BE185D"/>
+<text x="1178" y="262" font-size="15" font-weight="700" fill="#0F172A">Amazon Cognito</text>
+<text x="1148" y="284" font-size="12.5" fill="#334155">user pool signs the browser in;</text>
+<text x="1148" y="302" font-size="12.5" fill="#334155">identity pool grants it one action:</text>
+<text x="1148" y="320" font-size="12.5" fill="#334155">invoke that one Lambda</text>
+<path d="M290 272 L358 272" stroke="#1D4ED8" stroke-width="2" fill="none" marker-end="url(#arwBlue)"/>
+<text x="324" y="222" font-size="11.5" font-weight="500" fill="#1D4ED8" text-anchor="middle" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">GET /* (static)</text>
+<path d="M290 300 L330 300 L330 380 L895 380 L895 344" stroke="#1D4ED8" stroke-width="2" fill="none" marker-end="url(#arwBlue)"/>
+<text x="440" y="398" font-size="11.5" font-weight="500" fill="#1D4ED8" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">lambda:InvokeFunction, SigV4-signed, bearer token carried unchanged</text>
+<path d="M1200 342 L1200 364 L1000 364 L1000 346" stroke="#BE185D" stroke-width="2" fill="none" marker-end="url(#arwR)" stroke-dasharray="6 5"/>
+<text x="1100" y="380" font-size="11.5" font-weight="500" fill="#BE185D" text-anchor="middle" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">authorizes the invoke</text>
+<path d="M895 400 L895 452" stroke="#D97706" stroke-width="2" fill="none" marker-end="url(#arwA)"/>
+<text x="910" y="432" font-size="11.5" font-weight="500" fill="#D97706" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">http://&lt;internal NLB&gt;  (orchestrator-internal Service; nothing here is reachable from the internet)</text>
+<rect x="40" y="456" width="1420" height="176" rx="20" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
+<text x="68" y="488" font-size="13" font-weight="700" fill="#4338CA" letter-spacing="0.12em">ORCHESTRATOR (EKS, CPU NODE GROUP)</text>
+<text x="68" y="510" font-size="13" fill="#475569">Verifies the Cognito token, then runs the request through four sequential stages, applying each stage's mutations to a working copy before the next stage runs.</text>
+<g filter="url(#amb)"><rect x="68" y="522" width="440" height="92" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="68" y="522" width="6" height="92" rx="3" fill="#6366F1"/>
+<use href="#ic-route" x="86" y="537" width="22" height="22" color="#6366F1"/>
+<text x="116" y="554" font-size="15" font-weight="700" fill="#0F172A">Stage sequencer</text>
+<text x="86" y="576" font-size="12.5" fill="#334155">gives each stage the time left under tmax</text>
+<text x="86" y="594" font-size="12.5" fill="#334155">(floored at 10 ms); a slow container is</text>
+<text x="86" y="612" font-size="12.5" fill="#334155">reported timeout and the next stage still runs</text>
+<g filter="url(#amb)"><rect x="532" y="522" width="440" height="92" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="532" y="522" width="6" height="92" rx="3" fill="#6366F1"/>
+<use href="#ic-layers" x="550" y="537" width="22" height="22" color="#6366F1"/>
+<text x="580" y="554" font-size="15" font-weight="700" fill="#0F172A">Mutation applier (artf_applier.py)</text>
+<text x="550" y="576" font-size="12.5" fill="#334155">writes segments, deals, metrics and floors</text>
+<text x="550" y="594" font-size="12.5" fill="#334155">onto the working copy between stages;</text>
+<text x="550" y="612" font-size="12.5" fill="#334155">all-or-nothing per mutation</text>
+<g filter="url(#amb)"><rect x="996" y="522" width="440" height="92" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="996" y="522" width="6" height="92" rx="3" fill="#6366F1"/>
+<use href="#ic-list" x="1014" y="537" width="22" height="22" color="#6366F1"/>
+<text x="1044" y="554" font-size="15" font-weight="700" fill="#0F172A">Stage-ordered response</text>
+<text x="1014" y="576" font-size="12.5" fill="#334155">mutations in stage order, per-container</text>
+<text x="1014" y="594" font-size="12.5" fill="#334155">status and latency, metadata.stages for</text>
+<text x="1014" y="612" font-size="12.5" fill="#334155">the UI's latency breakdown</text>
+<path d="M752 632 L752 684" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
+<text x="766" y="664" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">four stages, in order; containers inside a stage run in parallel</text>
+<rect x="40" y="688" width="1420" height="270" rx="20" fill="#F1F5F9" stroke="#E2E8F0" stroke-width="1.5"/>
+<text x="68" y="720" font-size="13" font-weight="700" fill="#64748B" letter-spacing="0.12em">SIX ARTF CONTAINERS (EKS, CPU NODE GROUP)</text>
+<g filter="url(#amb)"><rect x="68" y="734" width="330" height="206" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="68" y="734" width="6" height="206" rx="3" fill="#0891B2"/>
+<circle cx="102" cy="762" r="14" fill="#0891B2"/>
+<text x="102" y="767" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<text x="124" y="767" font-size="13" font-weight="700" fill="#0891B2" letter-spacing="0.10em">ENRICH</text>
+<use href="#ic-signal" x="86" y="784" width="20" height="20" color="#0891B2"/>
+<text x="114" y="799" font-size="13" font-weight="700" fill="#0F172A">Signals Enricher</text>
+<text x="114" y="816" font-size="13" font-weight="700" fill="#0F172A">Audience Activator</text>
+<rect x="86" y="831" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="233.0" y="847" font-size="11.5" font-weight="600" fill="#0891B2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">ADD_METRICS  ADD_CIDS</text>
+<rect x="86" y="859" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="233.0" y="875" font-size="11.5" font-weight="600" fill="#0891B2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">ACTIVATE_SEGMENTS</text>
+<text x="86" y="903" font-size="12.5" fill="#334155">rules on CPU, no model</text>
+<g filter="url(#amb)"><rect x="422" y="734" width="330" height="206" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="422" y="734" width="6" height="206" rx="3" fill="#D97706"/>
+<circle cx="456" cy="762" r="14" fill="#D97706"/>
+<text x="456" y="767" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<text x="478" y="767" font-size="13" font-weight="700" fill="#D97706" letter-spacing="0.10em">DEALS</text>
+<use href="#ic-handshake" x="440" y="784" width="20" height="20" color="#D97706"/>
+<text x="468" y="799" font-size="13" font-weight="700" fill="#0F172A">Deal Scorer</text>
+<rect x="440" y="814" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="587.0" y="830" font-size="11.5" font-weight="600" fill="#D97706" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">ACTIVATE_DEALS</text>
+<rect x="440" y="842" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="587.0" y="858" font-size="11.5" font-weight="600" fill="#D97706" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">SUPPRESS_DEALS</text>
+<text x="440" y="886" font-size="12.5" fill="#334155">NCF on Triton (TensorRT)</text>
+<g filter="url(#amb)"><rect x="776" y="734" width="330" height="206" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="776" y="734" width="6" height="206" rx="3" fill="#BE185D"/>
+<circle cx="810" cy="762" r="14" fill="#BE185D"/>
+<text x="810" y="767" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+<text x="832" y="767" font-size="13" font-weight="700" fill="#BE185D" letter-spacing="0.10em">YIELD</text>
+<use href="#ic-scale" x="794" y="784" width="20" height="20" color="#BE185D"/>
+<text x="822" y="799" font-size="13" font-weight="700" fill="#0F172A">Yield Optimizer Floor</text>
+<text x="822" y="816" font-size="13" font-weight="700" fill="#0F172A">Yield Optimizer Margin</text>
+<rect x="794" y="831" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="941.0" y="847" font-size="11.5" font-weight="600" fill="#BE185D" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">ADJUST_DEAL_FLOOR</text>
+<rect x="794" y="859" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="941.0" y="875" font-size="11.5" font-weight="600" fill="#BE185D" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">ADJUST_DEAL_MARGIN</text>
+<text x="794" y="903" font-size="12.5" fill="#334155">two XGBoost models on Triton (FIL)</text>
+<g filter="url(#amb)"><rect x="1130" y="734" width="330" height="206" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="1130" y="734" width="6" height="206" rx="3" fill="#16A34A"/>
+<circle cx="1164" cy="762" r="14" fill="#16A34A"/>
+<text x="1164" y="767" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+<text x="1186" y="767" font-size="13" font-weight="700" fill="#16A34A" letter-spacing="0.10em">PRICE</text>
+<use href="#ic-tag" x="1148" y="784" width="20" height="20" color="#16A34A"/>
+<text x="1176" y="799" font-size="13" font-weight="700" fill="#0F172A">Bid Pricer</text>
+<rect x="1148" y="814" width="294" height="22" rx="11" fill="#F1F5F9" stroke="#E2E8F0"/>
+<text x="1295.0" y="830" font-size="11.5" font-weight="600" fill="#16A34A" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">BID_SHADE</text>
+<text x="1148" y="858" font-size="12.5" fill="#334155">DLRM on Triton (TensorRT);</text>
+<text x="1148" y="875" font-size="12.5" fill="#334155">runs only when a bid response is sent</text>
+<path d="M400 840 L420 840" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
+<path d="M754 840 L774 840" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
+<path d="M1108 840 L1128 840" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
+<path d="M587.0 940 L587.0 1000" stroke="#76B900" stroke-width="2" fill="none" marker-end="url(#arwNv)"/>
+<path d="M941.0 940 L941.0 1000" stroke="#76B900" stroke-width="2" fill="none" marker-end="url(#arwNv)"/>
+<path d="M1295.0 940 L1295.0 1000" stroke="#76B900" stroke-width="2" fill="none" marker-end="url(#arwNv)"/>
+<g filter="url(#amb)"><rect x="422" y="1004" width="1038" height="84" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
+<rect x="422" y="1004" width="6" height="84" rx="3" fill="#76B900"/>
+<use href="#ic-gpu" x="440" y="1019" width="22" height="22" color="#76B900"/>
+<text x="470" y="1036" font-size="15" font-weight="700" fill="#0F172A">NVIDIA Triton Inference Server (GPU node group, g5 / A10G)</text>
+<text x="440" y="1060" font-size="12.5" fill="#334155">Behind an internal-only load balancer. Serves two TensorRT engines (DLRM, NCF) and two XGBoost models (floor, margin) from one GPU.</text>
+<text x="440" y="1078" font-size="12.5" fill="#334155">The node group scales to zero on a nightly schedule. Stage 1 never touches the GPU; stages 2 to 4 make four GPU calls per request.</text>
+</svg>
