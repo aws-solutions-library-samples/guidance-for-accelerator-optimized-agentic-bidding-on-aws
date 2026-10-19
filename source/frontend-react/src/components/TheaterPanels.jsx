@@ -85,14 +85,18 @@ export function TheaterSceneRibbon({ context, revealed, stepLabel, scenarioName,
 
   return (
     <div className="th-ribbon">
-      <div className="th-ribbon-title" data-testid="theater-scenario-name">
+      <div
+        className="th-ribbon-title"
+        data-testid="theater-scenario-name"
+        title={scenarioName ?? "ARTF Auction Theater"}
+      >
         {scenarioName ?? "ARTF Auction Theater"}
       </div>
       <div className="th-ribbon-scene">
         {items.map(({ key, label, value }) => (
-          <div key={key} className={`th-scene-item${revealed ? " is-on" : ""}`}>
+          <div key={key} className={`th-scene-item th-scene-${key}${revealed ? " is-on" : ""}`}>
             <span className="th-scene-label">{label}</span>
-            <span className="th-scene-value">{value ?? UNKNOWN}</span>
+            <span className="th-scene-value" title={value ?? UNKNOWN}>{value ?? UNKNOWN}</span>
           </div>
         ))}
       </div>

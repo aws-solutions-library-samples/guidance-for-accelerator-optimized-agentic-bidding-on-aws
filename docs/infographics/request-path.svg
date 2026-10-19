@@ -97,6 +97,7 @@
 <text x="1014" y="612" font-size="12.5" fill="#334155">the UI's latency breakdown</text>
 <path d="M752 632 L752 684" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
 <text x="766" y="664" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">four stages, in order; containers inside a stage run in parallel</text>
+<text x="738" y="664" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="end" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">REST /mutate by default; gRPC :50051 when ARTF_CONTAINER_TRANSPORT=grpc</text>
 <rect x="40" y="688" width="1420" height="270" rx="20" fill="#F1F5F9" stroke="#E2E8F0" stroke-width="1.5"/>
 <text x="68" y="720" font-size="13" font-weight="700" fill="#64748B" letter-spacing="0.12em">SIX ARTF CONTAINERS (EKS, CPU NODE GROUP)</text>
 <g filter="url(#amb)"><rect x="68" y="734" width="330" height="206" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>

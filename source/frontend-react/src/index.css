@@ -3681,7 +3681,7 @@ h1, h2, h3, .sg-display {
      scene items it sits beside. */
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 26ch;
+  max-width: 48ch;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -3689,10 +3689,10 @@ h1, h2, h3, .sg-display {
   display: flex;
   /* Five items now (publisher, page, content, audience, deals), so the gap is
      narrower than the three-item version and wraps rather than overflowing. */
-  gap: 18px;
+  gap: 28px;
   flex: 1 1 auto;
   flex-wrap: wrap;
-  justify-content: center;
+  justify-content: space-between;
   min-width: 0;
 }
 .th-scene-item {
@@ -3718,6 +3718,10 @@ h1, h2, h3, .sg-display {
   text-overflow: ellipsis;
   max-width: 240px;
 }
+/* Audience is the longest value; it takes whatever width the row has left.
+   The full string is on the value's title attribute. */
+.th-scene-audience { flex: 1 1 0; }
+.th-scene-audience .th-scene-value { max-width: none; }
 .th-ribbon-step {
   font-family: var(--font-mono, monospace);
   font-size: 11px;

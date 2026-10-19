@@ -163,9 +163,9 @@
 <rect x="40" y="908" width="6" height="112" rx="3" fill="#64748B"/>
 <use href="#ic-tag" x="58" y="923" width="22" height="22" color="#64748B"/>
 <text x="88" y="940" font-size="14" font-weight="700" fill="#0F172A" text-anchor="start">What is different from the Prebid path</text>
-<text x="58" y="962" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">Two things: stage 4 runs because a seatbid is</text>
-<text x="58" y="980" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">present, and the host (not a Prebid hook) applies</text>
-<text x="58" y="998" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">the list to both documents.</text>
+<text x="58" y="962" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">Stage 4 runs because a seatbid is present, and</text>
+<text x="58" y="980" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">the host (not a Prebid hook) applies the list and</text>
+<text x="58" y="998" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">calls POST /v1/mutations, not the hook's gRPC.</text>
 <g filter="url(#amb)"><rect x="521" y="908" width="457" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="521" y="908" width="6" height="112" rx="3" fill="#64748B"/>
 <use href="#ic-clock" x="539" y="923" width="22" height="22" color="#64748B"/>

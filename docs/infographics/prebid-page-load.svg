@@ -35,7 +35,7 @@
 <text x="74" y="78" font-size="13" font-weight="700" fill="#6366F1" letter-spacing="0.14em">OPTIONAL HOST: PREBID SERVER</text>
 <text x="74" y="116" font-size="28" font-weight="700" fill="#0F172A">One page load through Prebid Server with the ARTF hook installed</text>
 <text x="74" y="146" font-size="14" fill="#475569">The hook enriches the request at processed-auction-request, before any bidder sees it. Prebid then runs the auction it always runs.</text>
-<text x="74" y="166" font-size="14" fill="#475569">The orchestrator is the same one the UI calls; the Prebid pod reaches it by in-cluster Service name.</text>
+<text x="74" y="166" font-size="14" fill="#475569">The orchestrator is the same one the UI calls; the Prebid pod reaches it over gRPC by in-cluster Service name.</text>
 <g filter="url(#amb)"><rect x="40" y="230" width="260" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="40" y="230" width="6" height="112" rx="3" fill="#1D4ED8"/>
 <use href="#ic-browser" x="58" y="245" width="22" height="22" color="#1D4ED8"/>
@@ -52,8 +52,8 @@
 <use href="#ic-hook" x="394" y="267" width="22" height="22" color="#1D4ED8"/>
 <text x="424" y="284" font-size="15" font-weight="700" fill="#0F172A">2. ARTF hook module</text>
 <text x="394" y="306" font-size="12.5" fill="#334155">checks the remaining budget, calls the</text>
-<text x="394" y="324" font-size="12.5" fill="#334155">orchestrator, applies the returned list</text>
-<text x="394" y="342" font-size="12.5" fill="#334155">to the bid request</text>
+<text x="394" y="324" font-size="12.5" fill="#334155">orchestrator over gRPC, applies the</text>
+<text x="394" y="342" font-size="12.5" fill="#334155">returned list to the bid request</text>
 <g filter="url(#amb)"><rect x="700" y="252" width="340" height="96" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="700" y="252" width="6" height="96" rx="3" fill="#1D4ED8"/>
 <use href="#ic-gavel" x="718" y="267" width="22" height="22" color="#1D4ED8"/>
@@ -71,7 +71,7 @@
 <path d="M676 300 L698 300" stroke="#1D4ED8" stroke-width="2" fill="none" marker-end="url(#arwBlue)"/>
 <path d="M1040 300 L1062 300" stroke="#1D4ED8" stroke-width="2" fill="none" marker-end="url(#arwBlue)"/>
 <path d="M480 348 L480 420" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
-<text x="556" y="392" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">3. POST /v1/mutations  (Cognito client_credentials bearer held in memory)</text>
+<text x="556" y="392" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">3. gRPC GetMutations on :50051, JSON-over-gRPC  (Cognito client_credentials bearer held in memory)</text>
 <path d="M540 422 L540 350" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
 <text x="556" y="412" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">4. stage-ordered mutations with per-container status</text>
 <rect x="40" y="424" width="1420" height="200" rx="20" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>
@@ -112,7 +112,7 @@
 <rect x="68" y="712" width="6" height="160" rx="3" fill="#16A34A"/>
 <use href="#ic-catalog" x="86" y="727" width="22" height="22" color="#16A34A"/>
 <text x="116" y="744" font-size="15" font-weight="700" fill="#0F172A">artfhouse adapter, then its demand endpoint</text>
-<text x="86" y="766" font-size="12.5" fill="#334155">API Gateway + Lambda holding a campaign</text>
+<text x="86" y="766" font-size="12.5" fill="#334155">In-cluster Deployment holding a campaign</text>
 <text x="86" y="784" font-size="12.5" fill="#334155">catalog: matches deals on the impression,</text>
 <text x="86" y="802" font-size="12.5" fill="#334155">compares each campaign's CPM to the floor,</text>
 <text x="86" y="820" font-size="12.5" fill="#334155">returns a seatbid or a per-campaign</text>
