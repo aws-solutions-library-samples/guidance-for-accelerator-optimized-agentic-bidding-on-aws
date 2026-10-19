@@ -32,7 +32,7 @@
 <rect x="40" y="36" width="7" height="158" rx="3.5" fill="#6366F1"/>
 <text x="74" y="78" font-size="13" font-weight="700" fill="#6366F1" text-anchor="start" letter-spacing="0.14em">SEQUENCED FAN-OUT, PREBID SERVER AS THE HOST</text>
 <text x="74" y="116" font-size="28" font-weight="700" fill="#0F172A" text-anchor="start">How the orchestrator sequences the containers when Prebid Server hosts ARTF</text>
-<text x="74" y="146" font-size="14" font-weight="400" fill="#475569" text-anchor="start">Prebid's ARTF hook calls the orchestrator once at processed-auction-request. Stages 1 to 3 run and are applied in order;</text>
+<text x="74" y="146" font-size="14" font-weight="400" fill="#475569" text-anchor="start">Prebid's ARTF hook calls the orchestrator over gRPC once at processed-auction-request. Stages 1 to 3 run and are applied in order;</text>
 <text x="74" y="166" font-size="14" font-weight="400" fill="#475569" text-anchor="start">Prebid applies the returned list itself before its bidders see the request. Stage 4 does not run here: no bids exist yet.</text>
 <g filter="url(#amb)"><rect x="40" y="230" width="230" height="112" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="40" y="230" width="6" height="112" rx="3" fill="#1D4ED8"/>
@@ -49,7 +49,7 @@
 <use href="#ic-hook" x="364" y="267" width="22" height="22" color="#1D4ED8"/>
 <text x="394" y="284" font-size="15" font-weight="700" fill="#0F172A" text-anchor="start">ARTF hook module</text>
 <text x="364" y="306" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">runs at processed-auction-request;</text>
-<text x="364" y="324" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">posts the request as an ARTF envelope,</text>
+<text x="364" y="324" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">sends the ARTF envelope over gRPC,</text>
 <text x="364" y="342" font-size="12.5" font-weight="400" fill="#334155" text-anchor="start">applies the reply in list order</text>
 <g filter="url(#amb)"><rect x="620" y="252" width="230" height="96" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="620" y="252" width="6" height="96" rx="3" fill="#1D4ED8"/>
@@ -76,7 +76,7 @@
 <path d="M850 300 L872 300" stroke="#1D4ED8" stroke-width="2" fill="none" marker-end="url(#arwBlue)"/>
 <path d="M1164 300 L1186 300" stroke="#64748B" stroke-width="2" fill="none" marker-end="url(#arwGrey)" stroke-dasharray="6 5"/>
 <path d="M430 348 L430 414" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
-<text x="520" y="380" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">POST /v1/mutations  (Cognito client_credentials bearer)</text>
+<text x="520" y="380" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">gRPC GetMutations on :50051, JSON-over-gRPC  (Cognito client_credentials bearer)</text>
 <path d="M470 416 L470 350" stroke="#6366F1" stroke-width="2" fill="none" marker-end="url(#arw)"/>
 <text x="560" y="398" font-size="11.5" font-weight="500" fill="#6366F1" text-anchor="start" stroke="#F8FAFC" stroke-width="4" paint-order="stroke">stage-ordered mutations + metadata.stages</text>
 <rect x="40" y="416" width="1420" height="372" rx="20" fill="#EEF2FF" stroke="#C7D2FE" stroke-width="1.5"/>

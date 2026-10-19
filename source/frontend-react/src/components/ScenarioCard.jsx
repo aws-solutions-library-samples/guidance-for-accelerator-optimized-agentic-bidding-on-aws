@@ -439,7 +439,7 @@ export const TUNER_DEFAULTS = {
   // still-untrained genesis model can produce a real mutation instead of always
   // 0. Once a real model has been trained at least once, the user can flip this
   // off to see that model's unperturbed prediction.
-  explore: true,
+  explore: false,
 };
 
 /**

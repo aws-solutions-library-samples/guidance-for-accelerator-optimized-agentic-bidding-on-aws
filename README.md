@@ -585,11 +585,11 @@ Calling all six containers at once would hand every container the same unmodifie
 
 Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
 
-With Prebid Server as the host, the hook calls the orchestrator at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
+With Prebid Server as the host, the hook calls the orchestrator over gRPC at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
 
 ![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
 
-When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The endpoint, envelope and stage order are the same; only the caller's lifecycle and documents differ:
+When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The envelope, handler and stage order are the same; only the caller's lifecycle and documents differ (this host POSTs `/v1/mutations`, where Prebid's hook uses gRPC by default):
 
 ![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
 
