@@ -18,6 +18,7 @@ Run AI models that price bids, activate audience segments, and manage private ma
     - [Cost](#cost)
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
+    - [Learner mode (no GPUs)](#learner-mode-no-gpus)
     - [Deals and campaigns: the deals table](#deals-and-campaigns-the-deals-table)
     - [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings)
     - [Network layout: nothing in the VPC is internet-facing](#network-layout-nothing-in-the-vpc-is-internet-facing)
@@ -381,6 +382,8 @@ Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the c
 ./deploy.sh --prefix dv1 --profile prof    # AWS CLI profile (default: $AWS_PROFILE if set, else the profile remembered for this prefix, else "default")
 ./deploy.sh --prefix dv1 --with-retraining # deploy Part 2 closed-loop learning (DEFAULT)
 ./deploy.sh --prefix dv1 --no-retraining   # Part 1 only: skip the closed-loop stack and the NGC key requirement
+./deploy.sh --prefix dv1 --learner-mode    # no GPUs: Triton serves the models on CPU nodes; not for production (see Learner mode below)
+./deploy.sh --prefix dv1 --no-learner-mode # switch a learner prefix back to the standard GPU deployment (default)
 ./deploy.sh --prefix dv1 --ngc-key KEY     # NGC API key for the NeMo-RL training image (needed once per prefix when Part 2 is on)
 ./deploy.sh --prefix dv1 --ngc-secret my-secret-name  # reuse an NGC key already stored in Secrets Manager
 ./deploy.sh --prefix dv1 --skip-agentcore  # do not register the MCP runtime (default: registered)
@@ -417,6 +420,40 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ```
 
 **`--start-at` takes a phase number, 1 to 5.** The step numbers this README cites (for example Step 1.5 or Step 7.5) are steps inside those phases and are not valid `--start-at` values. The step-to-phase table in [RENAME_MAP.md](RENAME_MAP.md) shows which phase each step belongs to.
+
+### Learner mode (no GPUs)
+
+Learner mode deploys the stack without any GPU instances, for accounts that have no GPU quota, such as AWS Workshop Studio event accounts:
+
+```bash
+./deploy.sh --prefix dv1 --learner-mode      # deploy without GPUs
+./deploy.sh --prefix dv1 --no-learner-mode   # switch back to the standard GPU deployment
+```
+
+Both flags are remembered for the prefix, so later runs stay in the mode you last chose.
+
+**Learner mode is for learning, not for production.** The ARTF containers implement the IAB Tech Lab Agentic Real Time Framework. For this implementation to remain ARTF-compliant, do not use learner mode for production workloads. The UI says so in a notice on every page load and in a persistent **Learner mode** badge in the header.
+
+What changes in learner mode:
+
+- **Inference runs on CPUs instead of GPUs.** NVIDIA Triton Inference Server (the same `nvcr.io/nvidia/tritonserver` image) runs on the `cpu-services` node group. The Floor and Margin yield models run on the FIL backend on CPU; the Deal Scorer (NCF) and Bid Pricer (DLRM) run as ONNX models on the ONNX Runtime backend on CPU. The served model configurations come from `source/triton/model_repository_learner/`.
+- **No GPU node group.** There is no `gpu-inference` node group, no NVIDIA device plugin, no nightly GPU shutdown, and no TensorRT engine build (the model-optimizer image is not built). The `cpu-services` group runs 4 x c5.2xlarge nodes with 100 GB volumes instead of 3, to fit Triton.
+- **Part 2 (closed-loop learning) is off,** as with `--no-retraining`, because retraining and promotion need GPUs. `--with-retraining` is refused in learner mode, and no NGC API key is needed. The Adaptive Bidding tab reports that its agent is not deployed.
+- **The Governance tab is disabled.** It stays visible in the header, marked "(unavailable in learner mode)", and the orchestrator answers its API with HTTP 409. The Container Health panel shows Triton readiness on CPU in place of the GPU start and stop controls.
+- **Latency is CPU latency.** DLRM and NCF on CPU are slower than TensorRT on a GPU, so load-test results from a learner deployment are not comparable with GPU results.
+
+What does not change: the four ARTF containers and their gRPC and HTTP path to Triton, the orchestrator's sequencing, and the Auction Theater, including deal activation and the deal floor and margin models. No model location input is needed: the models are built and exported on the deploying machine as in a standard deploy.
+
+**Switching modes on an existing prefix.** Switching re-runs Phase 1 (the served model repository) and Phase 3 (the manifests and node groups). Switching to learner mode scales an existing `gpu-inference` node group to zero; it never deletes it. Switching back creates the group again if it is missing. An existing `cpu-services` group keeps its 50 GB volumes, because node group volumes cannot be changed in place; only a cluster created in learner mode gets 100 GB. The switch is detected from the prefix's record in `deployment/.deploy-state.json`. On a machine that does not have that record, pass `--start-at 1` along with the mode flag, since the AWS probe cannot tell a CPU Triton from a GPU one.
+
+**What learner mode still needs.** Without GPUs, the stack still uses, and the account's IAM policy and quotas must allow:
+
+- Amazon EKS with an OIDC provider for IRSA (created by eksctl), in a three-AZ VPC with three NAT gateways. The Triton image pull from `nvcr.io` leaves through those NAT gateways.
+- 32 On-Demand Standard vCPUs (4 x c5.2xlarge; Service Quotas code `L-1216C47A`). The deploy checks this quota and warns if it is lower.
+- AWS CodeBuild for the remote image builds, or `--local-build` with Docker and about 30 GB of free disk.
+- Amazon ECR, Amazon S3, Amazon CloudFront, Amazon Cognito user and identity pools, Amazon DynamoDB, an AWS Lambda function in the VPC (the UI API proxy), internal Network Load Balancers, and IAM roles and customer-managed policies.
+- Amazon Bedrock access to the Claude Haiku 4.5 global inference profile for the Auction Theater captions. Anthropic models need the one-time use-case form in each account.
+- The Amazon Bedrock AgentCore MCP runtime in Phase 5, unless you pass `--skip-agentcore`.
 ### Deals and campaigns: the deals table
 Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-deals` (for example `stg-nvidia-artf-recommenders-deals`). Nothing is defined in code: `source/demand/artfhouse/catalog.py` and `source/shared/deal_library.py` (read by the Deal Scorer and the orchestrator) build their objects from the table's records.
 
@@ -516,7 +553,7 @@ If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, an
     (pass the flag explicitly to override, or delete deployment/.deploy-state.json)
 ```
 
-The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: the AWS profile, region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
+The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: the AWS profile, region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--learner-mode`/`--no-learner-mode`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
 
 The AWS profile is the one remembered value that is also **enforced**: if a later run resolves a different profile (from `--profile` or `AWS_PROFILE`) than the one recorded for the prefix, the script stops before its first AWS call and names both. Remove the prefix's record from `.deploy-state.json` to move it to another account on purpose.
 
