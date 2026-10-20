@@ -51,6 +51,9 @@ describe('LearnerModeNotice', () => {
       'For this implementation to remain ARTF-compliant, learner mode must not be used for production workloads.',
     );
     expect(text).toContain('Governance tab is unavailable');
+    const flat = text.replace(/\s+/g, ' ');
+    expect(flat).toContain('Adaptive Bidding is also unavailable');
+    expect(flat).toContain('the Adaptive Bidding agent is not deployed');
   });
 
   it('is a labelled modal dialog', () => {

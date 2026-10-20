@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { authFetch } from "../authFetch.js";
 import { invokeAdaptive, agentUnavailableReason } from "../agentCoreClient.js";
+import { useDeploymentMode } from "../hooks/useDeploymentMode.jsx";
 import {
   SUBTLE, MONO, fmt, MarkdownLite,
   IconCloudWatch, IconAgent, IconBrain, IconDynamo,
@@ -39,6 +40,7 @@ export default function AdaptiveBiddingPanel() {
   const [stateError, setStateError] = useState({});
   const [samplesScenario, setSamplesScenario] = useState(null); // scenario obj shown in sample-outcomes modal
   const revealTimer = useRef(null);
+  const { mode: deploymentMode } = useDeploymentMode();
 
   // Load scenarios once (filtered to the agentic loop).
   useEffect(() => {
@@ -123,7 +125,7 @@ export default function AdaptiveBiddingPanel() {
       setRunning(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, running, scenarios, modelType, refreshState]);
+  }, [selected, running, scenarios, modelType, refreshState, deploymentMode]);
 
   async function runAgentic(scenario) {
     // Step 1 — emit synthetic input via orchestrator (data-plane; NO invocation).
@@ -155,7 +157,7 @@ export default function AdaptiveBiddingPanel() {
     const ms = ctx.market_state || {};
 
     // Honest gate: is the Adaptive Bidding agent invokable?
-    const unavailable = agentUnavailableReason("adaptive");
+    const unavailable = agentUnavailableReason("adaptive", { deploymentMode });
 
     const baseNodes = [
       {
