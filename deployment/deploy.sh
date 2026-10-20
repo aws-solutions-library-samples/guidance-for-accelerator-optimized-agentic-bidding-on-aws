@@ -90,6 +90,8 @@ fi
 #                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
 #   ./deploy.sh --learner-mode                 # no GPUs: Triton on CPU nodes, Part 1 only, Governance tab
 #                                               # disabled. NOT for ARTF-compliant production workloads.
+#                                               # Deploys Prebid Server for the Auction Theater
+#                                               # (--no-prebid is refused); --ngc-key is ignored.
 #   ./deploy.sh --no-learner-mode              # back to the standard GPU deployment (both remembered)
 #   ./deploy.sh --status                       # what IS deployed, read live from AWS; deploys nothing
 #   ./deploy.sh --start-at 3                   # force a starting phase, overriding the AWS check
@@ -435,9 +437,22 @@ fi
 # --no-retraining configuration. _WITH_RETRAINING_CHOICE keeps the operator's own
 # value, which is what gets remembered, so --no-learner-mode later restores Part 2.
 #
+# Prebid Server is forced ON the same way: the Auction Theater's live auction is
+# POST /v1/auction/run, which the orchestrator answers with 501 unless Prebid
+# Server is deployed. _WITH_PREBID_CHOICE keeps the operator's own value for the
+# remembered record; an explicit --no-prebid is refused. The mutations scope is set
+# here too, because the WITH_PREBID check that normally sets it runs before
+# remembered values are restored.
+#
+# --ngc-key / --ngc-secret are dropped in learner mode: nothing NGC-based is built
+# (no NeMo, no TensorRT optimizer), so the key is not stored in Secrets Manager or
+# the state file and is not passed to any child script. Clearing (not unset, for
+# set -u) also empties an exported copy in every child.
+#
 # Uses printf rather than fail/warn/say: at the first call site those are not
 # defined yet.
 _WITH_RETRAINING_CHOICE=""
+_WITH_PREBID_CHOICE=""
 _LEARNER_NOTED=0
 validate_learner_mode() {
   if [[ "${LEARNER_MODE}" != "0" && "${LEARNER_MODE}" != "1" ]]; then
@@ -445,6 +460,7 @@ validate_learner_mode() {
     exit 1
   fi
   _WITH_RETRAINING_CHOICE="${WITH_RETRAINING}"
+  _WITH_PREBID_CHOICE="${WITH_PREBID}"
   if [[ "${LEARNER_MODE}" -eq 0 ]]; then
     return 0
   fi
@@ -456,13 +472,37 @@ validate_learner_mode() {
     printf '\033[0;31m[fail]\033[0m %s\n' "--with-retraining cannot be combined with learner mode: retraining and promotion need GPUs. Pass --no-learner-mode for the GPU deployment, or drop --with-retraining." >&2
     exit 1
   fi
+  if [[ "${_GIVEN_PREBID}" -eq 1 && "${WITH_PREBID}" -eq 0 ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "--no-prebid cannot be combined with learner mode: the Auction Theater's live auction needs Prebid Server. Drop --no-prebid, or pass --no-learner-mode." >&2
+    exit 1
+  fi
   WITH_RETRAINING=0
+  WITH_PREBID=1
+  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"
+  if [[ -n "${NGC_KEY}" || -n "${NGC_SECRET}" ]]; then
+    printf '\033[0;33m[warn]\033[0m %s\n' "--ngc-key / --ngc-secret are ignored in learner mode: nothing NGC-based is built, and the key is not stored or passed on."
+    NGC_KEY=""
+    NGC_SECRET=""
+  fi
   if [[ "${_LEARNER_NOTED}" -eq 0 ]]; then
     _LEARNER_NOTED=1
-    printf '  Learner mode: no GPUs. Triton serves on the CPU node group; Part 2 (retraining, Governance) is off. Not for ARTF-compliant production workloads.\n'
+    printf '  Learner mode: no GPUs. Triton serves on the CPU node group; Part 2 (retraining, Governance, the Adaptive Bidding agent) is off; Prebid Server is deployed for the Auction Theater. Not for ARTF-compliant production workloads.\n'
     if [[ "${_GIVEN_MAXGPUS}" -ne 0 ]]; then
       printf '\033[0;33m[warn]\033[0m %s\n' "--maxGPUs has no effect in learner mode (there is no GPU node group to size)."
     fi
+  fi
+  return 0
+}
+
+# warn_part2_left_on_switch <prev-learner> <learner> <prev-with-retraining>: a
+# standard prefix whose remembered state had Part 2 on (empty counts as on:
+# retraining is the default and older records may lack the key) keeps every Part 2
+# resource when it is switched to learner mode. Learner mode only stops deploying
+# Part 2; it removes nothing, and --no-retraining does not either.
+warn_part2_left_on_switch() {
+  local prev_learner="$1" learner="$2" prev_retraining="$3"
+  if [[ "${prev_learner}" == "0" && "${learner}" == "1" && "${prev_retraining}" != "0" ]]; then
+    printf '\033[0;33m[warn]\033[0m %s\n' "Prefix '${STACK_PREFIX}' had Part 2 deployed. Learner mode leaves its Part 2 resources in place, including the scheduled ml.g5.2xlarge retraining (${STACK_PREFIX}-governance-eventbridge) and the governance AgentCore runtime. To remove them, run ./deploy.sh --prefix ${STACK_PREFIX} --destroy, then deploy the prefix again with --learner-mode."
   fi
   return 0
 }
@@ -761,6 +801,13 @@ deploy_ui_api_proxy() {
   action="create-stack"
   [[ -n "${status}" && "${status}" != "None" ]] && action="update-stack"
   cfn_log="/tmp/cfn-deploy-${UI_API_PROXY_STACK}-$(date +%s).log"
+  # Learner mode targets Workshop Studio accounts, which cap reserved concurrency at
+  # 10 across all functions; the template default of 20 fails there. The standard
+  # path passes no override, so its call is unchanged and keeps the default.
+  local _learner_params=()
+  if [[ "${LEARNER_MODE:-0}" -eq 1 ]]; then
+    _learner_params=("ParameterKey=ReservedConcurrency,ParameterValue=5")
+  fi
   log "  ${action} ${UI_API_PROXY_STACK} (subnets ${subnets}, sg ${sg})"
   if aws cloudformation "${action}" --stack-name "${UI_API_PROXY_STACK}" \
       --template-body "file://${SCRIPT_DIR}/ui_api_proxy_cfn.yaml" \
@@ -769,6 +816,7 @@ deploy_ui_api_proxy() {
                    "ParameterKey=SubnetIds,ParameterValue=\"${subnets}\"" \
                    "ParameterKey=SecurityGroupIds,ParameterValue=${sg}" \
                    "ParameterKey=OrchestratorBaseUrl,ParameterValue=${orch_url}" \
+                   ${_learner_params[@]+"${_learner_params[@]}"} \
       >"${cfn_log}" 2>&1; then
     local wait_action="stack-create-complete"
     [[ "${action}" == "update-stack" ]] && wait_action="stack-update-complete"
@@ -956,25 +1004,6 @@ if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
   "${PYTHON}" -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"  # nosemgrep: unquoted-variable-expansion-in-command intentional word splitting of a space separated package list
 fi
 
-# sagemaker SDK: needed only for the Part 2 closed-loop path — resolving the
-# built-in XGBoost training image URI (below) and registering genesis model
-# versions (Step 5, register_genesis_models.py). It is NOT required for a
-# Part 1-only deploy, so it is installed here conditionally rather than added
-# to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
-# empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
-# the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
-#
-# The check imports `image_uris` specifically, NOT just `sagemaker`: the SDK's
-# v3 major version dropped the top-level `image_uris` module this project's
-# resolution relies on (`image_uris.retrieve`, also used by
-# register_genesis_models.py), so a python that has sagemaker v3 installed
-# would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
-# to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
-if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then
-  log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
-  "${PYTHON}" -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
-fi
-
 # step()/done_ok()/run_logged() and the status marks. Sourced before the gate so
 # `--status` output uses the same glyphs as the deploy itself.
 # shellcheck source=lib/deploy_progress.sh
@@ -1035,12 +1064,13 @@ fi
 say "  AWS profile: ${AWS_PROFILE} (${DEPLOY_PROFILE_SOURCE})"
 
 # --status skips the remembered-values block, but what a learner deployment is
-# expected to contain differs (no Model Optimizer image, no Part 2), so the probe
+# expected to contain differs (no Model Optimizer image, no Part 2, a Prebid host), so the probe
 # needs the mode. An explicit flag was applied by validate_learner_mode already.
 if [[ "${STATUS_ONLY}" -eq 1 && "${_GIVEN_LEARNER_MODE}" -eq 0 ]]; then
   if [[ "$(state_read "${STACK_PREFIX}" remembered.learnerMode)" == "1" ]]; then
     LEARNER_MODE=1
     WITH_RETRAINING=0
+    WITH_PREBID=1
   fi
 fi
 
@@ -1182,9 +1212,14 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   if [[ -z "${_PREV_LEARNER_MODE}" && -n "$(state_read "${STACK_PREFIX}" remembered.region)" ]]; then
     _PREV_LEARNER_MODE=0
   fi
-  # validate_learner_mode forced WITH_RETRAINING to 0 for a learner run; restore the
-  # operator's own value so _reuse and the re-validation below start from it.
+  # The Part 2 choice this prefix was last deployed with, for the switch warning
+  # below (a standard prefix switched to learner keeps its Part 2 resources).
+  _PREV_WITH_RETRAINING="$(state_read "${STACK_PREFIX}" remembered.withRetraining)"
+  # validate_learner_mode forced WITH_RETRAINING to 0 and WITH_PREBID to 1 for a
+  # learner run; restore the operator's own values so _reuse and the re-validation
+  # below start from them.
   WITH_RETRAINING="${_WITH_RETRAINING_CHOICE}"
+  WITH_PREBID="${_WITH_PREBID_CHOICE}"
   _reuse AWS_REGION       region        "${_GIVEN_REGION}"           "AWS_REGION"
   _reuse MAX_GPUS         maxGPUs       "${_GIVEN_MAXGPUS}"          "--maxGPUs"
   _reuse ARTF_NODE_ROLE   artfNodeRole  "${_GIVEN_ARTF_NODE_ROLE}"   "--artf-node-role"
@@ -1196,8 +1231,10 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   _reuse LEARNER_MODE     learnerMode   "${_GIVEN_LEARNER_MODE}"     "--learner-mode"
   # The NGC secret name is the case that prompted all of this: a re-run that
   # omits --ngc-key should not re-prompt for a key already stored for this stack.
-  # Only applied when neither NGC flag was given on this invocation.
-  if [[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" ]]; then
+  # Only applied when neither NGC flag was given on this invocation, and not in
+  # learner mode, which builds nothing NGC-based (the remembered name stays in the
+  # record for a later --no-learner-mode run).
+  if [[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" && "${LEARNER_MODE}" -eq 0 ]]; then
     _REMEMBERED_NGC="$(state_read "${STACK_PREFIX}" remembered.ngcSecretName)"
     if [[ -n "${_REMEMBERED_NGC}" ]]; then
       NGC_SECRET="${_REMEMBERED_NGC}"
@@ -1230,6 +1267,7 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
     force_phase 1 "the deployment mode changed (learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}): the served model repository is restaged"
     force_phase 3 "the deployment mode changed (learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}): manifests and node groups are reconciled"
     say "  Deployment mode change for prefix '${STACK_PREFIX}': learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}; Phases 1 and 3 will run."
+    warn_part2_left_on_switch "${_PREV_LEARNER_MODE}" "${LEARNER_MODE}" "${_PREV_WITH_RETRAINING}"
   fi
 
   # --- What is already deployed, according to AWS ---
@@ -1278,7 +1316,7 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
     "modelId=${BEDROCK_MODEL_ID}" \
     "localBuild=${LOCAL_BUILD}" \
     "withRetraining=${_WITH_RETRAINING_CHOICE}" \
-    "withPrebid=${WITH_PREBID}" \
+    "withPrebid=${_WITH_PREBID_CHOICE}" \
     "skipAgentcore=${SKIP_AGENTCORE}" \
     "learnerMode=${LEARNER_MODE}"
   # The secret NAME, never the key. remote_build.sh derives this same name from
@@ -1393,6 +1431,30 @@ DEAL_YIELD_GLUE_JOB_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}deal-yield-feature-en
 # (Phase 5) creates/queries any closed-loop stack outputs).
 YIELD_FLOOR_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-floor"
 YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-margin"
+# sagemaker SDK: needed only for the Part 2 closed-loop path: resolving the
+# built-in XGBoost training image URI (below) and registering genesis model
+# versions (Step 5, register_genesis_models.py). It is NOT required for a
+# Part 1-only deploy, so it is installed here conditionally rather than added
+# to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
+# empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
+# the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
+#
+# The check imports `image_uris` specifically, NOT just `sagemaker`: the SDK's
+# v3 major version dropped the top-level `image_uris` module this project's
+# resolution relies on (`image_uris.retrieve`, also used by
+# register_genesis_models.py), so a python that has sagemaker v3 installed
+# would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
+# to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
+#
+# Checked here, after the remembered values are restored and validate_learner_mode
+# has run again, so WITH_RETRAINING is final: a flagless rerun of a learner (or
+# remembered --no-retraining) prefix does not install it. The XGBoost image URI
+# resolution right below is its first consumer.
+if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then
+  log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
+  "${PYTHON}" -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
+fi
+
 # SageMaker's built-in XGBoost algorithm image lives in an AWS-owned
 # account that differs per region -- resolved via the sagemaker SDK, never
 # hardcoded/guessed (same resolution deploy_closed_loop.sh already uses
@@ -4705,8 +4767,11 @@ say "    Audience Activator      -- ACTIVATE_SEGMENTS (rule-based, no Triton)"
 say "    Deal Scorer             -- ACTIVATE_DEALS / SUPPRESS_DEALS"
 say "    Signals Enricher        -- ADD_METRICS"
 say ""
+say "  Prebid Server is deployed (Step 12): the Auction Theater's live auction runs through it."
+say ""
 say "  The UI shows a learner-mode notice on every page load; the Governance tab is"
-say "  disabled (training, retraining and promotion require GPUs)."
+say "  disabled (training, retraining and promotion require GPUs) and the Adaptive"
+say "  Bidding agent is not deployed."
 say ""
 else
 say "  NVIDIA Triton Inference Server:"
