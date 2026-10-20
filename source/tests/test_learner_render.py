@@ -51,8 +51,7 @@ def _changed_lines(before: str, after: str):
     return removed, added
 
 
-@pytest.mark.parametrize("name", ["triton-deployment", "triton-hpa", "cluster-config",
-                                  "artf-containers-deployment"])
+@pytest.mark.parametrize("name", ["triton-deployment", "triton-hpa", "cluster-config"])
 def test_learner_render_has_no_gpu_reference(name):
     out = transform(name, _rendered(name))
     assert "nvidia.com/gpu" not in out
@@ -128,32 +127,23 @@ def test_cluster_config_drops_the_gpu_group_and_sizes_cpu_services():
         assert cfg[key] == gpu_cfg[key], key
 
 
-def test_artf_containers_lose_only_the_gpu_toleration():
+def test_artf_containers_manifest_passes_through_unchanged():
+    # The ARTF containers' EKS deployment is applied as rendered in both modes,
+    # GPU tolerations included (they match no taint in learner mode).
     before = _rendered("artf-containers-deployment")
-    out = transform("artf-containers-deployment", before)
-    removed, added = _changed_lines(before, out)
-    assert added == []
-    assert removed == [
-        "      tolerations:",
-        "        - key: nvidia.com/gpu",
-        "          operator: Exists",
-        "          effect: NoSchedule",
-    ] * 4
-    before_docs, after_docs = _docs(before), _docs(out)
-    for b, a in zip(before_docs, after_docs):
-        if b.get("kind") == "Deployment":
-            b["spec"]["template"]["spec"].pop("tolerations", None)
-        assert a == b
+    assert transform("artf-containers-deployment", before) == before
+    assert "artf-containers-deployment" not in learner_render._TRANSFORMS
 
 
 @pytest.mark.parametrize("name", ["triton-deployment", "triton-hpa", "cluster-config",
-                                  "orchestrator-deployment", "artf-containers-deployment"])
+                                  "orchestrator-deployment"])
 def test_learner_render_keeps_document_kinds_and_names(name):
     before = _rendered(name)
     assert _kinds_and_names(transform(name, before)) == _kinds_and_names(before)
 
 
-@pytest.mark.parametrize("name", ["triton-internal-nlb", "orchestrator-internal-nlb"])
+@pytest.mark.parametrize("name", ["triton-internal-nlb", "orchestrator-internal-nlb",
+                                  "artf-containers-deployment"])
 def test_other_manifests_pass_through_unchanged(name):
     text = _rendered(name)
     assert transform(name, text) == text

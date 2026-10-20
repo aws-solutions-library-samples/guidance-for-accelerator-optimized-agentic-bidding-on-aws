@@ -17,8 +17,8 @@ Stdlib only: the deploy path does not install PyYAML.
 
 Usage: learner_render.py <kind> <input> <output>
   kind is the template file name without .yaml (cluster-config,
-  triton-deployment, triton-hpa, orchestrator-deployment, artf-containers-deployment);
-  any other kind is copied through unchanged.
+  triton-deployment, triton-hpa, orchestrator-deployment); any other kind,
+  including artf-containers-deployment, is copied through unchanged.
 """
 from __future__ import annotations
 
@@ -152,30 +152,14 @@ def _orchestrator_deployment(text: str) -> str:
     )
 
 
-def _artf_containers_deployment(text: str) -> str:
-    # The ARTF containers hold no GPU; their only GPU reference is a toleration
-    # that lets them schedule onto a tainted GPU node. Learner mode has no GPU
-    # node, so the toleration is dropped from the rendered copy. Images, env,
-    # ports, probes and node selector are untouched.
-    kind = "artf-containers-deployment"
-    return _replace(
-        text,
-        "      tolerations:\n"
-        "        - key: nvidia.com/gpu\n"
-        "          operator: Exists\n"
-        "          effect: NoSchedule\n",
-        "",
-        kind,
-        count=4,
-    )
-
-
+# artf-containers-deployment has no entry on purpose: the ARTF containers' EKS
+# deployment is applied exactly as rendered in both modes. Its GPU tolerations
+# match no taint in learner mode, so they have no effect there.
 _TRANSFORMS: Dict[str, Callable[[str], str]] = {
     "cluster-config": _cluster_config,
     "triton-deployment": _triton_deployment,
     "triton-hpa": _triton_hpa,
     "orchestrator-deployment": _orchestrator_deployment,
-    "artf-containers-deployment": _artf_containers_deployment,
 }
 
 

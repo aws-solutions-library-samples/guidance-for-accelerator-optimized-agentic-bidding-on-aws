@@ -2032,7 +2032,9 @@ test_learner_render_no_gpu() {
       done" _ "${D}" "${tmp}/m${mode}" 2>&1)"; rc=$?
     assert_eq "${rc}" "0" "the render functions succeed with LEARNER_MODE=${mode} (output: ${out})"
   done
-  assert_eq "$(grep -l 'nvidia.com/gpu' "${tmp}"/m1/*.yaml 2>/dev/null | wc -l | tr -d ' ')" "0" "no learner-rendered manifest references nvidia.com/gpu"
+  # The ARTF containers' manifest passes through as rendered (its GPU tolerations
+  # match no taint in learner mode); every other learner manifest has no GPU reference.
+  assert_eq "$(grep -l 'nvidia.com/gpu' "${tmp}"/m1/*.yaml 2>/dev/null | grep -v '/artf-containers-deployment.yaml$' | wc -l | tr -d ' ')" "0" "no learner-rendered manifest other than the ARTF containers' references nvidia.com/gpu"
   assert_eq "$(grep -c 'gpu-inference' "${tmp}/m1/cluster-config.yaml")" "0" "the learner cluster config has no gpu-inference group"
   assert_contains "$(cat "${tmp}/m1/triton-deployment.yaml")" "role: services" "learner Triton is placed on the cpu-services node group"
   assert_contains "$(cat "${tmp}/m1/orchestrator-deployment.yaml")" "name: DEPLOYMENT_MODE" "the learner orchestrator carries DEPLOYMENT_MODE"
@@ -2040,7 +2042,8 @@ test_learner_render_no_gpu() {
   assert_contains "$(cat "${tmp}/m0/cluster-config.yaml")" "name: gpu-inference" "the default cluster config still has the GPU group"
   assert_not_contains "$(cat "${tmp}/m0/orchestrator-deployment.yaml")" "DEPLOYMENT_MODE" "the default orchestrator has no DEPLOYMENT_MODE"
   # The two triton-*-nlb / orchestrator-internal-nlb manifests are identical in both modes.
-  for f in triton-internal-nlb.yaml orchestrator-internal-nlb.yaml; do
+  # The ARTF containers' EKS deployment is byte-identical between the two renders.
+  for f in triton-internal-nlb.yaml orchestrator-internal-nlb.yaml artf-containers-deployment.yaml; do
     assert_eq "$(shasum -a 256 < "${tmp}/m1/${f}")" "$(shasum -a 256 < "${tmp}/m0/${f}")" "${f} renders the same in both modes"
   done
   # The default render is exactly the sed output (no transform on the default path).
