@@ -15,7 +15,7 @@
 #
 # Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
 
-FROM --platform=linux/arm64 python:3.12-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
 
