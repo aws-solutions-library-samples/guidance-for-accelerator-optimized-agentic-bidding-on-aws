@@ -1858,6 +1858,265 @@ test_k8s_rollout() {
 }
 
 # =========================================================================
+# Learner mode (--learner-mode): flags, remembered state, renders, Phase 3 shape
+# =========================================================================
+# Learner mode deploys with no GPUs. The default path must not change, so each
+# test below checks the learner behaviour AND that the flag-absent path does what
+# it did before.
+test_learner_mode_flags() {
+  echo "test_learner_mode_flags"
+  local D="${SCRIPT_DIR}/.." out rc fn_src
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  _lm_arg_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE bash "$@" 2>&1; }
+
+  # --- the real script: parsing and the early validation, before any AWS call ---
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --bogus)"; rc=$?
+  assert_eq "${rc}" "1" "an unknown flag next to --learner-mode still stops the run"
+  assert_contains "${out}" "unknown argument '--bogus'" "--learner-mode itself is recognised; --bogus is the one named"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --no-learner-mode --bogus)"; rc=$?
+  assert_contains "${out}" "unknown argument '--bogus'" "--no-learner-mode is recognised"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --artf-on-gpu)"; rc=$?
+  assert_eq "${rc}" "1" "--learner-mode with ARTF containers on GPU nodes is refused"
+  assert_contains "${out}" "no inference nodes exist" "the refusal says why"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --with-retraining)"; rc=$?
+  assert_eq "${rc}" "1" "--learner-mode with an explicit --with-retraining is refused"
+  assert_contains "${out}" "retraining and promotion need GPUs" "the refusal names the GPU dependency"
+  out="$(bash "${DEPLOY_SH}" --help 2>&1)"
+  assert_contains "${out}" "--learner-mode" "--help documents --learner-mode"
+  assert_contains "${out}" "--no-learner-mode" "--help documents --no-learner-mode"
+  assert_contains "${out}" "NOT for ARTF-compliant production workloads" "--help carries the compliance caveat"
+
+  # --- validate_learner_mode in isolation, under /bin/bash and set -u ----------
+  fn_src="$(sed -n '/^_WITH_RETRAINING_CHOICE=""$/p; /^_LEARNER_NOTED=0$/p; /^validate_learner_mode() {/,/^}/p' "${DEPLOY_SH}")"
+  _lm_validate() {  # _lm_validate <LEARNER_MODE> <WITH_RETRAINING> <_GIVEN_RETRAINING> <ARTF_NODE_ROLE> [_GIVEN_MAXGPUS]
+    "${sh}" -c "set -euo pipefail
+      LEARNER_MODE='$1'; WITH_RETRAINING='$2'; _GIVEN_RETRAINING='$3'; ARTF_NODE_ROLE='$4'; _GIVEN_MAXGPUS='${5:-0}'
+      ${fn_src}
+      validate_learner_mode
+      validate_learner_mode
+      echo \"WR=\${WITH_RETRAINING} CHOICE=\${_WITH_RETRAINING_CHOICE}\"" 2>&1
+  }
+  out="$(_lm_validate 1 1 0 inference)"; rc=$?
+  assert_eq "${rc}" "1" "validate_learner_mode refuses --artf-node-role inference"
+  out="$(_lm_validate 1 1 1 services)"; rc=$?
+  assert_eq "${rc}" "1" "validate_learner_mode refuses an explicit --with-retraining"
+  out="$(_lm_validate 1 1 0 services)"; rc=$?
+  assert_eq "${rc}" "0" "validate_learner_mode accepts the default retraining value in learner mode (output: ${out})"
+  assert_contains "${out}" "WR=0 CHOICE=0" "learner mode forces WITH_RETRAINING=0 (second call sees the forced value)"
+  assert_eq "$(printf '%s\n' "${out}" | grep -c 'Learner mode: no GPUs')" "1" "the learner notice prints once across both calls"
+  out="$(_lm_validate 1 0 1 services 1)"; rc=$?
+  assert_contains "${out}" "--maxGPUs has no effect" "an explicit --maxGPUs is called out as having no effect"
+  out="$(_lm_validate 0 1 0 inference)"; rc=$?
+  assert_eq "${rc}" "0" "the default mode passes validation unchanged"
+  assert_eq "${out}" "WR=1 CHOICE=1" "the default mode changes nothing and prints nothing"
+  out="$(_lm_validate 2 1 0 services)"; rc=$?
+  assert_eq "${rc}" "1" "a remembered learnerMode other than 0/1 is refused"
+
+  # --- remembered state: the _reuse/state_set wiring, mirroring --maxGPUs ------
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_eq "$(grep -c '_reuse LEARNER_MODE     learnerMode   "${_GIVEN_LEARNER_MODE}"     "--learner-mode"' "${DEPLOY_SH}")" "1" "learnerMode is reused through _reuse like maxGPUs"
+  assert_eq "$(grep -c '"learnerMode=${LEARNER_MODE}"' "${DEPLOY_SH}")" "1" "learnerMode is recorded in the remembered block"
+  assert_eq "$(grep -c '"withRetraining=${_WITH_RETRAINING_CHOICE}"' "${DEPLOY_SH}")" "1" "the operator's own retraining choice is remembered, not the forced value"
+  assert_contains "${src}" 'WITH_RETRAINING="${_WITH_RETRAINING_CHOICE}"' "the forced value is undone before remembered values are applied"
+  # Reuse happens BEFORE the re-validation, and the mode is read before _reuse.
+  local prev_line reuse_line reval_line
+  prev_line="$(grep -n '_PREV_LEARNER_MODE="$(state_read' "${DEPLOY_SH}" | head -1 | cut -d: -f1)"
+  reuse_line="$(grep -n '_reuse LEARNER_MODE' "${DEPLOY_SH}" | cut -d: -f1)"
+  reval_line="$(grep -n '^  validate_learner_mode$' "${DEPLOY_SH}" | cut -d: -f1)"
+  if [[ -n "${prev_line}" && -n "${reuse_line}" && -n "${reval_line}" && "${prev_line}" -lt "${reuse_line}" && "${reuse_line}" -lt "${reval_line}" ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: previous mode read (%s) < _reuse (%s) < re-validation (%s)\n' "${prev_line}" "${reuse_line}" "${reval_line}" >&2
+  fi
+
+  # --- the real state library: a learner run's record round-trips -------------
+  local tmp; tmp="$(mktemp -d)"
+  out="$(DEPLOY_STATE_FILE="${tmp}/s.json" STATE_PYTHON=python3 "${sh}" -c '
+    set -euo pipefail
+    source "$1/lib/deploy_state.sh"
+    state_set dv1 remembered "region=us-east-1" "maxGPUs=3" "withRetraining=1" "learnerMode=1"
+    printf "LM=%s WR=%s\n" "$(state_read dv1 remembered.learnerMode)" "$(state_read dv1 remembered.withRetraining)"
+    printf "OTHER=[%s]\n" "$(state_read zz9 remembered.learnerMode)"
+  ' _ "${D}" 2>&1)"
+  assert_contains "${out}" "LM=1 WR=1" "learnerMode and the retraining choice are stored per prefix"
+  assert_contains "${out}" "OTHER=[]" "another prefix has no remembered learner mode"
+  rm -rf "${tmp}"
+
+  # --- the probe is told the mode (and nothing changes by default) -------------
+  out="$("${sh}" -c 'set -euo pipefail; WITH_RETRAINING=0 WITH_PREBID=0 SKIP_AGENTCORE=0 LEARNER_MODE=1 AWS_PROFILE=p
+    source "$1/lib/deploy_gate.sh"; _gate_flags | tr "\n" " "' _ "${D}" 2>&1)"
+  assert_eq "${out}" "--no-retraining --learner-mode --profile p " "learner mode passes --learner-mode (and --no-retraining) to the probe"
+  out="$("${sh}" -c 'set -euo pipefail; WITH_RETRAINING=1 WITH_PREBID=0 SKIP_AGENTCORE=0 AWS_PROFILE=p
+    source "$1/lib/deploy_gate.sh"; _gate_flags | tr "\n" " "' _ "${D}" 2>&1)"
+  assert_eq "${out}" "--profile p " "the default probe argv is unchanged"
+
+  # --- a mode switch forces Phases 1 and 3 ------------------------------------
+  assert_contains "${src}" 'force_phase 1 "the deployment mode changed' "a mode switch forces Phase 1 (served repository)"
+  assert_contains "${src}" 'force_phase 3 "the deployment mode changed' "a mode switch forces Phase 3 (manifests, node groups)"
+}
+
+# Shared by the render tests: the render functions from deploy.sh with fixed inputs.
+_learner_render_src() {
+  sed -n '/^LEARNER_MODEL_REPO=/p
+    /^_learner_transform() {/,/^}/p
+    /^render_cluster_config() {/,/^}/p
+    /^render_bootstrap_job() {/,/^}/p
+    /^render_manifest() {/,/^}/p
+    /^stage_served_repo() {/,/^}/p
+    /^reconcile_nodegroups_for_mode() {/,/^}/p' "${DEPLOY_SH}"
+}
+_LEARNER_RENDER_HARNESS='
+  set -euo pipefail
+  SCRIPT_DIR="$1"; PYTHON=python3; VERBOSE=1; DEPLOY_LOG=""
+  STACK_NAME=t-stack; STACK_PREFIX=t1; AWS_REGION=us-east-1; MAX_GPUS=3; ACCOUNT_ID=111111111111
+  REGISTRY=r; IMAGE_TAG=t; MODEL_BUCKET=b; TRITON_ROLE_ARN=arn:t; OPTIMIZER_ROLE_ARN=arn:o
+  ARTF_NODE_ROLE=services; COGNITO_USER_POOL_ID=p; ARTF_MUTATIONS_REQUIRED_SCOPE=""
+  CONTAINER_REGISTRY_TABLE=c; YIELD_FLOOR_MODEL_GROUP=f; YIELD_MARGIN_MODEL_GROUP=m
+  SAGEMAKER_TRAINING_ROLE_NAME=s; TRAINING_DATA_BUCKET=d; XGBOOST_TRAINING_IMAGE_URI=x
+  FEEDBACK_STREAM_NAME=fs; DEAL_YIELD_FEEDBACK_STREAM_NAME=dfs; OUTCOME_SIMULATOR_ENABLED=false
+  OUTCOME_SIMULATOR_WIN_RATE=""; OUTCOME_SIMULATOR_IMPRESSION_RATE=""; OUTCOME_SIMULATOR_CLICK_RATE=""
+  OUTCOME_SIMULATOR_CONVERSION_RATE=""; OUTCOME_SIMULATOR_CONVERSION_VALUE=""
+  GLUE_JOB_NAME=g; DEAL_YIELD_GLUE_JOB_NAME=dg; NCF_MODEL_LABEL=ncf-neumf-sample-0123456789ab
+  CLUSTER_NAME=t-stack-triton; RECOMMENDER_MODELS=(dlrm_bid_shader ncf_deal_manager)
+  log() { :; }; say() { printf "%s\n" "$*"; }; warn() { printf "[warn] %s\n" "$*"; }
+  quiet() { shift; "$@"; }
+  fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+'
+
+test_learner_served_repo() {
+  echo "test_learner_served_repo"
+  local tmp D="${SCRIPT_DIR}/.." out rc
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  for mode in 0 1; do
+    mkdir -p "${tmp}/m${mode}"
+    out="$("${sh}" -c "${_LEARNER_RENDER_HARNESS}${fn_src}
+      LEARNER_MODE=${mode}
+      stage_served_repo \"\$2\"" _ "${D}" "${tmp}/m${mode}" 2>&1)"; rc=$?
+    assert_eq "${rc}" "0" "stage_served_repo succeeds with LEARNER_MODE=${mode} (output: ${out})"
+    ( cd "${tmp}/m${mode}" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) > "${tmp}/m${mode}.sha"
+  done
+  # Default: exactly the committed repository plus the router model.py twice.
+  mkdir -p "${tmp}/expect"
+  cp -R "${D}/../source/triton/model_repository/." "${tmp}/expect/"
+  local m; for m in dlrm_bid_shader ncf_deal_manager; do
+    mkdir -p "${tmp}/expect/${m}/1"; cp "${D}/../source/triton/router/model.py" "${tmp}/expect/${m}/1/model.py"
+  done
+  ( cd "${tmp}/expect" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) > "${tmp}/expect.sha"
+  assert_eq "$(cat "${tmp}/m0.sha")" "$(cat "${tmp}/expect.sha")" "the default served repository is the committed repository plus the router model.py"
+  # Learner: same file list; only the five overlaid configs differ.
+  assert_eq "$(awk '{print $2}' "${tmp}/m1.sha")" "$(awk '{print $2}' "${tmp}/m0.sha")" "learner mode serves the same file list"
+  local differing
+  differing="$(diff "${tmp}/m0.sha" "${tmp}/m1.sha" | awk '/^>/{print $3}' | LC_ALL=C sort | tr '\n' ' ')"
+  assert_eq "${differing}" "./deal_yield_manager_floor/config.pbtxt ./deal_yield_manager_margin/config.pbtxt ./dlrm_bid_shader_canary/config.pbtxt ./dlrm_bid_shader_stable/config.pbtxt ./ncf_deal_manager_stable/config.pbtxt " "learner mode changes exactly the five engine/FIL configs"
+  assert_eq "$(grep -l 'KIND_GPU' "${tmp}"/m1/*/config.pbtxt 2>/dev/null | wc -l | tr -d ' ')" "0" "no learner-served config asks for a GPU"
+  assert_eq "$(grep -l 'onnxruntime_onnx' "${tmp}"/m1/*/config.pbtxt | wc -l | tr -d ' ')" "3" "three models are served by ONNX Runtime in learner mode"
+  assert_eq "$(grep -l 'onnxruntime_onnx' "${tmp}"/m0/*/config.pbtxt 2>/dev/null | wc -l | tr -d ' ')" "0" "the default repository serves no ONNX Runtime model"
+  rm -rf "${tmp}"
+}
+
+test_learner_render_no_gpu() {
+  echo "test_learner_render_no_gpu"
+  local tmp D="${SCRIPT_DIR}/.." out rc f
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  for mode in 0 1; do
+    mkdir -p "${tmp}/m${mode}"
+    out="$("${sh}" -c "${_LEARNER_RENDER_HARNESS}${fn_src}
+      LEARNER_MODE=${mode}
+      render_cluster_config \"\$2/cluster-config.yaml\"
+      for m in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml; do
+        render_manifest \"\$m\" \"\$2/\$m\"
+      done" _ "${D}" "${tmp}/m${mode}" 2>&1)"; rc=$?
+    assert_eq "${rc}" "0" "the render functions succeed with LEARNER_MODE=${mode} (output: ${out})"
+  done
+  assert_eq "$(grep -l 'nvidia.com/gpu' "${tmp}"/m1/*.yaml 2>/dev/null | wc -l | tr -d ' ')" "0" "no learner-rendered manifest references nvidia.com/gpu"
+  assert_eq "$(grep -c 'gpu-inference' "${tmp}/m1/cluster-config.yaml")" "0" "the learner cluster config has no gpu-inference group"
+  assert_contains "$(cat "${tmp}/m1/triton-deployment.yaml")" "role: services" "learner Triton is placed on the cpu-services node group"
+  assert_contains "$(cat "${tmp}/m1/orchestrator-deployment.yaml")" "name: DEPLOYMENT_MODE" "the learner orchestrator carries DEPLOYMENT_MODE"
+  assert_contains "$(cat "${tmp}/m0/triton-deployment.yaml")" 'nvidia.com/gpu: "1"' "the default Triton still requests a GPU"
+  assert_contains "$(cat "${tmp}/m0/cluster-config.yaml")" "name: gpu-inference" "the default cluster config still has the GPU group"
+  assert_not_contains "$(cat "${tmp}/m0/orchestrator-deployment.yaml")" "DEPLOYMENT_MODE" "the default orchestrator has no DEPLOYMENT_MODE"
+  # The two triton-*-nlb / orchestrator-internal-nlb manifests are identical in both modes.
+  for f in triton-internal-nlb.yaml orchestrator-internal-nlb.yaml; do
+    assert_eq "$(shasum -a 256 < "${tmp}/m1/${f}")" "$(shasum -a 256 < "${tmp}/m0/${f}")" "${f} renders the same in both modes"
+  done
+  # The default render is exactly the sed output (no transform on the default path).
+  assert_eq "$(grep -c 'learner_render.py' "${tmp}/m0/triton-deployment.yaml")" "0" "no learner header in a default render"
+  rm -rf "${tmp}"
+}
+
+test_learner_phase_structure() {
+  echo "test_learner_phase_structure"
+  local tmp D="${SCRIPT_DIR}/.." out rc calls
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  local mocks='
+    aws() {
+      printf "aws %s\n" "$*" >> "$CALLS"
+      if [[ "$1 $2" == "eks describe-nodegroup" ]]; then
+        case "$*" in
+          *"--nodegroup-name gpu-inference"*) [[ "${GPU_EXISTS}" == 1 ]] || return 1 ;;
+          *"--nodegroup-name cpu-services"*) [[ "$*" == *desiredSize* ]] && echo "${CPU_DESIRED}" ;;
+        esac
+      fi
+      return 0
+    }
+    eksctl() { printf "eksctl %s\n" "$*" >> "$CALLS"; return 0; }
+    kubectl() { printf "kubectl %s\n" "$*" >> "$CALLS"; return 0; }
+  '
+  _lm_reconcile() {  # _lm_reconcile <LEARNER_MODE> <_PREV_LEARNER_MODE> <GPU_EXISTS> <CPU_DESIRED>
+    : > "${tmp}/calls"
+    CALLS="${tmp}/calls" GPU_EXISTS="$3" CPU_DESIRED="$4" "${sh}" -c "${_LEARNER_RENDER_HARNESS}${mocks}${fn_src}
+      LEARNER_MODE=$1; _PREV_LEARNER_MODE='$2'
+      reconcile_nodegroups_for_mode" _ "${D}" 2>&1
+  }
+  out="$(_lm_reconcile 1 0 1 3)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "learner reconcile succeeds (output: ${out})"
+  assert_contains "${calls}" "--nodegroup-name gpu-inference --scaling-config minSize=0,maxSize=3,desiredSize=0" "learner scales an existing gpu-inference group to 0"
+  assert_not_contains "${calls}" "delete-nodegroup" "learner never deletes the GPU node group"
+  assert_not_contains "${calls}" "eksctl delete" "learner never deletes anything through eksctl"
+  assert_contains "${calls}" "--nodegroup-name cpu-services --scaling-config minSize=2,maxSize=8,desiredSize=4" "learner raises cpu-services to 4"
+  out="$(_lm_reconcile 1 1 0 4)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_not_contains "${calls}" "update-nodegroup-config" "learner on a learner cluster at 4 nodes changes nothing"
+  out="$(_lm_reconcile 0 1 0 4)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "standard after learner succeeds (output: ${out})"
+  assert_contains "${calls}" "eksctl create nodegroup --config-file" "standard after learner recreates the missing GPU group"
+  assert_contains "${calls}" "--include=gpu-inference" "only the gpu-inference group is created"
+  out="$(_lm_reconcile 0 1 1 4)"; calls="$(cat "${tmp}/calls")"
+  assert_not_contains "${calls}" "eksctl create" "standard after learner with the GPU group present creates nothing"
+  out="$(_lm_reconcile 0 '' 0 3)"; calls="$(cat "${tmp}/calls")"
+  assert_eq "${calls}" "" "the default path (never in learner mode) makes no call at all"
+  out="$(_lm_reconcile 0 0 0 3)"; calls="$(cat "${tmp}/calls")"
+  assert_eq "${calls}" "" "a standard prefix re-deployed in standard mode makes no call at all"
+
+  # --- GPU-only steps sit inside a LEARNER_MODE -eq 0 guard -------------------
+  _lm_guarded() {  # _lm_guarded <fixed-string>: is its first line inside an `if LEARNER_MODE -eq 0` block?
+    awk -v needle="$1" '
+      /^if \[\[ "\$\{LEARNER_MODE\}" -eq 0 \]\]; then$/ { g=1 }
+      /^fi # LEARNER_MODE -eq 0/ { g=0 }
+      /^else$/ && g { g=0 }
+      index($0, needle) { print (g ? "guarded" : "unguarded"); exit }
+    ' "${DEPLOY_SH}"
+  }
+  assert_eq "$(_lm_guarded 'quiet "kubectl apply model-optimizer-bootstrap Job"')" "guarded" "the optimizer bootstrap Job is applied only in standard mode"
+  assert_eq "$(_lm_guarded 'quiet "kubectl apply nvidia-device-plugin"')" "guarded" "the NVIDIA device plugin is applied only in standard mode"
+  assert_eq "$(_lm_guarded '--scheduled-action-name "${STACK_NAME}-gpu-nightly-shutdown"')" "guarded" "the nightly GPU shutdown is scheduled only in standard mode"
+  assert_eq "$(_lm_guarded 'GPU_NODES="$(kubectl get nodes -l nvidia.com/gpu=present')" "guarded" "the GPU node wait runs only in standard mode"
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_contains "${src}" '_k}" != "model-optimizer"' "learner mode drops the Model Optimizer image from Step 4"
+  assert_contains "${src}" 'if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then' "the GPU capacity and G/VT quota checks run only in standard mode"
+  assert_contains "${src}" "--quota-code L-1216C47A" "learner mode checks the Standard On-Demand vCPU quota instead"
+  assert_contains "${src}" 'upload_learner_onnx' "learner mode stages the ONNX exports for ONNX Runtime"
+  # The probe still finds the manifest list (deploy_status.py reads this literal).
+  assert_eq "$(grep -c '^_APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml)$' "${DEPLOY_SH}")" "1" "_APPLIED_MANIFESTS is unchanged"
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
 # Run all tests
 # =========================================================================
 test_k8s_rollout
@@ -1880,6 +2139,10 @@ test_demo_credentials_block
 test_ncf_build_wiring
 test_phase_staleness
 test_update_managed_policy
+test_learner_mode_flags
+test_learner_served_repo
+test_learner_render_no_gpu
+test_learner_phase_structure
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

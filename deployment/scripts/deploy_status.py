@@ -32,7 +32,7 @@ Three consequences worth stating, because they are the point:
 
 Usage:
     deploy_status.py --prefix bt1 [--region us-east-1] [--json]
-                     [--no-retraining] [--with-prebid] [--skip-agentcore]
+                     [--no-retraining] [--with-prebid] [--skip-agentcore] [--learner-mode]
                      [--expect-deals-seed-sha <sha256>]
                      [--expect-ncf-fingerprint <sha256>]
 
@@ -170,6 +170,14 @@ def phase_status(checks: List[Dict[str, Any]]) -> str:
 # deploy.sh (PHASE1_MARKER_KEY) and deployment/optimizer-bootstrap.json.
 PHASE1_MARKER_KEY = "deploy-markers/phase1.json"
 NCF_ENGINE_KEY = "triton-models/ncf_deal_manager_stable/1/model.plan"
+# Learner mode (deploy.sh --learner-mode) serves the Deal Scorer's Step 2 ONNX on
+# ONNX Runtime instead of a TensorRT engine, uploaded with the same
+# source-fingerprint metadata (deploy.sh upload_learner_onnx).
+NCF_SERVED_ONNX_KEY = "triton-models/ncf_deal_manager_stable/1/model.onnx"
+# The GPU node group. Learner mode creates none, and scales an existing one to 0.
+GPU_NODEGROUP = "gpu-inference"
+# The Model Optimizer image, which learner mode does not build.
+OPTIMIZER_IMAGE = "model-optimizer"
 # Engine metadata written by source/optimizer/app.py (S3 returns user metadata keys
 # lowercased, without the x-amz-meta- prefix). An engine with no provisioned-by
 # predates the metadata and counts as a bootstrap engine, as in the optimizer.
@@ -222,13 +230,17 @@ class Probe:
     # and the comparison that needs the value is skipped.
     expect_deals_seed_sha = ""
     expect_ncf_fingerprint = ""
+    # deploy.sh --learner-mode: no GPU node group and no Model Optimizer expected.
+    learner = False
 
     def __init__(self, prefix: str, region: str, *, retraining: bool,
                  prebid: bool, agentcore: bool, manifest_dir: str,
                  profile: Optional[str] = None,
                  expect_deals_seed_sha: str = "",
-                 expect_ncf_fingerprint: str = ""):
+                 expect_ncf_fingerprint: str = "",
+                 learner: bool = False):
         self.prefix = prefix
+        self.learner = learner
         self.region = region
         self.profile = profile or None
         self.expect_deals_seed_sha = expect_deals_seed_sha or ""
@@ -425,6 +437,8 @@ class Probe:
 
     def _expected_images(self) -> Tuple[str, ...]:
         names = list(CORE_IMAGES)
+        if self.learner:
+            names.remove(OPTIMIZER_IMAGE)
         if self.retraining:
             names.extend(RETRAINING_IMAGES)
         return tuple(names)
@@ -581,6 +595,10 @@ class Probe:
             # probe that cried FAILED every morning would be noise. But it is not OK
             # either: nothing can schedule on an empty group, so the dependent
             # workloads really are down. Reported as absent capacity, with the reason.
+            if desired == 0 and self.learner and ng == GPU_NODEGROUP:
+                out.append(self._check(f"node group {ng}", OK,
+                                       "scaled to 0; not used in learner mode"))
+                continue
             if desired == 0:
                 action = self._scheduled_action(d)
                 out.append(self._check(
@@ -686,8 +704,40 @@ class Probe:
     def phase3(self) -> List[Dict[str, Any]]:
         checks = self._workloads()
         if self.expect_ncf_fingerprint:
-            checks.append(self._ncf_engine())
+            checks.append(self._ncf_served_onnx() if self.learner else self._ncf_engine())
         return checks
+
+    def _ncf_served_onnx(self) -> Dict[str, Any]:
+        """Learner mode: the Deal Scorer ONNX that Triton serves on CPU, and its build.
+
+        Phase 1 uploads it with the build's source-fingerprint; a missing object or
+        another build's fingerprint means Phase 1 must run again. Read-only:
+        HeadObject.
+        """
+        name = "Deal Scorer served ONNX"
+        bucket = self._model_bucket()
+        if not bucket:
+            return self._check(name, UNKNOWN, "account not resolved")
+        s3 = self._client("s3")
+        if not s3:
+            return self._check(name, UNKNOWN, "no s3 client")
+        try:
+            head = s3.head_object(Bucket=bucket, Key=NCF_SERVED_ONNX_KEY)
+        except ClientError as exc:
+            code = _client_error_code(exc)
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return self._check(name, MISSING,
+                                   f"no model at {NCF_SERVED_ONNX_KEY}; learner mode stages it in Phase 1")
+            return self._check(name, UNKNOWN, f"{NCF_SERVED_ONNX_KEY}: {code or exc}")
+        except Exception as exc:
+            return self._check(name, UNKNOWN, f"{NCF_SERVED_ONNX_KEY}: {exc}")
+        meta = {str(k).lower(): str(v) for k, v in (head.get("Metadata") or {}).items()}
+        served_fp = meta.get(META_SOURCE_FINGERPRINT, "")
+        if served_fp == self.expect_ncf_fingerprint:
+            return self._check(name, OK, f"build {_short(served_fp)}")
+        return self._check(name, STALE,
+                           f"serves build {_short(served_fp)}, this checkout builds "
+                           f"{_short(self.expect_ncf_fingerprint)}")
 
     def _ncf_engine(self) -> Dict[str, Any]:
         """Compare the Deal Scorer engine's source-fingerprint with this checkout's.
@@ -1195,6 +1245,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-retraining", dest="retraining", action="store_false", default=True)
     ap.add_argument("--with-prebid", dest="prebid", action="store_true", default=False)
     ap.add_argument("--skip-agentcore", dest="agentcore", action="store_false", default=True)
+    ap.add_argument("--learner-mode", dest="learner", action="store_true", default=False,
+                    help="the deployment runs in learner mode (no GPU node group, no Model Optimizer)")
     ap.add_argument("--manifest-dir", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eks"))
     ap.add_argument("--expect-deals-seed-sha", default="",
@@ -1213,7 +1265,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                   prebid=args.prebid, agentcore=args.agentcore,
                   manifest_dir=args.manifest_dir, profile=args.profile,
                   expect_deals_seed_sha=args.expect_deals_seed_sha,
-                  expect_ncf_fingerprint=args.expect_ncf_fingerprint)
+                  expect_ncf_fingerprint=args.expect_ncf_fingerprint,
+                  learner=args.learner)
     result = probe.run()
     if args.shell:
         sys.stdout.write(render_shell(result) + "\n")
