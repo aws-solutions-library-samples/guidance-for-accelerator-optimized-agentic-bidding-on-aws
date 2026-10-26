@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Glue ETL Job for feature engineering and labeling of bid outcome data.
+  De-duplicates by request_id, engineers features (ROI, shade_ratio, win_rate_bucket),
+  and produces labeled training datasets in S3.
+  Requirements: 2.2, 2.3, 2.4, 2.6
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
+
+  GlueScriptS3Path:
+    Type: String
+    Description: >-
+      S3 path to the Glue ETL script (e.g., s3://my-scripts-bucket/etl/glue_feature_engineering.py)
+
+  DealYieldGlueScriptS3Path:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 path to the deal yield Glue ETL script (e.g.,
+      s3://my-scripts-bucket/etl/glue_deal_yield_feature_engineering.py) that
+      transforms raw_deal_yield_outcomes into labeled training data for the
+      Yield Optimizer's floor/margin XGBoost models (source/training/
+      xgboost_pipeline.py). Optional -- left empty (default), the deal yield
+      ETL job and its schedule are not created, matching this template's
+      original bid-shading-only scope. Not the same script as
+      GlueScriptS3Path above (that one is bid-shading-specific).
+
+  TrainingDataBucketName:
+    Type: String
+    Description: >-
+      Name of the S3 bucket where labeled training data will be written
+
+  RawOutcomesGlueDatabaseName:
+    Type: String
+    Default: feedback_pipeline
+    Description: >-
+      Name of the Glue Data Catalog database created by feedback_pipeline_cfn.yaml
+      (its GlueDatabaseName output — e.g. "feedback_pipeline" unprefixed, or
+      "<prefix>_feedback_pipeline" when a stack prefix is used). Must match
+      exactly, or the ETL job's "Table or view not found" error will occur.
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues:
+      - G.1X
+      - G.2X
+      - G.4X
+    Description: Glue worker type for the ETL job
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 100
+    Description: Number of Glue workers for the ETL job
+
+  ScheduleIntervalHours:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 24
+    Description: How often (in hours) the ETL job runs
+
+  WindowDurationHours:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 168
+    Description: Duration of the processing window in hours (matches schedule interval by default)
+
+  ConversionLagHours:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 168
+    Description: >-
+      How far in the past the rolling window ends, so a bid is only processed once its
+      downstream signals have had time to arrive. The window filters on the bid's own
+      timestamp, so a conversion that lands after its bid's window was processed can
+      never be joined and that row stays unlabelled. Set this to the longest signal lag
+      you expect. 0 processes up to the present moment and accepts that loss.
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  # Deal yield ETL resources (job, schedule, extra catalog-access policy) are
+  # only created when a script path is actually supplied -- see
+  # DealYieldGlueScriptS3Path's description above.
+  HasDealYieldScript: !Not [!Equals [!Ref DealYieldGlueScriptS3Path, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket - labeled training data output
+  # ---------------------------------------------------------------------------
+  TrainingDataBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 access logging is not enabled for this demo data bucket which is the documented choice for this guidance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-training-data-${AWS::AccountId}-${AWS::Region}'
+        - !Sub 'training-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !ImportValue
+                Fn::If:
+                  - HasStackPrefix
+                  - !Sub '${StackPrefix}-FeedbackPipelineKMSKeyArn'
+                  - 'FeedbackPipelineKMSKeyArn'
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  TrainingDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrainingDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLSOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TrainingDataBucket.Arn
+              - !Sub '${TrainingDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Glue ETL Job
+  # ---------------------------------------------------------------------------
+  GlueETLJobRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-glue-etl-feature-engineering-role'
+        - 'glue-etl-feature-engineering-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: RawOutcomesReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !ImportValue
+                    Fn::If:
+                      - HasStackPrefix
+                      - !Sub '${StackPrefix}-RawOutcomesBucketArn'
+                      - 'RawOutcomesBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        Fn::If:
+                          - HasStackPrefix
+                          - !Sub '${StackPrefix}-RawOutcomesBucketArn'
+                          - 'RawOutcomesBucketArn'
+        - PolicyName: TrainingDataWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !GetAtt TrainingDataBucket.Arn
+                  - !Sub '${TrainingDataBucket.Arn}/*'
+        - PolicyName: GlueScriptReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${GlueScriptS3Path}'
+                  # DealYieldFeatureEngineeringJob's ScriptLocation (and its
+                  # --extra-py-files reference back to GlueScriptS3Path
+                  # above) both need read access on this shared role.
+                  # Omitted (via AWS::NoValue) when DealYieldGlueScriptS3Path
+                  # is empty, to avoid a malformed "arn:aws:s3:::" resource.
+                  - !If
+                    - HasDealYieldScript
+                    - !Sub 'arn:aws:s3:::${DealYieldGlueScriptS3Path}'
+                    - !Ref 'AWS::NoValue'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !ImportValue
+                  Fn::If:
+                    - HasStackPrefix
+                    - !Sub '${StackPrefix}-FeedbackPipelineKMSKeyArn'
+                    - 'FeedbackPipelineKMSKeyArn'
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${RawOutcomesGlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${RawOutcomesGlueDatabaseName}/raw_bid_outcomes'
+                  # Granted unconditionally (regardless of HasDealYieldScript)
+                  # since this one role is shared by both the bid-shading and
+                  # deal-yield Glue jobs -- an unused grant on a table that may
+                  # not exist yet is harmless, and this avoids threading
+                  # Fn::If into a Resource list.
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${RawOutcomesGlueDatabaseName}/raw_deal_yield_outcomes'
+              - Effect: Allow
+                # --enable-glue-datacatalog requires glue:CreateDatabase per
+                # AWS docs ("a database called 'default' is created in the
+                # Data Catalog if it does not exist") -- scoped to the
+                # account's default database only, not a broad grant.
+                Action:
+                  - glue:CreateDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+
+  # ---------------------------------------------------------------------------
+  # AWS Glue ETL Job
+  # ---------------------------------------------------------------------------
+  FeatureEngineeringJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-feature-engineering-etl'
+        - 'feature-engineering-etl'
+      Description: >-
+        ETL job that de-duplicates bid outcomes, engineers features (ROI, shade_ratio,
+        win_rate_bucket), applies labeling, validates no raw PII, and writes labeled
+        Parquet training datasets.
+      Role: !GetAtt GlueETLJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${GlueScriptS3Path}'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        # Required for spark.read.table("<db>.<table>") to resolve against the
+        # Glue Data Catalog as an external Hive metastore -- without it Spark
+        # SQL has no metastore at all and raises "Table or view not found"
+        # even when the table genuinely exists and IAM permissions are correct
+        # (confirmed live). See AWS docs: "AWS Glue Data Catalog support for
+        # Spark SQL jobs".
+        '--enable-glue-datacatalog': ''
+        '--database_name': !Ref RawOutcomesGlueDatabaseName
+        '--table_name': raw_bid_outcomes
+        '--output_bucket': !Ref TrainingDataBucket
+        '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp/'
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 120
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # ---------------------------------------------------------------------------
+  # Glue Trigger - scheduled execution (every N hours)
+  # ---------------------------------------------------------------------------
+  FeatureEngineeringSchedule:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-feature-engineering-schedule'
+        - 'feature-engineering-schedule'
+      Description: !Sub 'Triggers the feature engineering ETL job every ${ScheduleIntervalHours} hours'
+      Type: SCHEDULED
+      Schedule: !Sub 'cron(0 */${ScheduleIntervalHours} * * ? *)'
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref FeatureEngineeringJob
+          Arguments:
+            # No window_start/window_end here: CloudFormation can only render
+            # static values at template time, not a computed "now" or "N
+            # hours ago" timestamp. window_hours is a static duration the
+            # script uses to self-compute its own rolling window at
+            # execution time (see glue_feature_engineering.py's
+            # _resolve_window()) — this is what actually makes the schedule
+            # work, unlike the previous --start_timestamp/--end_timestamp
+            # arguments which passed literal placeholder text.
+            '--window_hours': !Ref WindowDurationHours
+            # Holds the window back so downstream signals have landed before a
+            # bid is processed -- see ConversionLagHours' description.
+            '--conversion_lag_hours': !Ref ConversionLagHours
+
+  # ---------------------------------------------------------------------------
+  # AWS Glue ETL Job - Deal Yield (Yield Optimizer floor/margin outcomes)
+  #
+  # Parallel to FeatureEngineeringJob above, for
+  # etl/glue_deal_yield_feature_engineering.py -- reads raw_deal_yield_outcomes
+  # instead of raw_bid_outcomes, writes two labeled datasets (floor/margin
+  # targets) instead of one, into the SAME TrainingDataBucket (distinct
+  # prefixes: training-data-deal-yield-floor/, training-data-deal-yield-margin/
+  # -- see that script's module docstring). Reuses GlueETLJobRole (already
+  # granted read access to raw_deal_yield_outcomes above) rather than a
+  # second role, since both jobs need the same shape of permissions
+  # (RawOutcomesBucket read, TrainingDataBucket write, Glue catalog read).
+  # Only created when DealYieldGlueScriptS3Path is supplied.
+  # ---------------------------------------------------------------------------
+  DealYieldFeatureEngineeringJob:
+    Type: AWS::Glue::Job
+    Condition: HasDealYieldScript
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-feature-engineering-etl'
+        - 'deal-yield-feature-engineering-etl'
+      Description: >-
+        ETL job that de-duplicates deal yield (floor/margin) outcomes by
+        (request_id, deal_id, intent), reconstructs the Yield Optimizer's
+        inference-time feature vector, and writes two labeled Parquet
+        training datasets (floor target, margin target) for
+        XGBoostTrainingPipeline.
+      Role: !GetAtt GlueETLJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DealYieldGlueScriptS3Path}'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        # See FeatureEngineeringJob's identical argument above for why this
+        # is required (Glue Data Catalog as Spark SQL's Hive metastore).
+        '--enable-glue-datacatalog': ''
+        '--database_name': !Ref RawOutcomesGlueDatabaseName
+        '--table_name': raw_deal_yield_outcomes
+        '--output_bucket': !Ref TrainingDataBucket
+        '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp-deal-yield/'
+        # glue_deal_yield_feature_engineering.py imports _resolve_window()
+        # from glue_feature_engineering.py rather than duplicating it --
+        # Glue does NOT put ScriptLocation's own directory on sys.path
+        # automatically (confirmed against AWS's own --extra-py-files docs),
+        # so that sibling module must be listed explicitly here. Uses
+        # GlueScriptS3Path (this template's existing bid-shading script
+        # parameter) rather than a new one, since both scripts are uploaded
+        # to the same etl/ prefix by deploy_closed_loop.sh Step 2.
+        '--extra-py-files': !Sub 's3://${GlueScriptS3Path}'
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 120
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  # ---------------------------------------------------------------------------
+  # Glue Trigger - scheduled execution for the deal yield ETL job
+  # ---------------------------------------------------------------------------
+  DealYieldFeatureEngineeringSchedule:
+    Type: AWS::Glue::Trigger
+    Condition: HasDealYieldScript
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-feature-engineering-schedule'
+        - 'deal-yield-feature-engineering-schedule'
+      Description: !Sub 'Triggers the deal yield feature engineering ETL job every ${ScheduleIntervalHours} hours'
+      Type: SCHEDULED
+      Schedule: !Sub 'cron(0 */${ScheduleIntervalHours} * * ? *)'
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref DealYieldFeatureEngineeringJob
+          Arguments:
+            '--window_hours': !Ref WindowDurationHours
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  GlueETLJobName:
+    Description: Name of the Glue ETL job for feature engineering
+    Value: !Ref FeatureEngineeringJob
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-FeatureEngineeringJobName'
+        - 'FeatureEngineeringJobName'
+
+  GlueETLJobRoleArn:
+    Description: ARN of the IAM role used by the Glue ETL job
+    Value: !GetAtt GlueETLJobRole.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-GlueETLJobRoleArn'
+        - 'GlueETLJobRoleArn'
+
+  TrainingDataBucketName:
+    Description: Name of the S3 bucket storing labeled training data
+    Value: !Ref TrainingDataBucket
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingDataBucketName'
+        - 'TrainingDataBucketName'
+
+  TrainingDataBucketArn:
+    Description: ARN of the training data S3 bucket
+    Value: !GetAtt TrainingDataBucket.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-TrainingDataBucketArn'
+        - 'TrainingDataBucketArn'
+
+  DealYieldGlueETLJobName:
+    Condition: HasDealYieldScript
+    Description: Name of the Glue ETL job for deal yield feature engineering
+    Value: !Ref DealYieldFeatureEngineeringJob
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldGlueETLJobName'
+        - 'DealYieldGlueETLJobName'

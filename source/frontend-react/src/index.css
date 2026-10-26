@@ -1,4 +1,92 @@
+/* ───────────────────────────────────────────────────────────────────────────
+   Typography — Amazon Ember (Alexa/Echo brand typeface).
+   Self-hosted TrueType files in public/fonts/ (see public/fonts/README.md).
+   If absent, the UI falls back to the system stack (font-display: swap).
+   No separate "Display" cut is shipped — headings use Amazon Ember (700/800).
+   ─────────────────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Th.ttf") format("truetype");
+  font-weight: 100 200;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Lt.ttf") format("truetype");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_LtIt.ttf") format("truetype");
+  font-weight: 300;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Rg.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_RgIt.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/Amazon-Ember-Medium.ttf") format("truetype");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/Amazon-Ember-MediumItalic.ttf") format("truetype");
+  font-weight: 500;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_Bd.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_BdIt.ttf") format("truetype");
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_He.ttf") format("truetype");
+  font-weight: 800 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Amazon Ember";
+  src: url("/fonts/AmazonEmber_HeIt.ttf") format("truetype");
+  font-weight: 800 900;
+  font-style: italic;
+  font-display: swap;
+}
+
 :root {
+  /* Brand font stacks (FR-13) */
+  --font-sans: "Amazon Ember", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-display: "Amazon Ember", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
   --accent: #6366f1;
   --accent-light: #818cf8;
   --accent-glow: rgba(99,102,241,.15);
@@ -16,12 +104,21 @@
   --code-bg: #f8fafc;
   --editor-bg: #1e293b;
   --editor-text: #e2e8f0;
+
+  /* ── styleguide.md canvas + glow tokens (FR-12) ── */
+  --canvas-base: #f8fafc;
+  --surface-low: #f1f5f9;
+  --surface-raised: #ffffff;
+  --glow-neutral-ambient: rgba(148, 163, 184, 0.06);
+  --glow-brand-primary: rgba(99, 102, 241, 0.12);
+  --glow-brand-success: rgba(34, 197, 94, 0.10);
+  --glow-processing-halo: rgba(99, 102, 241, 0.18);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg);
   color: var(--text);
   font-size: clamp(13px, 1.1vw, 15px);
@@ -46,10 +143,6 @@ body {
   align-items: center;
   gap: 14px;
 }
-.header-logo {
-  height: 32px;
-  width: auto;
-}
 .header h1 { font-size: clamp(16px, 1.5vw, 20px); font-weight: 700; }
 .header h1 span {
   background: linear-gradient(135deg, var(--accent), #a855f7);
@@ -58,6 +151,25 @@ body {
 }
 .header .subtitle { font-size: clamp(10px, 0.9vw, 12px); color: var(--text-muted); margin-top: 1px; }
 .header-actions { display: flex; gap: 8px; align-items: center; }
+
+.header-nav { display: flex; gap: 2px; }
+.header-nav-link {
+  background: none;
+  border: none;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 6px;
+  transition: color .15s, background .15s;
+}
+.header-nav-link:hover { color: var(--text); background: var(--bg); }
+.header-nav-link.active {
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
 
 /* ── Transport Selector pill ── */
 .transport-pill {
@@ -168,19 +280,13 @@ body {
   
 }
 .scenario:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); transform: translateY(-1px); }
+/* `active` means "this is the scenario currently selected in the picker", so the
+   ring is all it should say. It used to also paint a green "✓ Sent" badge, which
+   was already loose when the sidebar listed every card and became plainly wrong
+   with the picker: selecting a scenario sets `active`, so the badge claimed the
+   scenario had been submitted the moment it was merely chosen. The loading spinner
+   below is the honest progress signal, and it fires on a real submission. */
 .scenario.active { border-color: var(--accent); box-shadow: 0 4px 20px var(--accent-glow); }
-.scenario.active::after {
-  content: '✓ Sent';
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  background: var(--green);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  padding: 3px 8px;
-  border-radius: 20px;
-}
 .scenario.loading::after {
   content: '';
   position: absolute;
@@ -194,7 +300,60 @@ body {
   animation: spin .6s linear infinite;
 }
 .scenario h3 { font-size: clamp(13px, 1.2vw, 15px); font-weight: 700; margin-bottom: 4px; }
+.scenario-models { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.scenario-model-chip {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: clamp(9px, 0.75vw, 10px);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: var(--surface-low, rgba(148,163,184,.15));
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.scenario-model-chip.rules-based {
+  font-weight: 500;
+  font-style: italic;
+  opacity: 0.85;
+}
 .scenario p { font-size: clamp(11px, 1vw, 13px); color: var(--text-secondary); line-height: 1.5; margin-bottom: 8px; }
+
+/* Every scenario is a publisher bid request, described the way the sell side reads
+   one: the page, the audience asserted on it, the demand eligible to compete. A
+   definition list, because the three keys label their values. */
+.scenario-brief {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  row-gap: 3px;
+  margin: 0 0 8px;
+  font-size: clamp(11px, 1vw, 12px);
+  line-height: 1.5;
+}
+.scenario-brief dt {
+  font-size: clamp(9px, 0.75vw, 10px);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  /* Aligns the key with the first line of its value rather than the cell centre. */
+  padding-top: 2px;
+  white-space: nowrap;
+}
+.scenario-brief dd {
+  margin: 0;
+  color: var(--text-secondary);
+}
+/* How the Deal Scorer was trained, on every card whose scenario it scores. */
+.scenario .scenario-disclosure {
+  margin: 0 0 8px;
+  font-size: clamp(10px, 0.9vw, 11px);
+  line-height: 1.45;
+  font-style: italic;
+  color: var(--text-secondary);
+}
 .scenario.disabled {
   opacity: 0.5;
   pointer-events: none;
@@ -217,6 +376,7 @@ body {
 .tag.seg { background: rgba(99,102,241,.1); color: var(--accent); }
 .tag.deal { background: rgba(245,158,11,.1); color: #d97706; }
 .tag.metric { background: rgba(6,182,212,.1); color: #0891b2; }
+.tag.yield { background: rgba(190,24,93,.1); color: #be185d; }
 
 /* ── Info bar ── */
 .info-bar {
@@ -374,6 +534,21 @@ body {
 .flow-stop[data-status="ok"] { border-color: var(--green); box-shadow: 0 0 0 2px rgba(34, 197, 94, .18); }
 .flow-stop[data-status="failed"] { border-color: var(--red); box-shadow: 0 0 0 2px rgba(239, 68, 68, .22); background: rgba(239, 68, 68, .04); }
 .flow-stop[data-status="unknown"] { border-color: var(--text-muted); opacity: .7; }
+/* Statuses the orchestrator now reports distinctly (see
+   source/orchestrator/container_registry.py). Without these they fell through
+   unstyled, which read as "unknown" and lost the distinction the vocabulary
+   exists to draw.
+   - no_mutations: reached and ran, chose not to mutate. Neutral, not a failure,
+     and deliberately not green either — nothing changed.
+   - disabled/skipped: not called. Faded, and NOT red: a container the operator
+     switched off must not look broken.
+   - unreachable/error/timeout: real failures, same treatment as "failed". */
+.flow-stop[data-status="no_mutations"] { border-color: var(--border); box-shadow: 0 0 0 2px rgba(148, 163, 184, .14); }
+.flow-stop[data-status="disabled"],
+.flow-stop[data-status="skipped"] { border-color: var(--border); opacity: .55; }
+.flow-stop[data-status="unreachable"],
+.flow-stop[data-status="error"],
+.flow-stop[data-status="timeout"] { border-color: var(--red); box-shadow: 0 0 0 2px rgba(239, 68, 68, .22); background: rgba(239, 68, 68, .04); }
 
 @keyframes flow-stop-pulse {
   0%, 100% { transform: translateY(0); box-shadow: 0 0 0 3px var(--accent-glow); }
@@ -593,18 +768,9 @@ body {
   border-radius: 12px;
 }
 
-.total-latency-summary {
-  font-size: clamp(14px, 1.3vw, 17px);
-  font-weight: 600;
-  color: var(--text);
-  text-align: center;
-  margin-bottom: 10px;
-  font-variant-numeric: tabular-nums;
-}
-
-.total-latency-summary strong {
-  font-weight: 800;
-}
+/* `.total-latency-summary` and the `--network` segment/dot rules are gone with the
+   markup they styled: the browser round-trip is not part of a bid path, and a
+   total that folded it in was not a figure worth showing. */
 
 .latency-bar-stack {
   display: flex;
@@ -628,9 +794,6 @@ body {
   background: #f59e0b;
 }
 
-.latency-bar-segment--network {
-  background: var(--text-muted);
-}
 
 .latency-breakdown-legend {
   display: flex;
@@ -662,9 +825,6 @@ body {
   background: #f59e0b;
 }
 
-.latency-legend-dot--network {
-  background: var(--text-muted);
-}
 
 .latency-legend-label {
   color: var(--text-secondary);
@@ -674,6 +834,66 @@ body {
   font-weight: 700;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+/* Per-stage strip under the legend: one chip per sequential stage, in run
+   order, so the reader can see which stage the agent time came from. Shown
+   only when the orchestrator reported stages. */
+.latency-stage-strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 10px;
+}
+.latency-stage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: clamp(10px, 0.85vw, 11px);
+  color: var(--text-secondary);
+  background: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(148, 163, 184, 0.06);
+  transition: box-shadow 0.2s ease;
+}
+.latency-stage-chip:hover {
+  box-shadow:
+    0px 0px 0px 1px rgba(99, 102, 241, 0.15),
+    0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.latency-stage-chip-name {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.latency-stage-chip-value {
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Stage number in front of an agent's name on the timeline: the sequential
+   stage the orchestrator ran it in (1 enrich, 2 deals, 3 yield, 4 price). */
+.agent-stage-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 6px;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 700;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0px 1px 2px rgba(0, 0, 0, 0.02), 0px 2px 8px rgba(148, 163, 184, 0.06);
+  font-variant-numeric: tabular-nums;
+  vertical-align: middle;
 }
 
 /* ── Error overlay ── */
@@ -928,6 +1148,37 @@ body {
 .container-status.ready { background: rgba(34,197,94,.1); color: var(--green); }
 .container-status.degraded { background: rgba(245,158,11,.1); color: #d97706; }
 .container-status.unreachable { background: rgba(239,68,68,.1); color: var(--red); }
+/* "no changes" — reached and ran, produced nothing. Neutral: not a success
+   worth green, not a failure worth red. */
+.container-status.no-mutations { background: rgba(148,163,184,.12); color: var(--text-muted); }
+/* "inactive" — deliberately switched off, and "not applicable" — intents did not
+   match. Neither is a fault, so neither is coloured like one. The dashed border
+   distinguishes a deliberate non-participation from a neutral outcome. */
+.container-status.disabled {
+  background: rgba(148,163,184,.08);
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  padding: 2px 9px;
+}
+
+/* Intent chips on a container row. The shared variant marks an intent claimed by
+   more than one container: both are called and both sets of mutations merge, so
+   merge order decides which value survives downstream. */
+.intent-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(99,102,241,.08);
+  color: var(--text-muted);
+  border: 1px solid rgba(99,102,241,.15);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.intent-chip--shared {
+  background: rgba(245,158,11,.1);
+  color: #d97706;
+  border-color: rgba(245,158,11,.25);
+}
 
 /* ── GPU Control ── */
 .gpu-control {
@@ -957,6 +1208,41 @@ body {
 .gpu-status-stopped { background: rgba(239, 68, 68, 0.12); color: #dc2626; }
 .gpu-status-scaling { background: rgba(245, 158, 11, 0.12); color: #d97706; }
 .gpu-status-error { background: rgba(239, 68, 68, 0.08); color: var(--text-muted); }
+/* Distinct from .gpu-status-stopped: stopped is a state the operator chose, blocked
+   is one they need to act on. The halo draws the eye without a hard stroke. */
+.gpu-status-blocked {
+  background: rgba(239, 68, 68, 0.14);
+  color: #b91c1c;
+  animation: gpu-blocked-halo 2.4s infinite ease-in-out;
+}
+@keyframes gpu-blocked-halo {
+  0%, 100% {
+    box-shadow:
+      0px 0px 0px 1px rgba(239, 68, 68, 0.20),
+      0px 2px 8px rgba(239, 68, 68, 0.08);
+  }
+  50% {
+    box-shadow:
+      0px 0px 0px 3px rgba(239, 68, 68, 0.28),
+      0px 6px 20px rgba(239, 68, 68, 0.16);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gpu-status-blocked { animation: none; box-shadow: 0px 0px 0px 1px rgba(239, 68, 68, 0.24); }
+}
+.gpu-control-detail {
+  font-size: clamp(11px, 1vw, 12px);
+  line-height: 1.5;
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0 0 12px;
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(239, 68, 68, 0.06);
+}
 .btn-gpu-start, .btn-gpu-stop {
   font-size: clamp(11px, 1vw, 13px);
   font-weight: 600;
@@ -983,6 +1269,13 @@ body {
   animation: spin .6s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* Gentle breathing halo for "running/processing" flow + pipeline nodes
+   (referenced by .cl-pi-stage--running and .cl-flow-node--processing). */
+@keyframes sg-halo-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(99,102,241,.2), 0 2px 8px rgba(99,102,241,.08); }
+  50%      { box-shadow: 0 0 0 3px rgba(99,102,241,.3), 0 8px 24px var(--glow-brand-primary); }
+}
 
 /* ── Raw Panel (below timeline, full width) ── */
 .raw-panel {
@@ -1111,6 +1404,21 @@ body {
   min-width: 45px;
   text-align: right;
   color: var(--text);
+}
+.tuner-row-toggle label {
+  min-width: 0;
+  flex: 1;
+}
+.tuner-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+.tuner-row-toggle input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  flex: none;
 }
 .tuner-send {
   margin-top: 10px;
@@ -2132,6 +2440,115 @@ body {
   height: 0;
 }
 
+/* ── Load Test Outcome-Capture Targeting (FR-2/FR-3) ── */
+.loadtest-target {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.loadtest-target-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.loadtest-target-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-solid);
+  color: var(--text);
+  font-size: clamp(10px, 0.9vw, 12px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.loadtest-target-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0px 0px 0px 3px var(--accent-glow);
+}
+
+/* ── Load Test Traffic Scenario selector ── */
+.loadtest-scenario {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.loadtest-scenario-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.loadtest-scenario-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-solid);
+  color: var(--text);
+  font-size: clamp(10px, 0.9vw, 12px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.loadtest-scenario-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0px 0px 0px 3px var(--accent-glow);
+}
+
+.loadtest-scenario-detail {
+  margin: 0;
+  font-size: clamp(9px, 0.85vw, 11px);
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.loadtest-target-variant {
+  display: flex;
+  gap: 6px;
+}
+
+.loadtest-target-variant-option {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.loadtest-target-variant-option:hover:not(:has(input:disabled)) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.loadtest-target-variant-option.active {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+.loadtest-target-variant-option input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
 /* ── Load Test Extra Stats ── */
 .loadtest-extra-stats {
   margin-top: 12px;
@@ -2596,4 +3013,2400 @@ body {
 .auth-signout:hover {
   color: var(--text-primary, #e0e0e0);
   border-color: var(--text-secondary, #888);
+}
+
+/* NOTE: The pre-redesign "Model Tuning Page" cl-* block was removed here. The
+   redesigned closed-loop panel (agent reasoning + architecture-mapped flow) is
+   defined below, after the styleguide utilities. See ClosedLoopPanel.jsx. */
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Styleguide utilities (styleguide.md — FR-12). Light canvas, ambient glows,
+   subtle feedback. Guardrails: static glow/shadow transitions 150–250ms;
+   processing halo ≥ 1.8s/cycle; box-shadow blur ≤ 24px; text contrast ≥ 4.5:1.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Display typeface for headings (Amazon Ember Display). */
+h1, h2, h3, .sg-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+/* Three-point ambient elevation for cards/containers/panels. */
+.sg-elevated {
+  background: var(--surface-raised);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px var(--glow-neutral-ambient),
+    0px 8px 24px rgba(148, 163, 184, 0.04);
+  border-radius: 14px;
+}
+
+/* Interactive "glow state" — colored aura on hover, ring halo on focus. */
+.sg-interactive {
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sg-interactive:hover {
+  box-shadow:
+    0px 0px 0px 1px rgba(99, 102, 241, 0.15),
+    0px 4px 20px var(--glow-brand-primary);
+}
+.sg-interactive:focus-visible {
+  outline: none;
+  box-shadow:
+    0px 0px 0px 2px var(--surface-raised),
+    0px 0px 0px 5px var(--glow-brand-primary),
+    inset 0px 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+/* Processing "color halo" — breathing aura for in-flight/compute states. */
+.state-processing {
+  animation: sg-halo-pulse 2.2s infinite ease-in-out;
+}
+@keyframes sg-halo-pulse {
+  0% {
+    box-shadow:
+      0px 0px 0px 1px rgba(99, 102, 241, 0.2),
+      0px 2px 8px rgba(99, 102, 241, 0.08);
+  }
+  50% {
+    box-shadow:
+      0px 0px 0px 3px rgba(99, 102, 241, 0.3),
+      0px 8px 24px var(--glow-processing-halo);
+  }
+  100% {
+    box-shadow:
+      0px 0px 0px 1px rgba(99, 102, 241, 0.2),
+      0px 2px 8px rgba(99, 102, 241, 0.08);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .state-processing { animation: none; }
+}
+
+/* Success-tinted ambient (e.g. promote / applied states). */
+.sg-glow-success {
+  box-shadow: 0px 0px 0px 1px rgba(34, 197, 94, 0.2), 0px 4px 20px var(--glow-brand-success);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Closed-Loop panel (Adaptive Bidding & Governance) — styleguide.md (FR-12/FR-13)
+   Light canvas, ambient elevation, gentle glows, architecture-mapped circle flow.
+   ══════════════════════════════════════════════════════════════════════════ */
+.cl-page { padding: 4px 2px 40px; }
+.cl-page-header { margin-bottom: 18px; }
+.cl-page-header h2 { font-family: var(--font-display); font-size: clamp(20px, 2vw, 26px); font-weight: 700; color: var(--text); }
+.cl-page-desc { font-size: clamp(12px, 1.1vw, 14px); color: var(--text-secondary); line-height: 1.5; margin-top: 4px; max-width: 720px; }
+
+.cl-layout { display: grid; grid-template-columns: minmax(0, 420px) minmax(0, 1fr); gap: 24px; align-items: start; margin-bottom: 20px; }
+@media (max-width: 1024px) { .cl-layout { grid-template-columns: 1fr; } }
+.cl-layout-left { min-width: 0; }
+.cl-layout-right { min-width: 0; position: sticky; top: 84px; }
+
+.cl-section-title {
+  font-family: var(--font-display);
+  font-size: clamp(11px, 1vw, 13px); font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-muted); margin: 18px 0 10px;
+}
+
+/* ── Collapsible section (native <details>) — used for the demoted
+   "Governance Agent Testing" harness, collapsed by default. ── */
+.cl-collapsible {
+  margin: 24px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+  overflow: hidden;
+}
+.cl-collapsible-summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 14px 18px;
+  font-family: var(--font-display);
+  font-size: clamp(12px, 1.05vw, 14px);
+  font-weight: 700;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: color .2s ease, background .2s ease;
+}
+.cl-collapsible-summary:hover { color: var(--accent); }
+.cl-collapsible-summary:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-glow);
+}
+/* Hide the default marker and draw our own rotating chevron. */
+.cl-collapsible-summary::-webkit-details-marker { display: none; }
+.cl-collapsible-summary::before {
+  content: "";
+  width: 8px; height: 8px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .2s ease;
+  flex: 0 0 auto;
+}
+.cl-collapsible[open] > .cl-collapsible-summary::before { transform: rotate(45deg); }
+.cl-collapsible-body {
+  padding: 4px 18px 18px;
+  border-top: 1px solid var(--border);
+}
+.cl-collapsible-note {
+  margin: 12px 0 16px;
+  font-size: clamp(10px, 0.9vw, 12px);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+/* ── Controls bar — single compact row: scenario select, model select, run
+   button, matching the prototype's controls-bar (not a scenario-card grid). ── */
+.cl-controls-bar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 12px 16px; border-radius: 12px;
+  background: var(--surface-raised); border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+}
+.cl-control-group { display: flex; align-items: center; gap: 8px; }
+.cl-control-group label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+.cl-run-status { font-size: 11px; color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ── Scenario cards ── */
+.cl-scenario-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 560px) { .cl-scenario-grid { grid-template-columns: 1fr; } }
+.cl-scenario-card {
+  padding: 0; color: var(--text);
+  display: flex; flex-direction: column; font-family: inherit; overflow: hidden;
+}
+.cl-scenario-card.selected {
+  box-shadow: 0 0 0 2px var(--accent), 0 6px 22px var(--glow-brand-primary);
+}
+.cl-scenario-card-btn {
+  text-align: left; padding: 14px 14px 10px; cursor: pointer; color: inherit;
+  display: flex; flex-direction: column; gap: 6px; font-family: inherit;
+  background: none; border: none; width: 100%;
+}
+/* Selected-scenario "peek" card (single card, not a grid) — same body layout
+   as the button variant, minus the click-to-select affordance. */
+.cl-scenario-peek { margin-bottom: 20px; }
+.cl-scenario-card-body {
+  padding: 14px 14px 10px; display: flex; flex-direction: column; gap: 6px;
+}
+.cl-scenario-label { font-weight: 700; font-size: clamp(13px, 1.1vw, 14px); }
+.cl-scenario-desc { font-size: clamp(11px, 1vw, 12px); color: var(--text-secondary); line-height: 1.45; }
+.cl-scenario-hint { font-size: clamp(10px, 0.9vw, 12px); color: var(--text-secondary); margin-top: 2px; }
+.cl-hint-tag {
+  display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--accent); background: var(--glow-brand-primary);
+  padding: 1px 7px; border-radius: 10px; margin-right: 4px;
+}
+.cl-samples-link {
+  text-align: left; padding: 8px 14px; cursor: pointer; font-family: inherit;
+  background: var(--surface-low); border: none; border-top: 1px solid var(--border);
+  font-size: 11px; font-weight: 600; color: var(--accent);
+}
+.cl-samples-link:hover { background: var(--glow-brand-primary); }
+
+.cl-run-row { display: flex; gap: 12px; align-items: center; margin: 16px 0 4px; }
+.cl-select {
+  font-family: inherit; font-size: clamp(11px, 1vw, 13px); padding: 6px 10px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--surface-raised); color: var(--text);
+}
+
+/* ── Right column: empty + flow ── */
+.cl-empty { padding: 40px 24px; text-align: center; color: var(--text-muted); font-size: clamp(12px, 1.1vw, 14px); line-height: 1.6; }
+.cl-flow { padding: 22px 20px; }
+
+.cl-flow-track { display: flex; align-items: flex-start; justify-content: center; gap: 4px; flex-wrap: wrap; }
+.cl-flow-connector {
+  flex: 0 0 28px; height: 2px; margin-top: 34px; border-radius: 2px;
+  background: var(--border); opacity: .5; transition: background .2s ease, opacity .2s ease;
+}
+.cl-flow-connector.active { background: var(--accent); opacity: .55; }
+
+.cl-flow-node {
+  width: 96px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center;
+  opacity: 0; transform: translateY(6px);
+  transition: opacity .25s ease, transform .25s ease;
+}
+.cl-flow-node.revealed { opacity: 1; transform: translateY(0); }
+.cl-flow-icon {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-raised); color: var(--text-secondary);
+  border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+  transition: color .2s ease, box-shadow .25s ease;
+}
+.cl-flow-label { font-size: 11px; font-weight: 700; color: var(--text); line-height: 1.2; }
+.cl-flow-service { font-size: 9px; color: var(--text-muted); line-height: 1.2; }
+
+/* Node states — colored icon ring + gentle glow (no harsh strokes) */
+.cl-flow-node--ok .cl-flow-icon { color: var(--green); box-shadow: 0 0 0 1px rgba(34,197,94,.25), 0 4px 18px var(--glow-brand-success); }
+.cl-flow-node--processing .cl-flow-icon { color: var(--accent); animation: sg-halo-pulse 2.2s infinite ease-in-out; }
+.cl-flow-node--error .cl-flow-icon { color: var(--red); box-shadow: 0 0 0 1px rgba(239,68,68,.25), 0 4px 16px rgba(239,68,68,.10); }
+.cl-flow-node--warn .cl-flow-icon { color: #d97706; box-shadow: 0 0 0 1px rgba(245,158,11,.25), 0 4px 16px var(--aws-glow); }
+.cl-flow-node--skip .cl-flow-icon { color: var(--text-muted); opacity: .85; }
+.cl-flow-node--event .cl-flow-icon { color: var(--text-muted); border-style: dashed; }
+.cl-flow-node--pending .cl-flow-icon { color: var(--text-muted); opacity: .6; }
+
+/* ── Detail panels below the track ── */
+.cl-flow-details { margin-top: 18px; display: flex; flex-direction: column; gap: 10px; }
+.cl-flow-detail {
+  background: var(--surface-low); border-radius: 12px; padding: 12px 14px;
+  border-left: 3px solid var(--border); animation: cl-fade-in .25s ease;
+}
+.cl-flow-detail--ok { border-left-color: var(--green); }
+.cl-flow-detail--error { border-left-color: var(--red); }
+.cl-flow-detail--warn { border-left-color: #d97706; }
+.cl-flow-detail--event { border-left-color: var(--text-muted); }
+.cl-flow-detail-head { font-size: 11px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.cl-flow-detail-head span { color: var(--text-muted); font-weight: 500; }
+@keyframes cl-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+.cl-detail-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cl-dur { font-size: 10px; font-weight: 600; color: var(--text-muted); background: var(--surface-raised); border-radius: 8px; padding: 1px 7px; }
+.cl-kv { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--text-secondary); }
+.cl-kv b { color: var(--text); font-variant-numeric: tabular-nums; }
+.cl-kv small { color: var(--text-muted); }
+
+.cl-rationale {
+  font-size: 12.5px; line-height: 1.6; color: var(--text); margin: 4px 0 8px;
+  background: var(--surface-raised); border-radius: 10px; padding: 10px 12px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+}
+/* Rendered markdown (MarkdownLite) inside the rationale card */
+.cl-rationale > :first-child { margin-top: 0; }
+.cl-rationale > :last-child { margin-bottom: 0; }
+.cl-rationale p { margin: 0 0 8px; }
+.cl-rationale ul, .cl-rationale ol { margin: 4px 0 8px; padding-left: 18px; }
+.cl-rationale li { margin: 2px 0; }
+.cl-rationale strong { font-weight: 700; color: var(--text); }
+.cl-rationale em { font-style: italic; }
+.cl-rationale code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  background: var(--surface-low); padding: 1px 5px; border-radius: 5px;
+}
+.cl-updates { display: flex; flex-direction: column; gap: 8px; }
+.cl-update { padding: 10px 12px; }
+.cl-update-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--text); flex-wrap: wrap; }
+.cl-update-reason { font-size: 11.5px; color: var(--text-secondary); margin-top: 4px; line-height: 1.45; }
+
+.cl-chip { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: 10px; }
+.cl-chip-skip { background: rgba(148,163,184,.18); color: var(--text-secondary); }
+.cl-chip-applied { background: var(--glow-brand-success); color: #15803d; }
+
+.cl-rec-badge, .cl-approval-badge {
+  display: inline-block; align-self: flex-start; width: auto; flex: none;
+  color: #fff; font-size: 10px; font-weight: 700; padding: 3px 12px; border-radius: 20px; letter-spacing: .03em;
+}
+/* A registry version trained on sample interactions (training_data "sample").
+   Indigo 700 on the brand wash over a white row: above 4.5:1. */
+.cl-sample-badge {
+  display: inline-block; margin-left: 6px; vertical-align: middle;
+  font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: #4338ca; background: var(--glow-brand-primary, rgba(99, 102, 241, 0.12));
+  border-radius: 20px; padding: 2px 8px; white-space: nowrap; cursor: help;
+}
+
+/* Governance reason for a model version's approval status. The cell shows a
+   short lead-in; the full text (which can be an entire HTTP error body) is on
+   the title attribute, so the row height stays stable. */
+.cl-approval-reason {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; line-height: 1.4; cursor: help;
+}
+/* Marks a rejection caused by a failed pipeline step rather than by a model
+   losing its A/B test — the two read identically without it. */
+.cl-approval-reason-tag {
+  display: inline-block; flex: none;
+  font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: #b45309; background: rgba(245, 158, 11, .12);
+  border-radius: 20px; padding: 2px 8px; white-space: nowrap;
+}
+/* Qualifier under a preselected control run, stating which baseline it actually
+   is so a most-recent fallback is never read as the training data. */
+.cl-control-note {
+  margin-top: 4px; font-size: 11px; line-height: 1.45; color: var(--text-muted);
+}
+/* Glue failure text inside an honest-state block. Truncated inline with the full
+   message on hover, since a Spark stack trace would otherwise dominate the card. */
+.cl-etl-error-detail {
+  margin-top: 6px; font-size: 11px; line-height: 1.45; cursor: help;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #92400e; word-break: break-word;
+}
+/* Honest unknown/unreachable states (no fabricated data). */
+.cl-honest {
+  font-size: 12px; color: #b45309; background: rgba(245, 158, 11, .10);
+  border-radius: 8px; padding: 8px 10px; line-height: 1.45;
+}
+.cl-honest-block { margin-bottom: 12px; }
+
+/* ── Persisted-state blocks + tables ── */
+.cl-block { padding: 14px 16px; margin-top: 14px; }
+.cl-block-title { font-family: var(--font-display); font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 10px; }
+.cl-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.cl-table th { text-align: left; color: var(--text-muted); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.cl-table td { padding: 5px 8px; border-bottom: 1px solid rgba(148,163,184,.12); color: var(--text); vertical-align: top; }
+.cl-table tr:last-child td { border-bottom: none; }
+
+/* ── Sample outcomes modal ── */
+.cl-modal-overlay {
+  position: fixed; inset: 0; background: rgba(15, 23, 42, .45);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  z-index: 1000; animation: cl-fade-in .2s ease;
+}
+.cl-modal {
+  background: var(--surface-raised); border-radius: 16px; padding: 20px 22px;
+  max-width: 640px; width: 100%; max-height: 80vh; overflow-y: auto;
+  border: 1px solid rgba(255,255,255,.7);
+}
+.cl-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.cl-modal-title { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--text); }
+.cl-modal-close {
+  background: var(--surface-low); border: none; border-radius: 8px; width: 26px; height: 26px;
+  color: var(--text-secondary); cursor: pointer; font-size: 12px; line-height: 1;
+}
+.cl-modal-close:hover { background: var(--glow-brand-primary); color: var(--accent); }
+.cl-modal-note {
+  font-size: 11.5px; color: var(--text-secondary); line-height: 1.5;
+  background: var(--surface-low); border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   ARTF mutation framing (Model Governance panel) — mutation-intent cards,
+   technical popovers, verdict card, bidstream-impact card, session audit,
+   built on the styleguide token system.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Pipeline bar (top of page, icon steps) — sized and animated to match
+   the Adaptive Bidding FlowTrack (.cl-flow-node / .cl-flow-icon) so both
+   closed-loop views feel consistent. ── */
+.cl-pipeline-bar {
+  display: flex; align-items: flex-start; justify-content: center; gap: 4px;
+  padding: 22px 20px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.cl-pi-stage {
+  width: 96px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center;
+  opacity: 0; transform: translateY(6px);
+  transition: opacity .25s ease, transform .25s ease;
+}
+.cl-pi-stage.revealed { opacity: 1; transform: translateY(0); }
+.cl-pi-icon {
+  width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); background: var(--surface-raised);
+  border: 1px solid rgba(255,255,255,.7);
+  box-shadow: 0 1px 2px rgba(0,0,0,.02), 0 4px 16px var(--glow-neutral-ambient);
+  transition: color .2s ease, box-shadow .25s ease, border-color .25s ease;
+}
+.cl-pi-icon svg { width: 24px; height: 24px; }
+.cl-pi-name { font-size: 12px; font-weight: 700; text-align: center; color: var(--text); line-height: 1.2; }
+.cl-pi-service { font-size: 10px; color: var(--text-muted); text-align: center; line-height: 1.2; }
+.cl-pi-conn {
+  flex: 0 0 28px; height: 2px; margin-top: 34px; border-radius: 2px;
+  background: var(--border); opacity: .5; transition: background .2s ease, opacity .2s ease;
+}
+.cl-pi-conn.active { background: var(--accent); opacity: .55; }
+
+/* Stage states — colored icon ring + gentle glow, matching .cl-flow-node--* */
+.cl-pi-stage--active .cl-pi-icon { color: var(--green); box-shadow: 0 0 0 1px rgba(34,197,94,.25), 0 4px 18px var(--glow-brand-success); }
+.cl-pi-stage--running .cl-pi-icon { color: var(--accent); box-shadow: 0 0 0 1px rgba(99,102,241,.25), 0 4px 18px var(--glow-brand-primary); animation: sg-halo-pulse 2.2s infinite ease-in-out; }
+.cl-pi-stage--error .cl-pi-icon { color: var(--red); box-shadow: 0 0 0 1px rgba(239,68,68,.25), 0 4px 16px rgba(239,68,68,.10); }
+.cl-pi-stage--done .cl-pi-icon { color: var(--text-muted); }
+
+/* ── Step-by-step log (simple text lines, not per-stage detail cards) ── */
+.cl-steplog { font-size: 11px; line-height: 2; color: var(--text-secondary); }
+.cl-steplog-line { padding: 2px 0; }
+.cl-steplog-line strong { color: var(--text); }
+
+.cl-mutation-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;
+}
+@media (max-width: 780px) { .cl-mutation-grid { grid-template-columns: 1fr; } }
+
+/* Two compact sections side by side instead of each spanning the full page
+   width with most of it empty. Same idiom as .cl-mutation-grid above; the
+   breakpoint is wider (980px) because these columns hold selects with long
+   option text (run ids plus timestamps) and get cramped sooner than the
+   verdict cards do. align-items:start so a taller column does not stretch
+   its neighbour's card. */
+.cl-side-by-side {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  align-items: start;
+  /* .cl-page has no row gap -- vertical rhythm comes from element margins, and
+     the step-log/history pair has no .cl-section-title to supply one. Matches
+     .cl-mutation-grid's spacing so stacked grids do not butt together. */
+  margin-bottom: 20px;
+}
+.cl-side-by-side-col { min-width: 0; }
+@media (max-width: 980px) { .cl-side-by-side { grid-template-columns: 1fr; } }
+
+/* ── Train from load test (FR-4/FR-5) ── */
+.cl-train-estimate {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: clamp(11px, 0.95vw, 13px);
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+/* ── Load test outcome pipeline (sweep status, inside the Train card) ── */
+/* Sits directly under the Train card's run picker and draws the selected run's
+   four stages. The stage bar is nested inside the card, so it drops the
+   standalone bar's surface treatment and uses compact sizing. */
+.cl-sweep-body { margin-bottom: 14px; }
+.cl-sweep-body .cl-pipeline-bar {
+  padding: 12px 6px;
+  margin-bottom: 12px;
+  gap: 2px;
+  background: var(--surface-low);
+  box-shadow: none;
+}
+.cl-sweep-body .cl-pi-stage { width: 66px; gap: 4px; }
+.cl-sweep-body .cl-pi-icon { width: 34px; height: 34px; }
+.cl-sweep-body .cl-pi-icon svg { width: 16px; height: 16px; }
+.cl-sweep-body .cl-pi-name { font-size: 10px; }
+.cl-sweep-body .cl-pi-service { font-size: 8.5px; }
+.cl-sweep-body .cl-pi-conn { flex: 0 0 14px; margin-top: 22px; }
+.cl-sweep-summary {
+  font-size: clamp(11.5px, 0.95vw, 13px);
+  font-weight: 600;
+  line-height: 1.5;
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border-left: 3px solid var(--border);
+  background: var(--surface-low);
+  color: var(--text-secondary);
+  transition: background .2s ease, border-color .2s ease, color .2s ease;
+}
+.cl-sweep-summary--ok { border-left-color: var(--green); color: var(--text); }
+.cl-sweep-summary--active { border-left-color: var(--accent); }
+.cl-sweep-summary--error { border-left-color: var(--red); }
+
+.cl-sweep-stagelog { font-size: 11px; line-height: 1.6; color: var(--text-muted); }
+.cl-sweep-stageline { padding: 3px 0; }
+.cl-sweep-stageline strong { color: var(--text); }
+.cl-sweep-stageline--ok strong { color: var(--green); }
+.cl-sweep-stageline--processing strong { color: var(--accent); }
+.cl-sweep-stageline--error strong { color: var(--red); }
+
+.cl-sweep-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.cl-train-result {
+  font-size: 12px;
+  color: var(--text);
+  background: var(--glow-brand-success);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.cl-train-confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: clamp(11px, 0.95vw, 13px);
+  color: var(--text);
+}
+
+/* ── Compare load-test outcomes + Promote (FR-7..FR-10) ── */
+.cl-compare-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cl-compare-source {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ── Generic card (verdict / bidstream-impact / session audit) ── */
+.cl-card { padding: 14px 16px; }
+.cl-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.cl-card-title { font-size: 12px; font-weight: 700; display: flex; align-items: center; gap: 6px; color: var(--text); }
+.cl-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; }
+.cl-dot--purple { background: var(--accent); }
+.cl-dot--green { background: var(--green); }
+.cl-dot--ink { background: var(--text); }
+.cl-badge { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 5px; text-transform: uppercase; letter-spacing: .03em; }
+.cl-badge--agentcore { background: var(--glow-brand-primary); color: #5b21b6; }
+
+/* ── Mutation intent card ── */
+.cl-intent-card { padding: 14px 16px; position: relative; }
+.cl-intent-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.cl-intent-icon {
+  width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+  flex: none; color: var(--accent); background: var(--glow-brand-primary);
+}
+.cl-intent-icon--ncf_deal_manager { color: #16a34a; background: rgba(34, 197, 94, .10); }
+.cl-intent-name { font-size: 12px; font-weight: 700; color: var(--text); }
+.cl-intent-artf {
+  font-size: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent);
+  background: var(--glow-brand-primary); padding: 1px 6px; border-radius: 4px; margin-left: 6px;
+}
+.cl-intent-desc { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; line-height: 1.5; }
+.cl-intent-outcome { padding: 8px 10px; background: var(--surface-low); border-radius: 6px; font-size: 11px; }
+.cl-outcome-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 3px; }
+.cl-outcome-val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cl-outcome-impact { font-size: 10px; color: var(--text-secondary); margin-top: 4px; line-height: 1.5; }
+
+/* ── Technical detail popover (hover / focus / click) ── */
+.cl-has-detail { position: relative; }
+.cl-detail-trigger {
+  display: inline-flex; align-items: center; gap: 3px; font-size: 9px; font-weight: 600;
+  color: var(--accent); background: none; border: none; border-bottom: 1px dashed var(--accent);
+  cursor: pointer; margin-top: 6px; padding: 0; font-family: inherit;
+}
+.cl-detail-pop {
+  position: absolute; left: 0; bottom: calc(100% + 8px); width: 320px; max-width: 90vw;
+  background: #0f1729; color: #e8ecf3; padding: 12px 14px; border-radius: 8px;
+  font-size: 10px; line-height: 1.6; z-index: 50; box-shadow: 0 12px 30px rgba(15, 23, 41, .4);
+}
+.cl-detail-pop::after {
+  content: ''; position: absolute; top: 100%; left: 20px; border: 6px solid transparent;
+  border-top-color: #0f1729;
+}
+.cl-detail-pop strong { color: #fff; }
+.cl-detail-pop code { background: rgba(255, 255, 255, .1); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
+.cl-detail-pop > div { margin-bottom: 8px; }
+.cl-detail-pop > div:last-child { margin-bottom: 0; }
+
+/* ── Verdict card ── */
+.cl-verdict-card { display: flex; flex-direction: column; align-items: flex-start; }
+.cl-verdict-text { font-size: 12px; color: var(--text-secondary); line-height: 1.6; margin-top: 10px; align-self: stretch; }
+.cl-verdict-text strong { color: var(--text); }
+.cl-verdict-text p { margin: 0 0 8px; }
+.cl-verdict-text p:last-child { margin-bottom: 0; }
+
+/* ── Bidstream impact card ── */
+.cl-bidstream-impact { font-size: 12px; color: var(--text-secondary); line-height: 1.55; }
+.cl-bidstream-impact p { margin: 0 0 8px; }
+.cl-bidstream-impact p:last-child { margin-bottom: 0; }
+.cl-bidstream-impact strong { color: var(--text); }
+
+/* ── Session audit trail ── */
+.cl-audit-list {
+  font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-secondary);
+  line-height: 1.8; max-height: 160px; overflow-y: auto;
+}
+.cl-audit-empty { color: var(--text-muted); font-style: italic; font-family: var(--font-sans); }
+.cl-audit-entry { padding: 2px 0; border-bottom: 1px solid rgba(148, 163, 184, .10); }
+.cl-audit-entry:last-child { border-bottom: none; }
+
+/* ==========================================================================
+   ARTF Auction Theater
+   Full-screen guided walkthrough. Keeps the mockup's visual language: teal for
+   the sell side, indigo for the buy side, gold for a winner, purple for
+   enrichment. Those accents carry meaning, so they are not folded into the
+   app's generic palette.
+
+   Minimum font size is 10px throughout. The source mockup used 8px to 9.5px for
+   most labels; every one of those has been raised, which costs some density.
+   ========================================================================== */
+
+.th-stage {
+  --th-canvas: #ffffff;
+  --th-panel: #f7f8fa;
+  --th-panel-2: #eef1f5;
+  --th-ink: #1a1f2b;
+  --th-ink-2: #5b6472;
+  --th-ink-3: #6d7686;
+  --th-hair: #e3e7ee;
+  --th-hair-2: #d3d9e2;
+  --th-sell: #0a7d6c;
+  --th-sell-soft: #e3f4f0;
+  --th-buy: #3b5bdb;
+  --th-buy-soft: #e7ecfd;
+  --th-gold: #b7791f;
+  --th-gold-soft: #fbf1dc;
+  --th-enrich: #6b3fb5;
+  --th-enrich-soft: #efe8fb;
+  --th-radius: 14px;
+  --th-radius-sm: 9px;
+
+  --thv-track: #e7ddf7;
+  --thv-accent: var(--th-enrich);
+  --thv-safe: var(--th-sell);
+
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  background: var(--th-canvas);
+  color: var(--th-ink);
+  font-family: var(--font-sans);
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------ ribbon */
+
+.th-ribbon {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 22px;
+  border-bottom: 1px solid var(--th-hair);
+  background: var(--th-panel);
+  flex: none;
+}
+.th-ribbon-title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--th-enrich);
+  white-space: nowrap;
+  /* Now a scenario name rather than a fixed product label, so its length is not
+     ours to predict. Bounded and elided: an unbounded nowrap title squeezes the
+     scene items it sits beside. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 48ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.th-ribbon-scene {
+  display: flex;
+  /* Five items now (publisher, page, content, audience, deals), so the gap is
+     narrower than the three-item version and wraps rather than overflowing. */
+  gap: 28px;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  min-width: 0;
+}
+.th-scene-item {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  opacity: 0;
+  transition: opacity 0.5s;
+}
+.th-scene-item.is-on { opacity: 1; }
+.th-scene-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--th-ink-3);
+}
+.th-scene-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--th-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+/* Audience is the longest value; it takes whatever width the row has left.
+   The full string is on the value's title attribute. */
+.th-scene-audience { flex: 1 1 0; }
+.th-scene-audience .th-scene-value { max-width: none; }
+.th-ribbon-step {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--th-ink-2);
+  background: var(--th-panel-2);
+  border: 1px solid var(--th-hair);
+  padding: 4px 10px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------------------- chooser */
+
+.th-chooser {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+}
+.th-chooser-title { font-size: 20px; font-weight: 700; margin: 0; }
+.th-chooser-sub {
+  font-size: 13px;
+  color: var(--th-ink-2);
+  max-width: 60ch;
+  margin: 0;
+  line-height: 1.5;
+}
+.th-chooser-sub.th-error { color: #b3261e; font-weight: 600; }
+.th-chooser-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  width: min(900px, 100%);
+}
+.th-scenario {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  padding: 14px 16px;
+  background: var(--th-canvas);
+  border: 1px solid var(--th-hair);
+  border-radius: var(--th-radius-sm);
+  cursor: pointer;
+  transition: border-color 0.2s, box-shadow 0.25s;
+}
+.th-scenario:hover {
+  border-color: var(--th-enrich);
+  box-shadow: 0 4px 20px rgba(107, 63, 181, 0.12);
+}
+.th-scenario-name { font-size: 13px; font-weight: 700; }
+.th-scenario-desc {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--th-ink-2);
+  line-height: 1.45;
+}
+/* Spans rather than a dl: the chooser row is a <button>, whose content model is
+   phrasing content, and dl/dt/dd are flow content. */
+.th-scenario-facet { display: block; }
+.th-scenario-facet-key {
+  display: inline-block;
+  min-width: 62px;
+  margin-right: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  vertical-align: baseline;
+}
+.th-chooser-actions { display: flex; gap: 10px; }
+.th-chooser-exit { margin-top: 8px; }
+
+/* ----------------------------------------------------------------- columns */
+
+.th-columns {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1.15fr 1fr;
+  min-height: 0;
+}
+.th-col {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+.th-col-sell {
+  background: linear-gradient(180deg, var(--th-sell-soft) 0%, #fff 55%);
+  border-right: 1px solid var(--th-hair);
+}
+.th-col-buy {
+  background: linear-gradient(180deg, var(--th-buy-soft) 0%, #fff 55%);
+  border-left: 1px solid var(--th-hair);
+}
+.th-col-centre { align-items: center; }
+
+.th-col-head { display: flex; flex-direction: column; gap: 2px; }
+.th-col-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.th-col-sell .th-col-title { color: var(--th-sell); }
+.th-col-buy .th-col-title { color: var(--th-buy); }
+.th-col-sub { font-size: 11px; color: var(--th-ink-3); }
+
+.th-empty { font-size: 11px; color: var(--th-ink-3); font-style: italic; }
+
+.th-rows { display: flex; flex-direction: column; gap: 6px; }
+.th-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 10px;
+  background: var(--th-canvas);
+  border: 1px solid var(--th-hair);
+  border-radius: var(--th-radius-sm);
+  font-size: 12px;
+}
+.th-row-key { color: var(--th-ink-2); }
+/* The Deal Scorer's training disclosure, under its deal rows. */
+.th-row-note { padding: 0 2px; font-size: 11px; line-height: 1.4; color: var(--th-ink-2); }
+.th-row-val {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  text-align: right;
+}
+.th-row-to { color: var(--th-ink-3); margin: 0 6px; font-weight: 400; }
+
+/* ------------------------------------------------------------ request card */
+
+.th-card {
+  width: 100%;
+  max-width: 380px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--th-canvas);
+  border: 1.5px solid var(--th-hair-2);
+  border-radius: var(--th-radius);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02), 0 4px 16px rgba(148, 163, 184, 0.06);
+  overflow: hidden;
+  transition: border-color 0.5s, box-shadow 0.5s;
+}
+.th-card-enriching {
+  border-color: var(--th-enrich);
+  box-shadow: 0 0 0 1px rgba(107, 63, 181, 0.15), 0 4px 20px rgba(107, 63, 181, 0.14);
+}
+.th-card-settled {
+  border-color: var(--th-gold);
+  box-shadow: 0 0 0 1px rgba(183, 121, 31, 0.18), 0 4px 20px rgba(183, 121, 31, 0.16);
+}
+.th-card-head {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--th-hair);
+  font-size: 12px;
+  font-weight: 700;
+}
+.th-card-body { padding: 12px 14px; overflow-y: auto; flex: 1; }
+
+.th-group + .th-group { margin-top: 14px; }
+.th-group-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--th-ink-3);
+  margin-bottom: 7px;
+}
+.th-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.th-chips + .th-chips { margin-top: 6px; }
+.th-chip {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  border: 1px solid var(--th-hair);
+  display: inline-flex;
+  gap: 5px;
+  white-space: nowrap;
+}
+.th-chip-key { color: var(--th-ink-3); }
+/* Data the exchange already sent, distinct from anything a container added. */
+.th-chip-request { background: #f3f4f6; border-style: dashed; }
+
+.th-values { display: flex; flex-direction: column; gap: 8px; }
+
+.th-contrib { margin-top: 14px; border-top: 1px dashed var(--th-hair-2); padding-top: 10px; }
+.th-contrib-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 3px 0;
+}
+.th-contrib-name { font-weight: 600; color: var(--th-ink); }
+.th-contrib-count { color: var(--th-ink-3); }
+
+/* ------------------------------------------------------------ offers column */
+
+.th-col-offers {
+  background: linear-gradient(180deg, var(--th-buy-soft) 0%, #fff 55%);
+  border-left: 1px solid var(--th-hair);
+}
+.th-col-offers .th-col-title { color: var(--th-buy); }
+
+/* The notice states the provenance of every value below it, so it is set at the
+   body scale rather than shrunk to a footnote. */
+.th-offers-notice {
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: var(--th-radius-sm);
+  padding: 8px 10px;
+  margin: 0;
+}
+.th-offers-notice-illustrative {
+  color: #7a4b00;
+  background: #fff8e6;
+  border: 1px solid #f0d9a3;
+}
+.th-offers-notice-declared_inventory {
+  color: var(--th-ink-2);
+  background: var(--th-panel);
+  border: 1px solid var(--th-hair);
+}
+
+/* A fault reads as a fault: red, not the neutral grey of an expected absence. */
+.th-offers-fault {
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: var(--th-radius-sm);
+  padding: 8px 10px;
+  margin: 0;
+}
+.th-offers-fault-failed {
+  color: #8c1d18;
+  background: #fdeceb;
+  border: 1px solid #f2b8b5;
+}
+.th-offers-fault-not_deployed {
+  color: var(--th-ink-2);
+  background: var(--th-panel-2);
+  border: 1px solid var(--th-hair-2);
+}
+
+/* Holds the column's place until the enrichment beats have run. */
+.th-offers-pending {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--th-ink-3);
+  background: var(--th-panel);
+  border: 1px dashed var(--th-hair-2);
+  border-radius: var(--th-radius-sm);
+  padding: 10px 12px;
+}
+
+.th-offer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "campaign price"
+    "deal     outcome"
+    "reason   reason";
+  align-items: baseline;
+  column-gap: 12px;
+  row-gap: 2px;
+  padding: 9px 11px 9px 12px;
+  background: var(--th-canvas);
+  border: 1px solid var(--th-hair);
+  /* The left rule carries the category. The text mark inside the row carries it
+     as well, so the distinction survives greyscale and colour-blindness. */
+  border-left-width: 3px;
+  border-left-color: var(--th-hair-2);
+  border-radius: var(--th-radius-sm);
+}
+.th-offer-campaign {
+  grid-area: campaign;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.th-offer-deal {
+  grid-area: deal;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--th-ink-3);
+  overflow-wrap: anywhere;
+}
+.th-offer-price {
+  grid-area: price;
+  justify-self: end;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.th-offer-outcome {
+  grid-area: outcome;
+  justify-self: end;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.th-offer-mark {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--th-ink-3);
+}
+/* The reason is the whole point of a no-offer row, so it takes its own line
+   rather than trailing the outcome as an aside. */
+.th-offer-reason {
+  grid-area: reason;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--th-hair);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--th-ink-2);
+}
+
+.th-offer-Won,
+.th-offer.is-winner {
+  border-color: var(--th-gold);
+  border-left-color: var(--th-gold);
+  background: linear-gradient(180deg, var(--th-gold-soft) 0%, #fff 60%);
+}
+.th-offer-Won .th-offer-price { color: var(--th-gold); }
+.th-offer-AuctionOutcome { border-left-color: var(--th-buy); }
+.th-offer-ArtfDecision { border-left-color: var(--th-enrich); }
+.th-offer-ArtfDecision .th-offer-mark { color: var(--th-enrich); }
+.th-offer-InfrastructureFailure { border-left-color: #b3261e; }
+.th-offer-InfrastructureFailure .th-offer-mark { color: #b3261e; }
+.th-offer-NotAttempted {
+  border-left-style: dashed;
+  background: var(--th-panel);
+}
+.th-offer-NotAttempted .th-offer-campaign,
+.th-offer-NotAttempted .th-offer-price { color: var(--th-ink-2); }
+
+/* A bid that is in, before the auction is called. Every such row looks IDENTICAL
+   — no gold, no accent that separates one from another — because at that point in
+   the walkthrough nothing distinguishes them yet. The indigo left edge marks them
+   as live in the auction without ranking them. */
+.th-offer-pending {
+  border-left-color: rgba(99, 102, 241, 0.55);
+  background: var(--th-panel);
+}
+.th-offer-pending .th-offer-price { color: var(--th-ink-1); }
+.th-offer-pending .th-offer-mark { color: rgba(99, 102, 241, 0.9); }
+
+/* Folded groups for everything that did not bid. Quieter than a bid row and set
+   apart from them, so the bids read as the content and these as the footnote. */
+.th-offers-group {
+  border: 1px solid var(--th-hair);
+  border-radius: var(--th-radius-sm);
+  background: var(--th-panel);
+}
+.th-offers-group-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+/* The default triangle is replaced with one that reads in both states. */
+.th-offers-group-summary::-webkit-details-marker { display: none; }
+.th-offers-group-summary::before {
+  content: "▸";
+  position: absolute;
+  margin-left: -9px;
+  color: var(--th-ink-3);
+  font-size: 9px;
+}
+.th-offers-group[open] > .th-offers-group-summary::before { content: "▾"; }
+.th-offers-group-summary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(107, 63, 181, 0.35);
+  border-radius: var(--th-radius-sm);
+}
+.th-offers-group-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--th-ink-2);
+  padding-left: 4px;
+}
+.th-offers-group-breakdown {
+  font-size: 10px;
+  color: var(--th-ink-3);
+  padding-left: 4px;
+}
+.th-offers-group-rows { padding: 0 8px 9px; }
+/* Rows inside a group sit on the group's panel, so they lose their own fill. */
+.th-offers-group-rows .th-offer { background: var(--th-canvas); }
+.th-offers-group-rows .th-offer-NotAttempted { background: var(--th-panel-2); }
+
+/* The outcome, set apart from the candidate rows: the winning deal leads, the
+   campaign and cleared price support it. */
+.th-offers-winner,
+.th-offers-unsold,
+.th-offers-pending-winner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 10px;
+  row-gap: 3px;
+  align-items: baseline;
+  margin-top: auto;
+  padding: 11px 12px;
+  border-radius: var(--th-radius-sm);
+  font-size: 12px;
+}
+.th-offers-winner {
+  border: 1px solid var(--th-gold);
+  background: linear-gradient(180deg, var(--th-gold-soft) 0%, #fff 70%);
+}
+.th-offers-winner .th-row-val {
+  font-size: 13px;
+  color: var(--th-gold);
+  overflow-wrap: anywhere;
+}
+.th-offers-winner-campaign {
+  grid-column: 2;
+  font-size: 12px;
+  font-weight: 600;
+}
+.th-offers-winner-price {
+  grid-column: 2;
+  font-size: 10px;
+  color: var(--th-ink-3);
+}
+.th-offers-unsold {
+  border: 1px dashed var(--th-hair-2);
+  background: var(--th-panel);
+}
+/* Bids in, auction not yet called. Deliberately NOT gold: the gold treatment is
+   the winner's, and wearing it a step early would read as an announced outcome.
+   The soft indigo halo marks it as in-progress, matching the processing state
+   used elsewhere. */
+.th-offers-pending-winner {
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  background: var(--th-panel);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.02),
+    0 4px 16px rgba(99, 102, 241, 0.12);
+}
+.th-offers-pending-winner .th-row-val {
+  font-family: inherit;
+  font-weight: 400;
+  text-align: left;
+  color: var(--th-ink-3);
+}
+.th-offers-unsold .th-row-val {
+  font-family: inherit;
+  font-weight: 400;
+  text-align: left;
+  color: var(--th-ink-3);
+}
+
+/* ------------------------------------------------- sell column, with wrapper */
+
+/* SellSideDecisionsPanel wraps the sell column so it can append consequences.
+   The wrapper is the grid child, so it has to carry the cell's sizing. */
+.th-col-sell-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  background: linear-gradient(180deg, var(--th-sell-soft) 0%, #fff 55%);
+  border-right: 1px solid var(--th-hair);
+}
+.th-col-sell-wrap > .th-col-sell {
+  overflow: visible;
+  background: none;
+  border-right: none;
+  flex: none;
+}
+/* `.th-consequences` is gone with the `consequences` prop it styled. That prop
+   was read from `run.sellSideConsequences`, which useTheaterRun never returned,
+   so the block never rendered once. Replaced by `.th-kpis` below, fed by
+   deriveSellSideKpis. */
+
+/* ------------------------------------------------------------- visualisers */
+
+.thv {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--th-enrich-soft);
+  border: 1px solid #d9c9f5;
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+.thv-svg { width: 34px; height: 24px; flex: none; }
+.thv-shield .thv-svg { height: 22px; }
+.thv-meta { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.thv-meta-stacked { gap: 4px; width: 100%; }
+.thv-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--th-ink-3);
+}
+.thv-value {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 700;
+  color: #4d2b8f;
+}
+.thv-shield .thv-value { color: var(--th-sell); }
+.thv-track-h {
+  display: block;
+  width: 100%;
+  height: 8px;
+  background: var(--thv-track);
+  border-radius: 5px;
+  overflow: hidden;
+  position: relative;
+}
+.thv-track-h > i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--th-enrich);
+  border-radius: 5px;
+  transition: width 0.8s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.thv-bar, .thv-tokens, .thv-bid { flex-direction: column; align-items: stretch; gap: 6px; }
+.thv-token-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.thv-token {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #fff;
+  border: 1px solid #d9c9f5;
+  font-size: 11px;
+}
+.thv-token-name { font-weight: 600; color: #4d2b8f; }
+.thv-token-id {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--th-ink-3);
+}
+/* Marks an identifier as ours rather than a published IAB one. */
+.thv-token-vendor { border-style: dashed; }
+.thv-token-floor { background: var(--th-gold-soft); border-color: #e8d3a3; }
+.thv-token-badge {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--th-gold);
+}
+.thv-bidbar {
+  display: block;
+  position: relative;
+  height: 20px;
+  background: var(--th-panel-2);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.thv-bidbar > i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, var(--th-buy) 0%, #5b76e6 100%);
+  border-radius: 5px;
+  transition: width 0.8s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.thv-bidbar.thv-crossed > i {
+  background: linear-gradient(90deg, var(--th-gold) 0%, #d99a3e 100%);
+}
+.thv-floorline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--th-sell);
+}
+.thv-bidbar.thv-crossed .thv-floorline {
+  background: var(--th-gold);
+  box-shadow: 0 0 6px rgba(183, 121, 31, 0.5);
+}
+.thv-before { color: var(--th-ink-3); font-weight: 500; }
+.thv-before.thv-unknown { font-style: italic; }
+.thv-arrow { color: var(--th-ink-3); margin: 0 5px; font-weight: 400; }
+.thv-after { color: var(--th-ink); }
+
+/* ------------------------------------------------------------- seam arrow */
+
+.th-seam {
+  position: absolute;
+  top: 50%;
+  height: 2px;
+  pointer-events: none;
+  z-index: 20;
+}
+.th-seam-sell-to-request { left: 33%; width: 4%; }
+.th-seam-request-to-buy { left: 63%; width: 4%; }
+.th-seam-trail {
+  position: absolute;
+  inset: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, rgba(107, 63, 181, 0) 0%, rgba(107, 63, 181, 0.35) 100%);
+}
+.th-seam-head {
+  position: absolute;
+  right: -3px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--th-enrich);
+}
+
+/* ---------------------------------------------------------------- caption */
+
+/* The `.th-caption*` and `.th-recap` rules that were here are gone with
+   TheaterCaption. The narration moved to `.th-mstage`, over the centre of the
+   stage; see the embedded-Theater section below. */
+
+/* --------------------------------------------------------------- controls */
+
+.th-controls {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--th-hair);
+  border-radius: 30px;
+  padding: 7px 10px 7px 16px;
+  box-shadow: 0 6px 26px rgba(30, 40, 70, 0.12);
+  z-index: 50;
+}
+.th-controls-status {
+  font-size: 11px;
+  color: var(--th-ink-2);
+  font-weight: 600;
+  min-width: 92px;
+}
+.th-btn {
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  border-radius: 22px;
+  transition: background 0.2s, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.th-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(107, 63, 181, 0.4);
+}
+.th-btn:disabled { opacity: 0.4; cursor: default; }
+.th-btn-primary {
+  background: var(--th-enrich);
+  color: #fff;
+  padding: 8px 16px;
+  font-size: 13px;
+}
+.th-btn-primary:hover:not(:disabled) { background: #5a34a0; }
+.th-btn-ghost {
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.th-btn-ghost:hover:not(:disabled) { background: var(--th-hair); }
+
+/* ---------------------------------------------------------- motion, a11y */
+
+@media (prefers-reduced-motion: no-preference) {
+  .thv-landing { animation: thLand 0.5s ease-out; }
+  @keyframes thLand {
+    0% { transform: translateY(-5px) scale(1.03); opacity: 0.6; }
+    100% { transform: none; opacity: 1; }
+  }
+  .th-card-enriching { animation: thPulse 0.6s ease-out; }
+  @keyframes thPulse {
+    0%, 100% { box-shadow: 0 0 0 1px rgba(107, 63, 181, 0.15), 0 4px 20px rgba(107, 63, 181, 0.14); }
+    45% { box-shadow: 0 0 0 3px rgba(107, 63, 181, 0.22), 0 6px 28px rgba(107, 63, 181, 0.26); }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .th-stage *,
+  .th-stage *::before,
+  .th-stage *::after {
+    animation: none !important;
+  }
+  /* Width and opacity transitions convey state rather than decorate it, so
+     they are kept; removing them would remove information. */
+}
+
+/* ===================================================================
+   Scenario picker — surface toggle, dropdown, selected card
+   =================================================================== */
+
+.scenario-picker { display: flex; flex-direction: column; gap: 10px; }
+
+/* Two mutually exclusive surfaces, so a radiogroup rather than tabs: the choice
+   filters a list, it does not navigate anywhere. */
+.scenario-surface-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-low, rgba(148, 163, 184, 0.12));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.scenario-surface-option {
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: clamp(10px, 0.85vw, 11px);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1), color 0.2s ease;
+}
+.scenario-surface-option:hover:not(:disabled):not(.is-on) {
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-surface-option.is-on {
+  background: #fff;
+  color: var(--text-primary, #0f172a);
+  border-color: rgba(99, 102, 241, 0.2);
+  box-shadow: 0px 1px 2px rgba(0, 0, 0, 0.02), 0px 4px 16px rgba(148, 163, 184, 0.06);
+}
+.scenario-surface-option:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+.scenario-surface-option:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Scenario chooser — a listbox, not a <select>, so each row can carry the name
+   with its intent chips underneath instead of a comma-separated string that
+   overflowed the control and lost the colour coding. */
+.scenario-combo { position: relative; }
+
+.scenario-combo-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  background: var(--surface-raised, #fff);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.scenario-combo-trigger:hover:not(:disabled) {
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-trigger.is-open {
+  border-color: rgba(99, 102, 241, 0.25);
+  box-shadow: 0px 1px 2px rgba(0, 0, 0, 0.02), 0px 4px 16px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* min-width:0 so a long scenario name wraps inside the flex row instead of
+   forcing the control wider than the sidebar. */
+.scenario-combo-value {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.scenario-combo-name {
+  font-size: clamp(11px, 0.95vw, 12px);
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--text-primary, #0f172a);
+  /* Wraps rather than truncating: the name is the only thing identifying the
+     scenario, so hiding half of it is worse than two lines. */
+  overflow-wrap: anywhere;
+}
+.scenario-combo-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+
+.scenario-combo-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--text-secondary);
+  opacity: 0.6;
+  transition: transform 0.2s ease;
+}
+.scenario-combo-trigger.is-open .scenario-combo-caret { transform: rotate(180deg); }
+
+.scenario-combo-list {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--surface-raised, #fff);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 10px;
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(148, 163, 184, 0.06),
+    0px 8px 24px rgba(148, 163, 184, 0.04);
+}
+.scenario-combo-list:focus-visible { outline: none; }
+
+.scenario-combo-option {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* The keyboard cursor and the current selection are DIFFERENT states: arrowing
+   through the list moves the cursor without committing anything, so they must not
+   look the same. The cursor gets the wash, the selection gets the rim. */
+.scenario-combo-option.is-cursor {
+  background: rgba(99, 102, 241, 0.06);
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.scenario-combo-option.is-selected { border-color: rgba(99, 102, 241, 0.3); }
+
+/* Two actions now: Send, and open the walkthrough. */
+.tuner-actions { display: flex; flex-direction: column; gap: 6px; }
+.tuner-send-theater {
+  background: transparent;
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  color: var(--accent, #6366f1);
+  font-weight: 700;
+}
+.tuner-send-theater:hover:not(:disabled) {
+  background: #fff;
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+
+/* ===================================================================
+   Embedded Auction Theater
+   =================================================================== */
+
+/* ===================================================================
+   Embedded Auction Theater
+
+   The Theater is a view INSIDE this application, not a page over it. That
+   required undoing `.th-stage`'s `position: fixed; inset: 0; z-index: 100`,
+   which pinned it to the viewport and painted over the header and the
+   scenario panel. The class was already named "embedded" and already
+   applied; it only set `min-height: 0`, so the name described an intention
+   the CSS never carried out.
+
+   The previous rule here was `.app-layout--theater { grid-template-columns:
+   1fr }` — a grid property on a flex container, so inert. The sidebar
+   vanished because App unmounted it. It is now collapsed instead, and these
+   rules do the work the old one only claimed to.
+   =================================================================== */
+
+/* Header (sticky, ~72px) plus the layout's 20px padding top and bottom. */
+.app-layout { --th-chrome: 116px; }
+
+.app-layout--theater {
+  /* Expanding the panel pushes the Theater right and scrolls, rather than
+     squeezing the walkthrough's three columns into whatever is left. */
+  overflow-x: auto;
+  align-items: stretch;
+}
+.app-layout--theater > .app-main {
+  /* `flex: 1 1 0` — basis ZERO, not auto. With `auto` the base size is the
+     content size, and the Theater's max-content width is large (nowrap chips, the
+     JSON panel, the offers rows), so the main column sized itself to its content
+     and `flex-shrink: 0` then forbade it from coming back down: it ran past the
+     viewport with no way to recover.
+
+     Basis 0 plus grow 1 makes the width purely "the free space that is left",
+     which the browser computes from the real box model — the rail's actual width,
+     the actual gap and the actual padding — rather than from arithmetic hardcoded
+     here that would drift the moment any of the three changed.
+
+     `min-width: 0` is load-bearing: a flex item's default `min-width: auto`
+     floors it at its content's min-content width, which is the other half of why
+     it would not shrink. */
+  flex: 1 1 0;
+  min-width: 0;
+  height: calc(100vh - var(--th-chrome));
+  min-height: 560px;
+  display: flex;
+}
+/* Only an EXPANDED panel makes the Theater refuse to compress, which is what
+   turns expansion into a horizontal scroll. While the panel is a rail there is
+   nothing to scroll and the Theater must fit exactly, so the floor is applied
+   here rather than unconditionally above. */
+.app-layout--theater.app-layout--panel-open > .app-main { min-width: 860px; }
+
+.th-stage-embedded {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  min-height: 0;
+  /* As a flex item of `.app-main`, an `auto` minimum would floor this at its
+     content's min-content width and let it push out of the column. */
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  /* The outer margin the fixed overlay could not have: labels and buttons in
+     the ribbon were touching the viewport edge. */
+  padding: 14px 16px 12px;
+  border: 1px solid var(--th-hair);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.02),
+    0 4px 16px rgba(148, 163, 184, 0.06),
+    0 8px 32px rgba(148, 163, 184, 0.04);
+}
+
+/* Everything between the ribbon and the controls. Establishes the containing
+   block for the centre-stage and summary surfaces, which were previously
+   positioned against the viewport. */
+.th-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.th-stage-embedded .th-columns {
+  border: 1px solid var(--th-hair);
+  border-radius: 14px;
+  overflow: hidden;
+}
+/* `1fr` is `minmax(auto, 1fr)`, and that `auto` minimum is the item's content
+   min-content width — so a nowrap chip or a long deal id in any one column could
+   force its track wider than its share and push the grid past its container.
+   `min-width: 0` lets the tracks actually honour the 1 : 1.15 : 1 split. */
+.th-stage-embedded .th-columns > * { min-width: 0; }
+/* Each region scrolls on its own when it overflows (FR-5). The columns already
+   carried `overflow-y: auto`; it did nothing until the stage had a bounded
+   height, which it now has. */
+.th-stage-embedded .th-col,
+.th-stage-embedded .th-col-sell-wrap,
+.th-stage-embedded .th-col-offers {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* The scenario name and Close moved into the ribbon, so `.th-embedded-bar` and
+   `.th-embedded-scenario` are gone along with the row they occupied. */
+.th-stage-embedded .th-ribbon {
+  border: 1px solid var(--th-hair);
+  border-radius: 14px;
+  margin-bottom: 10px;
+}
+/* Pinned right, past the step pill. `margin-left: auto` would fight the ribbon's
+   flex gap on a narrow viewport; ordering it last and letting the scene block
+   flex-grow keeps it at the edge. */
+.th-ribbon-close {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 11px;
+}
+
+/* ---- controls, in flow ----
+   They were `position: absolute; bottom: 14px`, floating over the columns
+   together with the caption strip above them. Both covered the data they were
+   describing. */
+.th-stage-embedded .th-controls {
+  position: static;
+  transform: none;
+  bottom: auto;
+  left: auto;
+  margin: 10px auto 0;
+  flex: none;
+}
+
+/* ---- collapsible scenario panel ---- */
+.app-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: width 0.2s ease;
+}
+.app-sidebar--collapsed {
+  width: 44px;
+  min-width: 44px;
+}
+.app-sidebar-body { min-width: 0; }
+.app-sidebar-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.app-sidebar-toggle:hover {
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.15), 0 4px 20px rgba(99, 102, 241, 0.12);
+}
+.app-sidebar-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg, #0b0f19), 0 0 0 5px rgba(99, 102, 241, 0.4);
+}
+.app-sidebar-toggle-chevron { font-size: 15px; line-height: 1; }
+.app-sidebar--collapsed .app-sidebar-toggle {
+  flex-direction: column;
+  justify-content: flex-start;
+  padding: 10px 6px;
+  height: 100%;
+  align-items: center;
+}
+.app-sidebar--collapsed .app-sidebar-toggle-label {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+/* ===================================================================
+   Centre-stage mutation card
+   =================================================================== */
+
+.th-mstage-wrap {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(620px, 78%);
+  z-index: 46;
+  /* Click-through: the card covers the request card it is describing, and the
+     reader must be able to reach the columns underneath without dismissing it.
+     .th-mstage-close re-enables pointer events for itself alone. */
+  pointer-events: none;
+  opacity: 1;
+}
+/* The dwell has elapsed, or the reader dismissed it. The duration here must match
+   MUTATION_STAGE_FADE_MS, which is when the card unmounts. */
+.th-mstage-wrap.is-leaving {
+  opacity: 0;
+}
+.th-mstage {
+  /* Opaque enough to read as a surface ABOVE the columns rather than a tint over
+     them. The old caption strip was 0.62 alpha and the data behind it competed
+     with the text. */
+  background: rgba(255, 255, 255, 0.97);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 12px 44px rgba(30, 40, 70, 0.18);
+  border-radius: 18px;
+  padding: 16px 20px 14px;
+}
+.th-mstage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.th-mstage-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--th-ink-3);
+}
+/* Attribution and the dismiss control travel together on the right, so adding the
+   button does not pull the attribution into the middle of a space-between row. */
+.th-mstage-head-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.th-mstage-attr { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.th-mstage-close {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  border: none;
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.th-mstage-close:hover { background: var(--th-hair); }
+.th-mstage-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(107, 63, 181, 0.4);
+}
+.th-mstage-container {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--th-enrich);
+  white-space: nowrap;
+}
+.th-mstage-intent {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #4c2a86;
+  background: var(--th-enrich-soft);
+  border: 1px solid #ddd0f3;
+  border-radius: 20px;
+  padding: 3px 9px;
+  white-space: nowrap;
+}
+.th-mstage-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+  /* 4.5:1 against the card (NFR-5). */
+  color: var(--th-ink);
+}
+/* The full sentence is in the DOM; only the untyped remainder is invisible, so
+   the card does not reflow as characters arrive. */
+.th-mstage-pending { visibility: hidden; }
+.th-mstage-foot {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--th-ink-3);
+}
+.th-mstage-explore { color: var(--th-gold); font-weight: 700; }
+/* A mutation the exchange did not apply: the reason it gave, beside the sentence.
+   Muted rather than alarming: a rejection is a normal outcome (BR-16). */
+.th-mstage-disposition {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--th-ink-2);
+}
+/* The Deal Scorer's training disclosure, under a Deal Scorer mutation. */
+.th-mstage-sample {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--th-ink-2);
+}
+.th-mstage-disposition-kind {
+  margin-right: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--th-gold);
+}
+/* A value on screen that did not change the auction. Kept visible at full text
+   contrast, set apart by a soft warm outline and its named disposition, so it
+   never reads as applied. */
+.th-val-not-applied {
+  border-radius: var(--th-radius-sm);
+  box-shadow: 0 0 0 1px rgba(183, 121, 31, 0.22), 0 2px 10px rgba(183, 121, 31, 0.08);
+  transition: box-shadow 0.2s ease;
+}
+.th-val-disposition {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  /* 4.5:1 against the soft fill (NFR-5). */
+  color: #7a4f12;
+  background: var(--th-gold-soft);
+  box-shadow: 0 0 0 1px rgba(183, 121, 31, 0.18);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .th-mstage { animation: thMStageIn 0.22s ease-out; }
+  @keyframes thMStageIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  /* Entry animates the inner card, exit animates the wrapper, so the two never
+     drive the same property on the same element. */
+  .th-mstage-wrap { transition: opacity 240ms ease; }
+}
+
+/* ===================================================================
+   Run summary
+   =================================================================== */
+
+.th-summary-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(26, 31, 43, 0.28);
+}
+.th-summary {
+  width: min(560px, 100%);
+  background: var(--th-canvas);
+  border: 1px solid var(--th-hair-2);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 16px 48px rgba(30, 40, 70, 0.22);
+  padding: 18px 20px 16px;
+  pointer-events: auto;
+}
+.th-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.th-summary-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--th-enrich);
+}
+.th-summary-close {
+  border: none;
+  background: var(--th-panel-2);
+  color: var(--th-ink-2);
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.th-summary-close:hover { background: var(--th-hair); }
+.th-summary-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 5px rgba(107, 63, 181, 0.4);
+}
+.th-summary-text {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--th-ink);
+}
+.th-summary-sub {
+  margin: 12px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--th-hair);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--th-ink-3);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .th-summary { animation: thSummaryIn 0.24s ease-out; }
+  @keyframes thSummaryIn {
+    from { opacity: 0; transform: scale(0.98); }
+    to { opacity: 1; transform: scale(1); }
+  }
+}
+
+/* ===================================================================
+   Request card: three-view toggle
+   =================================================================== */
+
+.th-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.th-card-views { display: flex; gap: 2px; }
+.th-card-view {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--th-ink-3);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.th-card-view:hover {
+  color: var(--th-ink-2);
+  background: var(--th-panel-2);
+}
+.th-card-view.is-on {
+  color: var(--th-enrich);
+  background: var(--th-enrich-soft);
+  border-color: #ddd0f3;
+}
+.th-card-view:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px rgba(107, 63, 181, 0.4);
+}
+
+.th-card--wide { max-width: 100%; }
+
+/* The code view hosts RawPanel, which carries the application's dark JSON
+   palette. Kept dark on purpose: it is the same view as the default scenario
+   screen, and recolouring it would make two presentations of one thing. */
+.th-card-body-code {
+  padding: 0;
+  background: var(--th-ink);
+}
+.th-card-body-code .raw-section-standalone {
+  border: none;
+  border-radius: 0;
+  background: none;
+}
+.th-card-body-info { padding: 14px; }
+.th-card-info { display: flex; flex-direction: column; gap: 12px; }
+.th-card-info-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--th-ink);
+}
+.th-card-info-reopen { align-self: flex-start; }
+
+/* ===================================================================
+   Sell-side deal package result
+   =================================================================== */
+
+.th-kpis {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 18px 16px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--th-hair-2);
+}
+.th-kpis-head { margin-bottom: 2px; }
+.th-kpis-notice {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #7a4b00;
+  background: #fff8e6;
+  border: 1px solid #f0d9a3;
+  border-radius: var(--th-radius-sm);
+  padding: 7px 9px;
+}
+.th-kpis .th-row-key {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.th-kpi-detail {
+  font-size: 10px;
+  color: var(--th-ink-3);
+}
+
+/* ===================================================================
+   Pass banner: "without ARTF mutations" / "with ARTF mutations"
+   =================================================================== */
+
+/* Full-stage scrim, like the run summary, so the banner reads as a chapter
+   heading over the whole stage rather than as another card over the request.
+   Below the summary (z 60) and above the mutation stage (z 46): the summary is
+   never open on a pass beat, and the mutation stage is not rendered on one. */
+.th-pass-banner-wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(26, 31, 43, 0.22);
+  /* Click-through, like the mutation stage: the banner announces, it does not
+     take the controls away. */
+  pointer-events: none;
+  opacity: 0;
+}
+/* `is-visible` drives the entry fade, `is-leaving` the exit; the component holds
+   the element mounted for PASS_BANNER_FADE_MS after the beat changes so the exit
+   is seen. The 240ms here must match that constant. */
+.th-pass-banner-wrap.is-visible { opacity: 1; }
+.th-pass-banner-wrap.is-leaving { opacity: 0; }
+.th-pass-banner {
+  width: min(520px, 100%);
+  text-align: center;
+  background: rgba(255, 255, 255, 0.97);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.03),
+    0 12px 44px rgba(30, 40, 70, 0.18);
+  padding: 22px 26px 20px;
+}
+.th-pass-banner-step {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--th-ink-3);
+  margin-bottom: 6px;
+}
+.th-pass-banner-headline {
+  margin: 0 0 8px;
+  font-size: 22px;
+  line-height: 1.2;
+  font-weight: 700;
+  color: var(--th-ink);
+}
+/* The with-ARTF banner takes the enrichment colour the container beats use, so
+   the two passes are told apart by the same cue as the rest of the stage. */
+.th-pass-banner-wrap[data-artf="with"] .th-pass-banner-headline { color: var(--th-enrich); }
+.th-pass-banner-body {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--th-ink-2);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .th-pass-banner-wrap { transition: opacity 240ms ease; }
+}
+
+/* ===================================================================
+   Comparison: with ARTF vs without
+   =================================================================== */
+
+.th-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 18px 14px;
+}
+/* The left-column form sits above the yield rows; a dashed rule closes it the
+   same way the KPI block is opened. */
+.th-compare-compact { padding-bottom: 12px; border-bottom: 1px dashed var(--th-hair-2); }
+.th-compare-head { margin-bottom: 2px; }
+.th-compare-missing {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--th-ink-2);
+  background: var(--th-panel);
+  border: 1px solid var(--th-hair);
+  border-radius: var(--th-radius-sm);
+  padding: 7px 9px;
+}
+.th-compare-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr) minmax(48px, auto);
+  column-gap: 10px;
+  row-gap: 4px;
+  font-size: 12px;
+}
+.th-compare-row { display: contents; }
+.th-compare-row > * {
+  padding: 5px 0;
+  border-bottom: 1px solid var(--th-hair);
+  min-width: 0;
+}
+.th-compare-labels > * {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--th-ink-3);
+  border-bottom: 1px solid var(--th-hair-2);
+}
+.th-compare-key {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  color: var(--th-ink-2);
+}
+.th-compare-cell {
+  font-variant-numeric: tabular-nums;
+  color: var(--th-ink);
+  overflow-wrap: anywhere;
+}
+.th-compare-with { font-weight: 700; color: var(--th-enrich); }
+.th-compare-delta {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  font-weight: 700;
+  color: var(--th-sell);
+  white-space: nowrap;
+}
+/* The full comparison makes the summary tall; it scrolls inside the scrim rather
+   than growing past the stage. */
+.th-summary { max-height: 100%; overflow-y: auto; }
+/* Under the summary prose, separated the same way the provenance line is. */
+.th-summary-compare {
+  margin-top: 12px;
+  padding-top: 6px;
+  border-top: 1px solid var(--th-hair);
+}
+.th-summary-compare .th-compare { padding: 6px 0 0; }
+
+/* ===================================================================
+   Governance stepper
+   =================================================================== */
+
+.gov-stepper { margin: 0 0 16px; }
+.gov-stepper-list {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (max-width: 1100px) {
+  .gov-stepper-list { grid-template-columns: repeat(2, 1fr); }
+}
+.gov-stepper-item { display: flex; }
+.gov-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  background: var(--surface-raised, #fff);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.gov-step:hover:not(.is-on) {
+  background: #fff;
+  box-shadow: 0px 0px 0px 1px rgba(99, 102, 241, 0.15), 0px 4px 20px rgba(99, 102, 241, 0.12);
+}
+.gov-step.is-on {
+  border-color: rgba(99, 102, 241, 0.25);
+  box-shadow:
+    0px 1px 2px rgba(0, 0, 0, 0.02),
+    0px 4px 16px rgba(99, 102, 241, 0.12),
+    0px 8px 32px rgba(148, 163, 184, 0.04);
+}
+.gov-step:focus-visible {
+  outline: none;
+  box-shadow: 0px 0px 0px 2px #fff, 0px 0px 0px 5px rgba(99, 102, 241, 0.12);
+}
+.gov-step-number {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--surface-low, rgba(148, 163, 184, 0.15));
+  border: 1px solid var(--border);
+}
+.gov-step.is-on .gov-step-number {
+  color: #fff;
+  background: var(--accent, #6366f1);
+  border-color: transparent;
+}
+.gov-step-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.gov-step-title { font-size: 12px; font-weight: 700; color: var(--text-primary, #0f172a); }
+.gov-step-blurb { font-size: 10px; line-height: 1.4; color: var(--text-secondary); }
+
+.gov-step-panel { display: block; }
+
+/* ── Load test: controls beside results ──
+   The launcher and the results are two halves of one activity, so they share a
+   row instead of stacking full width. align-items: start keeps both cards
+   pinned to the top of the row rather than stretching to the tallest. */
+.gov-loadtest-split {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+/* Both cards carry standalone-layout margins from when they were the only
+   thing on their row; inside the grid the gap provides the spacing. */
+.gov-loadtest-split > .loadtest-panel { margin-top: 0; }
+.gov-loadtest-split > #flow-canvas {
+  margin-bottom: 0;
+  /* Centring made sense for the pipeline canvas this rule was written for; the
+     results content is top-aligned so the two card headers line up. */
+  justify-content: flex-start;
+  min-height: 0;
+}
+
+/* Four presets in ~380px is tight — give them a real basis so they drop to a
+   2x2 grid instead of squeezing "100,000 req" onto two lines. */
+.gov-loadtest-split .loadtest-presets { flex-wrap: wrap; }
+.gov-loadtest-split .loadtest-preset { flex: 1 1 72px; }
+
+@media (max-width: 980px) {
+  .gov-loadtest-split { grid-template-columns: 1fr; }
+}
+
+/* ---------------------------------------------------------------------------
+   Mutation precedence
+   ---------------------------------------------------------------------------
+   Two containers may claim the same intent. Both are called, but for a given
+   (path, intent) only the highest-priority one's mutation is returned. The
+   losing container ran and computed a value that was then discarded, which is
+   neither a success nor a failure and needs its own treatment: amber, the same
+   language the shared-intent chip already uses, rather than the red reserved
+   for something that actually went wrong.
+   --------------------------------------------------------------------------- */
+
+.container-precedence {
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--surface-low, rgba(241, 245, 249, 0.6));
+  border: 1px solid rgba(245, 158, 11, 0.18);
+  line-height: 1.5;
+}
+
+.agent-superseded-tag {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #d97706;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+
+/* Sits alongside .agent-row--active rather than replacing it: the container did
+   run, so it keeps the active treatment and gains a marker. */
+.agent-row--superseded {
+  box-shadow: inset 2px 0 0 rgba(245, 158, 11, 0.45);
 }

@@ -1,0 +1,94 @@
+{
+  "id": "sample-response-multi-seat-001",
+  "tmax": 150,
+  "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+  "originator": {"type": "TYPE_DSP", "id": "dsp-meridian-trading-001"},
+  "applicable_intents": [
+    "BID_SHADE",
+    "ADD_METRICS"
+  ],
+  "bid_request": {
+    "id": "auction-response-multi-seat-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "video": {
+          "w": 1280,
+          "h": 720,
+          "mimes": ["video/mp4"],
+          "minduration": 6,
+          "maxduration": 30,
+          "protocols": [2, 3, 5, 6],
+          "startdelay": 0,
+          "placement": 1,
+          "skip": 1
+        },
+        "bidfloor": 0.25,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-sideline-01",
+      "domain": "sideline-report.example",
+      "cat": ["IAB17"],
+      "page": "https://sideline-report.example/highlights/conference-final-recap"
+    },
+    "user": {
+      "id": "user-multi-seat-01",
+      "yob": 1991,
+      "gender": "M"
+    },
+    "device": {
+      "ua": "Roku/DVP-13.0 (13.0.0.4183-88)",
+      "ip": "203.0.113.93",
+      "geo": {"country": "USA", "region": "TX"}
+    }
+  },
+  "bid_response": {
+    "id": "auction-response-multi-seat-001",
+    "seatbid": [
+      {
+        "seat": "dsp-meridian-trading-001",
+        "bid": [
+          {
+            "id": "bid-meridian-high",
+            "impid": "imp-1",
+            "price": 22.00,
+            "adomain": ["meridian-auto.example"],
+            "crid": "cr-meridian-1280x720",
+            "cid": "camp-meridian-launch"
+          },
+          {
+            "id": "bid-meridian-mid",
+            "impid": "imp-1",
+            "price": 9.50,
+            "adomain": ["meridian-auto.example"],
+            "crid": "cr-meridian-alt-1280x720",
+            "cid": "camp-meridian-retarget"
+          }
+        ]
+      },
+      {
+        "seat": "dsp-harborline-002",
+        "bid": [
+          {
+            "id": "bid-harborline-mid",
+            "impid": "imp-1",
+            "price": 1.80,
+            "adomain": ["harborline-travel.example"],
+            "crid": "cr-harborline-1280x720",
+            "cid": "camp-harborline-summer"
+          },
+          {
+            "id": "bid-harborline-low",
+            "impid": "imp-1",
+            "price": 0.60,
+            "adomain": ["harborline-travel.example"],
+            "crid": "cr-harborline-remnant-1280x720",
+            "cid": "camp-harborline-remnant"
+          }
+        ]
+      }
+    ]
+  }
+}

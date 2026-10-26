@@ -5,9 +5,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: orchestrator
-  namespace: artf
-  annotations:
-    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
   labels:
     app: artf
     component: orchestrator
@@ -23,6 +20,15 @@ spec:
         app: artf
         component: orchestrator
     spec:
+      # Pin to the CPU/services node group. The orchestrator is a lightweight
+      # always-on router with no GPU workload — without this it can schedule
+      # onto the GPU/inference node, whose node role never gets the
+      # closed-loop IAM policy attached (deploy.sh Step 7.7 attaches it only
+      # to the services node group), causing every DynamoDB
+      # parameter-store/audit-trail read from that pod to fail with
+      # AccessDeniedException.
+      nodeSelector:
+        role: services
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -42,17 +48,103 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+            # RTBExtensionPoint/GetMutations for the Prebid hook (gRPC transport
+            # plan P3.2). Same process, same auth; reached through the headless
+            # orchestrator-grpc Service below, never through the HTTP Service.
+            - containerPort: 50051
+              name: grpc
           env:
+            # Service DNS names below match the k8s Service names in
+            # artf-containers-deployment.yaml (job-oriented display names — see
+            # RENAME_MAP.md). Env var names are unchanged internal identifiers
+            # read by source/orchestrator/app.py.
             - name: DLRM_URL
-              value: "http://dlrm-bid-shader:8081"
+              value: "http://bid-pricer:8081"
             - name: WIDEDEEP_URL
-              value: "http://widedeep-segment-activator:8081"
+              value: "http://audience-activator:8081"
             - name: NCF_URL
-              value: "http://ncf-deal-manager:8081"
+              value: "http://deal-scorer:8081"
             - name: METRICS_URL
-              value: "http://metrics-enricher:8081"
+              value: "http://signals-enricher:8081"
+            # Two Yield Optimizer Services, one per intent (see
+            # artf-containers-deployment.yaml). Same single-value *_URL form the
+            # other four containers use above.
+            - name: YIELD_FLOOR_URL
+              value: "http://yield-optimizer-floor:8081"
+            - name: YIELD_MARGIN_URL
+              value: "http://yield-optimizer-margin:8081"
+            # ARTF Template container. Unlike the six above, this endpoint is a
+            # FALLBACK: the template is a store-defined container, so its real
+            # endpoint comes from its container-registry record. This value is
+            # used only if that record omits one.
+            - name: ARTF_TEMPLATE_URL
+              value: "http://artf-template:8081"
+            # gRPC targets: the headless *-grpc Services (artf-containers-
+            # deployment.yaml), so dns:/// resolution returns every pod and the
+            # channel's round_robin policy spreads calls across replicas. Without
+            # these, app.py derives the gRPC target from *_URL, which is the MCP
+            # host swapped to port 50051 on the ClusterIP name -- reachable, but
+            # pinned to one pod per channel.
+            - name: DLRM_GRPC
+              value: "bid-pricer-grpc:50051"
+            - name: WIDEDEEP_GRPC
+              value: "audience-activator-grpc:50051"
+            - name: NCF_GRPC
+              value: "deal-scorer-grpc:50051"
+            - name: METRICS_GRPC
+              value: "signals-enricher-grpc:50051"
+            - name: YIELD_FLOOR_GRPC
+              value: "yield-optimizer-floor-grpc:50051"
+            - name: YIELD_MARGIN_GRPC
+              value: "yield-optimizer-margin-grpc:50051"
+            # Which transport the fan-out tries first (source/orchestrator/app.py
+            # _call_container): "http" = REST /mutate then MCP, the order the
+            # Phase 0 baseline was measured with; "grpc" = RTBExtensionPoint.
+            # GetMutations on the *_GRPC targets, then REST, then MCP. Flip with
+            #   kubectl set env deploy/orchestrator ARTF_CONTAINER_TRANSPORT=grpc
+            # for a measurement run (no image rebuild); this default becomes
+            # "grpc" once a measured run shows it beats http on this hop.
+            - name: ARTF_CONTAINER_TRANSPORT
+              value: "http"
+            # Port of the orchestrator's own gRPC listener (0 disables it).
+            - name: ARTF_GRPC_SERVER_PORT
+              value: "50051"
+            # Container registry table (base stack, created by deploy.sh Step
+            # 1.5). Holds store-defined containers: name, display name,
+            # description, intents, endpoint and the active flag the Container
+            # Health panel toggles. Read through a TTL cache, so a toggle costs
+            # the bid path one Query per TTL window per replica rather than a
+            # round trip per request.
+            #
+            # Unset means the feature is off: the orchestrator falls back to the
+            # six code-defined containers and reports the template as
+            # not-configurable with the real reason, rather than as an empty
+            # registry. Deliberately a base-stack table and NOT a partition of
+            # the closed-loop stack's parameter-store, which is optional.
+            - name: CONTAINER_REGISTRY_TABLE
+              value: "__CONTAINER_REGISTRY_TABLE__"
+            # CONTAINER_REGISTRY_TTL is intentionally not set here so the 30s
+            # default in orchestrator/container_registry.py applies. Set it to
+            # trade toggle responsiveness against DynamoDB read volume.
             - name: LOADTEST_TABLE
               value: "__STACK_NAME__-loadtest-history"
+            # Deals table (base stack, Step 1.5), read-only (Step 7.5 DealsBook
+            # statement). The orchestrator reads each activated deal's auction type
+            # from it (shared/deal_library.py snapshot, refreshed every 30 s) so the
+            # working request carries OpenRTB `at`. Unreachable means activated
+            # deals are inserted id-only and a warning is logged; auctions continue.
+            - name: DEALS_TABLE
+              value: "__STACK_NAME__-deals"
+            # A running load test lives in one replica's memory. A replica that
+            # does not know a test id asks its siblings, found through the
+            # headless orchestrator-grpc Service below, and skips its own address
+            # (orchestrator/loadtest_peers.py).
+            - name: ORCHESTRATOR_PEER_DNS
+              value: "orchestrator-grpc"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: EKS_CLUSTER_NAME
               value: "__STACK_NAME__-triton"
             - name: GPU_NODEGROUP_NAME
@@ -63,6 +155,150 @@ spec:
               value: "__COGNITO_USER_POOL_ID__"
             - name: COGNITO_REGION
               value: "__REGION__"
+            # Scope required of a MACHINE credential on POST /v1/mutations.
+            #
+            # EMPTY BY DEFAULT, and empty means no scope authorization at all -- the
+            # orchestrator behaves exactly as it did before this variable existed.
+            # That is deliberate: the only machine caller is the optional Prebid ARTF
+            # host, so a stack deployed without --with-prebid must not acquire an
+            # authorization rule it has no client for.
+            #
+            # deploy.sh sets it only with --with-prebid; deploy_prebid.sh sets it when
+            # run standalone and clears it on --destroy.
+            #
+            # It never affects the frontend: a Cognito USER access token is authorized
+            # by the user_session mechanism, which does not consult scopes.
+            - name: ARTF_MUTATIONS_REQUIRED_SCOPE
+              value: "__ARTF_MUTATIONS_REQUIRED_SCOPE__"
+            # Part 2 closed-loop demo API — DynamoDB tables created by
+            # deploy_closed_loop.sh (closed_loop_cfn.yaml). deploy.sh substitutes
+            # these with the stack-prefix-aware names (e.g. "dv2-parameter-store")
+            # so the orchestrator and the AgentCore agents read the SAME tables.
+            - name: PARAMETER_STORE_TABLE
+              value: "__PARAMETER_STORE_TABLE__"
+            - name: AUDIT_TRAIL_TABLE
+              value: "__AUDIT_TRAIL_TABLE__"
+            # SageMaker Model Package Group names, stack-prefix-aware to match
+            # closed_loop_cfn.yaml's HasStackPrefix naming (e.g.
+            # "dv2-artf-dlrm-bid-shader"). Without these, closed_loop_api.py's
+            # _model_group() falls back to the unprefixed default
+            # ("artf-dlrm-bid-shader"), which does not exist when a stack
+            # prefix is in use — the Governance page's model registry list
+            # would query a group name that was never created.
+            - name: CLOSED_LOOP_MODEL_GROUP_DLRM_BID_SHADER
+              value: "__DLRM_MODEL_GROUP__"
+            - name: CLOSED_LOOP_MODEL_GROUP_NCF_DEAL_MANAGER
+              value: "__NCF_MODEL_GROUP__"
+            # Same stack-prefix-aware Model Package Group wiring as above,
+            # for the Yield Optimizer's two independently-trained sub-models
+            # (see training/xgboost_pipeline.py's module docstring on the
+            # FIL multi-output-limitation correction). Without these,
+            # closed_loop_api._model_group() falls back to the unprefixed
+            # default, which does not exist when a stack prefix is in use.
+            - name: CLOSED_LOOP_MODEL_GROUP_DEAL_YIELD_MANAGER_FLOOR
+              value: "__YIELD_FLOOR_MODEL_GROUP__"
+            - name: CLOSED_LOOP_MODEL_GROUP_DEAL_YIELD_MANAGER_MARGIN
+              value: "__YIELD_MARGIN_MODEL_GROUP__"
+            # Governance panel on-demand training trigger (Train-from-Load-Test
+            # feature, Unit 2). Reuses the SageMaker training execution role
+            # and buckets closed_loop_cfn.yaml already provisions (Condition:
+            # HasTrainingBuckets) — same infra the scheduled retraining Lambda
+            # uses, not a new/parallel setup.
+            - name: SAGEMAKER_TRAINING_ROLE_ARN
+              value: "__SAGEMAKER_TRAINING_ROLE_ARN__"
+            - name: MODEL_BUCKET
+              value: "__MODEL_BUCKET__"
+            - name: TRAINING_DATA_BUCKET
+              value: "__TRAINING_DATA_BUCKET__"
+            - name: TRAINING_IMAGE_REGISTRY
+              value: "__TRAINING_IMAGE_REGISTRY__"
+            # SageMaker's built-in XGBoost algorithm container URI, resolved
+            # at deploy time (see deploy_closed_loop.sh's own resolution for
+            # the scheduled retraining Lambda) -- required only for
+            # deal_yield_manager_floor/margin's on-demand training trigger
+            # (orchestrator/training_trigger.py's xgboost-shaped branch).
+            # Left empty when unresolved (e.g. sagemaker SDK unavailable at
+            # deploy time) -- training_trigger.py raises a clear,
+            # never-fabricated error for that model type until this is set,
+            # rather than guessing a SageMaker-owned account ID/URI.
+            - name: XGBOOST_TRAINING_IMAGE_URI
+              value: "__XGBOOST_TRAINING_IMAGE_URI__"
+            # Feedback pipeline (source/orchestrator/feedback_integration.py):
+            # emits real BidShadingOutcomeEvents (live traffic + load-test outcome
+            # capture) to the Kinesis stream created by feedback_pipeline_cfn.yaml
+            # / deploy_closed_loop.sh Step 1. Left empty (--with-retraining not
+            # used) means emission is a documented no-op, not a fabricated
+            # success — see FeedbackCollector's own "unset -> disabled" contract.
+            - name: FEEDBACK_STREAM_NAME
+              value: "__FEEDBACK_STREAM_NAME__"
+            # Deal yield feedback pipeline (source/orchestrator/
+            # deal_yield_feedback.py): emits real DealYieldOutcomeEvents for
+            # ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN mutations. Separate stream
+            # from FEEDBACK_STREAM_NAME above: Firehose's Glue-schema Parquet
+            # conversion maps by column name, so a shared stream would silently
+            # drop this event's fields. Same "unset -> disabled, not fabricated"
+            # contract.
+            - name: DEAL_YIELD_FEEDBACK_STREAM_NAME
+              value: "__DEAL_YIELD_FEEDBACK_STREAM_NAME__"
+            # Outcome simulator (source/orchestrator/outcome_simulator.py).
+            # SYNTHETIC win/impression/click/conversion outcomes, for a deployment
+            # with no exchange win notice and no advertiser pixel — without them the
+            # bid-shading training loop has no labels and every `cpa` retrain is
+            # refused by the trainer's dataset gate.
+            #
+            # OFF by default, and it must stay that way unless a deployment
+            # deliberately wants synthetic labels. Everything it emits carries
+            # provenance="simulated", which travels into the training record and the
+            # model manifest, so a model trained this way is always identifiable as
+            # one. Set to "true" to enable.
+            - name: OUTCOME_SIMULATOR_ENABLED
+              value: "__OUTCOME_SIMULATOR_ENABLED__"
+            # Funnel rates for the simulator above. Each is left EMPTY by default,
+            # which outcome_simulator._env_float reads as "use the code default"
+            # (win 0.40, impression 0.95, click 0.02, conversion 0.05, value 25.0).
+            # Those defaults sit in the range display advertising actually sees, so a
+            # simulated dataset is not trivially separable.
+            #
+            # A short demo that needs labels quickly can raise the click and
+            # conversion rates well above realistic levels to reach the trainer's
+            # dataset gate in minutes rather than days. That trade is legitimate but
+            # it is not a measurement: rates set this way describe the simulator, not
+            # any campaign, and the resulting model carries provenance="simulated".
+            - name: OUTCOME_SIMULATOR_WIN_RATE
+              value: "__OUTCOME_SIMULATOR_WIN_RATE__"
+            - name: OUTCOME_SIMULATOR_IMPRESSION_RATE
+              value: "__OUTCOME_SIMULATOR_IMPRESSION_RATE__"
+            - name: OUTCOME_SIMULATOR_CLICK_RATE
+              value: "__OUTCOME_SIMULATOR_CLICK_RATE__"
+            - name: OUTCOME_SIMULATOR_CONVERSION_RATE
+              value: "__OUTCOME_SIMULATOR_CONVERSION_RATE__"
+            - name: OUTCOME_SIMULATOR_CONVERSION_VALUE
+              value: "__OUTCOME_SIMULATOR_CONVERSION_VALUE__"
+            # Glue ETL job names (source/orchestrator/governance_api.py's
+            # trainable_runs_handler) -- used to check whether a completed
+            # Glue job run has actually swept a load test's data into
+            # training-data/ before offering it in the "Train from load
+            # test" run picker.
+            - name: GLUE_JOB_NAME
+              value: "__GLUE_JOB_NAME__"
+            - name: DEAL_YIELD_GLUE_JOB_NAME
+              value: "__DEAL_YIELD_GLUE_JOB_NAME__"
+            # How long a completed load test waits before its on-demand Glue
+            # sweep starts (source/orchestrator/etl_trigger.py). Those Glue
+            # jobs are otherwise only scheduled every 6 hours, so without the
+            # sweep a run stays untrainable for hours.
+            #
+            # Must exceed the Firehose buffering interval — 300s on both
+            # delivery streams in feedback_pipeline_cfn.yaml. Sweeping sooner
+            # would read S3 before the run's outcomes land, and the sweep's
+            # CompletedOn would then mark the run trainable with no data
+            # behind it. 360 = 300s buffer + 60s margin. Raise this if the
+            # delivery streams' BufferingHints are ever increased.
+            - name: ETL_SWEEP_DELAY_SECONDS
+              value: "360"
+            # NOTE: The orchestrator does NOT invoke agent runtimes. Agent
+            # invocation is browser-direct (SigV4 via the Cognito Identity Pool).
+            # The former BID_SHADING_RUNTIME_ARN env was removed intentionally.
           resources:
             requests:
               cpu: "500m"
@@ -88,13 +324,45 @@ apiVersion: v1
 kind: Service
 metadata:
   name: orchestrator
-  namespace: artf
 spec:
-  type: LoadBalancer
+  # ClusterIP for in-cluster callers (Prebid hook, ARTF containers). The
+  # orchestrator has no public address. The UI reaches it through the
+  # <prefix>-ui-api-proxy Lambda (deployment/ui_api_proxy_cfn.yaml), which runs
+  # inside the cluster VPC and forwards to the INTERNAL NLB defined in
+  # orchestrator-internal-nlb.yaml, not to this Service: a Lambda ENI cannot
+  # resolve cluster.local and has no route to a ClusterIP. That is what lets the
+  # stack deploy under VPC Block Public Access block-ingress, where an
+  # internet-facing load balancer could not be created.
+  type: ClusterIP
   ports:
     - port: 80
       targetPort: 8000
       protocol: TCP
+  selector:
+    app: artf
+    component: orchestrator
+---
+# In-cluster gRPC endpoint for the Prebid hook. Headless, so the hook's HTTP/2
+# connections can land on different replicas (a ClusterIP would pin each
+# long-lived connection to one pod). Deliberately NOT a port on the
+# orchestrator Service above: the gRPC listener is for in-cluster hosts, and
+# the UI path stays HTTP through the ui-api-proxy Lambda.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-grpc
+  labels:
+    app: artf
+    component: orchestrator
+    artf.transport: grpc
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+    - port: 50051
+      targetPort: 50051
+      protocol: TCP
+      name: grpc
   selector:
     app: artf
     component: orchestrator

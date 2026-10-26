@@ -10,7 +10,10 @@ import {
   DISPLAY_NAME_BY_STOP_ID,
 } from "./intentMapping.js";
 
-const CONTAINER_STOP_IDS = Object.freeze(["dlrm", "widedeep", "ncf", "metrics"]);
+// Two yield stops, one per container -- see intentMapping.js's INTENT_TO_STOP note.
+const CONTAINER_STOP_IDS = Object.freeze([
+  "dlrm", "widedeep", "ncf", "metrics", "yield-floor", "yield-margin",
+]);
 
 function isFiniteNumber(n) {
   return typeof n === "number" && Number.isFinite(n);
@@ -30,6 +33,9 @@ function resolveOpName(code) {
   return `OP_${code}`;
 }
 
+/** The host dispositions the orchestrator stamps onto a lifted auction report. */
+const DISPOSITIONS = new Set(["applied", "rejected", "superseded", "unknown"]);
+
 export function toMutationModel(m) {
   const raw = m ?? {};
   const intentCode = raw.intent;
@@ -39,6 +45,9 @@ export function toMutationModel(m) {
   if (raw.ids !== undefined && raw.ids !== null) payload = raw.ids;
   else if (raw.adjust_bid !== undefined && raw.adjust_bid !== null) payload = raw.adjust_bid;
   else if (raw.adjust_deal !== undefined && raw.adjust_deal !== null) payload = raw.adjust_deal;
+  // ARTF standard field is `add_metrics`; tolerate the legacy `metrics` key so
+  // the UI renders correctly across backend versions during the migration.
+  else if (raw.add_metrics !== undefined && raw.add_metrics !== null) payload = raw.add_metrics;
   else if (raw.metrics !== undefined && raw.metrics !== null) payload = raw.metrics;
 
   return {
@@ -48,6 +57,15 @@ export function toMutationModel(m) {
     opCode: typeof opCode === "number" ? opCode : 0,
     path: typeof raw.path === "string" ? raw.path : "",
     payload,
+    // What the exchange did with this mutation, when the response says: "applied",
+    // "rejected", "superseded" or "unknown". Present only on responses lifted from
+    // the auction (normalizeExtensionPoint); null on a plain /v1/mutations answer,
+    // which carries no host decision.
+    disposition: DISPOSITIONS.has(raw.disposition) ? raw.disposition : null,
+    dispositionReason:
+      typeof raw.disposition_reason === "string" && raw.disposition_reason
+        ? raw.disposition_reason
+        : null,
     raw,
   };
 }
@@ -82,23 +100,69 @@ function makePlaceholderContainerStop(id) {
     status: "unknown",
     latency: null,
     mutations: [],
+    superseded: 0,
   };
 }
 
+// Prefix for stops synthesized from a container the frontend has no build-time
+// entry for. Namespaced so it can never collide with one of the six fixed stop
+// ids, and so downstream code can recognise a dynamic stop when it needs to.
+export const DYNAMIC_STOP_PREFIX = "dynamic:";
+
+export function isDynamicStopId(id) {
+  return typeof id === "string" && id.startsWith(DYNAMIC_STOP_PREFIX);
+}
+
 function containerEntryToStop(entry) {
-  const stopId = CONTAINER_NAME_TO_STOP_ID[entry?.name];
-  if (!stopId) return null;
+  const name = entry?.name;
+  if (typeof name !== "string" || name === "") return null;
+
+  const stopId = CONTAINER_NAME_TO_STOP_ID[name];
+  const latency = isFiniteNumber(entry.latency_ms)
+    ? { ms: entry.latency_ms, source: "orchestrator" }
+    : null;
+  const mutations = Array.isArray(entry.mutations)
+    ? entry.mutations.map(toMutationModel)
+    : [];
+  const status = typeof entry.status === "string" ? entry.status : "unknown";
+
+  // A container the frontend was not built with -- a store-defined one, e.g.
+  // the ARTF template or a user's own container. This used to `return null`,
+  // and buildExplicitContainerStops then dropped it, so such a container was
+  // absent from the pipeline entirely rather than merely unlabelled. Synthesize
+  // a stop instead, and take its label from the response since no build-time
+  // lookup can know the name.
+  // How many of this container's mutations lost a contest for a (path, intent)
+  // to a higher-priority container. The mutations above still list them, because
+  // the container really did compute them -- this count is what lets the UI say
+  // "ran and was overridden" rather than showing a mutation that looks applied.
+  const superseded = isFiniteNumber(entry.superseded) ? entry.superseded : 0;
+
+  if (!stopId) {
+    return {
+      id: `${DYNAMIC_STOP_PREFIX}${name}`,
+      // Falls back to the internal name, never to an invented label.
+      displayName: (typeof entry.display_name === "string" && entry.display_name) || name,
+      modelFamily: "CUSTOM",
+      status,
+      latency,
+      mutations,
+      superseded,
+    };
+  }
+
   return {
     id: stopId,
-    displayName: DISPLAY_NAME_BY_STOP_ID[stopId],
+    // The response's display name wins so a renamed container shows its
+    // configured name; the build-time table is the fallback.
+    displayName:
+      (typeof entry.display_name === "string" && entry.display_name) ||
+      DISPLAY_NAME_BY_STOP_ID[stopId],
     modelFamily: STOP_MODEL_FAMILY[stopId],
-    status: typeof entry.status === "string" ? entry.status : "unknown",
-    latency: isFiniteNumber(entry.latency_ms)
-      ? { ms: entry.latency_ms, source: "orchestrator" }
-      : null,
-    mutations: Array.isArray(entry.mutations)
-      ? entry.mutations.map(toMutationModel)
-      : [],
+    status,
+    latency,
+    mutations,
+    superseded,
   };
 }
 
@@ -166,16 +230,30 @@ export function extractTotalLatency(raw, browserObservedMs) {
 
 function buildExplicitContainerStops(containers) {
   const byId = {};
+  // Dynamic stops are collected separately and appended, so the six fixed stops
+  // keep their positions and no existing layout moves when a store-defined
+  // container appears or disappears.
+  const dynamic = [];
   for (const entry of containers) {
     const stop = containerEntryToStop(entry);
     if (!stop) continue;
+    if (isDynamicStopId(stop.id)) {
+      if (!dynamic.some((s) => s.id === stop.id)) dynamic.push(stop);
+      continue;
+    }
     if (!byId[stop.id]) byId[stop.id] = stop;
   }
-  return CONTAINER_STOP_IDS.map((id) => byId[id] ?? makePlaceholderContainerStop(id));
+  const fixed = CONTAINER_STOP_IDS.map((id) => byId[id] ?? makePlaceholderContainerStop(id));
+  // Registry order is the orchestrator's attribution order, so it is preserved
+  // rather than re-sorted here.
+  return [...fixed, ...dynamic];
 }
 
 function buildInferredContainerStops(mutations) {
-  const buckets = { dlrm: [], widedeep: [], ncf: [], metrics: [] };
+  const buckets = {
+    dlrm: [], widedeep: [], ncf: [], metrics: [],
+    "yield-floor": [], "yield-margin": [],
+  };
   for (const m of mutations) {
     const intentCode = m?.intent;
     const stopId = (typeof intentCode === "number" && INTENT_TO_STOP[intentCode]) || "metrics";
@@ -188,7 +266,58 @@ function buildInferredContainerStops(mutations) {
     status: "unknown",
     latency: null,
     mutations: buckets[id],
+    // The inferred path has no per-container metadata to read a count from, so
+    // 0 here means "not known", not "nothing was overridden".
+    superseded: 0,
   }));
+}
+
+/** A stable identity for one raw mutation, for matching the flattened list to a container's list. */
+function mutationKey(raw) {
+  return JSON.stringify([raw?.intent, raw?.op, raw?.path, raw?.ids, raw?.adjust_deal, raw?.adjust_bid, raw?.add_metrics, raw?.metrics]);
+}
+
+/**
+ * The orchestrator's flattened mutation list, in its order, each stamped with the
+ * stop that produced it.
+ *
+ * `raw.mutations` is already conflict-resolved and in application order; the
+ * per-container lists on the stops say who produced what. A mutation that two
+ * containers both produced byte-for-byte is attributed to the first in stop order,
+ * which is the orchestrator's own tie-break. One that no stop lists (an inferred
+ * attribution, or an older server) is attributed by intent.
+ */
+export function attributeOrderedMutations(raw, containerStops) {
+  const list = Array.isArray(raw?.mutations) ? raw.mutations : [];
+  const byKey = new Map();
+  for (const stop of containerStops ?? []) {
+    for (const m of stop.mutations ?? []) {
+      const key = mutationKey(m.raw);
+      if (!byKey.has(key)) byKey.set(key, stop.id);
+    }
+  }
+  return list.map((m) => {
+    const model = toMutationModel(m);
+    const intentCode = m?.intent;
+    const fallback = (typeof intentCode === "number" && INTENT_TO_STOP[intentCode]) || "metrics";
+    return { ...model, sourceAgent: byKey.get(mutationKey(m)) ?? fallback };
+  });
+}
+
+/** metadata.stages as the UI reads it. [] when absent. */
+export function normalizeStages(rawStages) {
+  if (!Array.isArray(rawStages)) return [];
+  return rawStages
+    .filter((s) => s && typeof s === "object")
+    .map((s) => ({
+      stage: isFiniteNumber(s.stage) ? s.stage : 0,
+      name: typeof s.name === "string" ? s.name : "",
+      containers: Array.isArray(s.containers) ? s.containers.filter((c) => typeof c === "string") : [],
+      latencyMs: isFiniteNumber(s.latency_ms) ? s.latency_ms : null,
+      budgetMs: isFiniteNumber(s.budget_ms) ? s.budget_ms : null,
+      applied: isFiniteNumber(s.applied) ? s.applied : 0,
+      rejected: Array.isArray(s.rejected) ? s.rejected : [],
+    }));
 }
 
 /**
@@ -208,13 +337,12 @@ export function normalize(raw, transport, submittedPayload) {
       totalLatencyMs: 0,
       stops: [
         makeSspStop(),
-        makePlaceholderContainerStop("dlrm"),
-        makePlaceholderContainerStop("widedeep"),
-        makePlaceholderContainerStop("ncf"),
-        makePlaceholderContainerStop("metrics"),
+        ...CONTAINER_STOP_IDS.map((id) => makePlaceholderContainerStop(id)),
         makeDspStop(),
       ],
       packet: summarizePacket(safePayload, raw),
+      mutations: [],
+      stages: [],
       attribution: "inferred",
       lifecycle,
       isResponseLifecycle,
@@ -236,12 +364,57 @@ export function normalize(raw, transport, submittedPayload) {
     transport,
     totalLatencyMs: extractTotalLatency(raw),
     stops,
+    // The orchestrator's returned list: stage-ordered and conflict-resolved, which
+    // is the order the host applies. Each entry carries the stop id of the
+    // container that produced it (resolved by matching the mutation against the
+    // per-container lists; by intent when no container claims it). Stops above are
+    // in display order and must not be used as an application order.
+    mutations: attributeOrderedMutations(raw, containerStops),
+    // The sequenced fan-out's own account: which containers ran in which stage
+    // and how long each stage took. [] when the server did not report stages
+    // (bypassed pass, or an orchestrator predating staging).
+    stages: normalizeStages(raw?.metadata?.stages),
     packet: summarizePacket(safePayload, raw),
     attribution: hasExplicitContainers ? "explicit" : "inferred",
+    // Contests for a (path, intent) claimed by more than one container. Always an
+    // array: an orchestrator predating precedence omits the key, and for a
+    // renderer "nothing to show" and "this build cannot tell you" both mean
+    // render nothing.
+    conflicts: Array.isArray(raw?.metadata?.conflicts) ? raw.metadata.conflicts : [],
     lifecycle,
     isResponseLifecycle,
     error: null,
     raw,
     submittedPayload: safePayload,
   };
+}
+
+/**
+ * Normalize the ARTF hook's report of a real auction, `artf_meta.extension_point`
+ * from `/v1/auction/run?artf=on`, into the same NormalizedFlowResult `normalize`
+ * returns.
+ *
+ * `extensionPoint.response` is the RTBResponse the hook received, with a
+ * disposition stamped on every mutation, so it goes through `normalize` unchanged:
+ * one normalizer, one beat builder, whichever call the mutations came from. When
+ * the hook got no answer (timeout, transport failure, skip) or the report is
+ * unavailable, the result has no container mutations.
+ *
+ * `artfReport` says where the result came from and whether the hook's report was
+ * usable. A plain `normalize()` result has no `artfReport`.
+ */
+export function normalizeExtensionPoint(extensionPoint, submittedPayload) {
+  const ep = extensionPoint && typeof extensionPoint === "object" ? extensionPoint : {};
+  const raw =
+    ep.response && typeof ep.response === "object"
+      ? ep.response
+      : { id: "", mutations: [], metadata: { containers: [] } };
+  const result = normalize(raw, "PREBID", submittedPayload);
+  result.artfReport = {
+    source: "auction",
+    available: ep.available === true,
+    outcome: typeof ep.outcome === "string" ? ep.outcome : null,
+    reason: typeof ep.reason === "string" ? ep.reason : null,
+  };
+  return result;
 }

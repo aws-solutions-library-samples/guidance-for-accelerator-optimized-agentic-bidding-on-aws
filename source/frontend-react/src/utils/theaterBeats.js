@@ -1,0 +1,408 @@
+// theaterBeats.js — derive the Auction Theater's beat sequence from a real
+// orchestrator response.
+//
+// Pure: no I/O, no clock, no randomness. Given the same submitted payload and
+// normalized result it returns the same beats, which is what makes the stepper
+// reproducible and this module property-testable.
+
+import { DISPLAY_NAME_BY_STOP_ID, CONTAINER_NAME_TO_STOP_ID } from "./intentMapping.js";
+import { findOriginalDealBidfloor } from "./applyMutations.js";
+import { showsDealScorerDisclosure } from "./dealScorerTraining.js";
+
+/** Margin.calculation_type from the ARTF proto. */
+const CALC_TYPE = Object.freeze({ 0: "CPM", 1: "PERCENT" });
+
+const EXPLORE_SUFFIX = ":explore";
+
+/** Beat kinds. */
+export const BEAT_ORIGIN = "origin";
+export const BEAT_CONTAINER = "container";
+export const BEAT_BIDS = "bids";
+export const BEAT_RECAP = "recap";
+/**
+ * A pass banner: announces whether the auction about to run is the one WITHOUT
+ * ARTF mutations (pass 1) or the one WITH them (pass 2). A beat, not a transient
+ * overlay, so stepping back to it shows it again and the screen stays a pure
+ * function of (beats, index).
+ */
+export const BEAT_PASS = "pass";
+/**
+ * The baseline auction settling: the beat at which pass 1's winner is revealed.
+ * Pass 1 has no recap -- there were no mutations to recap -- so this is the beat
+ * that plays the recap's role of closing the pass.
+ */
+export const BEAT_BASELINE = "baseline";
+
+/** The two passes, by number. Pass 1 is the baseline; pass 2 is the one with ARTF. */
+export const PASS_BASELINE = 1;
+export const PASS_ARTF = 2;
+
+/** Where attention travels for each beat kind (BR-20). */
+const MOVEMENT_BY_KIND = Object.freeze({
+  [BEAT_PASS]: "none",
+  [BEAT_ORIGIN]: "sell-to-request",
+  [BEAT_CONTAINER]: "none",
+  // Attention crosses to the buy side when the BIDS land, not at the recap: the
+  // bids are the first thing the offers column shows, so that is the move.
+  [BEAT_BIDS]: "request-to-buy",
+  [BEAT_BASELINE]: "none",
+  [BEAT_RECAP]: "none",
+});
+
+function isFiniteNumber(n) {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+/**
+ * Whether a beat or value describes a mutation that changed the auction.
+ *
+ * `disposition` is the exchange's decision, carried on mutations lifted from the
+ * auction report: "applied", "rejected", "superseded" or "unknown". null means the
+ * source carries no host decision (the /v1/mutations fallback), and is treated as
+ * applied, which is what that source has always meant. Every consumer that counts
+ * or acts on a value uses this one rule.
+ */
+export function isAppliedValue(v) {
+  return v?.disposition == null || v.disposition === "applied";
+}
+
+/** The values that changed the auction, in order. */
+export function appliedValues(values) {
+  return (values ?? []).filter(isAppliedValue);
+}
+
+/**
+ * True only when the container's real model_version carries the explore
+ * suffix. Never inferred from the returned value: a value can look unusual
+ * without exploration, and exploration can occur without it looking unusual
+ * (BR-12).
+ */
+export function isExplored(modelVersion) {
+  return typeof modelVersion === "string" && modelVersion.endsWith(EXPLORE_SUFFIX);
+}
+
+/** Parse the deal id out of an ARTF `/imp/{imp_id}/deals/{deal_id}` path. */
+export function dealIdFromPath(path) {
+  if (typeof path !== "string") return null;
+  const match = /^\/imp\/([^/]+)\/deals\/([^/]+)$/.exec(path);
+  return match ? match[2] : null;
+}
+
+/**
+ * Map one mutation to its typed values (BR-6 through BR-10).
+ *
+ * An unrecognised payload yields an empty array. The caller still emits a beat
+ * for it, so an intent we don't render yet degrades visibly rather than
+ * silently (BR-5).
+ */
+export function mutationToValues(mutation, submittedPayload) {
+  const intent = mutation?.intent;
+  const payload = mutation?.payload;
+  if (!payload) return [];
+
+  if (intent === "ADD_METRICS") {
+    const metrics = Array.isArray(payload.metric) ? payload.metric : [];
+    return metrics
+      .filter((m) => typeof m?.type === "string" && isFiniteNumber(m?.value))
+      .map((m) => ({ kind: "metric", type: m.type, value: m.value }));
+  }
+
+  if (intent === "ACTIVATE_SEGMENTS" || intent === "ACTIVATE_DEALS" || intent === "SUPPRESS_DEALS") {
+    const ids = Array.isArray(payload.id) ? payload.id : [];
+    if (ids.length === 0) return [];
+    const role =
+      intent === "ACTIVATE_SEGMENTS"
+        ? "segments"
+        : intent === "ACTIVATE_DEALS"
+          ? "deals-activated"
+          : "deals-suppressed";
+    return [{ kind: "ids", role, ids }];
+  }
+
+  if (intent === "ADJUST_DEAL_FLOOR") {
+    if (!isFiniteNumber(payload.bidfloor)) return [];
+    return [{
+      kind: "floor",
+      dealId: dealIdFromPath(mutation.path),
+      // null is a real "unknown baseline", never defaulted to zero (BR-8).
+      before: findOriginalDealBidfloor({ submittedPayload }, mutation.path),
+      after: payload.bidfloor,
+    }];
+  }
+
+  if (intent === "ADJUST_DEAL_MARGIN") {
+    const margin = payload.margin;
+    if (!margin || !isFiniteNumber(margin.value)) return [];
+    return [{
+      kind: "margin",
+      dealId: dealIdFromPath(mutation.path),
+      value: margin.value,
+      // Read from the mutation, never assumed to be percent (BR-9).
+      calculationType: CALC_TYPE[margin.calculation_type] ?? "CPM",
+    }];
+  }
+
+  if (intent === "BID_SHADE") {
+    if (!isFiniteNumber(payload.price)) return [];
+    const before = submittedPayload?.bid_response?.seatbid?.[0]?.bid?.[0]?.price;
+    return [{
+      kind: "price",
+      before: isFiniteNumber(before) ? before : null,
+      after: payload.price,
+    }];
+  }
+
+  return [];
+}
+
+/** Describe the impression, entirely from the submitted request (FR-13). */
+export function buildScenarioContext(submittedPayload) {
+  const payload = submittedPayload ?? {};
+  const br = payload.bid_request ?? {};
+  const site = br.site ?? br.app ?? {};
+  const device = br.device ?? {};
+  const user = br.user ?? {};
+  const imps = Array.isArray(br.imp) ? br.imp : [];
+  const imp0 = imps[0] ?? {};
+
+  const kinds = [];
+  if (imp0.banner) kinds.push("banner");
+  if (imp0.video) kinds.push("video");
+  if (imp0.audio) kinds.push("audio");
+  if (imp0.native) kinds.push("native");
+
+  const deals = [];
+  for (const imp of imps) {
+    for (const deal of imp?.pmp?.deals ?? []) {
+      if (typeof deal?.id === "string") {
+        deals.push({
+          id: deal.id,
+          bidFloor: isFiniteNumber(deal.bidfloor) ? deal.bidfloor : null,
+          auctionType: Number.isInteger(deal.at) ? deal.at : null,
+        });
+      }
+    }
+  }
+
+  // Request-borne user data. Kept separate from mutation values so it can only
+  // ever render as "already sent by the exchange" (BR-23).
+  const userSignals = [];
+  if (Number.isInteger(user.yob)) {
+    userSignals.push({ label: "year of birth", value: String(user.yob), provenance: "request" });
+  }
+  if (typeof user.gender === "string" && user.gender.length > 0) {
+    userSignals.push({ label: "gender", value: user.gender, provenance: "request" });
+  }
+  for (const provider of user.data ?? []) {
+    for (const seg of provider?.segment ?? []) {
+      const name = seg?.name ?? seg?.id;
+      if (typeof name === "string" && name.length > 0) {
+        userSignals.push({ label: "data segment", value: name, provenance: "request" });
+      }
+    }
+  }
+
+  return {
+    requestId: typeof payload.id === "string" ? payload.id : null,
+    publisher: typeof site.domain === "string" ? site.domain : null,
+    page: typeof site.page === "string" ? site.page : null,
+    contentCategories: Array.isArray(site.cat) ? site.cat.filter((c) => typeof c === "string") : [],
+    categoryTaxonomy: Number.isInteger(site.cattax) ? site.cattax : null,
+    deviceType: typeof device.ua === "string" && device.ua.length > 0 ? device.ua : null,
+    geo: typeof device?.geo?.region === "string"
+      ? `${device.geo.country ?? ""}-${device.geo.region}`.replace(/^-/, "")
+      : (typeof device?.geo?.country === "string" ? device.geo.country : null),
+    impressionFormat: kinds.length === 1 ? kinds[0] : kinds.length > 1 ? "mixed" : "unknown",
+    bidFloor: isFiniteNumber(imp0.bidfloor) ? imp0.bidfloor : null,
+    deals,
+    userSignals,
+  };
+}
+
+function displayLabelFor(containerName) {
+  const stopId = CONTAINER_NAME_TO_STOP_ID[containerName];
+  return (stopId && DISPLAY_NAME_BY_STOP_ID[stopId]) || containerName || null;
+}
+
+function makeBeat(index, kind, extra) {
+  return {
+    index,
+    kind,
+    movement: MOVEMENT_BY_KIND[kind],
+    // Which pass this beat belongs to. Defaults to the ARTF pass so a beat built
+    // without saying is the one that existed before passes did.
+    pass: PASS_ARTF,
+    containerName: null,
+    displayLabel: null,
+    intent: null,
+    operation: null,
+    modelVersion: null,
+    explored: false,
+    // True on a Deal Scorer beat: the renderer adds the training disclosure.
+    sampleTrained: false,
+    latencyMs: null,
+    path: null,
+    disposition: null,
+    dispositionReason: null,
+    values: [],
+    ...extra,
+  };
+}
+
+/**
+ * Derive the beat sequence (BR-1 through BR-4, extended to two passes).
+ *
+ * Pass 1, the baseline: a pass banner, the request arriving, the seats bidding on
+ * it exactly as sent, and the auction settling. No container appears, because
+ * none was consulted -- the auction endpoint marks the request so the extension
+ * point proposes nothing.
+ *
+ * Pass 2, with ARTF: a pass banner, the request arriving again, one beat per
+ * Mutation object in stop order, the seats bidding on the enriched request, and
+ * the recap. A stop with no mutations contributes no beats, so a container that
+ * was invoked and deliberately recommended no change is absent from the
+ * walkthrough (BR-4). The total is therefore only knowable after the response.
+ *
+ * `normalizedResult` is normally the with-ARTF auction's own report
+ * (normalizeExtensionPoint), so each container beat carries the exchange's
+ * disposition for its mutation. A rejected or superseded mutation keeps its beat,
+ * marked with that disposition, and is not counted as a change.
+ *
+ * Every beat carries `pass`, and every pass-1 beat precedes every pass-2 beat.
+ * Nothing in pass 1 carries values, so `visibleValues` is empty until the first
+ * container beat, which is in pass 2 by construction.
+ */
+export function buildBeats(submittedPayload, normalizedResult) {
+  const stops = Array.isArray(normalizedResult?.stops) ? normalizedResult.stops : [];
+  const beats = [];
+
+  // ---- pass 1: the baseline -------------------------------------------------
+  beats.push(makeBeat(beats.length, BEAT_PASS, { pass: PASS_BASELINE, artf: false }));
+  beats.push(makeBeat(beats.length, BEAT_ORIGIN, { pass: PASS_BASELINE }));
+  beats.push(makeBeat(beats.length, BEAT_BIDS, { pass: PASS_BASELINE }));
+  beats.push(makeBeat(beats.length, BEAT_BASELINE, { pass: PASS_BASELINE }));
+
+  // ---- pass 2: with ARTF ----------------------------------------------------
+  beats.push(makeBeat(beats.length, BEAT_PASS, { pass: PASS_ARTF, artf: true }));
+  beats.push(makeBeat(beats.length, BEAT_ORIGIN, { pass: PASS_ARTF }));
+
+  for (const stop of stops) {
+    // Only container stops carry a resolvable container name; the ssp and dsp
+    // bookends do not and contribute nothing.
+    const containerName = stop?.id;
+    if (containerName === "ssp" || containerName === "dsp") continue;
+    const mutations = Array.isArray(stop?.mutations) ? stop.mutations : [];
+    for (const mutation of mutations) {
+      const modelVersion = typeof stop.modelVersion === "string" ? stop.modelVersion : null;
+      beats.push(makeBeat(beats.length, BEAT_CONTAINER, {
+        containerName,
+        // The stop's own displayName wins. It is resolved by normalizer.js,
+        // which prefers the label the orchestrator sent — the only source that
+        // can name a store-defined container, since its name is not known when
+        // this bundle is built. Falling straight through to the stop id would
+        // print a synthesized id like "dynamic:artf-template" as the label.
+        displayLabel:
+          (typeof stop?.displayName === "string" && stop.displayName) ||
+          DISPLAY_NAME_BY_STOP_ID[containerName] ||
+          containerName,
+        intent: mutation?.intent ?? null,
+        operation: mutation?.op ?? null,
+        modelVersion,
+        explored: isExplored(modelVersion),
+        sampleTrained: showsDealScorerDisclosure(containerName, modelVersion),
+        latencyMs: isFiniteNumber(stop?.latency?.ms) ? stop.latency.ms : null,
+        path: typeof mutation?.path === "string" ? mutation.path : null,
+        disposition: typeof mutation?.disposition === "string" ? mutation.disposition : null,
+        dispositionReason:
+          typeof mutation?.dispositionReason === "string" ? mutation.dispositionReason : null,
+        values: mutationToValues(mutation, submittedPayload),
+      }));
+      // Attribution travels WITH the value. visibleValues flattens the beat
+      // away, so a floor change reaching the sell-side column could otherwise
+      // only render as "Floor · deal-x" — the container that decided it was lost
+      // at the flatten. Stamped here rather than passed alongside because every
+      // consumer that reads a value already has the value and nothing else.
+      const beat = beats[beats.length - 1];
+      for (const value of beat.values) {
+        value.containerName = beat.containerName;
+        value.displayLabel = beat.displayLabel;
+        value.intent = beat.intent;
+        value.disposition = beat.disposition;
+        value.dispositionReason = beat.dispositionReason;
+        value.sampleTrained = beat.sampleTrained;
+      }
+    }
+  }
+
+  // The bids land between the last mutation and the recap, so the reader sees the
+  // seats respond to the enriched request before anything names a winner.
+  //
+  // Structural, like origin and recap: the offers column states what the auction
+  // returned when this beat is reached (real bids, no bids, the fixture with its
+  // own notice, or a fault), so the beat itself carries no bid count.
+  beats.push(makeBeat(beats.length, BEAT_BIDS, { pass: PASS_ARTF }));
+
+  // The recap restates what actually changed. A container that produced nothing
+  // is absent from it, consistent with having produced no beat (BR-9 of the
+  // logic model).
+  const contributors = [];
+  for (const beat of beats) {
+    if (beat.kind !== BEAT_CONTAINER) continue;
+    // A rejected or superseded mutation did not change the request, so its
+    // container is not credited with changing it.
+    if (!isAppliedValue(beat)) continue;
+    const existing = contributors.find((c) => c.containerName === beat.containerName);
+    if (existing) existing.beatIndexes.push(beat.index);
+    else contributors.push({
+      containerName: beat.containerName,
+      displayLabel: beat.displayLabel,
+      beatIndexes: [beat.index],
+    });
+  }
+  beats.push(makeBeat(beats.length, BEAT_RECAP, {
+    pass: PASS_ARTF,
+    contributors,
+    // Where the with-ARTF mutations came from, and whether the auction's own
+    // report was usable. null for the /v1/mutations fallback.
+    artfReport: normalizedResult?.artfReport ?? null,
+  }));
+
+  return beats;
+}
+
+/**
+ * Values from beats up to and including `index`, so what is on screen is
+ * derived rather than accumulated across moves (BR-17, BR-24).
+ */
+export function visibleValues(beats, index) {
+  if (!Array.isArray(beats)) return [];
+  return beats.slice(0, index + 1).flatMap((b) => b.values ?? []);
+}
+
+/** The pass the beat at `index` belongs to, or null when there is no such beat. */
+export function passOf(beats, index) {
+  if (!Array.isArray(beats) || index < 0 || index >= beats.length) return null;
+  return beats[index]?.pass ?? null;
+}
+
+/**
+ * Whether a beat of `kind` in `pass` has been REACHED by `index` -- i.e. sits at or
+ * before it. Scoped to a pass because both passes have a bids beat: having reached
+ * pass 1's must not reveal pass 2's offers.
+ */
+export function sawKindInPass(beats, index, kind, pass) {
+  if (!Array.isArray(beats)) return false;
+  return beats.slice(0, index + 1).some((b) => b.kind === kind && b.pass === pass);
+}
+
+/** Card state as a function of how far the walkthrough has progressed (BR-25). */
+export function cardStateFor(beats, index) {
+  if (!Array.isArray(beats) || beats.length === 0) return "neutral";
+  const seen = beats.slice(0, index + 1);
+  if (seen.some((b) => b.kind === BEAT_RECAP)) return "settled";
+  if (seen.some((b) => b.kind === BEAT_CONTAINER)) return "enriching";
+  return "neutral";
+}
+
+/** `displayLabelFor` is exported for the label-correction test in FR-42. */
+export { displayLabelFor };

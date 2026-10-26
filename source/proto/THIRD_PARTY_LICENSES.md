@@ -9,12 +9,12 @@ notices below apply only to the third-party files identified in each section.
 
 ---
 
-## 1. IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 schema — CC BY 3.0
+## 1. IAB Tech Lab Agentic Real Time Framework (ARTF) v1.0 schema — CC BY 3.0
 
 - **Files:**
   - `source/proto/agenticrtbframework.proto`
   - `source/proto/agenticrtbframeworkservices.proto`
-- **Title:** IAB Tech Lab Agentic RTB Framework (ARTF) v1.0 — Protocol Buffers schema
+- **Title:** IAB Tech Lab Agentic Real Time Framework (ARTF) v1.0 — Protocol Buffers schema
 - **Author:** IAB Tech Lab (Interactive Advertising Bureau Technology Laboratory)
 - **Source:** https://github.com/IABTechLab/agentic-realtime-framework
 - **License:** Creative Commons Attribution 3.0 (CC BY 3.0) —
@@ -24,16 +24,16 @@ notices below apply only to the third-party files identified in each section.
   reference implementation in the upstream repository is separately licensed
   under AGPL-3.0 and is **not** included in this Guidance.
 - **Modifications:** An attribution comment header was added to the top of each
-  file. In `agenticrtbframework.proto`, `MetricsPayload.metric` was changed from
+  file. In `agenticrtbframework.proto`, `AddMetricsPayload.metric` was changed from
   `com.iabtechlab.openrtb.v2.BidRequest.Metric` to
   `com.iabtechlab.openrtb.v2.BidRequest.Imp.Metric` — the correct nested type
   path for the bundled OpenRTB schema, without which the schema does not compile.
   The message, service, field numbers, and enum definitions are otherwise
   unmodified.
 
-> "Agentic RTB Framework" and the ARTF schema are © IAB Tech Lab, licensed under
+> "Agentic Real Time Framework" and the ARTF schema are © IAB Tech Lab, licensed under
 > CC BY 3.0. Changes: attribution header added; one type-path correction in
-> `MetricsPayload` (`BidRequest.Metric` → `BidRequest.Imp.Metric`).
+> `AddMetricsPayload` (`BidRequest.Metric` → `BidRequest.Imp.Metric`).
 
 ---
 

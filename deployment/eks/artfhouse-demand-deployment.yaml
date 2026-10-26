@@ -1,0 +1,158 @@
+# artfhouse demand service: the Prebid `artfhouse` seat's bid endpoint, in-cluster.
+#
+# Rendered and applied by deploy_prebid.sh Step 6. Placeholders:
+#   __NAMESPACE__          the namespace Prebid runs in
+#   __DEMAND_ROLE_ARN__    IRSA role (prebid_cfn.yaml DemandServiceRole): read-only
+#                          Query/GetItem/Scan on the deals table, nothing else
+#   __DEMAND_IMAGE__       <repo>@sha256:<digest>, resolved from ECR after the push
+#   __AWS_REGION__         region of the deals table and the user pool
+#   __DEALS_TABLE__        <stack>-deals
+#   __USER_POOL_ID__       the Cognito pool that issues Prebid's token
+#   __PREBID_CLIENT_ID__   the Prebid host's app client: the only accepted client_id
+#
+# The bid path makes no DynamoDB call: the catalog is loaded at startup and
+# refreshed every 30 s in a background thread (source/demand/artfhouse/snapshot.py).
+# Readiness fails until the catalog and the token signing keys are loaded.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: artfhouse-demand-sa
+  namespace: __NAMESPACE__
+  labels:
+    app: artfhouse-demand
+    app.kubernetes.io/part-of: prebid-artf
+  annotations:
+    eks.amazonaws.com/role-arn: "__DEMAND_ROLE_ARN__"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: artfhouse-demand
+  namespace: __NAMESPACE__
+  labels:
+    app: artfhouse-demand
+    app.kubernetes.io/part-of: prebid-artf
+    app.kubernetes.io/component: demand
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: artfhouse-demand
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: artfhouse-demand
+        app.kubernetes.io/part-of: prebid-artf
+    spec:
+      serviceAccountName: artfhouse-demand-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: artfhouse-demand
+      containers:
+        - name: demand
+          image: "__DEMAND_IMAGE__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AWS_REGION
+              value: "__AWS_REGION__"
+            - name: AWS_DEFAULT_REGION
+              value: "__AWS_REGION__"
+            - name: DEALS_TABLE
+              value: "__DEALS_TABLE__"
+            - name: COGNITO_REGION
+              value: "__AWS_REGION__"
+            - name: COGNITO_USER_POOL_ID
+              value: "__USER_POOL_ID__"
+            - name: DEMAND_ALLOWED_CLIENT_ID
+              value: "__PREBID_CLIENT_ID__"
+            - name: DEMAND_REQUIRED_SCOPE
+              value: "artf-demand/bid:read"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artfhouse-demand
+  namespace: __NAMESPACE__
+  labels:
+    app: artfhouse-demand
+    app.kubernetes.io/part-of: prebid-artf
+spec:
+  type: ClusterIP
+  selector:
+    app: artfhouse-demand
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+# Only the Prebid pods may reach the demand service. Enforced only when the cluster's
+# CNI enforces NetworkPolicy (VPC CNI: enableNetworkPolicy); deploy_prebid.sh reports
+# whether it does.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: artfhouse-demand-from-prebid-only
+  namespace: __NAMESPACE__
+  labels:
+    app: artfhouse-demand
+    app.kubernetes.io/part-of: prebid-artf
+spec:
+  podSelector:
+    matchLabels:
+      app: artfhouse-demand
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prebid-server
+      ports:
+        - protocol: TCP
+          port: 8080

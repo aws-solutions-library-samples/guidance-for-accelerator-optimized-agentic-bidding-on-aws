@@ -54,6 +54,7 @@ REMOTE_CONTAINERS = [
     {"name": "widedeep-segment-activator", "url": os.environ.get("WIDEDEEP_URL", "http://localhost:50062/mutate")},
     {"name": "ncf-deal-manager", "url": os.environ.get("NCF_URL", "http://localhost:50063/mutate")},
     {"name": "metrics-enricher", "url": os.environ.get("METRICS_URL", "http://localhost:50064/mutate")},
+    {"name": "deal-yield-manager", "url": os.environ.get("YIELD_URL", "http://localhost:50065/mutate")},
 ]
 
 # Local mutate functions (loaded lazily)
@@ -85,6 +86,20 @@ def _load_local_mutators():
         _local_mutators.append(("metrics-enricher", metrics))
     except ImportError as e:
         logger.warning("Metrics container not available locally: %s", e)
+    # The Yield Optimizer is TWO containers, one per intent -- imported
+    # separately so a failure to load one still leaves the other serving
+    # (BR-5: ADJUST_DEAL_FLOOR and ADJUST_DEAL_MARGIN are independent and
+    # atomic, never gated on each other).
+    try:
+        from containers.yield_optimizer_floor.app import mutate as yield_floor
+        _local_mutators.append(("yield-optimizer-floor", yield_floor))
+    except ImportError as e:
+        logger.warning("Yield Optimizer (Floor) container not available locally: %s", e)
+    try:
+        from containers.yield_optimizer_margin.app import mutate as yield_margin
+        _local_mutators.append(("yield-optimizer-margin", yield_margin))
+    except ImportError as e:
+        logger.warning("Yield Optimizer (Margin) container not available locally: %s", e)
     return _local_mutators
 
 
@@ -144,7 +159,7 @@ TOOLS = [{
         "Process an OpenRTB bid request/response through Accelerator-optimized Agentic Bidding "
         "containers (DLRM, Wide&Deep, NCF, Metrics) and return proposed mutations. "
         "Supports ARTF intents: ACTIVATE_SEGMENTS, ACTIVATE_DEALS, SUPPRESS_DEALS, "
-        "ADJUST_DEAL_FLOOR, BID_SHADE, ADD_METRICS."
+        "BID_SHADE, ADD_METRICS."
     ),
     "inputSchema": {
         "type": "object",
@@ -159,6 +174,10 @@ TOOLS = [{
             "applicable_intents": {
                 "type": "array", "items": {"type": "string"},
                 "description": "Filter which intents are returned. Empty = all.",
+            },
+            "ext": {
+                "type": "object",
+                "description": "ARTF extension object for nonstandard signaling (e.g. ext.model_params).",
             },
         },
     },
@@ -226,7 +245,7 @@ mcp_app = Starlette(routes=[
     Route("/mcp", mcp_endpoint, methods=["POST", "GET", "DELETE", "OPTIONS"]),
     Route("/ping", ping),
 ])
-mcp_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
+mcp_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])  # nosemgrep: wildcard-cors the MCP server is reached by AgentCore, not by browsers
 
 
 # ---------------------------------------------------------------------------
