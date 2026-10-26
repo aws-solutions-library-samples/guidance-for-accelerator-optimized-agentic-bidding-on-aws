@@ -52,9 +52,11 @@ TERMS_EXT_FIELDS = frozenset({"mindealfloor"})
 CAMPAIGN_FIELDS = frozenset({
     "campaign_id", "campaign_name", "adomain", "creative_id", "width", "height",
     "declared_cpm", "deal_ids", "open_market", "target_categories", "media_type",
-    "duration", "audience_uplift", "note",
+    "duration", "audience_uplift", "note", "target_content_ids",
 })
-CAMPAIGN_REQUIRED = CAMPAIGN_FIELDS - {"note", "duration", "audience_uplift"}
+CAMPAIGN_REQUIRED = CAMPAIGN_FIELDS - {"note", "duration", "audience_uplift", "target_content_ids"}
+#: Prefix the demand endpoint matches in imp.metric[].type for content targeting.
+CONTENT_ID_PREFIX = "cid:"
 
 
 class SeedError(ValueError):
@@ -168,6 +170,16 @@ def validate(seed: dict) -> None:
         if cid in campaign_ids:
             problems.append(f"{where}: duplicate campaign id")
         campaign_ids.add(cid)
+        if "target_content_ids" in campaign:
+            content_ids = campaign["target_content_ids"]
+            if not isinstance(content_ids, list) or not all(
+                isinstance(c, str) and c.startswith(CONTENT_ID_PREFIX) and len(c) > len(CONTENT_ID_PREFIX)
+                for c in content_ids
+            ):
+                problems.append(
+                    f"{where}: target_content_ids={content_ids!r} must be a list of "
+                    f"'{CONTENT_ID_PREFIX}<id>' strings"
+                )
         for deal_id in campaign.get("deal_ids") or []:
             if deal_id not in deal_ids:
                 problems.append(f"{where}: holds {deal_id}, which is not a deal in the seed")

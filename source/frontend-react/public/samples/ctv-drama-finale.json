@@ -1,0 +1,62 @@
+{
+  "id": "sample-ctv-drama-finale-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
+  "originator": {"type": "TYPE_SSP", "id": "ssp-streamco-001"},
+  "applicable_intents": ["ADD_CIDS", "ACTIVATE_DEALS", "ADJUST_DEAL_FLOOR", "ADJUST_DEAL_MARGIN"],
+  "bid_request": {
+    "id": "auction-ctv-drama-finale-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "video": {
+          "mimes": ["video/mp4"],
+          "minduration": 15,
+          "maxduration": 30,
+          "w": 1280,
+          "h": 720,
+          "plcmt": 1,
+          "startdelay": 0
+        },
+        "bidfloor": 8.00,
+        "bidfloorcur": "USD",
+        "pmp": {
+          "private_auction": 0,
+          "deals": [
+            {"id": "deal-ctv-drama-open-auto", "bidfloor": 10.00, "bidfloorcur": "USD", "at": 1, "guar": 0}
+          ]
+        }
+      }
+    ],
+    "app": {
+      "id": "app-streamco-ctv",
+      "name": "StreamCo TV",
+      "bundle": "com.streamco.ctv",
+      "domain": "streamco.example",
+      "content": {
+        "id": "harbor-lights-s03e10",
+        "title": "Harbor Lights: Season 3 Finale",
+        "series": "Harbor Lights",
+        "season": "3",
+        "episode": 10,
+        "livestream": 0,
+        "data": [
+          {
+            "id": "iris-tv",
+            "name": "iris.tv",
+            "ext": {"segtax": 504},
+            "segment": [{"id": "iris_8a92b23a77"}]
+          }
+        ]
+      }
+    },
+    "user": {
+      "id": "user-ctv-alex-01"
+    },
+    "device": {
+      "ua": "StreamCoTV/3.2 (Linux; Android TV 12)",
+      "devicetype": 3,
+      "geo": {"country": "USA", "region": "WA"}
+    }
+  }
+}
