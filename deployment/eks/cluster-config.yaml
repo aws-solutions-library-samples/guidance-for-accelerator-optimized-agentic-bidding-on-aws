@@ -16,6 +16,8 @@ metadata:
   name: __STACK_NAME__-triton
   region: __REGION__
   version: "1.31"
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
 
 # Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
 # On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
