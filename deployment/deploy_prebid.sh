@@ -40,6 +40,9 @@ fi
 #   6. Deploy           prebid_cfn.yaml, then the Kubernetes manifest
 #   7. Wire             substitute endpoints, upload prebid-config.yaml to S3
 #   8. Record           pinned version, image digest, stack name, endpoints
+#   9. Control plane    deploy_control_plane.sh: the campaign/deals MCP control plane
+#                       (AgentCore runtime + OAuth client_credentials). Skipped with
+#                       --no-control-plane; a warned skip when Docker is absent.
 #
 # Usage:
 #   ./deploy_prebid.sh --prefix nv5
@@ -84,8 +87,13 @@ fi
 #                        bidder's client secret: the value stays in the Secret and
 #                        never enters this repository, the rendered manifest, or
 #                        `kubectl get deploy -o yaml`. Repeatable.
+#   --no-control-plane   Do not deploy the campaign/deals MCP control plane (Step 9).
+#                        Seeded campaigns then bid without an activation step.
+#   --control-advertisers LIST
+#                        Passed to deploy_control_plane.sh: the domains the deploy's
+#                        control client may act for (default '*').
 #   --yes                Accept the cost disclosure without prompting
-#   --destroy            Tear down (Kubernetes first, then the CFN stack)
+#   --destroy            Tear down (control plane, then Kubernetes, then the CFN stack)
 #
 # Prerequisites (all checked in step 1, all reported together):
 #   - deploy.sh has run: EKS cluster, Cognito user pool, CodeBuild project
@@ -147,6 +155,11 @@ INJECT_PLUGINS=()
 # There is no list of known plugins or known variables in this repository.
 PLUGIN_ENV=()
 PLUGIN_SECRET_ENV=()
+# The campaign/deals MCP control plane (Step 9) is ON whenever Prebid is deployed and
+# OFF with --no-control-plane. deploy.sh passes the flag through; the choice is
+# remembered there (controlPlane in .deploy-state.json), not here.
+WITH_CONTROL_PLANE=1
+CONTROL_ADVERTISERS="${CONTROL_ADVERTISERS:-*}"
 
 # The configuration half of --inject-plugin, from --plugin-adapter. A seat that is
 # compiled in and has its environment set is STILL not served: this deployment's
@@ -202,6 +215,10 @@ for arg in "$@"; do
     --plugin-adapter)   ;;
     --skip-build)      SKIP_BUILD=1 ;;
     --no-simulator)    WITH_SIMULATOR=0 ;;
+    --no-control-plane) WITH_CONTROL_PLANE=0 ;;
+    --with-control-plane) WITH_CONTROL_PLANE=1 ;;
+    --control-advertisers=*) CONTROL_ADVERTISERS="${arg#--control-advertisers=}" ;;
+    --control-advertisers) ;;
     --yes|--non-interactive) ASSUME_YES=1 ;;
     --destroy)         DESTROY=1 ;;
     # The whole header block between the first two `# =====` banners, derived the
@@ -217,6 +234,7 @@ for arg in "$@"; do
       elif [[ "${_PREV_ARG:-}" == "--profile" ]];      then DEPLOY_PROFILE="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--tag" ]];          then IMAGE_TAG="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--start-at" ]];     then START_AT="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--control-advertisers" ]]; then CONTROL_ADVERTISERS="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--inject-plugin" ]]; then INJECT_PLUGINS+=("${arg}")
       elif [[ "${_PREV_ARG:-}" == "--plugin-env" ]]; then PLUGIN_ENV+=("${arg}")
       elif [[ "${_PREV_ARG:-}" == "--plugin-secret-env" ]]; then PLUGIN_SECRET_ENV+=("${arg}")
@@ -239,7 +257,7 @@ done
 # A value-taking flag as the LAST argument was swallowed: nothing followed it, so
 # the run proceeded with the default. Stop instead.
 case "${_PREV_ARG:-}" in
-  --prefix|--cluster|--user-pool-id|--namespace|--region|--profile|--tag|--start-at|--inject-plugin|--plugin-env|--plugin-secret-env|--plugin-adapter)
+  --prefix|--cluster|--user-pool-id|--namespace|--region|--profile|--tag|--start-at|--inject-plugin|--plugin-env|--plugin-secret-env|--plugin-adapter|--control-advertisers)
     printf '\033[0;31m[prebid][fail]\033[0m %s\n' "${_PREV_ARG} needs a value (it was the last argument)" >&2
     exit 1 ;;
 esac
@@ -261,7 +279,7 @@ log() {
     printf '\033[0;32m[prebid]\033[0m %s\n' "$*"
   fi
 }
-# step(): the "Step N/8" lines. Always on the terminal, in deploy.sh's own step
+# step(): the "Step N/9" lines. Always on the terminal, in deploy.sh's own step
 # shape so Prebid's steps read as part of the same run; also in the log when quiet.
 step() {
   printf '  \033[0;90m->\033[0m %s\n' "$*"
@@ -869,6 +887,13 @@ PY
 # =============================================================================
 if [[ "${DESTROY}" -eq 1 ]]; then
   log "Tearing down the Prebid ARTF stack (prefix=${STACK_PREFIX:-<none>})"
+  # The control plane first: its stack attaches a resource server and a client to
+  # the shared pool, and its runtime runs as a role that stack owns. Idempotent when
+  # nothing was deployed.
+  CP_DESTROY_ARGS=(--region "${AWS_REGION}" --profile "${AWS_PROFILE}" --destroy)
+  [[ -n "${STACK_PREFIX}" ]] && CP_DESTROY_ARGS+=(--prefix "${STACK_PREFIX}")
+  CONTROL_PLANE_DETAIL_LOG="${PREBID_DETAIL_LOG}" bash "${SCRIPT_DIR}/deploy_control_plane.sh" "${CP_DESTROY_ARGS[@]}" \
+    || warn "deploy_control_plane.sh --destroy did not finish cleanly; check for a leftover ${STACK_PREFIX:+${STACK_PREFIX}-}artf-control-plane stack or runtime."
 
   # ACCOUNT_ID is needed to build the pinned context name. Resolved before any delete,
   # because a delete against an unverified context is the destructive case.
@@ -976,7 +1001,7 @@ fi
 # first one turns a five-minute fix into five sequential five-minute fixes.
 # =============================================================================
 if [[ "${START_AT}" -le 1 ]]; then
-  step "Step 1/8: Preflight"
+  step "Step 1/9: Preflight"
   MISSING=()
 
   for tool in aws kubectl python3 curl tar; do
@@ -1100,19 +1125,21 @@ REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 # the stack exists is not a disclosure.
 # =============================================================================
 if [[ "${START_AT}" -le 2 ]]; then
-  step "Step 2/8: Idle cost"
+  step "Step 2/9: Idle cost"
   # The disclosure is for the person deciding; standalone it is on the terminal above
   # the prompt. Under deploy.sh the decision was made by passing --with-prebid, so it
   # goes to the detail log with the rest of this script's narration.
   _quiet || echo
-  _run python3 - "${ADDITIONAL_NODE_MONTHLY_USD}" <<'PY'
+  _run python3 - "${ADDITIONAL_NODE_MONTHLY_USD}" "${WITH_CONTROL_PLANE}" <<'PY'
 import sys, os
 sys.path.insert(0, os.path.join(os.environ["SCRIPT_DIR"], "scripts"))
 import prebid_release as p
 
 raw = sys.argv[1] if len(sys.argv) > 1 else ""
 node = float(raw) if raw not in ("", "None") else None
-print(p.format_cost_disclosure(p.build_cost_disclosure(node)))
+# The control-plane term (an AgentCore runtime) is part of this run unless --no-control-plane.
+control_plane = (sys.argv[2] if len(sys.argv) > 2 else "1") == "1"
+print(p.format_cost_disclosure(p.build_cost_disclosure(node, control_plane=control_plane)))
 PY
   _quiet || echo
 
@@ -1147,7 +1174,7 @@ fi
 # that points at the wrong thing.
 # =============================================================================
 if [[ "${START_AT}" -le 3 ]]; then
-  step "Step 3/8: Acquire upstream release ${PINNED_VERSION}"
+  step "Step 3/9: Acquire upstream release ${PINNED_VERSION}"
   rm -rf "${WORK_DIR}"
   mkdir -p "${WORK_DIR}"
   TARBALL="${WORK_DIR}/upstream.tar.gz"
@@ -1204,7 +1231,7 @@ BUILD_CONTEXT="${UPSTREAM_DIR}/deployment/ecr/prebid-server"
 # like success.
 # =============================================================================
 if [[ "${START_AT}" -le 4 ]]; then
-  step "Step 4/8: Place the ARTF hook module and artfhouse adapter"
+  step "Step 4/9: Place the ARTF hook module and artfhouse adapter"
 
   [[ -d "${BUILD_CONTEXT}" ]] \
     || fail "Upstream build context not found at ${BUILD_CONTEXT}. The release layout has changed; re-check it before deploying."
@@ -1397,7 +1424,7 @@ fi
 # What the build DOES need from the environment is nothing beyond ECR credentials.
 # =============================================================================
 if [[ "${START_AT}" -le 5 && "${SKIP_BUILD}" -ne 1 ]]; then
-  step "Step 5/8: Build the image on CodeBuild"
+  step "Step 5/9: Build the image on CodeBuild"
 
   if [[ -z "${IMAGE_TAG}" ]]; then
     SRC_HASH="$(find "${BUILD_CONTEXT}" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -c1-12)"
@@ -1616,7 +1643,7 @@ SPEC
   echo "${IMAGE_TAG}" >"${WORK_DIR}/image_tag.txt"
   echo "${DEMAND_IMAGE_TAG}" >"${WORK_DIR}/demand_image_tag.txt"
 elif [[ "${SKIP_BUILD}" -eq 1 ]]; then
-  step "Step 5/8: --skip-build; reusing the image already in ECR"
+  step "Step 5/9: --skip-build; reusing the image already in ECR"
 fi
 
 if [[ -z "${IMAGE_TAG}" ]]; then
@@ -1638,7 +1665,7 @@ DEMAND_IMAGE_TAG="${DEMAND_IMAGE_TAG:-$(cat "${WORK_DIR}/demand_image_tag.txt" 2
 # waited on, and one that does not complete fails the run with the pods' reasons.
 # =============================================================================
 if [[ "${START_AT}" -le 6 ]]; then
-  step "Step 6/8: Deploy"
+  step "Step 6/9: Deploy"
 
   OIDC_ISSUER="$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" \
     --query 'cluster.identity.oidc.issuer' --output text)"
@@ -2029,7 +2056,7 @@ fi
 # this object is the way to reconfigure.
 # =============================================================================
 if [[ "${START_AT}" -le 7 ]]; then
-  step "Step 7/8: Configuration overlay"
+  step "Step 7/9: Configuration overlay"
   CONFIG_BUCKET="${STACK_NAME}-codebuild-source-${ACCOUNT_ID}"
 
   # Step 6 already published this, because the pod cannot boot without it. Kept here
@@ -2049,7 +2076,7 @@ fi
 # which image are live without inferring it from tags.
 # =============================================================================
 if [[ "${START_AT}" -le 8 ]]; then
-  step "Step 8/8: Record"
+  step "Step 8/9: Record"
   IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_REPO}" --region "${AWS_REGION}" \
     --image-ids "imageTag=${IMAGE_TAG}" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo '')"
   [[ "${IMAGE_DIGEST}" == "None" ]] && IMAGE_DIGEST=""
@@ -2105,9 +2132,39 @@ if [[ ${#ROLLOUT_FAILURES[@]} -gt 0 ]]; then
   for _f in "${ROLLOUT_FAILURES[@]}"; do warn "Rollout did not complete: ${_f}"; done
   fail "Prebid ARTF host NOT deployed: ${#ROLLOUT_FAILURES[@]} rollout(s) did not complete (see above)."
 fi
+# =============================================================================
+# STEP 9 - THE CAMPAIGN/DEALS MCP CONTROL PLANE
+#
+# After the host is up, because the control plane needs the hosted domain and the
+# token endpoint this stack created. A failure here is a warned skip, not a failed
+# Prebid deploy: the host serves auctions without it. Seeded campaigns were written
+# paused only if deploy.sh knew the control plane would deploy (its seeder flags).
+# =============================================================================
+CONTROL_PLANE_STATUS="not deployed (--no-control-plane)"
+if [[ "${WITH_CONTROL_PLANE}" -eq 1 ]]; then
+  step "Step 9/9: Campaign/deals MCP control plane"
+  CP_ARGS=(--region "${AWS_REGION}" --profile "${AWS_PROFILE}" --yes --control-advertisers "${CONTROL_ADVERTISERS}")
+  [[ -n "${STACK_PREFIX}" ]] && CP_ARGS+=(--prefix "${STACK_PREFIX}")
+  [[ -n "${USER_POOL_ID}" ]] && CP_ARGS+=(--user-pool-id "${USER_POOL_ID}")
+  [[ "${VERBOSE}" -eq 1 ]] && CP_ARGS+=(--verbose)
+  set +e
+  CONTROL_PLANE_DETAIL_LOG="${PREBID_DETAIL_LOG}" bash "${SCRIPT_DIR}/deploy_control_plane.sh" "${CP_ARGS[@]}"
+  _CP_RC=$?
+  set -e
+  case "${_CP_RC}" in
+    0) CONTROL_PLANE_STATUS="deployed (see ${REPO_ROOT}/.control-plane-deployment.json)" ;;
+    2) CONTROL_PLANE_STATUS="SKIPPED: prerequisites missing (see the warnings above)"
+       warn "Control plane not deployed. Re-run on its own once Docker is available:"
+       warn "  ${SCRIPT_DIR}/deploy_control_plane.sh ${CP_ARGS[*]}" ;;
+    *) CONTROL_PLANE_STATUS="FAILED (deploy_control_plane.sh exited ${_CP_RC})"
+       warn "Control plane deploy failed. Re-run on its own: ${SCRIPT_DIR}/deploy_control_plane.sh ${CP_ARGS[*]}" ;;
+  esac
+fi
+
 log "Prebid ARTF host deployed."
 log "  Stack:    ${PREBID_STACK}"
 log "  Image:    ${PREBID_IMAGE_REF:-${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}}"
 log "  Demand:   ${DEMAND_ENDPOINT}"
 log "  In-cluster: http://prebid-server.${NAMESPACE}.svc.cluster.local"
+log "  Control plane: ${CONTROL_PLANE_STATUS}"
 log "  Teardown: ${0} --prefix ${STACK_PREFIX:-''} --destroy"

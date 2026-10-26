@@ -89,6 +89,24 @@ def _build_network_configuration(
     return {"networkMode": "PUBLIC"}
 
 
+def _apply_inbound_auth(
+    kwargs: dict,
+    authorizer: dict | None,
+    request_header_allowlist: list[str] | None,
+) -> None:
+    """Add the inbound-auth parameters to a create/update call when given.
+
+    Absent means absent: an existing runtime on IAM auth is not switched to JWT by a
+    caller that did not ask, and vice versa the control plane always passes both.
+    """
+    if authorizer:
+        if "customJWTAuthorizer" not in authorizer:
+            raise ValueError("authorizer must be {\"customJWTAuthorizer\": {...}}")
+        kwargs["authorizerConfiguration"] = authorizer
+    if request_header_allowlist:
+        kwargs["requestHeaderConfiguration"] = {"requestHeaderAllowlist": list(request_header_allowlist)}
+
+
 def deploy(
     client,
     *,
@@ -101,6 +119,8 @@ def deploy(
     network_mode: str = "PUBLIC",
     subnets: list[str] | None = None,
     security_groups: list[str] | None = None,
+    authorizer: dict | None = None,
+    request_header_allowlist: list[str] | None = None,
 ) -> str:
     """Create or update the AgentCore runtime.
 
@@ -112,6 +132,17 @@ def deploy(
         subnets: VPC subnet IDs (required for VPC mode). Must be in AgentCore's
             supported AZs for the region.
         security_groups: VPC security group IDs applied to the runtime ENIs.
+        authorizer: Optional ``authorizerConfiguration`` (``{"customJWTAuthorizer":
+            {"discoveryUrl": ..., "allowedClients": [...], "allowedScopes": [...]}}``).
+            WITHOUT IT THE RUNTIME DEFAULTS TO IAM SigV4 and never accepts a bearer
+            token. The campaign/deals control plane sets it; the ARTF MCP runtime and
+            the closed-loop agents do not and stay on IAM.
+        request_header_allowlist: Optional ``requestHeaderConfiguration.
+            requestHeaderAllowlist``. AgentCore does not forward ``Authorization`` to
+            the container unless it is listed here; a runtime that verifies the token
+            itself needs it.
+        Both parameter names verified against the installed botocore model for
+        CreateAgentRuntime and UpdateAgentRuntime (bedrock-agentcore-control).
     Returns:
         The runtime ARN once READY.
     """
@@ -139,6 +170,7 @@ def deploy(
             # environmentVariables is a top-level {string: string} map on
             # CreateAgentRuntime (verified against the control-plane API).
             create_kwargs["environmentVariables"] = env
+        _apply_inbound_auth(create_kwargs, authorizer, request_header_allowlist)
         resp = client.create_agent_runtime(**create_kwargs)
         runtime_id = resp["agentRuntimeId"]
         _LOG.info("Created runtime %s (id=%s)", name, runtime_id)
@@ -156,6 +188,7 @@ def deploy(
         )
         if env:
             update_kwargs["environmentVariables"] = env
+        _apply_inbound_auth(update_kwargs, authorizer, request_header_allowlist)
         client.update_agent_runtime(**update_kwargs)
 
     arn = _wait_ready(client, runtime_id)
@@ -242,6 +275,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated VPC security group IDs (for --network-mode VPC).",
     )
     parser.add_argument(
+        "--authorizer-json",
+        default="",
+        help=(
+            "Inbound JWT authorizer as JSON: {\"customJWTAuthorizer\": {\"discoveryUrl\": ..., "
+            "\"allowedClients\": [...], \"allowedScopes\": [...]}}. Without it the runtime uses "
+            "IAM SigV4 and accepts no bearer token."
+        ),
+    )
+    parser.add_argument(
+        "--request-header-allowlist",
+        action="append",
+        default=[],
+        metavar="HEADER",
+        help="Request header AgentCore forwards to the container; repeatable (e.g. Authorization).",
+    )
+    parser.add_argument(
         "--print-arn",
         action="store_true",
         help="Print the runtime ARN to stdout on success (for shell capture).",
@@ -278,6 +327,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.network_mode == "VPC" and not subnets:
             _LOG.error("--network-mode VPC requires --subnets")
             return 1
+        authorizer = None
+        if args.authorizer_json:
+            try:
+                authorizer = json.loads(args.authorizer_json)
+            except json.JSONDecodeError as exc:
+                _LOG.error("--authorizer-json is not valid JSON: %s", exc)
+                return 1
+            if not isinstance(authorizer, dict) or "customJWTAuthorizer" not in authorizer:
+                _LOG.error("--authorizer-json must be an object with a customJWTAuthorizer key")
+                return 1
         arn = deploy(
             client,
             name=args.runtime_name,
@@ -289,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
             network_mode=args.network_mode,
             subnets=subnets,
             security_groups=security_groups,
+            authorizer=authorizer,
+            request_header_allowlist=args.request_header_allowlist,
         )
         if args.print_arn:
             print(arn)

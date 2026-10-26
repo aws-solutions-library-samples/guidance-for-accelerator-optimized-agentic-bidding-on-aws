@@ -135,8 +135,16 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
 
     candidates: list[Candidate] = []
 
+    inactive = catalog.inactive_deal_ids
+
     for campaign in catalog.all():
-        # Checked FIRST, and before the deal lookup, because it is the most
+        # A paused campaign declines everything, before any other test: the buyer
+        # has switched it off, so no slot, deal or price could have made it bid.
+        if campaign.paused:
+            candidates.append(Candidate(campaign, None, ExclusionReason.CAMPAIGN_PAUSED))
+            continue
+
+        # Checked next, and before the deal lookup, because it is the most
         # fundamental reason: a creative that cannot be placed in any slot on this
         # impression is not a near miss on price or targeting. Reporting
         # "below_floor" for a video campaign on a banner-only slot would name a
@@ -163,12 +171,24 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
                 )
             continue
 
+        # A deal the seller has taken off the market (sellerstatus not 0) is not
+        # transactable whatever the request says about it. Checked before
+        # suppression: the Deal Scorer never sees an inactive deal from the
+        # library, so if one is on the request it came from the publisher, and
+        # "the seller paused it" is the truer reason than "the scorer suppressed it".
+        on_market = [d for d in matching if d.get("id") not in inactive]
+        if not on_market:
+            candidates.append(
+                Candidate(campaign, matching[0], ExclusionReason.DEAL_INACTIVE)
+            )
+            continue
+
         # A campaign may hold several deals on one impression. It transacts on the
         # first live one; if all are suppressed, the suppression is the reason.
-        live = [d for d in matching if not _is_suppressed(d)]
+        live = [d for d in on_market if not _is_suppressed(d)]
         if not live:
             candidates.append(
-                Candidate(campaign, matching[0], ExclusionReason.DEAL_SUPPRESSED)
+                Candidate(campaign, on_market[0], ExclusionReason.DEAL_SUPPRESSED)
             )
             continue
 

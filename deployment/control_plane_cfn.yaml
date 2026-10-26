@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Campaign/deals MCP control plane for the ARTF stack (deploy.sh with Prebid,
+  deploy_control_plane.sh). Attaches to the SHARED Cognito user pool and the
+  hosted domain prebid_cfn.yaml created, and adds: one resource server with the
+  four control scopes, one client_credentials app client holding exactly those
+  scopes, and the execution role for the AgentCore runtime that serves the MCP
+  tools. The runtime itself is created by deploy_to_agentcore.py, not here.
+  Nothing in this stack is created without --with-prebid (or --learner-mode).
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Prefix for resource names, matching deploy.sh's convention. Empty means no prefix.
+  UserPoolId:
+    Type: String
+    Description: >-
+      The EXISTING, SHARED Cognito user pool. This stack adds a resource server and an
+      app client to it and removes only those on delete. The pool and its hosted domain
+      (prebid_cfn.yaml) are never touched here.
+  DealsTableName:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9_.-]{3,255}'
+    Description: The deals table deploy.sh creates (<stack>-deals). The only table the runtime may touch.
+  EcrRepositoryName:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9._/-]{1,255}'
+    Description: >-
+      ECR repository holding the control-plane image. AgentCore pulls that image AS the
+      execution role, before any of our code runs, so the pull grant is scoped to it.
+  RuntimeName:
+    Type: String
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]{0,47}'
+    Description: >-
+      EXACT name of the AgentCore runtime deploy_control_plane.sh creates. The role's
+      trust policy and log grants are scoped to runtime/<RuntimeName>-* (AgentCore
+      appends a generated suffix), so a different name makes the role unassumable.
+  ScopePrefix:
+    Type: String
+    Default: artf-control
+    AllowedPattern: '[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}'
+    Description: Resource server identifier. Scopes are issued as <ScopePrefix>/<scope>.
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+
+Resources:
+  # ------------------------------------------------------------------ Cognito
+  # One resource server for the control plane, distinct from the two prebid_cfn.yaml
+  # creates (artf-orchestrator, artf-demand). A token for the auction path cannot
+  # carry a control scope and a control token cannot request mutations or bids.
+  ControlResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      Identifier: !Ref ScopePrefix
+      Name: ARTF campaign and deals control plane
+      Scopes:
+        - ScopeName: 'campaigns:read'
+          ScopeDescription: Read campaigns through the control plane
+        - ScopeName: 'campaigns:write'
+          ScopeDescription: Create, change, activate and pause campaigns
+        - ScopeName: 'deals:read'
+          ScopeDescription: Read Deals API deals through the control plane
+        - ScopeName: 'deals:write'
+          ScopeDescription: Create and change deals, including their sellerstatus
+
+  # The external agent's machine-to-machine credential. Machine-only: no user flows,
+  # no callback URLs, so it cannot authenticate as a person and is not a route into
+  # the frontend. SEPARATE from the Prebid hook's client on purpose: the hook sits on
+  # the public auction path and must never hold a credential that can write records.
+  ControlClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ControlResourceServer
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-artf-control'
+        - 'artf-control'
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${ScopePrefix}/campaigns:read'
+        - !Sub '${ScopePrefix}/campaigns:write'
+        - !Sub '${ScopePrefix}/deals:read'
+        - !Sub '${ScopePrefix}/deals:write'
+      SupportedIdentityProviders:
+        - COGNITO
+      # One hour, Cognito's default for machine tokens. The verification script and any
+      # agent framework fetch a token per session, not per call.
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+      PreventUserExistenceErrors: ENABLED
+
+  # ------------------------------------------------- AgentCore execution role
+  # Trust policy shape, confused-deputy conditions and the observability and
+  # workload-identity statements follow the AgentCore Runtime permissions page
+  # (https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html),
+  # read when this template was written. Three things that page lists are left out
+  # on purpose and named below.
+  ControlPlaneRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: deploy_control_plane.sh looks the role up by its predictable prefixed name
+          - id: W11
+            reason: ecr:GetAuthorizationToken, X-Ray and cloudwatch:PutMetricData support no resource-level permission; PutMetricData is conditioned on the bedrock-agentcore namespace
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - !If [HasStackPrefix, !Sub '${StackPrefix}-artf-control-plane', 'artf-control-plane']
+          - !Select [1, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Description: Execution role for the campaign/deals control-plane AgentCore runtime.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                # AgentCore appends a generated suffix to the runtime name, so the ARN is
+                # runtime/<name>-<suffix>. The wildcard covers only that suffix.
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${RuntimeName}-*'
+      Policies:
+        - PolicyName: DealsTableReadWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Reads: GetItem by key, Query by record_type (the partition key, so every
+              # list is a Query and no Scan is needed). Writes: PutItem (create and whole
+              # record replace) and UpdateItem. Read and write kept as separate statements.
+              - Sid: Read
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DealsTableName}'
+              - Sid: Write
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DealsTableName}'
+              # No DeleteItem. A campaign is paused and a deal's sellerstatus is changed;
+              # nothing is deleted, and the role cannot be talked into it either.
+        # AgentCore pulls the container image AS THIS ROLE, before any of our code runs.
+        # Without these, CreateAgentRuntime fails validation naming the three actions.
+        - PolicyName: EcrImagePull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}'
+              - Sid: EcrTokenAccess
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                # Account-scoped; supports no resource-level permission.
+                Resource: '*'
+        # The documented execution-role set for a runtime. AgentCore creates the log
+        # group and the resource policy on it itself, as this role.
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Effect: Allow
+                Action: logs:PutResourcePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}-*'
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                # A list operation; not scopable to one group.
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': bedrock-agentcore
+        - PolicyName: WorkloadIdentity
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeName}-*'
+              # Left out on purpose, per the permissions page's own recommendation:
+              #   GetWorkloadAccessTokenForUserId issues a token from a caller-supplied user
+              #   id with no IdP verification, which would undo the entitlement boundary the
+              #   control plane enforces on every call.
+              #   bedrock:InvokeModel: this runtime serves MCP tools over table records and
+              #   invokes no model.
+              #   dynamodb:DeleteItem and Scan: see DealsTableReadWrite.
+
+Outputs:
+  ControlClientId:
+    Description: Machine-to-machine app client id for the control plane (the secret stays on the client)
+    Value: !Ref ControlClient
+  ControlPlaneRoleArn:
+    Description: Execution role for the control-plane AgentCore runtime
+    Value: !GetAtt ControlPlaneRole.Arn
+  ControlPlaneRoleName:
+    Description: Execution role name
+    Value: !Ref ControlPlaneRole
+  ScopePrefix:
+    Description: Resource server identifier; scopes are <prefix>/campaigns:read|write and <prefix>/deals:read|write
+    Value: !Ref ScopePrefix
+  ControlScopes:
+    Description: The four control scopes, space separated, as a token requests them
+    Value: !Sub '${ScopePrefix}/campaigns:read ${ScopePrefix}/campaigns:write ${ScopePrefix}/deals:read ${ScopePrefix}/deals:write'
+  TokenIssuer:
+    Description: The pool's issuer URL, as the runtime verifies it
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+  DiscoveryUrl:
+    Description: OIDC discovery document for the AgentCore inbound JWT authorizer
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration'

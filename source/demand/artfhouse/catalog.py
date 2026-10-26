@@ -21,6 +21,19 @@ from typing import Iterable, Optional
 
 from . import deals_source
 
+CAMPAIGN_ACTIVE = "active"
+CAMPAIGN_PAUSED = "paused"
+
+
+def campaign_status(record: dict) -> str:
+    """``active`` or ``paused``. A record without the field is active.
+
+    Absence means active so a table written before the field existed, and a stack
+    seeded without a control plane, bid exactly as before. Only an explicit
+    ``paused`` silences a campaign.
+    """
+    return CAMPAIGN_PAUSED if record.get("status") == CAMPAIGN_PAUSED else CAMPAIGN_ACTIVE
+
 
 @dataclass(frozen=True)
 class Campaign:
@@ -59,6 +72,15 @@ class Campaign:
     #: What this buyer pays extra when the user carries one of its target audience
     #: segments. None means the campaign prices on content only.
     audience_uplift: Optional["AudienceUplift"] = None
+    #: ``active`` or ``paused``. A paused campaign is still CONSIDERED for every
+    #: impression (so the offers column can say why it made no offer) but never
+    #: bids. Written by the seeder and changed by the campaign/deals control
+    #: plane; the same rule lives in control_plane/records.py.
+    status: str = CAMPAIGN_ACTIVE
+
+    @property
+    def paused(self) -> bool:
+        return self.status == CAMPAIGN_PAUSED
 
     def price_for(self, segment_ids: tuple[str, ...]) -> float:
         """The CPM this campaign offers to a user carrying ``segment_ids``.
@@ -136,6 +158,7 @@ def campaigns_from_records(records: Iterable[dict]) -> tuple[Campaign, ...]:
                 )
                 if uplift else None
             ),
+            status=campaign_status(record),
         ))
     return tuple(campaigns)
 
@@ -148,10 +171,21 @@ class CampaignCatalog:
     claim false.
     """
 
-    def __init__(self, campaigns: Optional[Iterable[Campaign]] = None) -> None:
+    def __init__(
+        self,
+        campaigns: Optional[Iterable[Campaign]] = None,
+        inactive_deal_ids: Iterable[str] = (),
+    ) -> None:
+        """``inactive_deal_ids``: deals whose Deals API ``sellerstatus`` is not 0.
+
+        The deal records live in the same table; snapshot.py reads them and passes
+        the ids here so eligibility can refuse a deal the seller has paused without
+        the decision ever reading the table itself.
+        """
         if campaigns is None:
             campaigns = campaigns_from_records(deals_source.campaign_records())
         self._campaigns = tuple(campaigns)
+        self._inactive_deal_ids = frozenset(str(d) for d in inactive_deal_ids)
         by_deal: dict[str, Campaign] = {}
         for campaign in self._campaigns:
             for deal_id in campaign.deal_ids:
@@ -164,6 +198,11 @@ class CampaignCatalog:
                     )
                 by_deal[deal_id] = campaign
         self._by_deal = by_deal
+
+    @property
+    def inactive_deal_ids(self) -> frozenset[str]:
+        """Deals the seller has taken off the market (``sellerstatus`` not 0)."""
+        return self._inactive_deal_ids
 
     def by_deal(self, deal_id: str) -> Optional[Campaign]:
         """The campaign holding this deal, or None."""

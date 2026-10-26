@@ -1857,6 +1857,74 @@ test_k8s_rollout() {
   assert_not_contains "${src}" '__IMAGE__|${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}' "deploy_prebid.sh no longer renders Prebid by tag"
 }
 
+
+# =========================================================================
+# Test: campaign/deals MCP control plane gate
+# =========================================================================
+# The control plane deploys only with Prebid (effective WITH_PREBID=1), is on by
+# default there, and is switched off by --no-control-plane. Three scripts have to
+# agree on that: deploy.sh (the flag, the remembered state, the seeder's campaign
+# status, the pass-through), deploy_prebid.sh (Step 9 and the flag), and
+# deploy_control_plane.sh (its own argument contract). Asserted on the text of the
+# scripts, since none of this can run without AWS.
+test_control_plane_gate() {
+  local D="${SCRIPT_DIR}/.." src out rc
+  _cp_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE bash "$@" 2>&1; }
+
+  src="$(cat "${DEPLOY_SH}")"
+  assert_contains "${src}" '--no-control-plane)   CONTROL_PLANE=0; _GIVEN_CONTROL_PLANE=1 ;;' "deploy.sh parses --no-control-plane"
+  assert_contains "${src}" '--with-control-plane) CONTROL_PLANE=1; _GIVEN_CONTROL_PLANE=1 ;;' "deploy.sh parses --with-control-plane"
+  assert_contains "${src}" '_reuse CONTROL_PLANE    controlPlane  "${_GIVEN_CONTROL_PLANE}"' "deploy.sh remembers the control-plane choice per prefix"
+  assert_contains "${src}" '"controlPlane=${CONTROL_PLANE}"' "deploy.sh records controlPlane in the state file"
+  # The effective bit is set ONLY inside the WITH_PREBID block, so a deploy without
+  # Prebid never seeds campaigns paused and never passes the flag anywhere.
+  assert_contains "${src}" $'if [[ "${WITH_PREBID}" -eq 1 ]]; then\n  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"\n  CONTROL_PLANE_EFFECTIVE="${CONTROL_PLANE}"\nfi' "CONTROL_PLANE_EFFECTIVE is derived from WITH_PREBID"
+  assert_contains "${src}" 'SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)' "deploy.sh seeds campaigns paused when the control plane deploys"
+  assert_contains "${src}" 'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then' "the paused seed is gated on the effective bit"
+  assert_contains "${src}" 'PREBID_ARGS="${PREBID_ARGS} --no-control-plane"' "deploy.sh passes --no-control-plane through to deploy_prebid.sh"
+  assert_contains "${src}" 'deploy_control_plane.sh" ${STACK_PREFIX:+--prefix "${STACK_PREFIX}"}' "deploy.sh --destroy removes the control plane"
+  assert_contains "${src}" 'deployment/control_plane_cfn.yaml deployment/deploy_control_plane.sh' "control-plane files are part of the Prebid fingerprint"
+  assert_contains "${src}" 'source/prebid source/demand source/control_plane' "control-plane sources are part of the Prebid fingerprint"
+  assert_contains "${src}" 'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 && "${_PREBID_STEP_RAN}" -eq 0 ]]; then' "a missing control plane is installed when the Prebid step did not run"
+  assert_contains "${src}" "agentRuntimes[?agentRuntimeName=='\${_CP_RUNTIME}'].agentRuntimeArn" "presence is checked against the runtime itself, not the fingerprint"
+  assert_contains "${src}" '_PREBID_STEP_RAN=1' "the Prebid step records that it ran, so Step 9 is not repeated in the same run"
+
+  src="$(cat "${D}/deploy_prebid.sh")"
+  assert_contains "${src}" '--no-control-plane) WITH_CONTROL_PLANE=0 ;;' "deploy_prebid.sh parses --no-control-plane"
+  assert_contains "${src}" 'step "Step 9/9: Campaign/deals MCP control plane"' "deploy_prebid.sh has a Step 9 for the control plane"
+  assert_contains "${src}" 'if [[ "${WITH_CONTROL_PLANE}" -eq 1 ]]; then' "Step 9 is gated on the flag"
+  assert_contains "${src}" '2) CONTROL_PLANE_STATUS="SKIPPED: prerequisites missing' "a missing-Docker exit (2) is a warned skip, not a failed Prebid deploy"
+  assert_contains "${src}" 'build_cost_disclosure(node, control_plane=control_plane)' "the Step 2 cost disclosure carries the control-plane term"
+  assert_contains "${src}" 'CP_DESTROY_ARGS=(--region "${AWS_REGION}" --profile "${AWS_PROFILE}" --destroy)' "deploy_prebid.sh --destroy removes the control plane first"
+  assert_not_contains "${src}" 'Step 8/8' "deploy_prebid.sh no longer counts eight steps"
+
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --nope)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--nope'" "deploy_control_plane.sh names the unknown flag"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --start-at 9)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh rejects an out-of-range --start-at"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --help)"; rc=$?
+  assert_eq "${rc}" "0" "deploy_control_plane.sh --help exits 0"
+  assert_contains "${out}" "--no-control-plane" "the help names the opt-out that reaches it from deploy_prebid.sh"
+  assert_contains "${out}" "Exit codes" "the help documents the exit-code contract deploy_prebid.sh relies on"
+
+  src="$(cat "${D}/deploy_control_plane.sh")"
+  assert_contains "${src}" '--request-header-allowlist Authorization' "the runtime allowlists Authorization so the container can verify the token"
+  assert_contains "${src}" 'customJWTAuthorizer' "the runtime is registered with an inbound JWT authorizer"
+  assert_contains "${src}" 'ARTF_CONTROL_TOKEN_ISSUER=' "the runtime gets the issuer the container requires at startup"
+  assert_contains "${src}" 'ARTF_CONTROL_CLIENT_ENTITLEMENTS=' "the runtime gets the client entitlement map"
+  # The secret is printed as a command for the OPERATOR to run (escaped in a heredoc),
+  # never resolved by the script or written to its record.
+  assert_contains "${src}" '"secret": "on the Cognito app client only; never written here"' "the record file carries no secret"
+  assert_not_contains "${src}" 'CLIENT_SECRET="$(aws' "the deploy script never resolves the client secret itself"
+
+  # Comments in the template explain WHY these actions are absent, and necessarily
+  # name them; strip comments so the assertions see only what is declared.
+  src="$(grep -v '^[[:space:]]*#' "${D}/control_plane_cfn.yaml")"
+  assert_not_contains "${src}" 'dynamodb:DeleteItem' "the execution role cannot delete records"
+  assert_not_contains "${src}" 'GetWorkloadAccessTokenForUserId' "the execution role cannot mint unverified user tokens"
+  assert_not_contains "${src}" 'bedrock:InvokeModel' "the execution role invokes no model"
+}
 # =========================================================================
 # Run all tests
 # =========================================================================

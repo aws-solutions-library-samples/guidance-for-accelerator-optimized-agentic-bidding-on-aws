@@ -77,6 +77,8 @@ fi
 #   ./deploy.sh --prefix dv1                   # full deploy; resources named dv1-nvidia-artf-*
 #   ./deploy.sh --prefix dv1 --profile myprof  # use a named AWS CLI profile (see below)
 #   ./deploy.sh --prefix dv1 --skip-agentcore  # combine flags
+#   ./deploy.sh --prefix dv1 --with-prebid --no-control-plane
+#                                               # Prebid without the campaign/deals MCP control plane
 #   ./deploy.sh --prefix dv1                   # FULL stack incl. Part 2 closed-loop (default)
 #   ./deploy.sh --no-retraining                # Part 1 only (skip NeMo-RL, Model Registry, Glue ETL, agents)
 #   ./deploy.sh --model-id global.anthropic.claude-opus-4-8  # override the agents' Bedrock model
@@ -214,6 +216,7 @@ if [[ -n "${BEDROCK_MODEL_ID:-}" ]];then _GIVEN_MODEL_ID=1; fi
 _GIVEN_LOCAL_BUILD=0
 _GIVEN_RETRAINING=0
 _GIVEN_PREBID=0
+_GIVEN_CONTROL_PLANE=0
 _GIVEN_SKIP_AGENTCORE=0
 _GIVEN_START_AT=0
 # Recorded (redacted) in the state file for diagnostics.
@@ -247,6 +250,14 @@ WITH_RETRAINING=1
 # Secrets Manager secret and an auction host pod, none of which the core
 # deployment needs. Without --with-prebid nothing below changes.
 WITH_PREBID=0
+# The campaign/deals MCP control plane (deploy_control_plane.sh, invoked by
+# deploy_prebid.sh as its Step 9) is ON by default but only MEANS anything when
+# Prebid is deployed: without Prebid there is no hosted domain for its OAuth
+# client and nothing is created. --no-control-plane turns it off; remembered per
+# prefix like --with-prebid. CONTROL_PLANE_EFFECTIVE is the one bit the rest of
+# this script reads (the seeder's campaign status, the Prebid pass-through).
+CONTROL_PLANE=1
+CONTROL_PLANE_EFFECTIVE=0
 # Scope the orchestrator requires of a MACHINE credential on POST /v1/mutations.
 # EMPTY unless --with-prebid, and empty means the orchestrator's authorization
 # behaves exactly as it did before this feature existed. Resolved after arg parsing.
@@ -290,6 +301,8 @@ for arg in "$@"; do
     --no-retraining|--skip-retraining) WITH_RETRAINING=0; _GIVEN_RETRAINING=1 ;;
     --with-prebid)      WITH_PREBID=1; _GIVEN_PREBID=1 ;;       # opt-in; see Step 12
     --no-prebid)        WITH_PREBID=0; _GIVEN_PREBID=1 ;;       # default; explicit for symmetry
+    --no-control-plane)   CONTROL_PLANE=0; _GIVEN_CONTROL_PLANE=1 ;;  # Prebid without the MCP control plane
+    --with-control-plane) CONTROL_PLANE=1; _GIVEN_CONTROL_PLANE=1 ;;  # default; explicit to switch back
     --remote-build)     LOCAL_BUILD=0; _GIVEN_LOCAL_BUILD=1 ;;
     --local-build)      LOCAL_BUILD=1; _GIVEN_LOCAL_BUILD=1 ;;
     --ngc-secret=*)     NGC_SECRET="${arg#--ngc-secret=}" ;;
@@ -424,6 +437,7 @@ fi
 # authorization path is byte-identical to what it was before the Prebid feature.
 if [[ "${WITH_PREBID}" -eq 1 ]]; then
   ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"
+  CONTROL_PLANE_EFFECTIVE="${CONTROL_PLANE}"
 fi
 
 # Resolve the Bedrock model id for the Part 2 reasoning agents. Model access is
@@ -1110,6 +1124,7 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   _reuse LOCAL_BUILD      localBuild    "${_GIVEN_LOCAL_BUILD}"      "--local-build"
   _reuse WITH_RETRAINING  withRetraining "${_GIVEN_RETRAINING}"      "--with-retraining"
   _reuse WITH_PREBID      withPrebid    "${_GIVEN_PREBID}"           "--with-prebid"
+  _reuse CONTROL_PLANE    controlPlane  "${_GIVEN_CONTROL_PLANE}"    "--with-control-plane"
   _reuse SKIP_AGENTCORE   skipAgentcore "${_GIVEN_SKIP_AGENTCORE}"   "--skip-agentcore"
   # The NGC secret name is the case that prompted all of this: a re-run that
   # omits --ngc-key should not re-prompt for a key already stored for this stack.
@@ -1186,6 +1201,7 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
     "localBuild=${LOCAL_BUILD}" \
     "withRetraining=${WITH_RETRAINING}" \
     "withPrebid=${WITH_PREBID}" \
+    "controlPlane=${CONTROL_PLANE}" \
     "skipAgentcore=${SKIP_AGENTCORE}"
   # The secret NAME, never the key. remote_build.sh derives this same name from
   # STACK_NAME, so recording it needs no round trip through the child script.
@@ -1412,7 +1428,8 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   warn "DynamoDB tables, S3 buckets (including the ones marked DeletionPolicy:"
   warn "Retain in the CFN templates), SageMaker Model Registry, IAM policies/roles,"
   warn "ECR repos, the Prebid ARTF host stack (${PREBID_STACK}) with its Cognito"
-  warn "domain, resource servers, M2M client and credential secret, and all"
+  warn "domain, resource servers, M2M client and credential secret, the campaign/deals"
+  warn "control plane (AgentCore runtime, Cognito client, execution role), and all"
   warn "Kubernetes resources. NOTHING is retained — this is not reversible."
   warn "Also deleted: the UI API proxy Lambda stack (${UI_API_PROXY_STACK})."
   # Teardown genuinely needs a human, so unlike the resume prompt this does not
@@ -1651,6 +1668,12 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # delete against that file resolves all three objects (ServiceAccount
   # prebid-artf-host-sa, Deployment prebid-server, Service prebid-server) because
   # their names are literal, not placeholder-substituted.
+  # The campaign/deals control plane (runtime, its stack, its ECR repo). Owned by
+  # deploy_control_plane.sh, which is idempotent when nothing was deployed, so this
+  # runs whether or not --with-prebid was ever used.
+  say "Removing the campaign/deals control plane (if deployed)..."
+  bash "${SCRIPT_DIR}/deploy_control_plane.sh" ${STACK_PREFIX:+--prefix "${STACK_PREFIX}"} \
+    --region "${AWS_REGION}" --profile "${AWS_PROFILE}" --destroy 2>&1 | sed 's/^/    /' || true
   if aws cloudformation describe-stacks --stack-name "${PREBID_STACK}" --region "${AWS_REGION}" >/dev/null 2>&1; then
     say "Deleting Prebid ARTF host stack (${PREBID_STACK})..."
     aws cloudformation delete-stack --stack-name "${PREBID_STACK}" --region "${AWS_REGION}" 2>/dev/null || true
@@ -2306,10 +2329,12 @@ prebid_fingerprint() {
   local root="$1" seed_sha="$2" files="" p f
   local list=()
   [[ "${seed_sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  for p in source/prebid source/demand; do
+  for p in source/prebid source/demand source/control_plane; do
     if [[ -d "${root}/${p}" ]]; then files+="$(_hashable_files "${root}/${p}")"$'\n'; fi
   done
   for p in deployment/prebid_cfn.yaml deployment/deploy_prebid.sh \
+           deployment/control_plane_cfn.yaml deployment/deploy_control_plane.sh \
+           source/Dockerfile.control-plane source/requirements-control-plane.txt \
            deployment/scripts/prebid_config_template.yaml \
            deployment/eks/prebid-server-deployment.yaml deployment/eks/amt-simulator-deployment.yaml \
            deployment/eks/artfhouse-demand-deployment.yaml source/Dockerfile.demand \
@@ -2504,12 +2529,21 @@ fi
 DEALS_SEED_ROLE_ARN="$(_cfn_output "${DEALS_STACK}" DealsSeedRoleArn)"
 [[ -n "${DEALS_SEED_ROLE_ARN}" ]] || fail 1 "${DEALS_STACK} has no DealsSeedRoleArn output."
 log "  Deals table stack ready: ${DEALS_STACK} (table ${DEALS_TABLE})"
+# With the control plane, seeded campaigns are written PAUSED (activating one is a
+# step taken through the control plane) and items the control plane has already
+# written are left alone (--skip-managed). Without it, the seed behaves as it always
+# has: every campaign active, every record rewritten.
+SEED_STATUS_ARGS=()
+if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then
+  SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)
+fi
 "${PYTHON}" "${SCRIPT_DIR}/scripts/seed_deals_table.py" \
   --table "${DEALS_TABLE}" \
   --role-arn "${DEALS_SEED_ROLE_ARN}" \
   --seed "${SCRIPT_DIR}/seed/deals_and_campaigns.json" \
   --region "${AWS_REGION}" \
   --origin-prefix "${STACK_PREFIX}" \
+  ${SEED_STATUS_ARGS[@]+"${SEED_STATUS_ARGS[@]}"} \
   ${AWS_PROFILE:+--profile "${AWS_PROFILE}"} \
   || fail 1 "seed_deals_table.py could not seed ${DEALS_TABLE} from deployment/seed/deals_and_campaigns.json (see its error above)."
 
@@ -4185,7 +4219,9 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
   PREBID_FINGERPRINT="$(prebid_fingerprint "${SCRIPT_DIR}/.." "${_PB_SEED_SHA}" 2>/dev/null || true)"
   if ! [[ "${PREBID_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then PREBID_FINGERPRINT=""; fi
 fi
+_PREBID_STEP_RAN=0
 if prebid_step_needed "${_PHASE5_RAN}"; then
+  _PREBID_STEP_RAN=1
   if [[ "${_PHASE5_RAN}" -eq 0 ]]; then
     say "  Phase 5/5 reads as complete in AWS, but ${PREBID_STEP_WHY}; running Step 12."
   fi
@@ -4205,6 +4241,9 @@ if prebid_step_needed "${_PHASE5_RAN}"; then
   PREBID_ARGS="${PREBID_ARGS} --cluster ${CLUSTER_NAME} --region ${AWS_REGION} --profile ${AWS_PROFILE} --yes"
   if [[ -n "${COGNITO_USER_POOL_ID:-}" ]]; then
     PREBID_ARGS="${PREBID_ARGS} --user-pool-id ${COGNITO_USER_POOL_ID}"
+  fi
+  if [[ "${CONTROL_PLANE_EFFECTIVE}" -ne 1 ]]; then
+    PREBID_ARGS="${PREBID_ARGS} --no-control-plane"
   fi
   # Invoked through `bash` rather than executed directly: the execute bit is a
   # property of the checkout, not of the code, and losing it turned a working deploy
@@ -4245,7 +4284,44 @@ elif [[ "${_PHASE5_RAN}" -eq 1 ]]; then
   log ""
   log "  Skipping the Prebid ARTF host (pass --with-prebid to enable)."
   log "  This includes: a pinned Prebid Server build, a Cognito domain and M2M client,"
-  log "  a Secrets Manager credential, and the artfhouse demand endpoint."
+  log "  a Secrets Manager credential, the artfhouse demand endpoint, and the"
+  log "  campaign/deals MCP control plane."
+fi
+
+# Step 12b: the campaign/deals control plane, by PRESENCE rather than fingerprint.
+# The Prebid fingerprint is recorded when deploy_prebid.sh succeeds, and it succeeds
+# even when its Step 9 (the control plane) was skipped for want of Docker or failed,
+# so a later run would never retry. A runtime deleted by hand is invisible to the
+# fingerprint too. So whenever Step 12 did not run this time, look for the runtime
+# itself and install the control plane alone if it is missing. When Step 12 did run,
+# its Step 9 already had its attempt; this run does not repeat it.
+if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 && "${_PREBID_STEP_RAN}" -eq 0 ]]; then
+  _CP_RUNTIME="$(printf '%s' "${STACK_NAME}_control" | tr '-' '_')"
+  _CP_ARN="$(aws bedrock-agentcore-control list-agent-runtimes --region "${AWS_REGION}" \
+    --query "agentRuntimes[?agentRuntimeName=='${_CP_RUNTIME}'].agentRuntimeArn | [0]" \
+    --output text 2>/dev/null | sed 's/^None$//')"
+  if [[ -n "${_CP_ARN}" ]]; then
+    ok "Campaign/deals control plane present (${_CP_RUNTIME})"
+  else
+    step "Step 12b: Campaign/deals control plane not found (${_CP_RUNTIME}); installing it"
+    _CP_ARGS=(--region "${AWS_REGION}" --profile "${AWS_PROFILE}" --yes)
+    [[ -n "${STACK_PREFIX}" ]] && _CP_ARGS+=(--prefix "${STACK_PREFIX}")
+    [[ -n "${COGNITO_USER_POOL_ID:-}" ]] && _CP_ARGS+=(--user-pool-id "${COGNITO_USER_POOL_ID}")
+    [[ "${VERBOSE}" -eq 1 ]] && _CP_ARGS+=(--verbose)
+    _log_section "deploy_control_plane.sh"
+    set +e
+    CONTROL_PLANE_DETAIL_LOG="${DEPLOY_LOG}" \
+    PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
+    bash "${SCRIPT_DIR}/deploy_control_plane.sh" "${_CP_ARGS[@]}" 2>&1 | tee -a "${DEPLOY_LOG}"
+    _CP_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ "${_CP_RC}" -ne 0 ]]; then
+      _DEPLOY_DEGRADED=1
+      _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the campaign/deals control plane (deploy_control_plane.sh exited ${_CP_RC})"
+      warn "Control plane not installed (exit ${_CP_RC}; 2 means a prerequisite such as Docker is missing)."
+      warn "Re-run on its own: ${SCRIPT_DIR}/deploy_control_plane.sh ${_CP_ARGS[*]}"
+    fi
+  fi
 fi
 
 # =========================================================================

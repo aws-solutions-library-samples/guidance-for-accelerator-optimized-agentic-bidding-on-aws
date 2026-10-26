@@ -5,7 +5,7 @@ Run by deploy.sh Phase 1 Step 1.5 after the ``<stack>-deals`` stack is up:
 
     seed_deals_table.py --table <stack>-deals --role-arn <DealsSeedRoleArn> \\
         --seed deployment/seed/deals_and_campaigns.json --region <region> \\
-        --origin-prefix "<stack prefix>"
+        --origin-prefix "<stack prefix>" [--campaign-status paused --skip-managed]
 
 The seed holds IAB Tech Lab Deals API v1.0 Deal objects and the demand
 endpoint's campaign records. Every deal's ``origin`` is stored in the seed as
@@ -15,177 +15,65 @@ readers strip: ``record_type`` (``deal`` or ``campaign``, the partition key) and
 ``seq`` (its position in the seed, so readers keep the seed's order). The item's
 sort key ``id`` is ``Deal.id`` for a deal and ``campaign_id`` for a campaign.
 
-The write is put-only and idempotent: rerunning rewrites the same items. A
-record removed from the seed file stays in the table until deleted by hand,
-because the seeding role cannot delete.
+The rules a record must satisfy live in source/control_plane/records.py, which
+the campaign/deals control plane applies to every tool call. One validator for
+both writers, so an agent cannot write what the seed could not.
+
+Campaign status. ``--campaign-status`` is written onto every campaign item.
+deploy.sh passes ``paused`` when the control plane is being deployed, so that
+activating a campaign is a step taken through the control plane, and ``active``
+otherwise, so a stack without a control plane bids as it always has.
+
+Control-plane edits. With ``--skip-managed`` every put carries the condition
+``attribute_not_exists(managed_by)``: an item the control plane has written is
+left alone, and the conditional failure is counted as skipped rather than
+treated as an error. A batch writer cannot carry a condition, so that path puts
+one item at a time; at a few dozen records the difference is immaterial.
+
+The write is otherwise put-only and idempotent: rerunning rewrites the same
+items. A record removed from the seed file stays in the table until deleted by
+hand, because the seeding role cannot delete.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
+import os
 import sys
 import time
 from decimal import Decimal
 from typing import Any, Iterable, Iterator
 
-ORIGIN_TEMPLATE = "{stackprefix}-prebid.example"
-_DNS_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+# The shared record rules live with the control plane under source/, which is
+# not on the path when deploy.sh runs this script from deployment/scripts/.
+_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "source")
+if _SOURCE not in sys.path:
+    sys.path.insert(0, _SOURCE)
 
-#: Deals API v1.0 field names, by object.
-DEAL_FIELDS = frozenset({
-    "id", "name", "created", "sellerstatus", "origin", "seller", "desc", "wseat",
-    "bseat", "adtypes", "auxdata", "pubcount", "dinventory", "terms", "inventory",
-    "curation", "ext",
-})
-TERMS_FIELDS = frozenset({
-    "startdate", "enddate", "countries", "dealfloor", "cur", "guar", "pricetype",
-    "units", "totalcost", "ext",
-})
-INVENTORY_FIELDS = frozenset({
-    "inclinventory", "devicetype", "sellerids", "sitedomains", "appbundles", "cat",
-    "cattax", "ext",
-})
-#: The only Terms extension this stack defines.
-TERMS_EXT_FIELDS = frozenset({"mindealfloor"})
+from control_plane import records  # noqa: E402
 
-CAMPAIGN_FIELDS = frozenset({
-    "campaign_id", "campaign_name", "adomain", "creative_id", "width", "height",
-    "declared_cpm", "deal_ids", "open_market", "target_categories", "media_type",
-    "duration", "audience_uplift", "note",
-})
-CAMPAIGN_REQUIRED = CAMPAIGN_FIELDS - {"note", "duration", "audience_uplift"}
+ORIGIN_TEMPLATE = records.ORIGIN_TEMPLATE
+MANAGED_BY = records.MANAGED_BY_CONTROL_PLANE
 
 
 class SeedError(ValueError):
     """The seed file breaks the Deals API schema or its own consistency rules."""
 
 
-def _int_in(value: Any, allowed) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and allowed(value)
-
-
-def _number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _check_enum(problems: list[str], where: str, name: str, value: Any, allowed) -> None:
-    if not _int_in(value, allowed):
-        problems.append(f"{where}: {name}={value!r} is outside the Deals API range")
-
-
-def _check_enum_list(problems: list[str], where: str, name: str, value: Any, allowed) -> None:
-    if not isinstance(value, list) or not value or not all(_int_in(v, allowed) for v in value):
-        problems.append(f"{where}: {name}={value!r} must be a non-empty list of values in range")
-
-
 def validate(seed: dict) -> None:
     """Raise SeedError listing every problem; return None when the seed is valid."""
-    problems: list[str] = []
-    deals = seed.get("deals")
-    campaigns = seed.get("campaigns")
-    if not isinstance(deals, list) or not deals:
-        raise SeedError("seed has no deals list")
-    if not isinstance(campaigns, list):
-        raise SeedError("seed has no campaigns list")
-
-    deal_ids: set[str] = set()
-    for i, deal in enumerate(deals):
-        where = f"deals[{i}] {deal.get('id', '<no id>')}"
-        for required in ("id", "origin", "terms"):
-            if required not in deal:
-                problems.append(f"{where}: missing required {required}")
-        unknown = set(deal) - DEAL_FIELDS
-        if unknown:
-            problems.append(f"{where}: not Deals API Deal fields: {sorted(unknown)}")
-        deal_id = deal.get("id")
-        if not isinstance(deal_id, str) or not deal_id:
-            problems.append(f"{where}: id must be a non-empty string")
-        elif deal_id in deal_ids:
-            problems.append(f"{where}: duplicate deal id")
-        else:
-            deal_ids.add(deal_id)
-        if len(str(deal.get("desc", ""))) > 250:
-            problems.append(f"{where}: desc is over 250 characters")
-        if "sellerstatus" in deal:
-            _check_enum(problems, where, "sellerstatus", deal["sellerstatus"], lambda v: 0 <= v <= 4)
-        if "adtypes" in deal:
-            _check_enum_list(problems, where, "adtypes", deal["adtypes"], lambda v: 1 <= v <= 4)
-        if "auxdata" in deal:
-            _check_enum(problems, where, "auxdata", deal["auxdata"], lambda v: 0 <= v <= 4)
-        if "pubcount" in deal:
-            _check_enum(problems, where, "pubcount", deal["pubcount"], lambda v: 0 <= v <= 2)
-        if "dinventory" in deal:
-            _check_enum(problems, where, "dinventory", deal["dinventory"], lambda v: 0 <= v <= 2)
-
-        terms = deal.get("terms")
-        if not isinstance(terms, dict):
-            problems.append(f"{where}: terms must be an object")
-            terms = {}
-        unknown = set(terms) - TERMS_FIELDS
-        if unknown:
-            problems.append(f"{where}: not Deals API Terms fields: {sorted(unknown)}")
-        floor = terms.get("dealfloor")
-        if not _number(floor) or floor < 0:
-            problems.append(f"{where}: terms.dealfloor={floor!r} must be a non-negative number")
-        if "pricetype" in terms:
-            _check_enum(problems, where, "terms.pricetype", terms["pricetype"], lambda v: 0 <= v <= 3 or v >= 500)
-        if "guar" in terms:
-            _check_enum(problems, where, "terms.guar", terms["guar"], lambda v: v in (0, 1))
-        ext = terms.get("ext")
-        if ext is not None:
-            if not isinstance(ext, dict) or set(ext) - TERMS_EXT_FIELDS:
-                problems.append(f"{where}: terms.ext may hold only {sorted(TERMS_EXT_FIELDS)}")
-            else:
-                minimum = ext.get("mindealfloor")
-                if not _number(minimum) or minimum < 0:
-                    problems.append(f"{where}: terms.ext.mindealfloor={minimum!r} must be a non-negative number")
-                elif _number(floor) and minimum > floor:
-                    problems.append(f"{where}: terms.ext.mindealfloor {minimum} is above terms.dealfloor {floor}")
-
-        inventory = deal.get("inventory")
-        if inventory is not None:
-            if not isinstance(inventory, dict):
-                problems.append(f"{where}: inventory must be an object")
-            else:
-                unknown = set(inventory) - INVENTORY_FIELDS
-                if unknown:
-                    problems.append(f"{where}: not Deals API Inventory fields: {sorted(unknown)}")
-                if "inclinventory" in inventory:
-                    _check_enum_list(problems, where, "inventory.inclinventory", inventory["inclinventory"], lambda v: 1 <= v <= 6)
-
-    held: dict[str, str] = {}
-    campaign_ids: set[str] = set()
-    for i, campaign in enumerate(campaigns):
-        cid = campaign.get("campaign_id")
-        where = f"campaigns[{i}] {cid or '<no id>'}"
-        missing = CAMPAIGN_REQUIRED - set(campaign)
-        if missing:
-            problems.append(f"{where}: missing {sorted(missing)}")
-        unknown = set(campaign) - CAMPAIGN_FIELDS
-        if unknown:
-            problems.append(f"{where}: unknown campaign fields {sorted(unknown)}")
-        if cid in campaign_ids:
-            problems.append(f"{where}: duplicate campaign id")
-        campaign_ids.add(cid)
-        for deal_id in campaign.get("deal_ids") or []:
-            if deal_id not in deal_ids:
-                problems.append(f"{where}: holds {deal_id}, which is not a deal in the seed")
-            if deal_id in held:
-                problems.append(f"{where}: {deal_id} is already held by {held[deal_id]}")
-            held[deal_id] = cid
-
-    if problems:
-        raise SeedError("deals seed is invalid:\n  " + "\n  ".join(problems))
+    try:
+        records.validate_seed(seed)
+    except records.RecordError as exc:
+        raise SeedError(str(exc)) from exc
 
 
 def render_origin(prefix: str) -> str:
     """``origin`` for every deal: ``<prefix>-prebid.example``, or ``prebid.example`` with no prefix."""
-    prefix = (prefix or "").strip().lower()
-    label = f"{prefix}-prebid" if prefix else "prebid"
-    if not _DNS_LABEL.match(label) or len(label) > 63:
-        raise SeedError(f"origin prefix {prefix!r} does not make a valid DNS label ({label!r})")
-    return f"{label}.example"
+    try:
+        return records.render_origin(prefix)
+    except records.RecordError as exc:
+        raise SeedError(str(exc)) from exc
 
 
 def _decimals(value: Any) -> Any:
@@ -199,8 +87,13 @@ def _decimals(value: Any) -> Any:
     return value
 
 
-def items(seed: dict, origin: str) -> Iterator[dict]:
-    """Every table item: deals then campaigns, each with record_type and seq."""
+def items(seed: dict, origin: str, campaign_status: str = records.CAMPAIGN_ACTIVE) -> Iterator[dict]:
+    """Every table item: deals then campaigns, each with record_type and seq.
+
+    ``campaign_status`` is written onto every campaign; see the module note.
+    """
+    if campaign_status not in records.CAMPAIGN_STATUSES:
+        raise SeedError(f"campaign status must be one of {list(records.CAMPAIGN_STATUSES)}")
     for seq, deal in enumerate(seed["deals"]):
         record = dict(deal)
         if record.get("origin") == ORIGIN_TEMPLATE:
@@ -208,6 +101,7 @@ def items(seed: dict, origin: str) -> Iterator[dict]:
         yield _decimals({**record, "record_type": "deal", "seq": seq})
     for seq, campaign in enumerate(seed["campaigns"]):
         record = {k: v for k, v in campaign.items()}
+        record["status"] = campaign_status
         yield _decimals({**record, "record_type": "campaign", "id": campaign["campaign_id"], "seq": seq})
 
 
@@ -221,6 +115,26 @@ def write(table: Any, rows: Iterable[dict]) -> int:
     return count
 
 
+def write_unmanaged(table: Any, rows: Iterable[dict]) -> tuple[int, int]:
+    """Put each row unless the control plane has written that item.
+
+    Returns ``(written, skipped)``. The condition is on ``managed_by``, which only
+    the control plane sets, so a seeded item that was never edited keeps receiving
+    seed updates and an edited one keeps the edit.
+    """
+    written = skipped = 0
+    for row in rows:
+        try:
+            table.put_item(Item=row, ConditionExpression="attribute_not_exists(managed_by)")
+            written += 1
+        except Exception as exc:  # noqa: BLE001 - only the conditional failure is a skip
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+            if code != "ConditionalCheckFailedException":
+                raise
+            skipped += 1
+    return written, skipped
+
+
 # The seed role is created by the stack seconds before this runs, and IAM can
 # refuse a new role or its inline policy until it propagates. Puts are
 # idempotent, so a refused attempt is retried whole.
@@ -229,7 +143,7 @@ SEED_ATTEMPTS = 6
 SEED_RETRY_SECONDS = 10
 
 
-def _seed_once(args: argparse.Namespace, seed: dict, origin: str) -> int:
+def _seed_once(args: argparse.Namespace, seed: dict, origin: str) -> tuple[int, int]:
     import boto3
 
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
@@ -243,12 +157,15 @@ def _seed_once(args: argparse.Namespace, seed: dict, origin: str) -> int:
         region_name=args.region,
     )
     table = seeded.resource("dynamodb").Table(args.table)
-    return write(table, items(seed, origin))
+    rows = items(seed, origin, args.campaign_status)
+    if args.skip_managed:
+        return write_unmanaged(table, rows)
+    return write(table, rows), 0
 
 
 def _seed_with_retry(args: argparse.Namespace, seed: dict, origin: str,
                      attempts: int = SEED_ATTEMPTS, delay: float = SEED_RETRY_SECONDS,
-                     sleep=time.sleep) -> int:
+                     sleep=time.sleep):
     for attempt in range(1, attempts + 1):
         try:
             return _seed_once(args, seed, origin)
@@ -278,6 +195,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", required=True)
     parser.add_argument("--origin-prefix", default="", help="deploy prefix used to render Deal.origin")
     parser.add_argument("--profile", default=None, help="AWS profile for the identity that assumes the role")
+    parser.add_argument(
+        "--campaign-status", choices=list(records.CAMPAIGN_STATUSES), default=records.CAMPAIGN_ACTIVE,
+        help="status written onto every seeded campaign (paused when a control plane will activate them)",
+    )
+    parser.add_argument(
+        "--skip-managed", action="store_true",
+        help="leave items the control plane has written (managed_by set) untouched",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -289,14 +214,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        written = _seed_with_retry(args, seed, origin)
+        result = _seed_with_retry(args, seed, origin)
     except Exception as exc:  # noqa: BLE001 - any AWS failure fails the deploy step
         print(f"seed_deals_table: writing {args.table} failed: {exc}", file=sys.stderr)
         return 1
 
+    written, skipped = result if isinstance(result, tuple) else (int(result), 0)
+    skipped_note = f", {skipped} left to the control plane" if skipped else ""
     print(
         f"seeded {args.table}: {len(seed['deals'])} deals, {len(seed['campaigns'])} campaigns "
-        f"({written} items), origin {origin}"
+        f"({written} items written{skipped_note}), campaigns {args.campaign_status}, origin {origin}"
     )
     return 0
 
