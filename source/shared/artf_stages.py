@@ -1,15 +1,21 @@
 """The order in which the orchestrator consults the ARTF containers.
 
-Four stages, each run to completion before the next is called, and each stage's
+Five stages, each run to completion before the next is called, and each stage's
 mutations applied to a working copy of the bid request (shared/artf_applier.py)
 before the next stage sees it:
 
-    1. enrich   ACTIVATE_SEGMENTS, ADD_METRICS, ADD_CIDS
+    0. content  ADD_CIDS
+    1. enrich   ACTIVATE_SEGMENTS, ADD_METRICS
     2. deals    ACTIVATE_DEALS, SUPPRESS_DEALS
     3. yield    ADJUST_DEAL_FLOOR, ADJUST_DEAL_MARGIN
     4. price    BID_SHADE
 
-The order is the data dependency between the intents. The Deal Scorer scores
+The order is the data dependency between the intents. ADD_CIDS runs first so
+the content ids it adds (``cid:`` metrics on ``imp.metric``) are on the request
+when the Audience Activator runs, which lets segment activation take content
+into account. No shipped container claims ADD_CIDS; the stage runs only when a
+registry container claiming it (the ARTF template by default) is active and the
+request's applicable_intents allow it, like every other stage. The Deal Scorer scores
 deals against the user's segments, so it runs after the Audience Activator has
 written them. The yield containers price the deals on the impression, so they
 run after the Deal Scorer has activated or suppressed any. The Bid Pricer clamps
@@ -19,7 +25,8 @@ parallel.
 
 A container's stage is derived from the intents it registers: the earliest stage
 any of its intents belongs to. A container registering no recognised intent runs
-in stage 1, where it cannot depend on anything.
+in stage 1 (enrich), as it did before stage 0 existed; stage 0 is kept to
+ADD_CIDS.
 
 Pure. No I/O.
 """
@@ -30,24 +37,28 @@ from typing import Iterable, Sequence, TypeVar
 
 from shared.artf_types import Intent
 
+STAGE_CONTENT = 0
 STAGE_ENRICH = 1
 STAGE_DEALS = 2
 STAGE_YIELD = 3
 STAGE_PRICE = 4
 
 STAGE_NAMES: dict[int, str] = {
+    STAGE_CONTENT: "content",
     STAGE_ENRICH: "enrich",
     STAGE_DEALS: "deals",
     STAGE_YIELD: "yield",
     STAGE_PRICE: "price",
 }
 
-STAGE_ORDER: tuple[int, ...] = (STAGE_ENRICH, STAGE_DEALS, STAGE_YIELD, STAGE_PRICE)
+STAGE_ORDER: tuple[int, ...] = (
+    STAGE_CONTENT, STAGE_ENRICH, STAGE_DEALS, STAGE_YIELD, STAGE_PRICE,
+)
 
 INTENT_STAGE: dict[Intent, int] = {
+    Intent.ADD_CIDS: STAGE_CONTENT,
     Intent.ACTIVATE_SEGMENTS: STAGE_ENRICH,
     Intent.ADD_METRICS: STAGE_ENRICH,
-    Intent.ADD_CIDS: STAGE_ENRICH,
     Intent.ACTIVATE_DEALS: STAGE_DEALS,
     Intent.SUPPRESS_DEALS: STAGE_DEALS,
     Intent.ADJUST_DEAL_FLOOR: STAGE_YIELD,

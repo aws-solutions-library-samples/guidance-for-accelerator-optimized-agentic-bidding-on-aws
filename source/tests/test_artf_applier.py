@@ -383,6 +383,15 @@ def test_no_mutation_sequence_changes_the_impression_floor(mutations):
 # Stage table
 # ---------------------------------------------------------------------------
 
+def test_add_cids_runs_in_stage_0_before_enrichment():
+    assert artf_stages.stage_of({"ADD_CIDS"}) == 0
+    assert artf_stages.stage_of([8]) == 0
+    assert artf_stages.STAGE_NAMES[0] == "content"
+    assert artf_stages.STAGE_ORDER[0] == 0
+    # A container claiming ADD_CIDS alongside an enrich intent runs in the earliest.
+    assert artf_stages.stage_of({"ADD_CIDS", "ACTIVATE_SEGMENTS"}) == 0
+
+
 def test_the_six_built_in_containers_land_in_the_four_stages_in_order():
     assert artf_stages.stage_of({"ACTIVATE_SEGMENTS"}) == 1
     assert artf_stages.stage_of({"ADD_METRICS"}) == 1
