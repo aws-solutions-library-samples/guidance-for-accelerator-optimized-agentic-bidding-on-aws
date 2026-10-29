@@ -70,6 +70,7 @@ from shared.signal_associator import SignalAssociator  # noqa: E402
 from orchestrator.signal_receiver import receive_signal as _receive_signal_handler  # noqa: E402
 from orchestrator.feedback_integration import emit_bid_outcome  # noqa: E402
 from orchestrator.deal_yield_feedback import emit_deal_yield_outcome  # noqa: E402
+from orchestrator import deployment_mode  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -1263,7 +1264,11 @@ async def list_containers(request: Request) -> JSONResponse:
                 # Rules-based container — no Triton dependency
                 inference_status = "ready" if container_status == "ready" else "unavailable"
             elif not triton_ready:
-                inference_status = "gpu_offline"
+                # In learner mode Triton runs on CPU nodes, so "GPU offline"
+                # would name the wrong cause.
+                inference_status = (
+                    "triton_offline" if deployment_mode.is_learner() else "gpu_offline"
+                )
             elif triton_models.get(model_name, {}).get("state") == "READY":
                 inference_status = "ready"
             else:
@@ -1272,7 +1277,7 @@ async def list_containers(request: Request) -> JSONResponse:
             # Overall status: container must be reachable AND inference must work
             if container_status == "ready" and inference_status == "ready":
                 overall = "ready"
-            elif container_status == "ready" and inference_status == "gpu_offline":
+            elif container_status == "ready" and inference_status in ("gpu_offline", "triton_offline"):
                 overall = "degraded"
             elif container_status == "unreachable":
                 overall = "unreachable"
@@ -1618,6 +1623,9 @@ async def gpu_status(request: Request) -> JSONResponse:
     a permanent deadlock displayed as normal startup. The probe result is
     returned as evidence so the UI can show why, not just that.
     """
+    mode = deployment_mode.current_mode()
+    if mode == deployment_mode.LEARNER:
+        return await _learner_gpu_status()
     import boto3
     try:
         eks = boto3.client("eks", region_name=_AWS_REGION)
@@ -1672,6 +1680,7 @@ async def gpu_status(request: Request) -> JSONResponse:
             )
 
         return JSONResponse({
+            "deploymentMode": mode,
             "status": ng_status,
             "desiredSize": desired,
             "minSize": scaling["minSize"],
@@ -1683,9 +1692,44 @@ async def gpu_status(request: Request) -> JSONResponse:
             "secondsSinceNodegroupChange": int(settled_for) if settled_for is not None else None,
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        # The mode comes from the pod environment, not from EKS, so it is still
+        # known when the node group lookup fails.
+        return JSONResponse({"error": str(e), "deploymentMode": mode}, status_code=500)
 
 
+async def _learner_gpu_status() -> JSONResponse:
+    """GPU status in learner mode: there is no GPU node group, Triton runs on CPU.
+
+    No EKS call is made. The node group fields are null because no GPU node
+    group serves inference; zeros would read as a scaled-down group.
+    """
+    triton_url = os.environ.get("TRITON_URL", "triton-inference-server:8000")
+    triton_ready = False
+    triton_detail = None
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as tc:
+            resp = await tc.get(f"http://{triton_url}/v2/health/ready")
+            triton_ready = resp.status_code == 200
+            if not triton_ready:
+                triton_detail = f"/v2/health/ready returned HTTP {resp.status_code}"
+    except Exception as exc:
+        triton_detail = f"{type(exc).__name__} connecting to {triton_url}"
+    return JSONResponse({
+        "deploymentMode": deployment_mode.LEARNER,
+        "inferenceDevice": "cpu",
+        "status": None,
+        "desiredSize": None,
+        "minSize": None,
+        "maxSize": None,
+        "running": triton_ready,
+        "tritonReady": triton_ready,
+        "tritonState": "ready" if triton_ready else "not_ready",
+        "tritonDetail": triton_detail,
+        "secondsSinceNodegroupChange": None,
+    })
+
+
+@deployment_mode.require_standard_mode("Starting GPU nodes")
 async def gpu_start(request: Request) -> JSONResponse:
     """POST /v1/gpu/start — scale GPU node group to 3 nodes for Triton + NVIDIA containers."""
     import boto3
@@ -1701,6 +1745,7 @@ async def gpu_start(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@deployment_mode.require_standard_mode("Stopping GPU nodes")
 async def gpu_stop(request: Request) -> JSONResponse:
     """POST /v1/gpu/stop — scale GPU node group to 0."""
     import boto3
@@ -1844,16 +1889,19 @@ def _governance_routes(prefix: str) -> list:
     """Build the governance routes (training trigger + comparison/promotion) under a given prefix."""
     if not _GOVERNANCE_API_AVAILABLE:
         return []
+    # Training, comparison and promotion run GPU jobs (training, TensorRT
+    # compile), so in learner mode every governance route answers 409.
+    gov = deployment_mode.require_standard_mode("The Governance API")
     return [
-        Route(f"{prefix}/v1/governance/training-estimate", gov_training_estimate, methods=["GET"]),
-        Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
-        Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),
-        Route(f"{prefix}/v1/governance/trainable-runs", gov_trainable_runs, methods=["GET"]),
-        Route(f"{prefix}/v1/governance/sweep-status", gov_sweep_status, methods=["GET"]),
-        Route(f"{prefix}/v1/governance/comparison-pair", gov_comparison_pair, methods=["GET"]),
-        Route(f"{prefix}/v1/governance/compare", gov_compare, methods=["POST"]),
-        Route(f"{prefix}/v1/governance/stage-canary", gov_stage_canary, methods=["POST"]),
-        Route(f"{prefix}/v1/governance/promote", gov_promote, methods=["POST"]),
+        Route(f"{prefix}/v1/governance/training-estimate", gov(gov_training_estimate), methods=["GET"]),
+        Route(f"{prefix}/v1/governance/train", gov(gov_train), methods=["POST"]),
+        Route(f"{prefix}/v1/governance/eligible-runs", gov(gov_eligible_runs), methods=["GET"]),
+        Route(f"{prefix}/v1/governance/trainable-runs", gov(gov_trainable_runs), methods=["GET"]),
+        Route(f"{prefix}/v1/governance/sweep-status", gov(gov_sweep_status), methods=["GET"]),
+        Route(f"{prefix}/v1/governance/comparison-pair", gov(gov_comparison_pair), methods=["GET"]),
+        Route(f"{prefix}/v1/governance/compare", gov(gov_compare), methods=["POST"]),
+        Route(f"{prefix}/v1/governance/stage-canary", gov(gov_stage_canary), methods=["POST"]),
+        Route(f"{prefix}/v1/governance/promote", gov(gov_promote), methods=["POST"]),
     ]
 
 # Closed-loop demo API (Part 2 visualization + controllable synthetic input).

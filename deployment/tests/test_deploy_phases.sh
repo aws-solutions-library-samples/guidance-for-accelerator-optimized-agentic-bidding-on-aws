@@ -1052,6 +1052,41 @@ test_private_ui_api_path() {
   assert_contains "${calls}" "create-stack --stack-name t-ui-api-proxy" "a missing stack is created"
   assert_not_contains "${calls}" "elbv2" "nothing creates a load balancer"
   assert_not_contains "${calls}" "block-public-access" "nothing reads or changes the account's BPA settings"
+  assert_not_contains "${calls}" "ReservedConcurrency" "the standard path passes no ReservedConcurrency (the template default applies)"
+
+  # --- learner mode: the same call plus ReservedConcurrency=5 (Workshop Studio cap) ---
+  local std_create lm_create sh_lm=/bin/bash; [[ -x "${sh_lm}" ]] || sh_lm=bash
+  std_create="$(grep 'cloudformation create-stack' "${tmp}/calls")"
+  : > "${tmp}/calls"
+  out="$(CALLS="${tmp}/calls" "${sh_lm}" -c '
+    set -uo pipefail
+    LEARNER_MODE=1
+    AWS_REGION=us-east-1; AWS_PROFILE=t-profile; CLUSTER_NAME=t-cluster; STACK_PREFIX=t
+    SCRIPT_DIR=/deploy; UI_API_PROXY_STACK=t-ui-api-proxy
+    ORCH_URL=http://t-orch-0123456789abcdef.elb.us-east-1.amazonaws.com
+    log()  { :; }; ok() { :; }
+    fail() { printf "[fail] %s\n" "$*" >&2; exit 1; }
+    aws() {
+      printf "%s\n" "$*" >> "$CALLS"
+      case "$*" in
+        *eks\ describe-cluster*vpcId*) printf "vpc-0abc\n" ;;
+        *eks\ describe-cluster*clusterSecurityGroupId*) printf "sg-0cafe\n" ;;
+        *ec2\ describe-subnets*) printf "subnet-aaa\tsubnet-bbb\n" ;;
+        *cloudformation\ describe-stacks*StackStatus*) printf "\n"; return 1 ;;
+        *cloudformation\ create-stack*) printf "{\"StackId\":\"arn:x\"}\n" ;;
+        *cloudformation\ wait*) ;;
+        *cloudformation\ describe-stacks*ProxyFunctionArn*) printf "arn:aws:lambda:us-east-1:123456789012:function:t-ui-api-proxy\n" ;;
+        *) printf "UNEXPECTED aws %s\n" "$*" >&2; return 1 ;;
+      esac
+      return 0
+    }
+    '"${fn_src}"'
+    deploy_ui_api_proxy 3 "${ORCH_URL}"
+  ' 2>&1)"; rc=$?
+  assert_eq "${rc}" "0" "deploy_ui_api_proxy succeeds in learner mode under ${sh_lm} (output: ${out})"
+  lm_create="$(grep 'cloudformation create-stack' "${tmp}/calls")"
+  assert_eq "${lm_create}" "${std_create} ParameterKey=ReservedConcurrency,ParameterValue=5" "learner mode adds exactly ReservedConcurrency=5 to the standard stack call"
+  assert_eq "$(awk '/^  ReservedConcurrency:$/{f=1} f && /Default:/{print $2; exit}' "${SCRIPT_DIR}/../ui_api_proxy_cfn.yaml")" "20" "the template default stays 20"
 
   # --- no private subnets: a clear Phase-3 failure, no stack call -----------
   : > "${tmp}/calls"
@@ -1857,6 +1892,486 @@ test_k8s_rollout() {
   assert_not_contains "${src}" '__IMAGE__|${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}' "deploy_prebid.sh no longer renders Prebid by tag"
 }
 
+
+# =========================================================================
+# Test: campaign/deals MCP control plane gate
+# =========================================================================
+# The control plane deploys only with Prebid (effective WITH_PREBID=1), is on by
+# default there, and is switched off by --no-control-plane. Three scripts have to
+# agree on that: deploy.sh (the flag, the remembered state, the seeder's campaign
+# status, the pass-through), deploy_prebid.sh (Step 9 and the flag), and
+# deploy_control_plane.sh (its own argument contract). Asserted on the text of the
+# scripts, since none of this can run without AWS.
+test_control_plane_gate() {
+  local D="${SCRIPT_DIR}/.." src out rc
+  _cp_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE bash "$@" 2>&1; }
+
+  src="$(cat "${DEPLOY_SH}")"
+  assert_contains "${src}" '--no-control-plane)   CONTROL_PLANE=0; _GIVEN_CONTROL_PLANE=1 ;;' "deploy.sh parses --no-control-plane"
+  assert_contains "${src}" '--with-control-plane) CONTROL_PLANE=1; _GIVEN_CONTROL_PLANE=1 ;;' "deploy.sh parses --with-control-plane"
+  assert_contains "${src}" '_reuse CONTROL_PLANE    controlPlane  "${_GIVEN_CONTROL_PLANE}"' "deploy.sh remembers the control-plane choice per prefix"
+  assert_contains "${src}" '"controlPlane=${CONTROL_PLANE}"' "deploy.sh records controlPlane in the state file"
+  # The effective bit is set ONLY inside the WITH_PREBID block, so a deploy without
+  # Prebid never seeds campaigns paused and never passes the flag anywhere.
+  assert_contains "${src}" $'if [[ "${WITH_PREBID}" -eq 1 ]]; then\n  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"\n  CONTROL_PLANE_EFFECTIVE="${CONTROL_PLANE}"\nfi' "CONTROL_PLANE_EFFECTIVE is derived from WITH_PREBID"
+  assert_contains "${src}" 'SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)' "deploy.sh seeds campaigns paused when the control plane deploys"
+  assert_contains "${src}" 'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then' "the paused seed is gated on the effective bit"
+  assert_contains "${src}" 'PREBID_ARGS="${PREBID_ARGS} --no-control-plane"' "deploy.sh passes --no-control-plane through to deploy_prebid.sh"
+  assert_contains "${src}" 'deploy_control_plane.sh" ${STACK_PREFIX:+--prefix "${STACK_PREFIX}"}' "deploy.sh --destroy removes the control plane"
+  assert_contains "${src}" 'deployment/control_plane_cfn.yaml deployment/deploy_control_plane.sh' "control-plane files are part of the Prebid fingerprint"
+  assert_contains "${src}" 'source/prebid source/demand source/control_plane' "control-plane sources are part of the Prebid fingerprint"
+  assert_contains "${src}" 'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 && "${_PREBID_STEP_RAN}" -eq 0 ]]; then' "a missing control plane is installed when the Prebid step did not run"
+  assert_contains "${src}" "agentRuntimes[?agentRuntimeName=='\${_CP_RUNTIME}'].agentRuntimeArn" "presence is checked against the runtime itself, not the fingerprint"
+  assert_contains "${src}" '_PREBID_STEP_RAN=1' "the Prebid step records that it ran, so Step 9 is not repeated in the same run"
+
+  src="$(cat "${D}/deploy_prebid.sh")"
+  assert_contains "${src}" '--no-control-plane) WITH_CONTROL_PLANE=0 ;;' "deploy_prebid.sh parses --no-control-plane"
+  assert_contains "${src}" 'step "Step 9/9: Campaign/deals MCP control plane"' "deploy_prebid.sh has a Step 9 for the control plane"
+  assert_contains "${src}" 'if [[ "${WITH_CONTROL_PLANE}" -eq 1 ]]; then' "Step 9 is gated on the flag"
+  assert_contains "${src}" '2) CONTROL_PLANE_STATUS="SKIPPED: prerequisites missing' "a missing-Docker exit (2) is a warned skip, not a failed Prebid deploy"
+  assert_contains "${src}" 'build_cost_disclosure(node, control_plane=control_plane)' "the Step 2 cost disclosure carries the control-plane term"
+  assert_contains "${src}" 'CP_DESTROY_ARGS=(--region "${AWS_REGION}" --profile "${AWS_PROFILE}" --destroy)' "deploy_prebid.sh --destroy removes the control plane first"
+  assert_not_contains "${src}" 'Step 8/8' "deploy_prebid.sh no longer counts eight steps"
+
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --nope)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh exits 1 on an unknown flag"
+  assert_contains "${out}" "unknown argument '--nope'" "deploy_control_plane.sh names the unknown flag"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --prefix abc --with-prebid)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh refuses a deploy.sh flag"
+  assert_contains "${out}" "'--with-prebid' is a deploy.sh flag" "and says which script the flag belongs to"
+  assert_contains "${out}" "./deploy.sh --prefix <prefix> --with-prebid" "and gives the deploy.sh command"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --start-at 9)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh rejects an out-of-range --start-at"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --help)"; rc=$?
+  assert_eq "${rc}" "0" "deploy_control_plane.sh --help exits 0"
+  assert_contains "${out}" "--no-control-plane" "the help names the opt-out that reaches it from deploy_prebid.sh"
+  assert_contains "${out}" "--connection-info" "the help documents the connection-info mode"
+  assert_contains "${out}" "Exit codes" "the help documents the exit-code contract deploy_prebid.sh relies on"
+
+  src="$(cat "${D}/deploy_control_plane.sh")"
+  assert_contains "${src}" '--request-header-allowlist Authorization' "the runtime allowlists Authorization so the container can verify the token"
+  assert_contains "${src}" 'customJWTAuthorizer' "the runtime is registered with an inbound JWT authorizer"
+  assert_contains "${src}" 'ARTF_CONTROL_TOKEN_ISSUER=' "the runtime gets the issuer the container requires at startup"
+  assert_contains "${src}" 'ARTF_CONTROL_CLIENT_ENTITLEMENTS=' "the runtime gets the client entitlement map"
+  assert_contains "${src}" 'if [[ "${CONNECTION_INFO}" -eq 1 ]]; then' "connection-info returns before any deploy step"
+  assert_contains "${src}" '"mcp_url": "$(mcp_url_for' "the record file carries the MCP URL"
+  # The URL helper must match the Python verifier byte for byte.
+  local arn='arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/x_control-Ab1' sh_url py_url
+  eval "$(sed -n '/^mcp_url_for() {/,/^}/p' "${D}/deploy_control_plane.sh")"
+  sh_url="$(mcp_url_for "${arn}" us-east-1)"
+  py_url="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import control_plane_connect as c; print(c.mcp_url(sys.argv[2], "us-east-1"))' "${D}/scripts" "${arn}")"
+  assert_eq "${sh_url}" "${py_url}" "the shell and Python MCP URLs agree"
+  # The secret is printed as a command for the OPERATOR to run (escaped in a heredoc),
+  # never resolved by the script or written to its record.
+  assert_contains "${src}" '"secret": "on the Cognito app client only; never written here"' "the record file carries no secret"
+  assert_not_contains "${src}" 'CLIENT_SECRET="$(aws' "the deploy path never resolves the client secret (only --connection-info --token reads it, to mint a token)"
+
+  # Comments in the template explain WHY these actions are absent, and necessarily
+  # name them; strip comments so the assertions see only what is declared.
+  src="$(grep -v '^[[:space:]]*#' "${D}/control_plane_cfn.yaml")"
+  assert_not_contains "${src}" 'dynamodb:DeleteItem' "the execution role cannot delete records"
+  assert_not_contains "${src}" 'GetWorkloadAccessTokenForUserId' "the execution role cannot mint unverified user tokens"
+  assert_not_contains "${src}" 'bedrock:InvokeModel' "the execution role invokes no model"
+}
+# =========================================================================
+# Learner mode (--learner-mode): flags, remembered state, renders, Phase 3 shape
+# =========================================================================
+# Learner mode deploys with no GPUs. The default path must not change, so each
+# test below checks the learner behaviour AND that the flag-absent path does what
+# it did before.
+test_learner_mode_flags() {
+  echo "test_learner_mode_flags"
+  local D="${SCRIPT_DIR}/.." out rc fn_src
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  _lm_arg_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE bash "$@" 2>&1; }
+
+  # --- the real script: parsing and the early validation, before any AWS call ---
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --bogus)"; rc=$?
+  assert_eq "${rc}" "1" "an unknown flag next to --learner-mode still stops the run"
+  assert_contains "${out}" "unknown argument '--bogus'" "--learner-mode itself is recognised; --bogus is the one named"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --no-learner-mode --bogus)"; rc=$?
+  assert_contains "${out}" "unknown argument '--bogus'" "--no-learner-mode is recognised"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --artf-on-gpu)"; rc=$?
+  assert_eq "${rc}" "1" "--learner-mode with ARTF containers on GPU nodes is refused"
+  assert_contains "${out}" "no inference nodes exist" "the refusal says why"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --with-retraining)"; rc=$?
+  assert_eq "${rc}" "1" "--learner-mode with an explicit --with-retraining is refused"
+  assert_contains "${out}" "retraining and promotion need GPUs" "the refusal names the GPU dependency"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --no-prebid)"; rc=$?
+  assert_eq "${rc}" "1" "--learner-mode with an explicit --no-prebid is refused"
+  assert_contains "${out}" "--no-prebid cannot be combined with learner mode" "the refusal names --no-prebid"
+  assert_contains "${out}" "Auction Theater's live auction needs Prebid Server" "the refusal says why"
+  assert_not_contains "${out}" "AWS profile:" "the refusal comes before any AWS profile resolution"
+  out="$(_lm_arg_run "${D}/deploy.sh" --prefix dv1 --learner-mode --ngc-key nvapi-k --bogus)"; rc=$?
+  assert_contains "${out}" "unknown argument '--bogus'" "--ngc-key next to --learner-mode still parses its value"
+  out="$(bash "${DEPLOY_SH}" --help 2>&1)"
+  assert_contains "${out}" "--learner-mode" "--help documents --learner-mode"
+  assert_contains "${out}" "--no-learner-mode" "--help documents --no-learner-mode"
+  assert_contains "${out}" "NOT for ARTF-compliant production workloads" "--help carries the compliance caveat"
+
+  # --- validate_learner_mode in isolation, under /bin/bash and set -u ----------
+  fn_src="$(sed -n '/^_WITH_RETRAINING_CHOICE=""$/p; /^_WITH_PREBID_CHOICE=""$/p; /^_LEARNER_NOTED=0$/p; /^validate_learner_mode() {/,/^}/p' "${DEPLOY_SH}")"
+  # Prebid, scope and NGC inputs come from LM_PB / LM_GPB / LM_KEY / LM_SECRET
+  # (default: Prebid off and not given, no NGC). LM_EXTRA=1 adds a second output line.
+  _lm_validate() {  # _lm_validate <LEARNER_MODE> <WITH_RETRAINING> <_GIVEN_RETRAINING> <ARTF_NODE_ROLE> [_GIVEN_MAXGPUS]
+    "${sh}" -c "set -euo pipefail
+      LEARNER_MODE='$1'; WITH_RETRAINING='$2'; _GIVEN_RETRAINING='$3'; ARTF_NODE_ROLE='$4'; _GIVEN_MAXGPUS='${5:-0}'
+      WITH_PREBID='${LM_PB:-0}'; _GIVEN_PREBID='${LM_GPB:-0}'; ARTF_MUTATIONS_REQUIRED_SCOPE=''
+      NGC_KEY='${LM_KEY:-}'; NGC_SECRET='${LM_SECRET:-}'
+      ${fn_src}
+      validate_learner_mode
+      WITH_PREBID=\"\${_WITH_PREBID_CHOICE}\"  # deploy.sh restores the choice before _reuse
+      validate_learner_mode
+      echo \"WR=\${WITH_RETRAINING} CHOICE=\${_WITH_RETRAINING_CHOICE}\"
+      if [[ '${LM_EXTRA:-0}' == 1 ]]; then
+        echo \"PB=\${WITH_PREBID} PBCHOICE=\${_WITH_PREBID_CHOICE} SCOPE=[\${ARTF_MUTATIONS_REQUIRED_SCOPE}] KEY=[\${NGC_KEY}] SECRET=[\${NGC_SECRET}]\"
+      fi" 2>&1
+  }
+  out="$(_lm_validate 1 1 0 inference)"; rc=$?
+  assert_eq "${rc}" "1" "validate_learner_mode refuses --artf-node-role inference"
+  out="$(_lm_validate 1 1 1 services)"; rc=$?
+  assert_eq "${rc}" "1" "validate_learner_mode refuses an explicit --with-retraining"
+  out="$(_lm_validate 1 1 0 services)"; rc=$?
+  assert_eq "${rc}" "0" "validate_learner_mode accepts the default retraining value in learner mode (output: ${out})"
+  assert_contains "${out}" "WR=0 CHOICE=0" "learner mode forces WITH_RETRAINING=0 (second call sees the forced value)"
+  assert_eq "$(printf '%s\n' "${out}" | grep -c 'Learner mode: no GPUs')" "1" "the learner notice prints once across both calls"
+  out="$(_lm_validate 1 0 1 services 1)"; rc=$?
+  assert_contains "${out}" "--maxGPUs has no effect" "an explicit --maxGPUs is called out as having no effect"
+  out="$(_lm_validate 0 1 0 inference)"; rc=$?
+  assert_eq "${rc}" "0" "the default mode passes validation unchanged"
+  assert_eq "${out}" "WR=1 CHOICE=1" "the default mode changes nothing and prints nothing"
+  out="$(_lm_validate 2 1 0 services)"; rc=$?
+  assert_eq "${rc}" "1" "a remembered learnerMode other than 0/1 is refused"
+
+  # --- Prebid is forced on in learner mode; the operator's own choice is kept ---
+  out="$(LM_EXTRA=1 _lm_validate 1 1 0 services)"; rc=$?
+  assert_eq "${rc}" "0" "learner mode without a Prebid flag passes (output: ${out})"
+  assert_contains "${out}" "PB=1 PBCHOICE=0 SCOPE=[artf-orchestrator/mutations:write]" "learner mode forces WITH_PREBID=1 and the mutations scope, and keeps the operator's own choice (off)"
+  out="$(LM_EXTRA=1 LM_PB=1 LM_GPB=1 _lm_validate 1 1 0 services)"; rc=$?
+  assert_contains "${out}" "PB=1 PBCHOICE=1" "an explicit --with-prebid in learner mode is kept as the choice"
+  out="$(LM_EXTRA=1 LM_PB=0 LM_GPB=1 _lm_validate 1 1 0 services)"; rc=$?
+  assert_eq "${rc}" "1" "validate_learner_mode refuses an explicit --no-prebid"
+  assert_contains "${out}" "--no-prebid cannot be combined with learner mode" "the --no-prebid refusal names the flag"
+  assert_contains "${out}" "Auction Theater" "the --no-prebid refusal says the Theater needs Prebid"
+  out="$(LM_EXTRA=1 LM_PB=0 LM_GPB=1 _lm_validate 0 1 0 services)"; rc=$?
+  assert_eq "${rc}" "0" "--no-prebid is accepted in the default mode"
+  assert_eq "${out}" "$(printf 'WR=1 CHOICE=1\nPB=0 PBCHOICE=0 SCOPE=[] KEY=[] SECRET=[]')" "the default mode leaves Prebid, the scope and the NGC values untouched and prints nothing"
+  out="$(LM_EXTRA=1 LM_PB=1 LM_GPB=1 _lm_validate 0 1 0 services)"
+  assert_contains "${out}" "PB=1 PBCHOICE=1 SCOPE=[]" "the default mode with --with-prebid is untouched by validate_learner_mode"
+
+  # --- NGC flags are dropped in learner mode, with one warning ------------------
+  out="$(LM_EXTRA=1 LM_KEY=nvapi-k LM_SECRET=my-secret _lm_validate 1 1 0 services)"; rc=$?
+  assert_eq "${rc}" "0" "learner mode with --ngc-key/--ngc-secret passes (output: ${out})"
+  assert_contains "${out}" "KEY=[] SECRET=[]" "learner mode clears NGC_KEY and NGC_SECRET"
+  assert_eq "$(printf '%s\n' "${out}" | grep -c 'ngc-secret are ignored in learner mode')" "1" "the NGC warning prints once across both validation calls"
+  assert_not_contains "${out}" "nvapi-k" "the key value is never printed"
+  out="$(LM_EXTRA=1 LM_KEY=nvapi-k _lm_validate 0 1 0 services)"
+  assert_contains "${out}" "KEY=[nvapi-k] SECRET=[]" "the default mode keeps the NGC key"
+  assert_not_contains "${out}" "ignored in learner mode" "the default mode prints no NGC warning"
+
+  # --- remembered state: the _reuse/state_set wiring, mirroring --maxGPUs ------
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_eq "$(grep -c '_reuse LEARNER_MODE     learnerMode   "${_GIVEN_LEARNER_MODE}"     "--learner-mode"' "${DEPLOY_SH}")" "1" "learnerMode is reused through _reuse like maxGPUs"
+  assert_eq "$(grep -c '"learnerMode=${LEARNER_MODE}"' "${DEPLOY_SH}")" "1" "learnerMode is recorded in the remembered block"
+  assert_eq "$(grep -c '"withRetraining=${_WITH_RETRAINING_CHOICE}"' "${DEPLOY_SH}")" "1" "the operator's own retraining choice is remembered, not the forced value"
+  assert_contains "${src}" 'WITH_RETRAINING="${_WITH_RETRAINING_CHOICE}"' "the forced value is undone before remembered values are applied"
+  # Reuse happens BEFORE the re-validation, and the mode is read before _reuse.
+  local prev_line reuse_line reval_line
+  prev_line="$(grep -n '_PREV_LEARNER_MODE="$(state_read' "${DEPLOY_SH}" | head -1 | cut -d: -f1)"
+  reuse_line="$(grep -n '_reuse LEARNER_MODE' "${DEPLOY_SH}" | cut -d: -f1)"
+  reval_line="$(grep -n '^  validate_learner_mode$' "${DEPLOY_SH}" | cut -d: -f1)"
+  if [[ -n "${prev_line}" && -n "${reuse_line}" && -n "${reval_line}" && "${prev_line}" -lt "${reuse_line}" && "${reuse_line}" -lt "${reval_line}" ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: previous mode read (%s) < _reuse (%s) < re-validation (%s)\n' "${prev_line}" "${reuse_line}" "${reval_line}" >&2
+  fi
+  _lm_order() {  # _lm_order <label> <line>...: pass when the line numbers are strictly increasing
+    local label="$1" prev="" n; shift
+    for n in "$@"; do
+      if [[ -z "${n}" || ( -n "${prev}" && "${n}" -le "${prev}" ) ]]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: %s (lines: %s)\n' "${label}" "$*" >&2; return 0
+      fi
+      prev="${n}"
+    done
+    PASS_COUNT=$((PASS_COUNT + 1))
+  }
+  _lm_line() { grep -nF -- "$1" "${DEPLOY_SH}" | head -1 | cut -d: -f1; }
+
+  # Prebid: the operator's own choice is remembered, and the forced value is undone
+  # before remembered values are applied (mirrors withRetraining).
+  assert_eq "$(grep -c '"withPrebid=${_WITH_PREBID_CHOICE}"' "${DEPLOY_SH}")" "1" "the operator's own Prebid choice is remembered, not the forced value"
+  assert_eq "$(grep -c '"withPrebid=${WITH_PREBID}"' "${DEPLOY_SH}")" "0" "the forced Prebid value is never recorded"
+  _lm_order "the Prebid choice is restored before _reuse WITH_PREBID, which precedes the re-validation" \
+    "$(_lm_line 'WITH_PREBID="${_WITH_PREBID_CHOICE}"')" "$(_lm_line '_reuse WITH_PREBID')" "${reval_line}"
+
+  # NGC: a remembered secret name is not restored in learner mode, and the record
+  # is written after the re-validation (which cleared any supplied key).
+  assert_eq "$(grep -c 'if \[\[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" && "${LEARNER_MODE}" -eq 0 \]\]; then' "${DEPLOY_SH}")" "1" "the remembered NGC secret name is restored only outside learner mode"
+  _lm_order "_reuse LEARNER_MODE < NGC restore < re-validation < ngcSecretName record" \
+    "${reuse_line}" "$(_lm_line '_REMEMBERED_NGC="$(state_read')" "${reval_line}" "$(_lm_line '"ngcSecretName=${STACK_NAME}-ngc-api-key"')"
+  # The only paths a key takes to a child: build_images' NGC_FLAG (built from the
+  # two variables only) and Step 11, which runs only with retraining on (never in
+  # learner mode, which forces WITH_RETRAINING=0).
+  assert_eq "$(grep -c 'NGC_FLAG=(--ngc-key "${NGC_KEY}")' "${DEPLOY_SH}")" "1" "build_images passes --ngc-key only from NGC_KEY"
+  assert_eq "$(grep -c 'NGC_FLAG=(--ngc-secret "${NGC_SECRET}")' "${DEPLOY_SH}")" "1" "build_images passes --ngc-secret only from NGC_SECRET"
+  assert_eq "$(grep -c 'NGC_FLAG=(' "${DEPLOY_SH}")" "3" "NGC_FLAG has no other source (empty, key, secret)"
+  assert_eq "$(awk '
+      /^if \[\[ "\$\{WITH_RETRAINING\}" -eq 1 \]\]; then$/ { g=1 }
+      g && /^(else|fi)/ { g=0 }
+      /CLOSED_LOOP_ARGS=.*--ngc-(key|secret)/ { print (g ? "guarded" : "unguarded") }
+    ' "${DEPLOY_SH}" | sort -u)" "guarded" "Step 11's NGC pass-through sits inside the WITH_RETRAINING -eq 1 block"
+  assert_eq "$(grep -c 'NGC_KEY\|NGC_SECRET' "${D}/deploy_prebid.sh")" "0" "deploy_prebid.sh reads no NGC variable"
+  assert_eq "$(grep -c '^NGC_SECRET=""$' "${D}/codebuild/remote_build.sh")" "1" "remote_build.sh resets NGC_SECRET instead of reading the environment"
+  assert_eq "$(grep -c '^NGC_KEY=""$' "${D}/codebuild/remote_build.sh")" "1" "remote_build.sh resets NGC_KEY instead of reading the environment"
+
+  # sagemaker: checked after the remembered values and the re-validation, so a
+  # flagless rerun of a learner (or remembered --no-retraining) prefix does not
+  # pip-install it; still before its first consumer, the XGBoost URI resolution.
+  assert_eq "$(grep -c "pip install --quiet 'sagemaker>=2,<3'" "${DEPLOY_SH}")" "1" "exactly one sagemaker install"
+  assert_eq "$(grep -c '^if \[\[ "${WITH_RETRAINING}" -eq 1 \]\] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then$' "${DEPLOY_SH}")" "1" "the sagemaker check keeps its WITH_RETRAINING guard"
+  _lm_order "_reuse WITH_RETRAINING < re-validation < sagemaker install < XGBoost URI resolution" \
+    "$(_lm_line '_reuse WITH_RETRAINING')" "${reval_line}" "$(_lm_line "pip install --quiet 'sagemaker>=2,<3'")" \
+    "$(_lm_line 'XGBOOST_TRAINING_IMAGE_URI="$(SAGEMAKER_SUPPRESS_V2_WARNING=1')"
+  _lm_order "the --destroy / --ui-only branches still come after the sagemaker check" \
+    "$(_lm_line "pip install --quiet 'sagemaker>=2,<3'")" "$(_lm_line 'if [[ "${DESTROY}" -eq 1 ]]; then')"
+  # The re-validation and the sagemaker check both sit at the top level (not in a
+  # function), so the ordering above is execution order.
+  assert_eq "$(awk '/^if \[\[ "\$\{WITH_RETRAINING\}" -eq 1 \]\] && ! "\$\{PYTHON\}" -c "from sagemaker/{print "top"; exit}' "${DEPLOY_SH}")" "top" "the sagemaker check is a top-level statement"
+
+  # Part 2 switch warning: read before _reuse, called inside the mode-switch block.
+  _lm_order "_PREV_WITH_RETRAINING is read before _reuse WITH_RETRAINING" \
+    "$(_lm_line '_PREV_WITH_RETRAINING="$(state_read "${STACK_PREFIX}" remembered.withRetraining)"')" "$(_lm_line '_reuse WITH_RETRAINING')"
+  _lm_order "the warning is called inside the mode-switch block" \
+    "$(_lm_line 'if [[ -n "${_PREV_LEARNER_MODE}" && "${_PREV_LEARNER_MODE}" != "${LEARNER_MODE}" ]]; then')" \
+    "$(_lm_line 'warn_part2_left_on_switch "${_PREV_LEARNER_MODE}" "${LEARNER_MODE}" "${_PREV_WITH_RETRAINING}"')" \
+    "$(_lm_line '# --- What is already deployed, according to AWS ---')"
+  local warn_src; warn_src="$(sed -n '/^warn_part2_left_on_switch() {/,/^}/p' "${DEPLOY_SH}")"
+  _lm_switch() { "${sh}" -c "set -euo pipefail; STACK_PREFIX=dv1
+    ${warn_src}
+    warn_part2_left_on_switch '$1' '$2' '$3'" 2>&1; }
+  out="$(_lm_switch 0 1 1)"
+  assert_contains "${out}" "Prefix 'dv1' had Part 2 deployed" "standard (Part 2 on) to learner warns"
+  assert_contains "${out}" "ml.g5.2xlarge retraining (dv1-governance-eventbridge)" "the warning names the scheduled GPU retraining stack"
+  assert_contains "${out}" "governance AgentCore runtime" "the warning names the governance runtime"
+  assert_contains "${out}" "./deploy.sh --prefix dv1 --destroy" "the warning says how to remove them"
+  assert_contains "$(_lm_switch 0 1 '')" "had Part 2 deployed" "a record without withRetraining (the default, on) warns"
+  assert_eq "$(_lm_switch 0 1 0)" "" "a standard prefix deployed with --no-retraining does not warn"
+  assert_eq "$(_lm_switch 1 1 0)" "" "a learner prefix staying learner does not warn"
+  assert_eq "$(_lm_switch '' 1 '')" "" "a new prefix deployed in learner mode does not warn"
+  assert_eq "$(_lm_switch 1 0 1)" "" "learner back to standard does not warn"
+  assert_eq "$(_lm_switch 0 0 1)" "" "standard staying standard does not warn"
+
+  # --- the real state library: a learner run's record round-trips -------------
+  local tmp; tmp="$(mktemp -d)"
+  out="$(DEPLOY_STATE_FILE="${tmp}/s.json" STATE_PYTHON=python3 "${sh}" -c '
+    set -euo pipefail
+    source "$1/lib/deploy_state.sh"
+    state_set dv1 remembered "region=us-east-1" "maxGPUs=3" "withRetraining=1" "learnerMode=1"
+    printf "LM=%s WR=%s\n" "$(state_read dv1 remembered.learnerMode)" "$(state_read dv1 remembered.withRetraining)"
+    printf "OTHER=[%s]\n" "$(state_read zz9 remembered.learnerMode)"
+  ' _ "${D}" 2>&1)"
+  assert_contains "${out}" "LM=1 WR=1" "learnerMode and the retraining choice are stored per prefix"
+  assert_contains "${out}" "OTHER=[]" "another prefix has no remembered learner mode"
+  rm -rf "${tmp}"
+
+  # --- the probe is told the mode (and nothing changes by default) -------------
+  out="$("${sh}" -c 'set -euo pipefail; WITH_RETRAINING=0 WITH_PREBID=0 SKIP_AGENTCORE=0 LEARNER_MODE=1 AWS_PROFILE=p
+    source "$1/lib/deploy_gate.sh"; _gate_flags | tr "\n" " "' _ "${D}" 2>&1)"
+  assert_eq "${out}" "--no-retraining --learner-mode --profile p " "learner mode passes --learner-mode (and --no-retraining) to the probe"
+  out="$("${sh}" -c 'set -euo pipefail; WITH_RETRAINING=1 WITH_PREBID=0 SKIP_AGENTCORE=0 AWS_PROFILE=p
+    source "$1/lib/deploy_gate.sh"; _gate_flags | tr "\n" " "' _ "${D}" 2>&1)"
+  assert_eq "${out}" "--profile p " "the default probe argv is unchanged"
+  out="$("${sh}" -c 'set -euo pipefail; WITH_RETRAINING=0 WITH_PREBID=1 SKIP_AGENTCORE=0 LEARNER_MODE=1 AWS_PROFILE=p
+    source "$1/lib/deploy_gate.sh"; _gate_flags | tr "\n" " "' _ "${D}" 2>&1)"
+  assert_eq "${out}" "--no-retraining --with-prebid --learner-mode --profile p " "a learner run (Prebid forced on) tells the probe to expect the Prebid host"
+  assert_eq "$(grep -c '^    WITH_PREBID=1$' "${DEPLOY_SH}")" "1" "--status on a remembered learner prefix expects the Prebid host"
+
+  # --- Step 12 runs on a first learner deploy -----------------------------------
+  local pb_src; pb_src="$(sed -n '/^prebid_step_needed() {/,/^}/p' "${DEPLOY_SH}")"
+  out="$("${sh}" -c "set -euo pipefail
+    WITH_PREBID=1; STACK_PREFIX=dv1; DEPLOY_STATE_FILE=/x/.deploy-state.json
+    PREBID_FINGERPRINT=$(printf 'a%.0s' $(seq 1 64)); PREBID_STEP_WHY=''
+    state_read() { :; }
+    ${pb_src}
+    if prebid_step_needed 0; then echo \"RUN: \${PREBID_STEP_WHY}\"; else echo SKIP; fi" 2>&1)"
+  assert_contains "${out}" "RUN: no Prebid host fingerprint is recorded" "with WITH_PREBID forced to 1, Step 12 runs when no Prebid host is recorded"
+  assert_eq "$(awk '/^if prebid_step_needed /{print "top"; exit}' "${DEPLOY_SH}")" "top" "Step 12 is a top-level statement, not inside a learner-mode guard"
+
+  # --- the Prebid path schedules on CPU nodes in either mode ------------------
+  local pbf
+  for pbf in eks/prebid-server-deployment.yaml eks/artfhouse-demand-deployment.yaml eks/amt-simulator-deployment.yaml deploy_prebid.sh; do
+    assert_eq "$(grep -c -i 'nvidia.com/gpu\|tolerations:\|nodeSelector:\|affinity:' "${D}/${pbf}")" "0" "${pbf} has no GPU resource, toleration, node selector or affinity"
+  done
+
+  # --- a mode switch forces Phases 1 and 3 ------------------------------------
+  assert_contains "${src}" 'force_phase 1 "the deployment mode changed' "a mode switch forces Phase 1 (served repository)"
+  assert_contains "${src}" 'force_phase 3 "the deployment mode changed' "a mode switch forces Phase 3 (manifests, node groups)"
+}
+
+# Shared by the render tests: the render functions from deploy.sh with fixed inputs.
+_learner_render_src() {
+  sed -n '/^LEARNER_MODEL_REPO=/p
+    /^_learner_transform() {/,/^}/p
+    /^render_cluster_config() {/,/^}/p
+    /^render_bootstrap_job() {/,/^}/p
+    /^render_manifest() {/,/^}/p
+    /^stage_served_repo() {/,/^}/p
+    /^reconcile_nodegroups_for_mode() {/,/^}/p' "${DEPLOY_SH}"
+}
+_LEARNER_RENDER_HARNESS='
+  set -euo pipefail
+  SCRIPT_DIR="$1"; PYTHON=python3; VERBOSE=1; DEPLOY_LOG=""
+  STACK_NAME=t-stack; STACK_PREFIX=t1; AWS_REGION=us-east-1; MAX_GPUS=3; ACCOUNT_ID=111111111111
+  REGISTRY=r; IMAGE_TAG=t; MODEL_BUCKET=b; TRITON_ROLE_ARN=arn:t; OPTIMIZER_ROLE_ARN=arn:o
+  ARTF_NODE_ROLE=services; COGNITO_USER_POOL_ID=p; ARTF_MUTATIONS_REQUIRED_SCOPE=""
+  CONTAINER_REGISTRY_TABLE=c; YIELD_FLOOR_MODEL_GROUP=f; YIELD_MARGIN_MODEL_GROUP=m
+  SAGEMAKER_TRAINING_ROLE_NAME=s; TRAINING_DATA_BUCKET=d; XGBOOST_TRAINING_IMAGE_URI=x
+  FEEDBACK_STREAM_NAME=fs; DEAL_YIELD_FEEDBACK_STREAM_NAME=dfs; OUTCOME_SIMULATOR_ENABLED=false
+  OUTCOME_SIMULATOR_WIN_RATE=""; OUTCOME_SIMULATOR_IMPRESSION_RATE=""; OUTCOME_SIMULATOR_CLICK_RATE=""
+  OUTCOME_SIMULATOR_CONVERSION_RATE=""; OUTCOME_SIMULATOR_CONVERSION_VALUE=""
+  GLUE_JOB_NAME=g; DEAL_YIELD_GLUE_JOB_NAME=dg; NCF_MODEL_LABEL=ncf-neumf-sample-0123456789ab
+  CLUSTER_NAME=t-stack-triton; RECOMMENDER_MODELS=(dlrm_bid_shader ncf_deal_manager)
+  log() { :; }; say() { printf "%s\n" "$*"; }; warn() { printf "[warn] %s\n" "$*"; }
+  quiet() { shift; "$@"; }
+  fail() { local p=""; if [[ "$1" =~ ^[1-5]$ && $# -ge 2 ]]; then p="Phase $1/5: "; shift; fi; printf "[fail] %s%s\n" "$p" "$*" >&2; exit 1; }
+'
+
+test_learner_served_repo() {
+  echo "test_learner_served_repo"
+  local tmp D="${SCRIPT_DIR}/.." out rc
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  for mode in 0 1; do
+    mkdir -p "${tmp}/m${mode}"
+    out="$("${sh}" -c "${_LEARNER_RENDER_HARNESS}${fn_src}
+      LEARNER_MODE=${mode}
+      stage_served_repo \"\$2\"" _ "${D}" "${tmp}/m${mode}" 2>&1)"; rc=$?
+    assert_eq "${rc}" "0" "stage_served_repo succeeds with LEARNER_MODE=${mode} (output: ${out})"
+    ( cd "${tmp}/m${mode}" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) > "${tmp}/m${mode}.sha"
+  done
+  # Default: exactly the committed repository plus the router model.py twice.
+  mkdir -p "${tmp}/expect"
+  cp -R "${D}/../source/triton/model_repository/." "${tmp}/expect/"
+  local m; for m in dlrm_bid_shader ncf_deal_manager; do
+    mkdir -p "${tmp}/expect/${m}/1"; cp "${D}/../source/triton/router/model.py" "${tmp}/expect/${m}/1/model.py"
+  done
+  ( cd "${tmp}/expect" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done ) > "${tmp}/expect.sha"
+  assert_eq "$(cat "${tmp}/m0.sha")" "$(cat "${tmp}/expect.sha")" "the default served repository is the committed repository plus the router model.py"
+  # Learner: same file list; only the five overlaid configs differ.
+  assert_eq "$(awk '{print $2}' "${tmp}/m1.sha")" "$(awk '{print $2}' "${tmp}/m0.sha")" "learner mode serves the same file list"
+  local differing
+  differing="$(diff "${tmp}/m0.sha" "${tmp}/m1.sha" | awk '/^>/{print $3}' | LC_ALL=C sort | tr '\n' ' ')"
+  assert_eq "${differing}" "./deal_yield_manager_floor/config.pbtxt ./deal_yield_manager_margin/config.pbtxt ./dlrm_bid_shader_canary/config.pbtxt ./dlrm_bid_shader_stable/config.pbtxt ./ncf_deal_manager_stable/config.pbtxt " "learner mode changes exactly the five engine/FIL configs"
+  assert_eq "$(grep -l 'KIND_GPU' "${tmp}"/m1/*/config.pbtxt 2>/dev/null | wc -l | tr -d ' ')" "0" "no learner-served config asks for a GPU"
+  assert_eq "$(grep -l 'onnxruntime_onnx' "${tmp}"/m1/*/config.pbtxt | wc -l | tr -d ' ')" "3" "three models are served by ONNX Runtime in learner mode"
+  assert_eq "$(grep -l 'onnxruntime_onnx' "${tmp}"/m0/*/config.pbtxt 2>/dev/null | wc -l | tr -d ' ')" "0" "the default repository serves no ONNX Runtime model"
+  rm -rf "${tmp}"
+}
+
+test_learner_render_no_gpu() {
+  echo "test_learner_render_no_gpu"
+  local tmp D="${SCRIPT_DIR}/.." out rc f
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  for mode in 0 1; do
+    mkdir -p "${tmp}/m${mode}"
+    out="$("${sh}" -c "${_LEARNER_RENDER_HARNESS}${fn_src}
+      LEARNER_MODE=${mode}
+      render_cluster_config \"\$2/cluster-config.yaml\"
+      for m in triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml; do
+        render_manifest \"\$m\" \"\$2/\$m\"
+      done" _ "${D}" "${tmp}/m${mode}" 2>&1)"; rc=$?
+    assert_eq "${rc}" "0" "the render functions succeed with LEARNER_MODE=${mode} (output: ${out})"
+  done
+  # The ARTF containers' manifest passes through as rendered (its GPU tolerations
+  # match no taint in learner mode); every other learner manifest has no GPU reference.
+  assert_eq "$(grep -l 'nvidia.com/gpu' "${tmp}"/m1/*.yaml 2>/dev/null | grep -v '/artf-containers-deployment.yaml$' | wc -l | tr -d ' ')" "0" "no learner-rendered manifest other than the ARTF containers' references nvidia.com/gpu"
+  assert_eq "$(grep -c 'gpu-inference' "${tmp}/m1/cluster-config.yaml")" "0" "the learner cluster config has no gpu-inference group"
+  assert_contains "$(cat "${tmp}/m1/triton-deployment.yaml")" "role: services" "learner Triton is placed on the cpu-services node group"
+  assert_contains "$(cat "${tmp}/m1/orchestrator-deployment.yaml")" "name: DEPLOYMENT_MODE" "the learner orchestrator carries DEPLOYMENT_MODE"
+  assert_contains "$(cat "${tmp}/m0/triton-deployment.yaml")" 'nvidia.com/gpu: "1"' "the default Triton still requests a GPU"
+  assert_contains "$(cat "${tmp}/m0/cluster-config.yaml")" "name: gpu-inference" "the default cluster config still has the GPU group"
+  assert_not_contains "$(cat "${tmp}/m0/orchestrator-deployment.yaml")" "DEPLOYMENT_MODE" "the default orchestrator has no DEPLOYMENT_MODE"
+  # The two triton-*-nlb / orchestrator-internal-nlb manifests are identical in both modes.
+  # The ARTF containers' EKS deployment is byte-identical between the two renders.
+  for f in triton-internal-nlb.yaml orchestrator-internal-nlb.yaml artf-containers-deployment.yaml; do
+    assert_eq "$(shasum -a 256 < "${tmp}/m1/${f}")" "$(shasum -a 256 < "${tmp}/m0/${f}")" "${f} renders the same in both modes"
+  done
+  # The default render is exactly the sed output (no transform on the default path).
+  assert_eq "$(grep -c 'learner_render.py' "${tmp}/m0/triton-deployment.yaml")" "0" "no learner header in a default render"
+  rm -rf "${tmp}"
+}
+
+test_learner_phase_structure() {
+  echo "test_learner_phase_structure"
+  local tmp D="${SCRIPT_DIR}/.." out rc calls
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  local fn_src; fn_src="$(_learner_render_src)"
+  local mocks='
+    aws() {
+      printf "aws %s\n" "$*" >> "$CALLS"
+      if [[ "$1 $2" == "eks describe-nodegroup" ]]; then
+        case "$*" in
+          *"--nodegroup-name gpu-inference"*) [[ "${GPU_EXISTS}" == 1 ]] || return 1 ;;
+          *"--nodegroup-name cpu-services"*) [[ "$*" == *desiredSize* ]] && echo "${CPU_DESIRED}" ;;
+        esac
+      fi
+      return 0
+    }
+    eksctl() { printf "eksctl %s\n" "$*" >> "$CALLS"; return 0; }
+    kubectl() { printf "kubectl %s\n" "$*" >> "$CALLS"; return 0; }
+  '
+  _lm_reconcile() {  # _lm_reconcile <LEARNER_MODE> <_PREV_LEARNER_MODE> <GPU_EXISTS> <CPU_DESIRED>
+    : > "${tmp}/calls"
+    CALLS="${tmp}/calls" GPU_EXISTS="$3" CPU_DESIRED="$4" "${sh}" -c "${_LEARNER_RENDER_HARNESS}${mocks}${fn_src}
+      LEARNER_MODE=$1; _PREV_LEARNER_MODE='$2'
+      reconcile_nodegroups_for_mode" _ "${D}" 2>&1
+  }
+  out="$(_lm_reconcile 1 0 1 3)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "learner reconcile succeeds (output: ${out})"
+  assert_contains "${calls}" "--nodegroup-name gpu-inference --scaling-config minSize=0,maxSize=3,desiredSize=0" "learner scales an existing gpu-inference group to 0"
+  assert_not_contains "${calls}" "delete-nodegroup" "learner never deletes the GPU node group"
+  assert_not_contains "${calls}" "eksctl delete" "learner never deletes anything through eksctl"
+  assert_contains "${calls}" "--nodegroup-name cpu-services --scaling-config minSize=2,maxSize=8,desiredSize=4" "learner raises cpu-services to 4"
+  out="$(_lm_reconcile 1 1 0 4)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_not_contains "${calls}" "update-nodegroup-config" "learner on a learner cluster at 4 nodes changes nothing"
+  out="$(_lm_reconcile 0 1 0 4)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "standard after learner succeeds (output: ${out})"
+  assert_contains "${calls}" "eksctl create nodegroup --config-file" "standard after learner recreates the missing GPU group"
+  assert_contains "${calls}" "--include=gpu-inference" "only the gpu-inference group is created"
+  out="$(_lm_reconcile 0 1 1 4)"; calls="$(cat "${tmp}/calls")"
+  assert_not_contains "${calls}" "eksctl create" "standard after learner with the GPU group present creates nothing"
+  out="$(_lm_reconcile 0 '' 0 3)"; calls="$(cat "${tmp}/calls")"
+  assert_eq "${calls}" "" "the default path (never in learner mode) makes no call at all"
+  out="$(_lm_reconcile 0 0 0 3)"; calls="$(cat "${tmp}/calls")"
+  assert_eq "${calls}" "" "a standard prefix re-deployed in standard mode makes no call at all"
+
+  # --- GPU-only steps sit inside a LEARNER_MODE -eq 0 guard -------------------
+  _lm_guarded() {  # _lm_guarded <fixed-string>: is its first line inside an `if LEARNER_MODE -eq 0` block?
+    awk -v needle="$1" '
+      /^if \[\[ "\$\{LEARNER_MODE\}" -eq 0 \]\]; then$/ { g=1 }
+      /^fi # LEARNER_MODE -eq 0/ { g=0 }
+      /^else$/ && g { g=0 }
+      index($0, needle) { print (g ? "guarded" : "unguarded"); exit }
+    ' "${DEPLOY_SH}"
+  }
+  assert_eq "$(_lm_guarded 'quiet "kubectl apply model-optimizer-bootstrap Job"')" "guarded" "the optimizer bootstrap Job is applied only in standard mode"
+  assert_eq "$(_lm_guarded 'quiet "kubectl apply nvidia-device-plugin"')" "guarded" "the NVIDIA device plugin is applied only in standard mode"
+  assert_eq "$(_lm_guarded '--scheduled-action-name "${STACK_NAME}-gpu-nightly-shutdown"')" "guarded" "the nightly GPU shutdown is scheduled only in standard mode"
+  assert_eq "$(_lm_guarded 'GPU_NODES="$(kubectl get nodes -l nvidia.com/gpu=present')" "guarded" "the GPU node wait runs only in standard mode"
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_contains "${src}" '_k}" != "model-optimizer"' "learner mode drops the Model Optimizer image from Step 4"
+  assert_contains "${src}" 'if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then' "the GPU capacity and G/VT quota checks run only in standard mode"
+  assert_contains "${src}" "--quota-code L-1216C47A" "learner mode checks the Standard On-Demand vCPU quota instead"
+  assert_contains "${src}" 'upload_learner_onnx' "learner mode stages the ONNX exports for ONNX Runtime"
+  # The probe still finds the manifest list (deploy_status.py reads this literal).
+  assert_eq "$(grep -c '^_APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml)$' "${DEPLOY_SH}")" "1" "_APPLIED_MANIFESTS is unchanged"
+  rm -rf "${tmp}"
+}
+
 # =========================================================================
 # Run all tests
 # =========================================================================
@@ -1880,6 +2395,10 @@ test_demo_credentials_block
 test_ncf_build_wiring
 test_phase_staleness
 test_update_managed_policy
+test_learner_mode_flags
+test_learner_served_repo
+test_learner_render_no_gpu
+test_learner_phase_structure
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

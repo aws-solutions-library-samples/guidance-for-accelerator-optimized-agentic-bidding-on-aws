@@ -54,6 +54,11 @@ _gate_flags() {
   [[ "${WITH_RETRAINING:-1}" -eq 1 ]] || out+=(--no-retraining)
   [[ "${WITH_PREBID:-0}" -eq 1 ]] && out+=(--with-prebid)
   [[ "${SKIP_AGENTCORE:-0}" -eq 0 ]] || out+=(--skip-agentcore)
+  # Learner mode expects no GPU node group and no Model Optimizer image, and its
+  # Deal Scorer is the served ONNX rather than a TensorRT engine.
+  if [[ "${LEARNER_MODE:-0}" -eq 1 ]]; then
+    out+=(--learner-mode)
+  fi
   # deploy.sh resolves and exports AWS_PROFILE before sourcing this file. The probe
   # would inherit it anyway; passing it explicitly keeps the probe's credentials
   # visible in the command line and identical to every other child's.

@@ -114,7 +114,7 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 | AWS Service | Role in This Guidance |
 |-------------|------------------------|
 | Amazon Bedrock AgentCore | Hosts the Adaptive Bidding Strategy Agent and the Model Promotion Governance Agent |
-| Amazon Bedrock | Foundation model for both agents (default: the `global.anthropic.claude-opus-4-8` cross-region inference profile) |
+| Amazon Bedrock | Foundation model for both agents (default: the `global.anthropic.claude-opus-5-5` cross-region inference profile) |
 | Amazon SageMaker | Training jobs for the bid pricer (NeMo Framework-based training image) and the yield optimizer (built-in XGBoost); Model Registry with one Model Package Group per model |
 | Amazon Kinesis Data Streams and Amazon Data Firehose | Capture bid outcomes and deal-yield outcomes and deliver them to S3 as Parquet |
 | AWS Glue | Data Catalog tables for raw outcomes; two ETL jobs every 6 hours that de-duplicate and label outcomes |
@@ -187,12 +187,12 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 
 - The Part 1 prerequisites (see [GUIDANCE.md](GUIDANCE.md)); Part 2 runs on the same EKS cluster
 - Permissions to create Amazon Bedrock AgentCore runtimes, SageMaker training jobs and Model Package Groups, Kinesis streams, Firehose delivery streams, Glue jobs, EventBridge schedules and rules, DynamoDB tables, Lambda functions, KMS keys, SNS topics, and IAM roles
-- Access to an Amazon Bedrock model or inference profile in the target account and Region (default: `global.anthropic.claude-opus-4-8`)
+- Access to an Amazon Bedrock model or inference profile in the target account and Region (default: `global.anthropic.claude-opus-5-5`)
 - An NVIDIA NGC API key to pull the gated `nvcr.io/nvidia/nemo` base image for the training container
 
 ### Supported Regions
 
-Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G `g5` instances). Confirm AgentCore availability first; it has a smaller regional footprint than the other services. `deploy.sh` defaults the agents' model to the `global.anthropic.claude-opus-4-8` cross-region inference profile; `--model-id` (or `BEDROCK_MODEL_ID`, and per agent `ADAPTIVE_BIDDING_MODEL_ID` or `GOVERNANCE_MODEL_ID`) overrides it. Run standalone, `deploy_closed_loop.sh` has no default and requires one of these variables.
+Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G `g5` instances). Confirm AgentCore availability first; it has a smaller regional footprint than the other services. `deploy.sh` defaults the agents' model to the `global.anthropic.claude-opus-5-5` cross-region inference profile; `--model-id` (or `BEDROCK_MODEL_ID`, and per agent `ADAPTIVE_BIDDING_MODEL_ID` or `GOVERNANCE_MODEL_ID`) overrides it. Run standalone, `deploy_closed_loop.sh` has no default and requires one of these variables.
 
 ### Deployment Steps
 
@@ -273,7 +273,7 @@ The following costs are in addition to the Part 1 base cost (see [GUIDANCE.md](G
 | AWS Glue | 2 jobs × 10 G.1X workers, 4 runs/day each, ~5 minutes per run at $0.44 per DPU-hour | ~$88 |
 | Amazon DynamoDB | 3 tables (parameter store, audit trail, user features), on-demand | ~$5 |
 | Amazon SageMaker Training | Up to 4 jobs per daily trigger on `ml.g5.2xlarge` ($1.515/h); ~30 minutes each when the data passes the gate (shown), about $5/month when every job stops at the gate | up to ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | `global.anthropic.claude-opus-4-8`, 30 invocations/month, ~10K input and ~1K output tokens each ($5 / $25 per million) | ~$2 |
+| Amazon Bedrock (Adaptive Bidding Agent) | `global.anthropic.claude-opus-5-5`, 30 invocations/month, ~10K input and ~1K output tokens each ($4 / $20 per million) | ~$2 |
 | Amazon Bedrock (Governance Agent) | Same model; invoked on model registration only | ~$10 |
 | Amazon Bedrock AgentCore | Runtime consumption for both agents, $0.0895 per vCPU-hour and $0.00945 per GB-hour, ~30 s per invocation | ~$1 |
 | AWS Secrets Manager, Amazon EventBridge Scheduler, AWS Lambda, Amazon SNS | NGC key secret ($0.40), 2 schedules, invocation and proxy functions, alerts topic | ~$2 |

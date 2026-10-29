@@ -73,6 +73,18 @@ M2M token itself and serves from an in-memory catalog of the DynamoDB deals tabl
 refreshed every 30 s, so the bid path makes no DynamoDB call. A simulator seat
 (`amt`) returns static OpenRTB bids so the auction is contested.
 
+The Prebid variant also deploys a **campaign/deals MCP control plane** unless
+`--no-control-plane`: an Amazon Bedrock AgentCore runtime (`serverProtocol=MCP`,
+`deployment/deploy_control_plane.sh`) with ten tools that create, change, activate
+and pause campaigns and IAB Deals API v1.0 deals. It is the only writer of the deals
+table; the demand service and the Deal Scorer pick up a write within their 30 s
+refresh. An external agent connects with OAuth 2.0 `client_credentials` for a
+dedicated Cognito app client: AgentCore's inbound JWT authorizer accepts only that
+client and its four `artf-control` scopes, and the container verifies the token
+again and applies per-advertiser and per-seller entitlement. The Prebid host's
+own client holds no control scope. Seeded campaigns start paused when the control
+plane is deployed, so activating one is a tool call.
+
 A **React frontend** is hosted on Amazon S3 and delivered through Amazon CloudFront;
 Amazon Cognito provides user-pool authentication (SRP, admin-created users, no
 self-signup). An **Amazon Bedrock AgentCore MCP runtime**, registered by default
@@ -126,7 +138,9 @@ graph TB
 
     subgraph Bedrock["Amazon Bedrock AgentCore"]
         AC["MCP Runtime (default; --skip-agentcore omits)<br/>extend_rtb tool"]
+        CP["Campaign/deals control plane<br/>(--with-prebid; --no-control-plane omits)<br/>10 MCP tools, Cognito JWT authorizer"]
     end
+    AGENT["External agent<br/>OAuth 2.0 client_credentials"]
 
     Browser -->|"SRP auth, ID token -> SigV4 creds"| COG
     COG -->|"JWT tokens + temporary credentials"| Browser
@@ -151,6 +165,10 @@ graph TB
     YIELD_M -->|"tritonclient"| TRITON
     TRITON -.->|"load models at startup"| S3M
     AC -.->|"extend_rtb to orchestrator"| ORCH
+    AGENT -->|"token for the artf-control client"| COG
+    AGENT -->|"MCP over HTTPS, Bearer token"| CP
+    CP -->|"read and write, no delete"| DDB
+    NCF_C -.->|"deal book refresh (off the bid path)"| DDB
 
     style TRITON fill:#76b900,color:#000
     style DLRM_C fill:#16a34a,color:#fff
@@ -164,6 +182,7 @@ graph TB
     style PROXY fill:#f59e0b,color:#000
     style COG fill:#dd6b20,color:#fff
     style AC fill:#f59e0b,color:#000
+    style CP fill:#f59e0b,color:#000
 ```
 
 ## Request flow
@@ -223,5 +242,9 @@ which `deploy.sh` registers by default (`--skip-agentcore` omits it).
   America/New_York), deploys the frontend (S3 + CloudFront), registers the AgentCore
   MCP runtime (default; `--skip-agentcore` omits it) and, unless `--no-retraining`,
   runs `deploy_closed_loop.sh` for Part 2. `--with-prebid` (off by default) adds
-  Prebid Server to the same cluster as a second ARTF host via `deploy_prebid.sh`.
+  Prebid Server to the same cluster as a second ARTF host via `deploy_prebid.sh`,
+  whose Step 9 runs `deploy_control_plane.sh` for the campaign/deals MCP control
+  plane (`deployment/control_plane_cfn.yaml`: Cognito resource server, app client
+  and the runtime's execution role; image built locally with Docker buildx, arm64).
+  `--no-control-plane` leaves it out and seeds campaigns active.
   Region defaults to `us-east-1` (`AWS_REGION`).

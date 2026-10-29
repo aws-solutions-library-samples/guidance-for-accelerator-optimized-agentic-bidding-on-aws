@@ -18,6 +18,7 @@ Run AI models that price bids, activate audience segments, and manage private ma
     - [Cost](#cost)
     - [Prerequisites](#prerequisites)
     - [Customizing your deployment](#customizing-your-deployment)
+    - [Learner mode (no GPUs)](#learner-mode-no-gpus)
     - [Deals and campaigns: the deals table](#deals-and-campaigns-the-deals-table)
     - [Resuming, re-running, and remembered settings](#resuming-re-running-and-remembered-settings)
     - [Network layout: nothing in the VPC is internet-facing](#network-layout-nothing-in-the-vpc-is-internet-facing)
@@ -332,9 +333,9 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 | AWS Glue | 2 ETL jobs × 10 G.1X workers, each on a `cron(0 */6 * * ? *)` schedule (4 runs/day), ~5 min per run at $0.44/DPU-h | Part 2 | ~$88 |
 | Amazon DynamoDB | `parameter-store`, `audit-trail`, `user-features` (on-demand) | Part 2 | ~$5 |
 | Amazon SageMaker Training | up to 4 jobs per daily `rate(24 hours)` trigger on `ml.g5.2xlarge` at $1.515/h, ~30 min each when the data passes the trainer's gate (about $5 when every job stops at the gate) | Part 2 | up to ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-4-8` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation ($5 / $25 per million) | Part 2 | ~$2 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-5-5` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation ($4 / $20 per million) | Part 2 | ~$2 |
 | Amazon Bedrock (Governance Agent) | same model, invoked on model registration events only | Part 2 | ~$10 |
-| Amazon Bedrock AgentCore | runtime consumption for both agents ($0.0895/vCPU-h, $0.00945/GB-h), ~30 s per invocation | Part 2 | ~$1 |
+| Amazon Bedrock AgentCore | runtime consumption for both agents ($0.1276/vCPU-h, $0.0169/GB-h, billed per second), ~30 s per invocation | Part 2 | ~$1 |
 | AWS Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC key secret ($0.40), 2 schedules, `vpc-optimizer-proxy` Lambda, alerts topic | Part 2 | ~$2 |
 | **Part 2 subtotal** | | | **~$245** |
 | **Total (default deploy, scheduled GPU)** | | | **~$1,470** |
@@ -343,10 +344,10 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 
 - **GPU hours.** The deploy installs one scheduled action: the GPU node group scales to zero at 8:00 PM America/New_York every day. Nothing scales it back up automatically; the **Start GPUs** button in the UI does. 260 hours per month corresponds to starting it each weekday morning. Running it 24/7 makes the GPU line $734 and the total roughly **$1,945**. Leaving it stopped makes the GPU line $0.
 - **CPU nodes.** The `cpu-services` node group starts at 3 nodes (minimum 2, maximum 8, `deployment/eks/cluster-config.yaml`). There is no Cluster Autoscaler in this deployment, so the node count only changes when you change it. Dropping to the minimum of 2 saves $248.
-- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count, about $0.075 per invocation at ~10K input and ~1K output tokens: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. The schedule can also be disabled with the AWS CLI, which takes this line to zero without a teardown (see [pausing scheduled components](GUIDANCE-part2.md#pausing-scheduled-components)). Model choice is `--model-id` (default `global.anthropic.claude-opus-4-8`); a smaller model lowers the per-token rate.
+- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count, about $0.075 per invocation at ~10K input and ~1K output tokens: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. The schedule can also be disabled with the AWS CLI, which takes this line to zero without a teardown (see [pausing scheduled components](GUIDANCE-part2.md#pausing-scheduled-components)). Model choice is `--model-id` (default `global.anthropic.claude-opus-5-5`); a smaller model lowers the per-token rate.
 - **SageMaker training** starts every day from the first day, because the genesis model versions are registered as Approved. A job with no or unfit data ends at the trainer's dataset gate after a minute or two of billing, so this line sits near $5 until datasets pass the gate and grows toward ~$91 as they do.
 - **Part 1 only.** `--no-retraining` removes every Part 2 row: about **$1,225/month** scheduled, **$1,700/month** with the GPU on 24/7.
-- **Prebid variant.** `--with-prebid` adds about $0.40/month (one more Secrets Manager secret); Prebid Server, the artfhouse demand service and the bidder simulator run in the existing cluster and add no nodes or load balancers. See [its cost note](#variant-prebid-server-as-a-second-artf-host-sell-side).
+- **Prebid variant.** `--with-prebid` adds about $0.40/month standing (one more Secrets Manager secret); Prebid Server, the artfhouse demand service and the bidder simulator run in the existing cluster and add no nodes or load balancers. It also deploys the [campaign/deals MCP control plane](#managing-campaigns-and-deals-with-an-agent) unless `--no-control-plane`: one AgentCore runtime billed per second only while a tool call's session runs ($0.1276/vCPU-h, $0.0169/GB-h), so well under $1/month at demonstration volume (1,000 tool calls of about 1 s CPU and 30 s at 0.25 GB is about $0.07) and $0 when idle, plus one small ECR repository. Its Cognito resource server, app client and IAM role have no standing charge. See [its cost note](#cost-1). AgentCore rates are from the [AgentCore pricing page](https://aws.amazon.com/bedrock/agentcore/pricing/) Runtime example, read 2026-10-23.
 - **Not in the table:** CloudWatch Logs ingestion beyond a few GB, S3 request charges, CodeBuild build minutes (a per-build charge in Phase 2 only, incurred again only when an image's source changes), and data transfer out to the internet, all of which are small at demo volumes.
 
 Per-part line items are also in [GUIDANCE.md](GUIDANCE.md#cost-estimation) (Part 1) and [GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) / [CLOSED_LOOP.md](CLOSED_LOOP.md#cost) (Part 2).
@@ -364,7 +365,7 @@ brew install jq eksctl kubectl                   # or your Linux package manager
 docker buildx version                            # only needed for --local-build
 ```
 
-**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-4-8` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region. Check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
+**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-5-5` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region. Check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
 
 **NVIDIA NGC API key:** required by default, since Part 2 (closed-loop retraining) is on unless you pass `--no-retraining`; it is used only to pull the gated NeMo-RL base image, and is stored once in Secrets Manager as `<prefix>-nvidia-artf-recommenders-ngc-api-key`. `nvcr.io/nvidia/tritonserver` itself is a public image and needs no key. See the [Quick start](#quick-start) above for how to get one.
 
@@ -381,17 +382,20 @@ Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the c
 ./deploy.sh --prefix dv1 --profile prof    # AWS CLI profile (default: $AWS_PROFILE if set, else the profile remembered for this prefix, else "default")
 ./deploy.sh --prefix dv1 --with-retraining # deploy Part 2 closed-loop learning (DEFAULT)
 ./deploy.sh --prefix dv1 --no-retraining   # Part 1 only: skip the closed-loop stack and the NGC key requirement
+./deploy.sh --prefix dv1 --learner-mode    # no GPUs: Triton serves the models on CPU nodes; not for production (see Learner mode below)
+./deploy.sh --prefix dv1 --no-learner-mode # switch a learner prefix back to the standard GPU deployment (default)
 ./deploy.sh --prefix dv1 --ngc-key KEY     # NGC API key for the NeMo-RL training image (needed once per prefix when Part 2 is on)
 ./deploy.sh --prefix dv1 --ngc-secret my-secret-name  # reuse an NGC key already stored in Secrets Manager
 ./deploy.sh --prefix dv1 --skip-agentcore  # do not register the MCP runtime (default: registered)
 ./deploy.sh --prefix dv1 --with-prebid     # also deploy Prebid Server as a second ARTF host (default: off; --no-prebid turns a remembered value back off)
+./deploy.sh --prefix dv1 --with-prebid --no-control-plane  # Prebid without the campaign/deals MCP control plane (default: on with Prebid)
 ./deploy.sh --prefix dv1 --remote-build    # build images on AWS CodeBuild (DEFAULT)
 ./deploy.sh --prefix dv1 --local-build     # build images locally with Docker buildx instead
 ./deploy.sh --prefix dv1 --skip-images     # reuse the images already in ECR
 ./deploy.sh --prefix dv1 --skip-cluster    # reuse the existing EKS cluster
 ./deploy.sh --prefix dv1 --maxGPUs 5       # GPU node group maximum size (default 3; the group starts at 1 node)
 ./deploy.sh --prefix dv1 --artf-node-role inference   # schedule the ARTF containers on the GPU node (default: services, the CPU node group); --artf-on-gpu is the same thing
-./deploy.sh --prefix dv1 --model-id ID     # Bedrock model or inference profile for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --model-id ID     # Bedrock model or inference profile for both agents (default: global.anthropic.claude-opus-5-5)
 ./deploy.sh --prefix dv1 --start-at 3      # force a starting phase, 1-5 (default: probe AWS and run whatever is missing)
 ./deploy.sh --prefix dv1 --export-only     # only export the ONNX/XGBoost models and upload them to S3
 ./deploy.sh --prefix dv1 --ui-only         # only rebuild and redeploy the frontend
@@ -401,7 +405,7 @@ Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the c
 DEPLOY_NO_SPINNER=1 ./deploy.sh --prefix dv1   # hold the progress line still (no animation)
 AWS_REGION=us-west-2 ./deploy.sh --prefix dv1  # deploy to a different Region (default: us-east-1)
 ADAPTIVE_BIDDING_MODEL_ID=... GOVERNANCE_MODEL_ID=... ./deploy.sh --prefix dv1   # per-agent model override (default: the --model-id value)
-CAPTION_INFERENCE_PROFILE_ID=... ./deploy.sh --prefix dv1   # model the frontend uses for captions (default: global.anthropic.claude-haiku-4-5-20251001-v1:0)
+CAPTION_INFERENCE_PROFILE_ID=... ./deploy.sh --prefix dv1   # model the frontend uses for captions (default: global.anthropic.claude-haiku-5-5)
 DEMO_USER_EMAIL=you@example.com ./deploy.sh --prefix dv1    # demo Cognito user (default: admin@example.com)
 ```
 
@@ -417,6 +421,48 @@ The closed-loop stack (on by default) also builds an NVIDIA NeMo-RL training con
 ```
 
 **`--start-at` takes a phase number, 1 to 5.** The step numbers this README cites (for example Step 1.5 or Step 7.5) are steps inside those phases and are not valid `--start-at` values. The step-to-phase table in [RENAME_MAP.md](RENAME_MAP.md) shows which phase each step belongs to.
+
+### Learner mode (no GPUs)
+
+Learner mode deploys the stack without any GPU instances, for accounts that have no GPU quota, such as AWS Workshop Studio event accounts:
+
+```bash
+./deploy.sh --prefix dv1 --learner-mode      # deploy without GPUs
+./deploy.sh --prefix dv1 --no-learner-mode   # switch back to the standard GPU deployment
+```
+
+Both flags are remembered for the prefix, so later runs stay in the mode you last chose.
+
+**Learner mode is for learning, not for production.** The ARTF containers implement the IAB Tech Lab Agentic Real Time Framework. For this implementation to remain ARTF-compliant, do not use learner mode for production workloads. The UI says so in a notice on every page load and in a persistent **Learner mode** badge in the header.
+
+What changes in learner mode:
+
+- **Inference runs on CPUs instead of GPUs.** NVIDIA Triton Inference Server (the same `nvcr.io/nvidia/tritonserver` image) runs on the `cpu-services` node group. The Floor and Margin yield models run on the FIL backend on CPU; the Deal Scorer (NCF) and Bid Pricer (DLRM) run as ONNX models on the ONNX Runtime backend on CPU. The served model configurations come from `source/triton/model_repository_learner/`.
+- **No GPU node group.** There is no `gpu-inference` node group, no NVIDIA device plugin, no nightly GPU shutdown, and no TensorRT engine build (the model-optimizer image is not built). The `cpu-services` group runs 4 x c5.2xlarge nodes with 100 GB volumes instead of 3, to fit Triton.
+- **Part 2 (closed-loop learning) is off,** as with `--no-retraining`, because retraining and promotion need GPUs. `--with-retraining` is refused in learner mode. No NGC API key is needed: `--ngc-key` and `--ngc-secret` are ignored with a warning, and a key passed with them is not stored in Secrets Manager or in `deployment/.deploy-state.json`.
+- **Adaptive Bidding is unavailable.** Its agent belongs to Part 2, so learner mode does not deploy it. The learner-mode notice says so, and the Adaptive Bidding tab reports that the agent is not deployed in learner mode.
+- **The Governance tab is disabled.** It stays visible in the header, marked "(unavailable in learner mode)", and the orchestrator answers its API with HTTP 409. The Container Health panel shows Triton readiness on CPU in place of the GPU start and stop controls.
+- **Prebid Server is deployed,** as with `--with-prebid`, because the Auction Theater's live auction needs it: without Prebid Server the orchestrator answers the Theater's `POST /v1/auction/run` with HTTP 501. `--no-prebid` is refused in learner mode. The Prebid pods request CPU and memory only and run on the `cpu-services` nodes.
+- **The UI API proxy Lambda reserves 5 concurrent executions instead of 20.** Workshop Studio accounts allow at most 10 reserved concurrent executions across all functions, so the template default of 20 fails there.
+- **Latency is CPU latency.** DLRM and NCF on CPU are slower than TensorRT on a GPU, so load-test results from a learner deployment are not comparable with GPU results.
+
+What does not change: the four ARTF containers and their gRPC and HTTP path to Triton (their Kubernetes manifest is applied as in a standard deploy), the orchestrator's sequencing, and the models behind the Auction Theater, including deal activation and the deal floor and margin models. No model location input is needed: the models are built and exported on the deploying machine as in a standard deploy.
+
+**Switching modes on an existing prefix.** Switching re-runs Phase 1 (the served model repository) and Phase 3 (the manifests and node groups). Switching to learner mode scales an existing `gpu-inference` node group to zero; it never deletes it. Switching back creates the group again if it is missing. An existing `cpu-services` group keeps its 50 GB volumes, because node group volumes cannot be changed in place; only a cluster created in learner mode gets 100 GB. The switch is detected from the prefix's record in `deployment/.deploy-state.json`. On a machine that does not have that record, pass `--start-at 1` along with the mode flag, since the AWS probe cannot tell a CPU Triton from a GPU one.
+
+Switching a standard prefix that has Part 2 deployed to learner mode leaves its Part 2 resources in place, and the deploy prints a warning when it does. They include the `<prefix>-governance-eventbridge` stack, whose schedule (every 24 hours by default) keeps launching `ml.g5.2xlarge` retraining jobs, and the governance AgentCore runtime. Neither learner mode nor `--no-retraining` removes them: both only stop deploying Part 2. To remove them, run `./deploy.sh --prefix <prefix> --destroy`, which deletes the whole prefix, then deploy the prefix again with `--learner-mode`, or use a new prefix. A prefix first deployed in learner mode has no Part 2 resources.
+
+Switching back with `--no-learner-mode` returns to the prefix's own Prebid choice. If that choice was off, the Prebid host deployed in learner mode stays in place but later runs no longer update it; pass `--with-prebid` to keep it managed.
+
+**What learner mode still needs.** Without GPUs, the stack still uses, and the account's IAM policy and quotas must allow:
+
+- Amazon EKS with an OIDC provider for IRSA (created by eksctl), in a three-AZ VPC with three NAT gateways. The Triton image pull from `nvcr.io` leaves through those NAT gateways.
+- 32 On-Demand Standard vCPUs (4 x c5.2xlarge; Service Quotas code `L-1216C47A`). The deploy checks this quota and warns if it is lower.
+- AWS CodeBuild for the remote image builds, or `--local-build` with Docker and about 30 GB of free disk.
+- Amazon ECR, Amazon S3, Amazon CloudFront, Amazon Cognito user and identity pools, Amazon DynamoDB, an AWS Lambda function in the VPC (the UI API proxy), internal Network Load Balancers, and IAM roles and customer-managed policies.
+- Amazon Bedrock access to the Claude Haiku 4.5 global inference profile for the Auction Theater captions. Anthropic models need the one-time use-case form in each account.
+- The Amazon Bedrock AgentCore MCP runtime in Phase 5, unless you pass `--skip-agentcore`.
+- For Prebid Server (Step 12): its CloudFormation stack, which adds a Cognito user pool domain, resource servers and a machine-to-machine app client, IAM roles, and a Secrets Manager secret for the client credentials.
 ### Deals and campaigns: the deals table
 Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-deals` (for example `stg-nvidia-artf-recommenders-deals`). Nothing is defined in code: `source/demand/artfhouse/catalog.py` and `source/shared/deal_library.py` (read by the Deal Scorer and the orchestrator) build their objects from the table's records.
 
@@ -424,13 +470,16 @@ Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-
 - **The seed file.** `deployment/seed/deals_and_campaigns.json`. Deal records are [IAB Tech Lab Deals API v1.0](https://github.com/IABTechLab/deal-api) `Deal` objects with the spec's field names (`id`, `name`, `desc`, `origin`, `seller`, `sellerstatus`, `adtypes`, `pubcount`, `dinventory`, `auxdata`, `terms`, `inventory`). Campaigns are a separate record type: neither the Deals API nor OpenRTB defines a campaign, so a campaign record keeps the catalog's own fields (price, creative size, targeting, audience uplift) and references the deals it buys on by `Deal.id`. Every deal belongs to one publisher (`pubcount` 1, one entry in `inventory.sitedomains` or `inventory.appbundles`). `deployment/scripts/seed_deals_table.py` validates the file against the spec's required fields and enum ranges, then writes it.
 - **`origin`.** Stored in the seed as `{stackprefix}-prebid.example` and rendered at seed time from `--prefix`, so a `stg` deployment's deals carry `stg-prebid.example`.
 - **Seeding.** Every `deploy.sh` run writes every record through the stack's `DealsSeedRole`, which may only `BatchWriteItem` and `PutItem` on the table. The write is put-only, so a record you remove from the seed file stays in the table until you delete it by hand (`aws dynamodb delete-item --table-name <stack>-deals --key '{"record_type":{"S":"deal"},"id":{"S":"<deal id>"}}'`).
+- **Campaign status.** A campaign record carries `status`, `active` or `paused`; a record without it is active. The demand service still considers a paused campaign for every impression and lists it in the offers column with the reason `campaign_paused`. Without the control plane, `deploy.sh` seeds every campaign `active`, so a stack bids exactly as before. **With the control plane (the default with `--with-prebid`), seeded campaigns are written `paused`**, and activating one is a step you take through the control plane's `activate_campaign` tool.
+- **Deal status.** A deal's lifecycle is its own Deals API `sellerstatus` (0 active, 1 paused, 2 pending, 3 complete, 4 archived); a record without it is active, as the spec's default says. The Deal Scorer and the orchestrator see only active deals, and a campaign whose deals on the impression are all inactive declines with `deal_inactive`. Every seeded deal is active.
+- **The write path.** With the control plane deployed, its AgentCore runtime is the only identity that can change a record: `GetItem`, `Query`, `PutItem` and `UpdateItem` on this one table, and no `DeleteItem`. Every item it writes carries `managed_by: control-plane` and `updated_at`, which every reader strips. The seeder then runs with `--skip-managed`, a conditional put that leaves those items alone, so an edit made through the control plane survives a redeploy; records you never touched through it keep receiving seed-file updates. Records the readers see must pass the same validator (`source/control_plane/records.py`) whether they came from the seed file or a tool call.
 - **Readers.** Three identities can read the table, each on that one table ARN. Two have `dynamodb:GetItem`, `Query` and `Scan`: the in-cluster demand service's pod role (IRSA service account `artfhouse-demand-sa`, `deployment/prebid_cfn.yaml` `DemandServiceRole`) and the Deal Scorer's pod role (IRSA service account `deal-scorer-sa`, `deploy.sh` Step 7.2). The third is the `cpu-services` node group role, with `GetItem` and `Query` only (no `Scan`), granted by the `DealsBook` statement in `deploy.sh` Step 7.5. It is a node role, so every pod scheduled on the `cpu-services` nodes can read the table; the orchestrator, which runs there, uses it for its deal book snapshot, which copies the auction type (`at`) onto the deals the Deal Scorer activates. The demand service, like the Deal Scorer, loads its campaigns at startup and refreshes them every 30 seconds in a background thread; a bid reads only the in-memory snapshot.
 - **The Deal Scorer reads nothing on the request path.** ARTF containers make no external call while handling a request, so the Deal Scorer primes its deal book from the table before its server starts and refreshes it in a background thread every 30 seconds. A failed prime stops the process, so the pod never becomes ready; a failed refresh logs the error and keeps the last good snapshot. Requests read only the in-memory snapshot. A request is matched to a publisher's book by `site.domain` against `inventory.sitedomains` or `app.bundle` against `inventory.appbundles`, with `inventory.cat` as the fallback for a request that names only a category.
 - **The floor and margin containers have no table access** and no AWS SDK in their image. They read what they need from the request.
 - **Bid requests carry OpenRTB 2.6 deals built from the records:** `bidfloor` from `terms.dealfloor`, `bidfloorcur` from `terms.cur`, `at` from `terms.pricetype`, `guar` from `terms.guar`, `wseat`, and `ext.mindealfloor` from `terms.ext.mindealfloor`.
 - **A deal's minimum floor.** `terms.ext.mindealfloor` is the lowest floor the seller's own optimizer may set for the deal. The Yield Optimizer floor container clamps its adjusted floor to `max(mindealfloor, bidfloor x multiplier)`, reading `imp.pmp.deals[].ext.mindealfloor` from the request. A library deal the Deal Scorer activates reaches the floor container through `ADJUST_DEAL_FLOOR`, whose payload carries `bidfloor` only, so the clamp applies to deals the request itself offers with the field.
 
-**Adding or changing a campaign** means editing the seed file and running `./deploy.sh --prefix <prefix>` again (add `--with-prebid` on a stack that has the Prebid host). A changed seed makes that run seed the table even on a healthy stack, because the seed's sha256 differs from the one the model bucket's Phase 1 marker recorded. The Deal Scorer picks up the change within one 30 second refresh. The demand service picks it up within one 30 second refresh as well, without a restart.
+**Adding or changing a campaign** on a stack with the control plane is a tool call (`create_campaign`, `update_campaign`); see [Managing campaigns and deals with an agent](#managing-campaigns-and-deals-with-an-agent). Without it, edit the seed file and run `./deploy.sh --prefix <prefix>` again (add `--with-prebid` on a stack that has the Prebid host). A changed seed makes that run seed the table even on a healthy stack, because the seed's sha256 differs from the one the model bucket's Phase 1 marker recorded. The Deal Scorer picks up the change within one 30 second refresh. The demand service picks it up within one 30 second refresh as well, without a restart.
 
 **Deal ids.** Every deal id belongs to exactly one publisher, so a deal id always resolves to one floor and one auction type. Where several publishers offer the same kind of deal, each has its own id: the open remnant deal is `deal-remnant-open-parenting`, `-ledger`, `-hearth` and `-espn`, and the home premium deal is `deal-home-premium` on hearth-and-home.example and `deal-home-premium-ledger` on market-ledger.example.
 
@@ -516,7 +565,7 @@ If Phase 3 reports `unknown`, your `kubectl` has no context for that cluster, an
     (pass the flag explicitly to override, or delete deployment/.deploy-state.json)
 ```
 
-The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: the AWS profile, region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--with-prebid`, `--skip-agentcore`, and the NGC secret name.
+The NGC key is the one that matters most in practice: pass `--ngc-key` once and later runs of the same prefix find the stored secret on their own. An explicit flag always wins over a remembered value. Remembered: the AWS profile, region, `--maxGPUs`, `--artf-node-role`, `--model-id`, `--local-build`, `--with-retraining`/`--no-retraining`, `--learner-mode`/`--no-learner-mode`, `--with-prebid`, `--no-control-plane`/`--with-control-plane`, `--skip-agentcore`, and the NGC secret name.
 
 The AWS profile is the one remembered value that is also **enforced**: if a later run resolves a different profile (from `--profile` or `AWS_PROFILE`) than the one recorded for the prefix, the script stops before its first AWS call and names both. Remove the prefix's record from `.deploy-state.json` to move it to another account on purpose.
 
@@ -885,6 +934,18 @@ The switch is `PREBID_AUCTION_URL`, set on the orchestrator by `deploy_prebid.sh
 
 #### Walkthrough: the Auction Theater
 
+> **On a fresh deploy with the control plane, activate the buyers first.** Seeded campaigns start `paused`, so until one is activated every campaign declines with `campaign_paused` and the second pass below has no deal buyer. Activate the one this walkthrough uses (and any others you want bidding) with the control plane:
+>
+> ```bash
+> deployment/.deploy-venv/bin/python deployment/scripts/control_plane_connect.py --runtime-arn <runtime ARN> \
+>   --token-endpoint <token endpoint> --client-id <client id> --client-secret "$CLIENT_SECRET" \
+>   --call-tool activate_campaign --arg campaign_id=camp-cedar
+> ```
+>
+> `deploy_control_plane.sh --connection-info` prints the values. All four connection arguments are required on every call.
+>
+> The connection values are in [Managing campaigns and deals with an agent](#managing-campaigns-and-deals-with-an-agent). The demand service sees the change within its 30 second refresh. A stack deployed with `--no-control-plane` seeds campaigns active and needs no step.
+
 Every scenario card carries a **Step through in Auction Theater** button next to **Send**. It runs the same bid request through Prebid Server twice and steps you through both auctions frame by frame, so the effect of the ARTF containers is a before-and-after you can watch rather than a number you have to take on trust. The three columns stay fixed throughout: publisher yield decisions on the left, the bid request in the middle, and the candidate campaigns (the offers) on the right.
 
 The first pass sends the request to Prebid exactly as the publisher sent it. No container is consulted.
@@ -951,11 +1012,83 @@ Authorization on the orchestrator is a **list of mechanisms**, any one of which 
 
 > **The credential reaches the pod as a Kubernetes Secret, not through the AWS SDK.** The Prebid image is built from the pinned upstream release, whose pom declares only the AWS SDK's `s3` module: the jar carries no `secretsmanager` and no `sts`, so there is no client to call Secrets Manager with and no way to use the pod's IRSA identity. Adding either dependency would mean editing the upstream pom, which is a fork. So `deploy_prebid.sh` reads the secret with credentials that can and writes a Kubernetes Secret, referenced by `secretKeyRef` so the value never lands in a manifest. Secrets Manager remains the source of record; only the delivery route changed.
 
+#### Managing campaigns and deals with an agent
+
+With `--with-prebid`, `deploy_prebid.sh` Step 9 runs `deployment/deploy_control_plane.sh`, which deploys an **MCP control plane** for the deals table: an **Amazon Bedrock AgentCore Runtime with `serverProtocol=MCP`** whose front door is **OAuth 2.0 `client_credentials`**. An external agent manages campaigns and deals with a client id and secret and no AWS credentials. It is the same design as the [Guidance for Embedding a Prebid DSP on AWS](https://github.com/aws-solutions-library-samples/guidance-for-embedding-prebid-dsp-on-aws) control plane, adapted to this table's record shapes. `--no-control-plane` leaves it out; the choice is remembered for the prefix.
+
+**Ten tools.**
+
+| Tool | What it does |
+|---|---|
+| `create_campaign` | Creates a campaign, always `paused`. Validated with the seed's rules: each held deal must exist and be held by no other campaign, the campaign must hold a deal or set `open_market`, the CPM plus any audience uplift must not exceed the price ceiling (50 USD by default), a video creative needs a duration |
+| `update_campaign` | Changes the supplied fields and revalidates the merged record. Status moves only through the next two tools |
+| `activate_campaign` | Makes a campaign bid. Refuses one that holds no active deal and is not open market, because activating it would change nothing |
+| `pause_campaign` | Stops a campaign bidding. There is no delete |
+| `get_campaign`, `list_campaigns` | The record, its status, which of its deals are active, and whether it came from the seed or the control plane |
+| `create_deal` | Creates an IAB Tech Lab Deals API v1.0 deal. `origin` is set by the stack and cannot be supplied; `created` is set to now; `sellerstatus` defaults to 0 |
+| `update_deal` | Changes a deal, including its `sellerstatus` (1 pauses it, 0 reactivates it). 4 (archived) is final |
+| `get_deal`, `list_deals` | The Deal object, whether it is active, and which campaign holds it |
+
+A write reaches the bid path within one 30 second refresh of the demand service and the Deal Scorer, with no restart; every write response says so (`visible_within_seconds: 30`). Ids are lowercase letters, digits and hyphens, at most 64 characters.
+
+**Connecting.** One command prints everything an agent or MCP client needs, read live from AWS so it works from any machine with credentials for the account:
+
+```bash
+cd deployment
+./deploy_control_plane.sh --prefix <prefix> --connection-info            # human-readable
+./deploy_control_plane.sh --prefix <prefix> --connection-info --json     # for scripts
+./deploy_control_plane.sh --prefix <prefix> --connection-info --token    # also mint a ~60 min access token
+```
+
+It deploys nothing. Add `--profile` and `--region` if they are not your defaults. What it prints:
+
+| Item | What it is |
+|---|---|
+| MCP endpoint | `https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<runtime ARN, percent-encoded>/invocations?qualifier=DEFAULT`, streamable HTTP. There is no AgentCore Gateway in front; the client talks to the runtime directly |
+| Runtime ARN | the `<stack>_control` AgentCore runtime |
+| Token endpoint | `https://<domain>.auth.<region>.amazoncognito.com/oauth2/token`, the Cognito hosted domain the Prebid stack created |
+| Client id | the `<prefix>-artf-control` app client |
+| Client auth | HTTP Basic with `client_id:client_secret`, `grant_type=client_credentials` |
+| Scopes | `artf-control/campaigns:read artf-control/campaigns:write artf-control/deals:read artf-control/deals:write` |
+| Issuer, discovery URL | the user pool's, as AgentCore's authorizer validates them |
+| Client secret | never printed; the command to read it from the app client (`cognito-idp:DescribeUserPoolClient`) is |
+| MCP client config | an `mcpServers` snippet with the URL and an `Authorization: Bearer` header, for clients that take a URL and headers |
+
+Every MCP request carries `Authorization: Bearer <access token>`. Tokens last about 60 minutes, so a long-running agent fetches a new one from the token endpoint when it expires; a static config snippet with a pasted token stops working after an hour. The same values are in `.control-plane-deployment.json` on the machine that ran the deploy (never the secret).
+
+Verify the whole path (token, authorizer, container, tools), each step reported on its own; `--connection-info` prints this command with your values filled in:
+
+```bash
+python3 deployment/scripts/control_plane_connect.py --runtime-arn <runtime ARN> \
+  --token-endpoint <token endpoint> --client-id <client id> \
+  --client-secret "$(aws cognito-idp describe-user-pool-client --user-pool-id <pool> \
+      --client-id <client id> --query UserPoolClient.ClientSecret --output text)" \
+  --call-tool list_campaigns --arg status=paused
+```
+
+`control_plane_connect.py` needs the `mcp` package (`pip install mcp`; the deploy venv at `deployment/.deploy-venv` has it) and verifies TLS against `certifi`'s CA bundle, so a python.org macOS Python without its certificates installed still works. It is also a working example of the token fetch and the streamable-HTTP connection an agent framework makes.
+
+**Three clients, never merged.**
+
+| Client | Scopes | Used by |
+|---|---|---|
+| `<prefix>-prebid-artf-host` | `artf-orchestrator/mutations:write`, `artf-demand/bid:read` | the Prebid ARTF hook and artfhouse adapter |
+| `<prefix>-artf-control` | `artf-control/campaigns:read`, `:write`, `artf-control/deals:read`, `:write` | external agents |
+| the frontend's user-pool client | none (user tokens) | the browser |
+
+The Prebid host sits on the public auction path and only ever needs to ask for mutations and bids, so it never holds a credential that can write a record. A campaign scope does not open the deal tools, and a read scope does not open writes.
+
+**Two auth layers.** AgentCore's inbound `customJWTAuthorizer` checks signature, issuer, expiry, allowed client and allowed scope before the container is reached; without `authorizerConfiguration` a runtime defaults to IAM SigV4 and never accepts a bearer token. The container then verifies the token again (`source/control_plane/auth.py`, RS256 only) and requires the tool's scope, which needs `Authorization` on the runtime's request-header allowlist. The deploy sets both. If AgentCore answers 401, check the authorizer first: `aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id ID --region R --query authorizerConfiguration`.
+
+**Who an agent may act for.** A `client_credentials` token has no user, so it carries no `custom:advertisers` claim. The grant is attached to the client id in the runtime's environment, `ARTF_CONTROL_CLIENT_ENTITLEMENTS=client-id=acme.example,pub.example`. A campaign is entitled by its `adomain`, a deal by its `seller`. The deploy maps its own client to `*`; narrow it with `./deployment/deploy_control_plane.sh --prefix <prefix> --skip-build --control-advertisers acme.example,pub.example`. An unmapped client is entitled to nothing, a malformed entry is skipped rather than widened, and "not found" and "not yours" are the same answer so record ids cannot be probed.
+
+**Docker.** The rest of the Prebid path builds on CodeBuild; the control-plane image (arm64, small) is built on the deploying machine with Docker buildx, as the Phase 5 AgentCore image is. Without Docker, Step 9 is a warned skip: Prebid still deploys, seeded campaigns are paused, and `deploy_control_plane.sh` can be re-run on its own later. If you will not have Docker, deploy with `--no-control-plane` so campaigns are seeded active.
+
 #### Cost
 
 Everything runs on the cluster you already have, so there is no second VPC, no second NAT gateway, no ALB and no Fargate task.
 
-The deploy discloses cost **before** it provisions anything, and it will not accept that disclosure from a pipe. Known standing cost is **$0.40/month**, for one Secrets Manager secret. Cognito domains, resource servers and app clients carry no standing charge; CodeBuild is per-use and zero when idle. The demand service runs as two small pods on the existing cluster. The disclosure also names what it *cannot* price: ECR image storage, which depends on the built image size and is unknown until the image exists. It says so rather than printing a total that looks complete.
+The deploy discloses cost **before** it provisions anything, and it will not accept that disclosure from a pipe. Known standing cost is **$0.40/month**, for one Secrets Manager secret. Cognito domains, resource servers and app clients carry no standing charge; CodeBuild is per-use and zero when idle. The campaign/deals control plane's AgentCore runtime has no standing charge either: it is billed per second while a tool call's session runs ($0.1276/vCPU-h and $0.0169/GB-h, with CPU not billed during I/O wait), well under $1/month at demonstration volume. The disclosure lists it as a separate line, absent with `--no-control-plane`. The demand service runs as two small pods on the existing cluster. The disclosure also names what it *cannot* price: ECR image storage, which depends on the built image size and is unknown until the image exists. It says so rather than printing a total that looks complete.
 
 The upstream guidance's published ~$241.50/month figure describes **its** ECS Fargate deployment, not this one, and is not carried over.
 
@@ -972,7 +1105,10 @@ The upstream guidance's published ~$241.50/month figure describes **its** ECS Fa
 | Prebid config (floors, bidders, granularity, `multibid`) | `prebid-server/current/prebid-config.yaml` in the config bucket, then `kubectl rollout restart deployment/prebid-server` | rendered from `deployment/scripts/prebid_config_template.yaml` |
 | Orchestrator scope enforcement | `ARTF_MUTATIONS_REQUIRED_SCOPE` on the orchestrator Deployment | empty (inert) unless `--with-prebid` |
 | Demand endpoint campaigns and deals | `deployment/seed/deals_and_campaigns.json`, loaded into the `<stack>-deals` table by `deploy.sh` (see [Deals and campaigns](#deals-and-campaigns-the-deals-table)) | the bundled seed |
-| Resume a failed deploy at a step | `deploy_prebid.sh --start-at N` (1-8), `--skip-build` | n/a |
+| Resume a failed deploy at a step | `deploy_prebid.sh --start-at N` (1-8), `--skip-build`; Step 9 always runs unless `--no-control-plane` | n/a |
+| Deploy the campaign/deals control plane | on with `--with-prebid`; `--no-control-plane` on `deploy.sh` or `deploy_prebid.sh` to leave it out | on |
+| Who the control client may act for | `deploy_control_plane.sh --control-advertisers a.example,b.example` (sets `ARTF_CONTROL_CLIENT_ENTITLEMENTS` on the runtime) | `*` |
+| Control-plane CPM ceiling | `ARTF_CONTROL_PRICE_CEILING` on the runtime | `50` USD |
 
 Editing the config overlay in S3 is the supported way to reconfigure; the deploy **never overwrites an existing overlay**, so your edits survive a redeploy. No rebuild is needed; restart the Deployment.
 
@@ -983,7 +1119,7 @@ cd deployment
 ./deploy_prebid.sh --prefix <prefix> --destroy
 ```
 
-Kubernetes objects first, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to the authorization behaviour it has when the variant is not installed. Leaving it set would keep an existing component altered by a feature that has been uninstalled. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack if present.
+The campaign/deals control plane first (its AgentCore runtime, its `<prefix>-artf-control-plane` stack, its ECR repository), then Kubernetes objects, then the CloudFormation stack, then the ECR repository and its images. It also **clears `ARTF_MUTATIONS_REQUIRED_SCOPE`**, returning the orchestrator to the authorization behaviour it has when the variant is not installed. Leaving it set would keep an existing component altered by a feature that has been uninstalled. The shared Cognito user pool is **not** deleted: the frontend and the orchestrator use it. `deploy.sh --destroy` also removes this stack and the control plane if present. The deals table and its records are removed with the table's own stack by `deploy.sh --destroy`, not here.
 
 #### Alternative: the upstream stack, standalone
 

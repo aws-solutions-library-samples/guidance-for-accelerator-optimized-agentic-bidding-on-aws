@@ -157,8 +157,21 @@ class CostDisclosure:
         return not self.unknown_components
 
 
-def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostDisclosure:
+#: AgentCore Runtime microVM consumption rates, USD, read from the worked Runtime
+#: example on https://aws.amazon.com/bedrock/agentcore/pricing/ on 2026-10-23
+#: (per-second billing, 128 MB memory minimum, CPU scales to zero on I/O wait).
+AGENTCORE_RUNTIME_VCPU_HOUR_USD = 0.1276
+AGENTCORE_RUNTIME_GB_HOUR_USD = 0.0169
+
+
+def build_cost_disclosure(
+    additional_node_monthly_usd: Optional[float], *, control_plane: bool = True,
+) -> CostDisclosure:
     """The marginal monthly cost of adding this stack to an existing cluster.
+
+    ``control_plane``: whether the campaign/deals MCP control plane (an AgentCore
+    runtime, deployed by deploy_control_plane.sh unless --no-control-plane) is part
+    of this run. It adds a consumption-billed term with no standing charge.
 
     ``additional_node_monthly_usd`` is the cost of any node capacity the Prebid pods
     force. It is REQUIRED to be supplied and is NOT defaulted, because on a cluster
@@ -203,7 +216,19 @@ def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostD
                 basis="per build-minute, not a standing cost",
                 source="charged per build; zero when idle",
             ),
-        )
+        ) + ((
+            CostComponent(
+                name="AgentCore runtime (campaign/deals control plane)",
+                monthly_usd=0.0,
+                basis=(
+                    f"consumption-billed per second only while a tool call's session runs "
+                    f"(${AGENTCORE_RUNTIME_VCPU_HOUR_USD}/vCPU-h, ${AGENTCORE_RUNTIME_GB_HOUR_USD}/GB-h); "
+                    f"a few cents per month at demonstration volume, nothing when idle; "
+                    f"its ECR image is a second small repository"
+                ),
+                source="AWS Bedrock AgentCore pricing page, Runtime microVM example (read 2026-10-23)",
+            ),
+        ) if control_plane else ()),
     )
 
 

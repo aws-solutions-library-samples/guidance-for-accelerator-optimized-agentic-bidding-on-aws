@@ -8,6 +8,8 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: triton-hpa
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

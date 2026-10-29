@@ -61,8 +61,13 @@ REFRESH_SECONDS = 30
 ENV_TABLE = "DEALS_TABLE"
 ENV_SEED_FILE = "DEALS_SEED_FILE"
 
-#: Storage attributes the seeder adds to every item; not part of the Deal object.
-STORAGE_KEYS = ("record_type", "seq")
+#: Attributes the writers add to every item that are not part of the Deal object:
+#: the table keys and seed order from the seeder, the provenance marks from the
+#: control plane.
+STORAGE_KEYS = ("record_type", "seq", "managed_by", "updated_at")
+
+#: Deals API ``sellerstatus`` meaning the deal may transact. Also the spec's default.
+SELLERSTATUS_ACTIVE = 0
 
 #: Deals API integer fields (and integer arrays) that DynamoDB returns as Decimal.
 _INT_FIELDS = frozenset({
@@ -101,6 +106,21 @@ class LibraryDeal:
         return deal
 
 
+def deal_is_active(record: dict) -> bool:
+    """Whether the record's ``sellerstatus`` lets it transact.
+
+    Deals API v1.0: 0 active, 1 paused, 2 pending, 3 complete, 4 archived. A record
+    without the field is active, as the spec's default says. Anything else is off
+    the book for the request path: the scorer must not activate a deal the seller
+    has paused, and the orchestrator must not dress it with an auction type.
+    """
+    status = record.get("sellerstatus", SELLERSTATUS_ACTIVE)
+    try:
+        return int(status) == SELLERSTATUS_ACTIVE
+    except (TypeError, ValueError):
+        return False
+
+
 def deal_from_record(record: dict) -> LibraryDeal:
     """Map a Deals API v1.0 Deal record to the OpenRTB fields the scorer emits."""
     terms = record.get("terms") or {}
@@ -124,10 +144,19 @@ class _Entry:
     sitedomains: frozenset[str]
     appbundles: frozenset[str]
     cats: tuple[str, ...]
+    #: ``sellerstatus`` 0. Only active entries are offered to the request path.
+    active: bool = True
 
 
 class DealBook:
-    """An immutable snapshot of every deal, with the request-to-book lookup."""
+    """An immutable snapshot of every deal, with the request-to-book lookup.
+
+    Every record is kept, so ``all_deal_ids`` and ``__len__`` describe the whole
+    table and the cross-check against the demand catalog still sees a deal a
+    campaign holds. Only ACTIVE records reach ``deals_for`` and ``by_id``: a deal
+    the seller paused (or that is pending, complete or archived) is one the scorer
+    must not activate and the orchestrator must not complete with an auction type.
+    """
 
     def __init__(self, records: Iterable[dict]) -> None:
         entries = []
@@ -144,16 +173,22 @@ class DealBook:
                 sitedomains=frozenset(str(d).lower() for d in inventory.get("sitedomains") or ()),
                 appbundles=frozenset(str(b) for b in inventory.get("appbundles") or ()),
                 cats=tuple(str(c) for c in inventory.get("cat") or ()),
+                active=deal_is_active(record),
             ))
         self._entries = tuple(entries)
-        self._by_id = {e.deal.id: e.deal for e in self._entries}
+        self._active = tuple(e for e in self._entries if e.active)
+        self._by_id = {e.deal.id: e.deal for e in self._active}
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def by_id(self, deal_id: Any) -> Optional[LibraryDeal]:
-        """The deal with this id, or None when the book does not hold it."""
+        """The ACTIVE deal with this id, or None when the book does not hold one."""
         return self._by_id.get(deal_id) if isinstance(deal_id, str) else None
+
+    def inactive_deal_ids(self) -> frozenset[str]:
+        """Deals in the table whose seller has taken them off the market."""
+        return frozenset(e.deal.id for e in self._entries if not e.active)
 
     def deals_for(self, bid_request: Any) -> tuple[LibraryDeal, ...]:
         if not isinstance(bid_request, dict):
@@ -161,15 +196,15 @@ class DealBook:
         domain = _site_domain_of(bid_request)
         bundle = _app_bundle_of(bid_request)
         matched = tuple(
-            e.deal for e in self._entries
+            e.deal for e in self._active
             if (domain and domain in e.sitedomains) or (bundle and bundle in e.appbundles)
         )
         if matched:
             return matched
         for cat in _categories_of(bid_request):
-            first = next((e for e in self._entries if cat in e.cats), None)
+            first = next((e for e in self._active if cat in e.cats), None)
             if first is not None:
-                return tuple(e.deal for e in self._entries if e.seller == first.seller)
+                return tuple(e.deal for e in self._active if e.seller == first.seller)
         return ()
 
     def all_deal_ids(self) -> frozenset[str]:

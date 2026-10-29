@@ -8,6 +8,8 @@ import AdaptiveBiddingPanel from "./components/AdaptiveBiddingPanel";
 import GovernancePanel from "./components/GovernancePanel";
 import { LoadTestResults } from "./components/LoadTestPanel";
 import BidBubbleOverlay from "./components/BidBubbleOverlay";
+import LearnerModeNotice from "./components/LearnerModeNotice";
+import { DeploymentModeProvider, useDeploymentMode } from "./hooks/useDeploymentMode.jsx";
 import DemoToggle from "./components/DemoToggle";
 import AnnotationOverlay from "./components/AnnotationOverlay";
 import useDemoAnimation from "./animation/useDemoAnimation";
@@ -27,7 +29,21 @@ const SHOW_DEMO_TOUR = false;
 
 function AppContent() {
   const [showContainers, setShowContainers] = useState(false);
-  const [view, setView] = useState("scenarios");
+  const [requestedView, setView] = useState("scenarios");
+  const { mode: deploymentMode, reason: deploymentModeReason } = useDeploymentMode();
+  const learner = deploymentMode === "learner";
+  // Held in memory only, so the notice returns on every page load.
+  const [learnerNoticeAcknowledged, setLearnerNoticeAcknowledged] = useState(false);
+  // Governance needs GPUs. In learner mode it cannot be selected, and a view
+  // chosen before the mode was known falls back to scenarios.
+  const view = learner && requestedView === "governance" ? "scenarios" : requestedView;
+  const handleViewChange = useCallback(
+    (next) => {
+      if (learner && next === "governance") return;
+      setView(next);
+    },
+    [learner],
+  );
   const [lastPayload, setLastPayload] = useState(null);
   // The scenario currently open in the embedded Theater, with the tuner values it
   // was opened with. Null means the main area shows the mutation timeline instead.
@@ -146,7 +162,9 @@ function AppContent() {
         error={activeError}
         onContainersClick={() => setShowContainers(true)}
         view={view}
-        onViewChange={setView}
+        onViewChange={handleViewChange}
+        deploymentMode={deploymentMode}
+        deploymentModeReason={deploymentModeReason}
       />
       {/* Two markers, because the Theater sizes differently against a rail than
           against an expanded panel: against the rail it must fit the remaining
@@ -217,7 +235,9 @@ function AppContent() {
           the engine and the toggle handler above are all still wired. */}
       {SHOW_DEMO_TOUR && <DemoToggle isActive={demoActive} onToggle={handleDemoToggle} />}
       <AnnotationOverlay text={annotationText} visible={annotationVisible} targetElement={annotationTarget} />
-
+      {learner && !learnerNoticeAcknowledged && (
+        <LearnerModeNotice onAcknowledge={() => setLearnerNoticeAcknowledged(true)} />
+      )}
     </div>
   );
 }
@@ -230,7 +250,9 @@ export default function App() {
   // point, and the Theater always has a scenario in hand.
   return (
     <ComparisonProvider>
-      <AppContent />
+      <DeploymentModeProvider>
+        <AppContent />
+      </DeploymentModeProvider>
     </ComparisonProvider>
   );
 }
