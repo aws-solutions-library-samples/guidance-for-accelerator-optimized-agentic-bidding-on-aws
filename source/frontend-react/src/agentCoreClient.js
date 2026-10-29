@@ -141,8 +141,18 @@ export function isAgentCoreConfigured() {
   return isAdaptiveConfigured();
 }
 
-/** Human-readable reason an agent isn't invokable (for honest UI states), or null if it is. */
-export function agentUnavailableReason(agent /* "adaptive" | "governance" */) {
+/** Shown for the Adaptive Bidding agent in a learner-mode deployment, which is Part 1 only. */
+export const ADAPTIVE_LEARNER_UNAVAILABLE =
+  "The Adaptive Bidding agent is not deployed in learner mode. Deploy with --no-learner-mode to use it.";
+
+/**
+ * Human-readable reason an agent isn't invokable, or null if it is.
+ * deploymentMode is the orchestrator's reported mode ("learner" or "standard").
+ */
+export function agentUnavailableReason(agent /* "adaptive" | "governance" */, { deploymentMode } = {}) {
+  if (agent === "adaptive" && deploymentMode === "learner" && !ADAPTIVE_BIDDING_RUNTIME_ARN) {
+    return ADAPTIVE_LEARNER_UNAVAILABLE;
+  }
   if (!_identityConfigured()) {
     return "Sign-in / Identity Pool not configured — re-deploy with deploy.sh.";
   }

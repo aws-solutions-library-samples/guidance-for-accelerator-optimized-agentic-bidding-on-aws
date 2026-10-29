@@ -90,6 +90,11 @@ fi
 #   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
 #   ./deploy.sh --artf-node-role inference      # co-locate ARTF model containers on the GPU node
 #                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
+#   ./deploy.sh --learner-mode                 # no GPUs: Triton on CPU nodes, Part 1 only, Governance tab
+#                                               # disabled. NOT for ARTF-compliant production workloads.
+#                                               # Deploys Prebid Server for the Auction Theater
+#                                               # (--no-prebid is refused); --ngc-key is ignored.
+#   ./deploy.sh --no-learner-mode              # back to the standard GPU deployment (both remembered)
 #   ./deploy.sh --status                       # what IS deployed, read live from AWS; deploys nothing
 #   ./deploy.sh --start-at 3                   # force a starting phase, overriding the AWS check
 #   ./deploy.sh --verbose                      # print full detailed logs alongside phase output
@@ -219,6 +224,7 @@ _GIVEN_PREBID=0
 _GIVEN_CONTROL_PLANE=0
 _GIVEN_SKIP_AGENTCORE=0
 _GIVEN_START_AT=0
+_GIVEN_LEARNER_MODE=0
 # Recorded (redacted) in the state file for diagnostics.
 _DEPLOY_ARGV=("$@")
 
@@ -259,6 +265,11 @@ WITH_PREBID=0
 # this script reads (the seeder's campaign status, the Prebid pass-through).
 CONTROL_PLANE=1
 CONTROL_PLANE_EFFECTIVE=0
+# Learner mode (--learner-mode) is OFF by default: no GPU node group, Triton on the
+# CPU node group serving FIL and ONNX Runtime models, Part 2 off, Governance tab
+# disabled in the UI. Remembered per prefix; --no-learner-mode switches back. See
+# validate_learner_mode below.
+LEARNER_MODE=0
 # Scope the orchestrator requires of a MACHINE credential on POST /v1/mutations.
 # EMPTY unless --with-prebid, and empty means the orchestrator's authorization
 # behaves exactly as it did before this feature existed. Resolved after arg parsing.
@@ -304,6 +315,8 @@ for arg in "$@"; do
     --no-prebid)        WITH_PREBID=0; _GIVEN_PREBID=1 ;;       # default; explicit for symmetry
     --no-control-plane)   CONTROL_PLANE=0; _GIVEN_CONTROL_PLANE=1 ;;  # Prebid without the MCP control plane
     --with-control-plane) CONTROL_PLANE=1; _GIVEN_CONTROL_PLANE=1 ;;  # default; explicit to switch back
+    --learner-mode)     LEARNER_MODE=1; _GIVEN_LEARNER_MODE=1 ;;
+    --no-learner-mode)  LEARNER_MODE=0; _GIVEN_LEARNER_MODE=1 ;; # default; explicit to switch back
     --remote-build)     LOCAL_BUILD=0; _GIVEN_LOCAL_BUILD=1 ;;
     --local-build)      LOCAL_BUILD=1; _GIVEN_LOCAL_BUILD=1 ;;
     --ngc-secret=*)     NGC_SECRET="${arg#--ngc-secret=}" ;;
@@ -426,6 +439,88 @@ if [[ "${ARTF_NODE_ROLE}" != "services" && "${ARTF_NODE_ROLE}" != "inference" ]]
   printf '\033[0;31m[fail]\033[0m %s\n' "--artf-node-role must be 'services' or 'inference' (got '${ARTF_NODE_ROLE}')" >&2
   exit 1
 fi
+
+# validate_learner_mode: check --learner-mode against the other options and apply
+# what it implies. Called here, on the parsed flags, and again after remembered
+# values are restored (a restored value has not been checked yet).
+#
+# Learner mode is Part 1 only. Every Part 2 component except the Adaptive Bidding
+# agent trains or promotes on GPUs (NeMo-RL on NGC images, scheduled retraining on
+# GPU training instances, TensorRT promotion Jobs), and the Auction Theater uses
+# none of them. So WITH_RETRAINING is forced to 0, which is the tested
+# --no-retraining configuration. _WITH_RETRAINING_CHOICE keeps the operator's own
+# value, which is what gets remembered, so --no-learner-mode later restores Part 2.
+#
+# Prebid Server is forced ON the same way: the Auction Theater's live auction is
+# POST /v1/auction/run, which the orchestrator answers with 501 unless Prebid
+# Server is deployed. _WITH_PREBID_CHOICE keeps the operator's own value for the
+# remembered record; an explicit --no-prebid is refused. The mutations scope is set
+# here too, because the WITH_PREBID check that normally sets it runs before
+# remembered values are restored.
+#
+# --ngc-key / --ngc-secret are dropped in learner mode: nothing NGC-based is built
+# (no NeMo, no TensorRT optimizer), so the key is not stored in Secrets Manager or
+# the state file and is not passed to any child script. Clearing (not unset, for
+# set -u) also empties an exported copy in every child.
+#
+# Uses printf rather than fail/warn/say: at the first call site those are not
+# defined yet.
+_WITH_RETRAINING_CHOICE=""
+_WITH_PREBID_CHOICE=""
+_LEARNER_NOTED=0
+validate_learner_mode() {
+  if [[ "${LEARNER_MODE}" != "0" && "${LEARNER_MODE}" != "1" ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "learnerMode must be 0 or 1 (got '${LEARNER_MODE}', restored from deployment/.deploy-state.json). Pass --learner-mode or --no-learner-mode explicitly to override." >&2
+    exit 1
+  fi
+  _WITH_RETRAINING_CHOICE="${WITH_RETRAINING}"
+  _WITH_PREBID_CHOICE="${WITH_PREBID}"
+  if [[ "${LEARNER_MODE}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "${ARTF_NODE_ROLE}" == "inference" ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "--learner-mode creates no GPU node group, so no inference nodes exist; use --artf-node-role services (the default)." >&2
+    exit 1
+  fi
+  if [[ "${_GIVEN_RETRAINING}" -eq 1 && "${WITH_RETRAINING}" -eq 1 ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "--with-retraining cannot be combined with learner mode: retraining and promotion need GPUs. Pass --no-learner-mode for the GPU deployment, or drop --with-retraining." >&2
+    exit 1
+  fi
+  if [[ "${_GIVEN_PREBID}" -eq 1 && "${WITH_PREBID}" -eq 0 ]]; then
+    printf '\033[0;31m[fail]\033[0m %s\n' "--no-prebid cannot be combined with learner mode: the Auction Theater's live auction needs Prebid Server. Drop --no-prebid, or pass --no-learner-mode." >&2
+    exit 1
+  fi
+  WITH_RETRAINING=0
+  WITH_PREBID=1
+  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"
+  if [[ -n "${NGC_KEY}" || -n "${NGC_SECRET}" ]]; then
+    printf '\033[0;33m[warn]\033[0m %s\n' "--ngc-key / --ngc-secret are ignored in learner mode: nothing NGC-based is built, and the key is not stored or passed on."
+    NGC_KEY=""
+    NGC_SECRET=""
+  fi
+  if [[ "${_LEARNER_NOTED}" -eq 0 ]]; then
+    _LEARNER_NOTED=1
+    printf '  Learner mode: no GPUs. Triton serves on the CPU node group; Part 2 (retraining, Governance, the Adaptive Bidding agent) is off; Prebid Server is deployed for the Auction Theater. Not for ARTF-compliant production workloads.\n'
+    if [[ "${_GIVEN_MAXGPUS}" -ne 0 ]]; then
+      printf '\033[0;33m[warn]\033[0m %s\n' "--maxGPUs has no effect in learner mode (there is no GPU node group to size)."
+    fi
+  fi
+  return 0
+}
+
+# warn_part2_left_on_switch <prev-learner> <learner> <prev-with-retraining>: a
+# standard prefix whose remembered state had Part 2 on (empty counts as on:
+# retraining is the default and older records may lack the key) keeps every Part 2
+# resource when it is switched to learner mode. Learner mode only stops deploying
+# Part 2; it removes nothing, and --no-retraining does not either.
+warn_part2_left_on_switch() {
+  local prev_learner="$1" learner="$2" prev_retraining="$3"
+  if [[ "${prev_learner}" == "0" && "${learner}" == "1" && "${prev_retraining}" != "0" ]]; then
+    printf '\033[0;33m[warn]\033[0m %s\n' "Prefix '${STACK_PREFIX}' had Part 2 deployed. Learner mode leaves its Part 2 resources in place, including the scheduled ml.g5.2xlarge retraining (${STACK_PREFIX}-governance-eventbridge) and the governance AgentCore runtime. To remove them, run ./deploy.sh --prefix ${STACK_PREFIX} --destroy, then deploy the prefix again with --learner-mode."
+  fi
+  return 0
+}
+validate_learner_mode
 
 # Apply prefix to stack name AFTER arg parsing
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
@@ -721,6 +816,13 @@ deploy_ui_api_proxy() {
   action="create-stack"
   [[ -n "${status}" && "${status}" != "None" ]] && action="update-stack"
   cfn_log="/tmp/cfn-deploy-${UI_API_PROXY_STACK}-$(date +%s).log"
+  # Learner mode targets Workshop Studio accounts, which cap reserved concurrency at
+  # 10 across all functions; the template default of 20 fails there. The standard
+  # path passes no override, so its call is unchanged and keeps the default.
+  local _learner_params=()
+  if [[ "${LEARNER_MODE:-0}" -eq 1 ]]; then
+    _learner_params=("ParameterKey=ReservedConcurrency,ParameterValue=5")
+  fi
   log "  ${action} ${UI_API_PROXY_STACK} (subnets ${subnets}, sg ${sg})"
   if aws cloudformation "${action}" --stack-name "${UI_API_PROXY_STACK}" \
       --template-body "file://${SCRIPT_DIR}/ui_api_proxy_cfn.yaml" \
@@ -729,6 +831,7 @@ deploy_ui_api_proxy() {
                    "ParameterKey=SubnetIds,ParameterValue=\"${subnets}\"" \
                    "ParameterKey=SecurityGroupIds,ParameterValue=${sg}" \
                    "ParameterKey=OrchestratorBaseUrl,ParameterValue=${orch_url}" \
+                   ${_learner_params[@]+"${_learner_params[@]}"} \
       >"${cfn_log}" 2>&1; then
     local wait_action="stack-create-complete"
     [[ "${action}" == "update-stack" ]] && wait_action="stack-update-complete"
@@ -748,6 +851,12 @@ deploy_ui_api_proxy() {
 # compatibility (macOS default) — see _source_hash()/display_name() above
 # for the same pattern already used elsewhere in this script.
 phase_hint() {
+  if [[ "${LEARNER_MODE:-0}" -eq 1 ]]; then
+    case "$1" in
+      2) echo "Learner mode: check your EC2 On-Demand Standard vCPU quota (L-1216C47A) for the cpu-services c5.2xlarge nodes. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)."; return 0 ;;
+      3) echo "Learner mode: Triton runs on the cpu-services nodes. Check: kubectl get pods -l app=triton -o wide ; kubectl get nodes -l role=services ; and the UI API proxy stack: aws cloudformation describe-stack-events --stack-name ${UI_API_PROXY_STACK:-<prefix>-ui-api-proxy}"; return 0 ;;
+    esac
+  fi
   case "$1" in
     1) echo "Check AWS credentials (aws sts get-caller-identity) and that boto3/torch/onnx/onnxscript are installed." ;;
     2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild and your EC2 g5 GPU service quota for cluster creation. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)." ;;
@@ -910,25 +1019,6 @@ if [[ -n "${MISSING_PY_PACKAGES}" ]]; then
   "${PYTHON}" -m pip install --quiet ${MISSING_PY_PACKAGES} || fail "pip install failed for:${MISSING_PY_PACKAGES}"  # nosemgrep: unquoted-variable-expansion-in-command intentional word splitting of a space separated package list
 fi
 
-# sagemaker SDK: needed only for the Part 2 closed-loop path — resolving the
-# built-in XGBoost training image URI (below) and registering genesis model
-# versions (Step 5, register_genesis_models.py). It is NOT required for a
-# Part 1-only deploy, so it is installed here conditionally rather than added
-# to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
-# empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
-# the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
-#
-# The check imports `image_uris` specifically, NOT just `sagemaker`: the SDK's
-# v3 major version dropped the top-level `image_uris` module this project's
-# resolution relies on (`image_uris.retrieve`, also used by
-# register_genesis_models.py), so a python that has sagemaker v3 installed
-# would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
-# to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
-if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then
-  log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
-  "${PYTHON}" -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
-fi
-
 # step()/done_ok()/run_logged() and the status marks. Sourced before the gate so
 # `--status` output uses the same glyphs as the deploy itself.
 # shellcheck source=lib/deploy_progress.sh
@@ -987,6 +1077,17 @@ sys.exit(0 if sys.argv[1] in botocore.session.Session().available_profiles else 
   fi
 fi
 say "  AWS profile: ${AWS_PROFILE} (${DEPLOY_PROFILE_SOURCE})"
+
+# --status skips the remembered-values block, but what a learner deployment is
+# expected to contain differs (no Model Optimizer image, no Part 2, a Prebid host), so the probe
+# needs the mode. An explicit flag was applied by validate_learner_mode already.
+if [[ "${STATUS_ONLY}" -eq 1 && "${_GIVEN_LEARNER_MODE}" -eq 0 ]]; then
+  if [[ "$(state_read "${STACK_PREFIX}" remembered.learnerMode)" == "1" ]]; then
+    LEARNER_MODE=1
+    WITH_RETRAINING=0
+    WITH_PREBID=1
+  fi
+fi
 
 # =========================================================================
 # What this checkout would deploy, for the phase probe (read-only)
@@ -1118,6 +1219,22 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
     _REUSED_LINES+=("    ${label} = ${stored}")
     return 0
   }
+  # The learner mode this prefix was last deployed in, read before _reuse can
+  # overwrite LEARNER_MODE. Compared with this run's mode further down.
+  # Empty with a recorded region means a record that predates learner mode, which
+  # was a standard deployment; empty with no record at all means a new prefix.
+  _PREV_LEARNER_MODE="$(state_read "${STACK_PREFIX}" remembered.learnerMode)"
+  if [[ -z "${_PREV_LEARNER_MODE}" && -n "$(state_read "${STACK_PREFIX}" remembered.region)" ]]; then
+    _PREV_LEARNER_MODE=0
+  fi
+  # The Part 2 choice this prefix was last deployed with, for the switch warning
+  # below (a standard prefix switched to learner keeps its Part 2 resources).
+  _PREV_WITH_RETRAINING="$(state_read "${STACK_PREFIX}" remembered.withRetraining)"
+  # validate_learner_mode forced WITH_RETRAINING to 0 and WITH_PREBID to 1 for a
+  # learner run; restore the operator's own values so _reuse and the re-validation
+  # below start from them.
+  WITH_RETRAINING="${_WITH_RETRAINING_CHOICE}"
+  WITH_PREBID="${_WITH_PREBID_CHOICE}"
   _reuse AWS_REGION       region        "${_GIVEN_REGION}"           "AWS_REGION"
   _reuse MAX_GPUS         maxGPUs       "${_GIVEN_MAXGPUS}"          "--maxGPUs"
   _reuse ARTF_NODE_ROLE   artfNodeRole  "${_GIVEN_ARTF_NODE_ROLE}"   "--artf-node-role"
@@ -1127,10 +1244,13 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   _reuse WITH_PREBID      withPrebid    "${_GIVEN_PREBID}"           "--with-prebid"
   _reuse CONTROL_PLANE    controlPlane  "${_GIVEN_CONTROL_PLANE}"    "--with-control-plane"
   _reuse SKIP_AGENTCORE   skipAgentcore "${_GIVEN_SKIP_AGENTCORE}"   "--skip-agentcore"
+  _reuse LEARNER_MODE     learnerMode   "${_GIVEN_LEARNER_MODE}"     "--learner-mode"
   # The NGC secret name is the case that prompted all of this: a re-run that
   # omits --ngc-key should not re-prompt for a key already stored for this stack.
-  # Only applied when neither NGC flag was given on this invocation.
-  if [[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" ]]; then
+  # Only applied when neither NGC flag was given on this invocation, and not in
+  # learner mode, which builds nothing NGC-based (the remembered name stays in the
+  # record for a later --no-learner-mode run).
+  if [[ "${_STATE_REUSE}" -eq 1 && -z "${NGC_KEY}" && -z "${NGC_SECRET}" && "${LEARNER_MODE}" -eq 0 ]]; then
     _REMEMBERED_NGC="$(state_read "${STACK_PREFIX}" remembered.ngcSecretName)"
     if [[ -n "${_REMEMBERED_NGC}" ]]; then
       NGC_SECRET="${_REMEMBERED_NGC}"
@@ -1153,6 +1273,17 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   fi
   if [[ "${ARTF_NODE_ROLE}" != "services" && "${ARTF_NODE_ROLE}" != "inference" ]]; then
     fail "--artf-node-role must be 'services' or 'inference' (got '${ARTF_NODE_ROLE}', restored from deployment/.deploy-state.json). Pass --artf-node-role explicitly to override."
+  fi
+  validate_learner_mode
+
+  # A mode switch on an existing prefix changes the served model repository
+  # (Phase 1) and the manifests and node groups (Phase 3), none of which the probe
+  # can tell apart from the previous mode's.
+  if [[ -n "${_PREV_LEARNER_MODE}" && "${_PREV_LEARNER_MODE}" != "${LEARNER_MODE}" ]]; then
+    force_phase 1 "the deployment mode changed (learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}): the served model repository is restaged"
+    force_phase 3 "the deployment mode changed (learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}): manifests and node groups are reconciled"
+    say "  Deployment mode change for prefix '${STACK_PREFIX}': learnerMode ${_PREV_LEARNER_MODE} -> ${LEARNER_MODE}; Phases 1 and 3 will run."
+    warn_part2_left_on_switch "${_PREV_LEARNER_MODE}" "${LEARNER_MODE}" "${_PREV_WITH_RETRAINING}"
   fi
 
   # --- What is already deployed, according to AWS ---
@@ -1200,10 +1331,11 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
     "artfNodeRole=${ARTF_NODE_ROLE}" \
     "modelId=${BEDROCK_MODEL_ID}" \
     "localBuild=${LOCAL_BUILD}" \
-    "withRetraining=${WITH_RETRAINING}" \
-    "withPrebid=${WITH_PREBID}" \
+    "withRetraining=${_WITH_RETRAINING_CHOICE}" \
+    "withPrebid=${_WITH_PREBID_CHOICE}" \
     "controlPlane=${CONTROL_PLANE}" \
-    "skipAgentcore=${SKIP_AGENTCORE}"
+    "skipAgentcore=${SKIP_AGENTCORE}" \
+    "learnerMode=${LEARNER_MODE}"
   # The secret NAME, never the key. remote_build.sh derives this same name from
   # STACK_NAME, so recording it needs no round trip through the child script.
   if [[ -n "${NGC_KEY}" ]]; then
@@ -1316,6 +1448,30 @@ DEAL_YIELD_GLUE_JOB_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}deal-yield-feature-en
 # (Phase 5) creates/queries any closed-loop stack outputs).
 YIELD_FLOOR_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-floor"
 YIELD_MARGIN_MODEL_GROUP="${STACK_PREFIX:+${STACK_PREFIX}-}artf-deal-yield-manager-margin"
+# sagemaker SDK: needed only for the Part 2 closed-loop path: resolving the
+# built-in XGBoost training image URI (below) and registering genesis model
+# versions (Step 5, register_genesis_models.py). It is NOT required for a
+# Part 1-only deploy, so it is installed here conditionally rather than added
+# to REQUIRED_PY_PACKAGES above. Without it, the XGBoost image URI resolves
+# empty and on-demand Yield Optimizer (floor/margin) training reports a 503 in
+# the UI ("XGBOOST_TRAINING_IMAGE_URI unset").
+#
+# The check imports `image_uris` specifically, NOT just `sagemaker`: the SDK's
+# v3 major version dropped the top-level `image_uris` module this project's
+# resolution relies on (`image_uris.retrieve`, also used by
+# register_genesis_models.py), so a python that has sagemaker v3 installed
+# would pass a plain `import sagemaker` yet still fail to resolve the URI. Pin
+# to the v2 line (>=2,<3), which is what the whole closed-loop path targets.
+#
+# Checked here, after the remembered values are restored and validate_learner_mode
+# has run again, so WITH_RETRAINING is final: a flagless rerun of a learner (or
+# remembered --no-retraining) prefix does not install it. The XGBoost image URI
+# resolution right below is its first consumer.
+if [[ "${WITH_RETRAINING}" -eq 1 ]] && ! "${PYTHON}" -c "from sagemaker import image_uris" 2>/dev/null; then
+  log "Installing/ensuring sagemaker SDK (v2, with image_uris) for closed-loop retraining"
+  "${PYTHON}" -m pip install --quiet 'sagemaker>=2,<3' || fail "pip install failed for: sagemaker>=2,<3 (needed for --with-retraining; re-run with --no-retraining to skip Part 2)"
+fi
+
 # SageMaker's built-in XGBoost algorithm image lives in an AWS-owned
 # account that differs per region -- resolved via the sagemaker SDK, never
 # hardcoded/guessed (same resolution deploy_closed_loop.sh already uses
@@ -1857,7 +2013,29 @@ fi
 # deploy needs room for 2 GPU nodes. Fail fast with a clear message instead of
 # letting the Model Optimizer sit Pending for hours (which leaves Triton unable to
 # load its tensorrt_plan engines and the GPU containers stuck "gpu offline").
-if [[ "${EXPORT_ONLY}" -eq 0 ]]; then
+#
+# Learner mode has no GPU node group, so it checks the quota it does consume
+# instead: On-Demand Standard vCPUs (L-1216C47A, "Running On-Demand Standard
+# (A, C, D, H, I, M, R, T, Z) instances") for the cpu-services group at its learner
+# size of 4 x c5.2xlarge. Warn-only, like the GPU check's unreadable-quota path:
+# the group can start smaller and other workloads may share the quota.
+if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 1 ]]; then
+  LEARNER_NEEDED_VCPUS=32
+  STD_QUOTA="$(aws service-quotas get-service-quota \
+    --service-code ec2 --quota-code L-1216C47A \
+    --region "${AWS_REGION}" --query 'Quota.Value' --output text 2>/dev/null || echo '')"
+  if [[ -n "${STD_QUOTA}" && "${STD_QUOTA}" != "None" ]]; then
+    STD_VCPUS="${STD_QUOTA%.*}"
+    if [[ "${STD_VCPUS}" -lt "${LEARNER_NEEDED_VCPUS}" ]]; then
+      warn "  'Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances' (L-1216C47A) is ${STD_VCPUS} vCPUs in ${AWS_REGION}; learner mode sizes cpu-services at 4 x c5.2xlarge (${LEARNER_NEEDED_VCPUS} vCPUs). Nodes beyond the quota will not launch."
+    else
+      log "  Standard vCPU quota OK: ${STD_VCPUS}, learner mode needs ${LEARNER_NEEDED_VCPUS}"
+    fi
+  else
+    warn "  Could not read the Standard On-Demand vCPU quota (L-1216C47A; needs service-quotas:GetServiceQuota). Learner mode needs ${LEARNER_NEEDED_VCPUS} vCPUs for 4 x c5.2xlarge."
+  fi
+fi
+if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then
   # Steady state needs ONE GPU node (Triton only). The Model Optimizer no longer
   # runs as an always-on GPU Deployment — base engines are built by a one-shot
   # bootstrap Job (which exits and frees the GPU before Triton claims it) and
@@ -2070,6 +2248,209 @@ resolve_ncf_model_label() {
     || fail 3 "s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY} model_version '${label}' does not match ${NCF_LABEL_RE}."
   NCF_MODEL_LABEL="${label}"
   log "  Deal Scorer label from s3://${MODEL_BUCKET}/${NCF_MANIFEST_KEY}: ${NCF_MODEL_LABEL}"
+}
+
+# =========================================================================
+# Rendering: cluster config, manifests, bootstrap Job, served model repository
+# =========================================================================
+# One function per rendered artifact, so the standard and learner paths share the
+# sed substitutions and tests can render either one. With LEARNER_MODE=0 each
+# function writes exactly what the inline code it replaced wrote. With
+# LEARNER_MODE=1 the rendered text then goes through scripts/learner_render.py
+# (cluster config, manifests) or the learner model configs are overlaid
+# (served repository); the templates under eks/ and triton/ are not edited.
+LEARNER_MODEL_REPO="${SCRIPT_DIR}/../source/triton/model_repository_learner"
+
+# _learner_transform <kind> <file>: rewrite a rendered file in place for learner mode.
+_learner_transform() {
+  local kind="$1" file="$2" tmp
+  tmp="$(mktemp)"
+  if ! "${PYTHON}" "${SCRIPT_DIR}/scripts/learner_render.py" "${kind}" "${file}" "${tmp}"; then
+    rm -f "${tmp}"
+    fail "Learner-mode render of ${kind} failed (message above); the template no longer matches scripts/learner_render.py."
+  fi
+  mv -f "${tmp}" "${file}"
+  return 0
+}
+
+# render_cluster_config <out>: the eksctl ClusterConfig.
+render_cluster_config() {
+  local out="$1"
+  sed -e "s/__STACK_NAME__/${STACK_NAME}/g" \
+      -e "s/__REGION__/${AWS_REGION}/g" \
+      -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
+      "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${out}"
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    _learner_transform cluster-config "${out}"
+  fi
+  return 0
+}
+
+# render_bootstrap_job <out>: the one-shot Model Optimizer bootstrap Job (Step 8a,
+# standard mode only).
+render_bootstrap_job() {
+  local out="$1"
+  sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
+      -e "s|__REGION__|${AWS_REGION}|g" \
+      -e "s|__REGISTRY__|${REGISTRY}|g" \
+      -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+      -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+      -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
+      "${SCRIPT_DIR}/eks/model-optimizer-bootstrap-job.yaml" > "${out}"
+  return 0
+}
+
+# render_manifest <template-file-name> <out>: one Step 8b manifest.
+render_manifest() {
+  local manifest="$1" out="$2"
+  sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
+      -e "s|__REGION__|${AWS_REGION}|g" \
+      -e "s|__REGISTRY__|${REGISTRY}|g" \
+      -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
+      -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
+      -e "s|__TRITON_ROLE_ARN__|${TRITON_ROLE_ARN}|g" \
+      -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
+      -e "s|__ARTF_NODE_ROLE__|${ARTF_NODE_ROLE}|g" \
+      -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
+      -e "s|__ARTF_MUTATIONS_REQUIRED_SCOPE__|${ARTF_MUTATIONS_REQUIRED_SCOPE}|g" \
+      -e "s|__PARAMETER_STORE_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store|g" \
+      -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
+      -e "s|__CONTAINER_REGISTRY_TABLE__|${CONTAINER_REGISTRY_TABLE}|g" \
+      -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
+      -e "s|__NCF_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager|g" \
+      -e "s|__YIELD_FLOOR_MODEL_GROUP__|${YIELD_FLOOR_MODEL_GROUP}|g" \
+      -e "s|__YIELD_MARGIN_MODEL_GROUP__|${YIELD_MARGIN_MODEL_GROUP}|g" \
+      -e "s|__SAGEMAKER_TRAINING_ROLE_ARN__|arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}|g" \
+      -e "s|__TRAINING_DATA_BUCKET__|${TRAINING_DATA_BUCKET}|g" \
+      -e "s|__TRAINING_IMAGE_REGISTRY__|${REGISTRY}|g" \
+      -e "s|__XGBOOST_TRAINING_IMAGE_URI__|${XGBOOST_TRAINING_IMAGE_URI}|g" \
+      -e "s|__FEEDBACK_STREAM_NAME__|${FEEDBACK_STREAM_NAME}|g" \
+      -e "s|__DEAL_YIELD_FEEDBACK_STREAM_NAME__|${DEAL_YIELD_FEEDBACK_STREAM_NAME}|g" \
+      -e "s|__OUTCOME_SIMULATOR_ENABLED__|${OUTCOME_SIMULATOR_ENABLED}|g" \
+      -e "s|__OUTCOME_SIMULATOR_WIN_RATE__|${OUTCOME_SIMULATOR_WIN_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_IMPRESSION_RATE__|${OUTCOME_SIMULATOR_IMPRESSION_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CLICK_RATE__|${OUTCOME_SIMULATOR_CLICK_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CONVERSION_RATE__|${OUTCOME_SIMULATOR_CONVERSION_RATE}|g" \
+      -e "s|__OUTCOME_SIMULATOR_CONVERSION_VALUE__|${OUTCOME_SIMULATOR_CONVERSION_VALUE}|g" \
+      -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
+      -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
+      -e "s|__NCF_MODEL_LABEL__|${NCF_MODEL_LABEL}|g" \
+      "${SCRIPT_DIR}/eks/${manifest}" > "${out}"
+  if grep -q '__NCF_MODEL_LABEL__' "${out}"; then
+    fail 3 "${manifest} still has an unsubstituted __NCF_MODEL_LABEL__"
+  fi
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    _learner_transform "${manifest%.yaml}" "${out}"
+  fi
+  return 0
+}
+
+# stage_served_repo <dest>: assemble the served Triton repository in <dest> (Step
+# 3b): the committed configs plus the canary router's model.py in each router's
+# version directory. Learner mode then overlays the CPU configs from
+# source/triton/model_repository_learner/ (FIL on KIND_CPU, ONNX Runtime in place
+# of the TensorRT engines); everything else is the same files.
+stage_served_repo() {
+  local dest="$1" m
+  cp -R "${SCRIPT_DIR}/../source/triton/model_repository/." "${dest}/"
+  for m in "${RECOMMENDER_MODELS[@]}"; do
+    mkdir -p "${dest}/${m}/1"
+    cp "${SCRIPT_DIR}/../source/triton/router/model.py" "${dest}/${m}/1/model.py"
+  done
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    cp -R "${LEARNER_MODEL_REPO}/." "${dest}/"
+  fi
+  return 0
+}
+
+# upload_learner_onnx: learner mode only (Step 3b2). Serve the Step 2 ONNX exports
+# directly: the Deal Scorer build as ncf_deal_manager_stable (with the same
+# source-fingerprint metadata as its onnx-source/ copy, which the probe compares),
+# and the Bid Pricer export as both dlrm_bid_shader_stable and
+# dlrm_bid_shader_canary. Canary from the same genesis artifact at 0% traffic is
+# what the optimizer bootstrap provisions on GPU. The DLRM feature-spec check the
+# optimizer applies before compiling is applied here instead, because nothing
+# compiles in learner mode.
+upload_learner_onnx() {
+  local ncf_onnx="${ONNX_STAGING}/ncf_deal_manager/1/model.onnx"
+  local dlrm_dir="${ONNX_STAGING}/dlrm_bid_shader/1" want got slot
+  [[ -f "${ncf_onnx}" ]] || fail 1 "Learner mode serves ${ncf_onnx}, which Step 2 did not produce."
+  [[ -f "${dlrm_dir}/model.onnx" && -f "${dlrm_dir}/manifest.json" ]] \
+    || fail 1 "Learner mode serves the Bid Pricer ONNX and its manifest.json from ${dlrm_dir}; Step 2 did not produce both."
+  want="$("${PYTHON}" -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}/../source')
+from shared import dlrm_features
+print(dlrm_features.FEATURE_SPEC_VERSION)
+")" || fail 1 "Could not read FEATURE_SPEC_VERSION from source/shared/dlrm_features.py"
+  got="$("${PYTHON}" -c "
+import json, sys
+v = json.load(open(sys.argv[1])).get('feature_spec_version')
+print(v if isinstance(v, int) and not isinstance(v, bool) else '')
+" "${dlrm_dir}/manifest.json" 2>/dev/null || echo '')"
+  if [[ -z "${got}" || "${got}" != "${want}" ]]; then
+    fail 1 "The Bid Pricer export declares feature_spec_version '${got:-<none>}' in ${dlrm_dir}/manifest.json; this deployment serves version ${want} (source/shared/dlrm_features.py). Re-run Step 2."
+  fi
+  quiet "s3 cp ncf_deal_manager/model.onnx -> triton-models/ncf_deal_manager_stable/1/" \
+    aws s3 cp "${ncf_onnx}" "s3://${MODEL_BUCKET}/triton-models/ncf_deal_manager_stable/1/model.onnx" \
+      --metadata "source-fingerprint=${NCF_FINGERPRINT}" --region "${AWS_REGION}" \
+    || fail 1 "Could not upload the Deal Scorer ONNX to s3://${MODEL_BUCKET}/triton-models/ncf_deal_manager_stable/1/"
+  for slot in dlrm_bid_shader_stable dlrm_bid_shader_canary; do
+    quiet "s3 cp dlrm_bid_shader/model.onnx -> triton-models/${slot}/1/" \
+      aws s3 cp "${dlrm_dir}/model.onnx" "s3://${MODEL_BUCKET}/triton-models/${slot}/1/model.onnx" \
+        --region "${AWS_REGION}" \
+      || fail 1 "Could not upload the Bid Pricer ONNX to s3://${MODEL_BUCKET}/triton-models/${slot}/1/"
+  done
+  log "  Learner mode: Deal Scorer and Bid Pricer ONNX staged for ONNX Runtime on CPU"
+  return 0
+}
+
+# reconcile_nodegroups_for_mode: Phase 3, before anything is applied. Brings an
+# existing cluster's node groups in line with the mode:
+#   learner: an existing gpu-inference group is scaled to 0 (never deleted, so a
+#            switch back needs no recreate), and cpu-services is raised to at
+#            least 4 nodes for Triton.
+#   standard after learner: gpu-inference is created from the standard cluster
+#            config when it is missing (a cluster that was created in learner mode).
+#   standard otherwise: nothing, which is the path every default deploy takes.
+reconcile_nodegroups_for_mode() {
+  local cfg desired
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    if aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+      say "  Learner mode: scaling the existing gpu-inference node group to 0 (kept, not deleted)"
+      quiet "eks update-nodegroup-config gpu-inference (learner: 0 nodes)" \
+        aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+          --scaling-config "minSize=0,maxSize=${MAX_GPUS},desiredSize=0" --region "${AWS_REGION}" \
+        || warn "  Could not scale gpu-inference to 0 (continuing; nothing in learner mode schedules on it)"
+    fi
+    desired="$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name cpu-services \
+      --region "${AWS_REGION}" --query 'nodegroup.scalingConfig.desiredSize' --output text 2>/dev/null || echo '')"
+    if [[ "${desired}" =~ ^[0-9]+$ && "${desired}" -lt 4 ]]; then
+      say "  Learner mode: raising cpu-services from ${desired} to 4 nodes (Triton now runs there)"
+      quiet "eks update-nodegroup-config cpu-services (learner: 4 nodes)" \
+        aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name cpu-services \
+          --scaling-config "minSize=2,maxSize=8,desiredSize=4" --region "${AWS_REGION}" \
+        || warn "  Could not raise cpu-services to 4 nodes; Triton may wait for CPU capacity"
+      warn "  An existing cpu-services group keeps its 50 GB root volume (node groups are immutable); clusters created in learner mode get 100 GB."
+    fi
+    return 0
+  fi
+  if [[ "${_PREV_LEARNER_MODE:-}" == "1" ]]; then
+    if ! aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+        --region "${AWS_REGION}" >/dev/null 2>&1; then
+      say "  Standard mode after learner mode: creating the gpu-inference node group"
+      cfg="$(mktemp)"
+      render_cluster_config "${cfg}"
+      if ! quiet "eksctl create nodegroup gpu-inference" \
+          eksctl create nodegroup --config-file "${cfg}" --include=gpu-inference; then
+        rm -f "${cfg}"
+        fail 3 "Could not create the gpu-inference node group for the switch back to standard mode."
+      fi
+      rm -f "${cfg}"
+    fi
+  fi
+  return 0
 }
 
 # =========================================================================
@@ -2703,12 +3084,20 @@ done
 #     router model.py injected into each router model's version dir. Engines
 #     (model.plan) are built by the Model Optimizer at Step 8b, so they are NOT
 #     uploaded here (and NO --delete, which would wipe engines on re-deploy).
+#
+#     Learner mode serves the Yield Optimizer floor/margin on FIL and the Deal
+#     Scorer / Bid Pricer from their ONNX exports on ONNX Runtime, all on CPU. The
+#     floor and margin models are required there (the Auction Theater needs them),
+#     so a missing Step 2.5 artifact stops the deploy instead of being skipped.
+if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+  for m in "${YIELD_MODELS[@]}"; do
+    [[ -f "${ONNX_STAGING}/${m}/1/xgboost.json" ]] \
+      || fail 1 "Learner mode serves ${m} on Triton FIL, but Step 2.5 produced no ${ONNX_STAGING}/${m}/1/xgboost.json. Install the pinned packages and re-run: ${PYTHON} -m pip install ${XGBOOST_PIN} onnxmltools"
+  done
+  upload_learner_onnx
+fi
 SERVED_STAGING="$(mktemp -d)"
-cp -R "${SCRIPT_DIR}/../source/triton/model_repository/." "${SERVED_STAGING}/"
-for m in "${RECOMMENDER_MODELS[@]}"; do
-  mkdir -p "${SERVED_STAGING}/${m}/1"
-  cp "${SCRIPT_DIR}/../source/triton/router/model.py" "${SERVED_STAGING}/${m}/1/model.py"
-done
+stage_served_repo "${SERVED_STAGING}"
 quiet "s3 sync served Triton repo -> triton-models/" \
   aws s3 sync "${SERVED_STAGING}/" "s3://${MODEL_BUCKET}/triton-models/" \
     --exclude "*.onnx" --region "${AWS_REGION}"
@@ -2730,6 +3119,7 @@ from shared import dlrm_features
 print(dlrm_features.FEATURE_SPEC_VERSION)
 ")" || fail "Could not read FEATURE_SPEC_VERSION from source/shared/dlrm_features.py"
 log "  DLRM feature spec version: ${FEATURE_SPEC_VERSION}"
+if [[ "${LEARNER_MODE}" -eq 0 ]]; then
 BOOTSTRAP_TMP="$(mktemp)"
 sed -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
     -e "s|__FEATURE_SPEC_VERSION__|${FEATURE_SPEC_VERSION}|g" \
@@ -2741,6 +3131,9 @@ quiet "s3 cp optimizer bootstrap spec" \
     "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
 rm -f "${BOOTSTRAP_TMP}"
 log "  Model Optimizer bootstrap spec uploaded"
+else
+  log "  Learner mode: no Model Optimizer bootstrap spec (nothing is compiled to TensorRT)"
+fi
 
 # 3d. Phase 1 marker: the deals seed and the Deal Scorer build this phase put in
 #     place. Written last, so a phase that stops part way leaves the previous
@@ -3000,6 +3393,15 @@ build_image_local() {
 # on the cluster existing.
 build_images() {
   STEP4_KEYS=(dlrm-bid-shader widedeep-segment-activator ncf-deal-manager metrics-enricher yield-optimizer-floor yield-optimizer-margin artf-template orchestrator model-optimizer)
+  # Learner mode compiles nothing to TensorRT, so the Model Optimizer image is not
+  # built (and the probe does not expect it).
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    local _k _keys=()
+    for _k in "${STEP4_KEYS[@]}"; do
+      if [[ "${_k}" != "model-optimizer" ]]; then _keys+=("${_k}"); fi
+    done
+    STEP4_KEYS=("${_keys[@]}")
+  fi
   if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then STEP4_KEYS+=(agentcore); fi
 
   MISSING_KEYS=()
@@ -3135,12 +3537,13 @@ update_managed_policy() {
   return 0
 }
 create_eks_cluster() {
-  log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    log "  Learner mode: no GPU node group; Triton runs on cpu-services (4 x c5.2xlarge)"
+  else
+    log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
+  fi
   local CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
-  sed -e "s/__STACK_NAME__/${STACK_NAME}/g" \
-      -e "s/__REGION__/${AWS_REGION}/g" \
-      -e "s/__MAX_GPUS__/${MAX_GPUS}/g" \
-      "${SCRIPT_DIR}/eks/cluster-config.yaml" > "${CLUSTER_CONFIG}"
+  render_cluster_config "${CLUSTER_CONFIG}"
   # eksctl streams one line per CloudFormation waiter for 15-20 minutes, and it
   # runs CONCURRENTLY with the image build, so the two interleave. Captured to a
   # log file by default; the heartbeat in the orchestration block below is what
@@ -3301,9 +3704,13 @@ quiet "eks update-kubeconfig ${CLUSTER_NAME}" \
 # =========================================================================
 # Step 6: Install NVIDIA Kubernetes Device Plugin + Prometheus Operator CRDs
 # =========================================================================
+if [[ "${LEARNER_MODE}" -eq 0 ]]; then
 step "Step 6: Ensuring NVIDIA Kubernetes Device Plugin"
 quiet "kubectl apply nvidia-device-plugin" \
   kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml || true
+else
+  step "Step 6: Skipping the NVIDIA device plugin (learner mode: no GPU nodes)"
+fi
 
 log "  Ensuring Prometheus Operator CRDs (for Triton metrics)"
 if ! kubectl get crd podmonitors.monitoring.coreos.com >/dev/null 2>&1; then
@@ -3377,6 +3784,13 @@ log "  Triton IRSA role: ${TRITON_ROLE_ARN}"
 # The optimizer reads ONNX from onnx-source/ and writes TensorRT engines to
 # triton-models/ (base engines + canary engines). It needs read+write+list.
 # =========================================================================
+# Learner mode runs no optimizer Job, so it gets no service account; the empty
+# OPTIMIZER_ROLE_ARN is substituted only into the bootstrap Job, which learner mode
+# does not apply.
+OPTIMIZER_ROLE_ARN=""
+if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+  step "Step 7.1: Skipping Model Optimizer IRSA (learner mode: no TensorRT compile)"
+else
 step "Step 7.1: Ensuring IRSA for the Model Optimizer S3 access"
 OPTIMIZER_POLICY_NAME="${STACK_NAME}-model-optimizer-s3-${STACK_UID}"
 OPTIMIZER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${OPTIMIZER_POLICY_NAME}"
@@ -3418,6 +3832,7 @@ if [[ -z "${OPTIMIZER_ROLE_ARN}" ]]; then
   fail "Model Optimizer IRSA role annotation did not populate after 30s. If model-optimizer-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa model-optimizer-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite (find the role ARN via: aws cloudformation describe-stacks --stack-name eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-model-optimizer-sa --query 'Stacks[0].Outputs')"
 fi
 log "  Model Optimizer IRSA role: ${OPTIMIZER_ROLE_ARN}"
+fi # LEARNER_MODE -eq 0 (Step 7.1)
 # =========================================================================
 # Step 7.2: IRSA for the Deal Scorer (deals table read)
 # The Deal Scorer primes its deal book from the deals table at startup and
@@ -3579,6 +3994,9 @@ step "Step 8: Applying Kubernetes manifests"
 # The deal-scorer Deployment's NCF_MODEL_LABEL (substituted below). Resolved first
 # so a missing build stops the phase before anything is applied.
 resolve_ncf_model_label
+# Node groups follow the deployment mode before any workload is applied (no-op on
+# a standard deploy of a prefix that was never in learner mode).
+reconcile_nodegroups_for_mode
 
 # --- Provision Cognito BEFORE applying manifests so the orchestrator gets the real pool ID ---
 run_step "Provisioning the Cognito user pool (orchestrator auth)" \
@@ -3641,6 +4059,9 @@ state_set "${STACK_PREFIX}" resolved \
 # `default` namespace, matching the triton-sa IRSA service account. Keeping
 # them co-located lets the orchestrator reach backends by bare service name.
 
+# Learner mode has no GPU node group and compiles nothing, so the GPU scale-up, the
+# GPU node wait and the Step 8a bootstrap Job below are standard mode only.
+if [[ "${LEARNER_MODE}" -eq 0 ]]; then
 # Steady state needs ONE GPU node (Triton only). The Model Optimizer no longer runs
 # as an always-on GPU Deployment — base engines come from a one-shot bootstrap Job
 # and promotions from on-demand Jobs. The node group can still burst to --maxGPUs
@@ -3698,13 +4119,7 @@ done
 # running on another node, and EXITS when done — no always-on optimizer pod.
 log "  Step 8a: starting base TensorRT engine build (one-shot optimizer bootstrap Job)..."
 BOOTSTRAP_MANIFEST="/tmp/${CLUSTER_NAME}-model-optimizer-bootstrap-job.yaml"
-sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
-    -e "s|__REGION__|${AWS_REGION}|g" \
-    -e "s|__REGISTRY__|${REGISTRY}|g" \
-    -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
-    -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
-    -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
-    "${SCRIPT_DIR}/eks/model-optimizer-bootstrap-job.yaml" > "${BOOTSTRAP_MANIFEST}"
+render_bootstrap_job "${BOOTSTRAP_MANIFEST}"
 # Jobs are immutable — delete any prior run before re-applying (idempotent redeploy).
 kubectl delete job model-optimizer-bootstrap --ignore-not-found >/dev/null 2>&1 || true
 quiet "kubectl apply model-optimizer-bootstrap Job" kubectl apply -f "${BOOTSTRAP_MANIFEST}"
@@ -3742,6 +4157,9 @@ log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat 
 # once the bootstrap Job genuinely completes — FR-9/R-2). This costs one extra
 # GPU node for a bit longer than before, in exchange for not blocking the rest
 # of the deploy on the bootstrap Job.
+else
+  log "  Learner mode: no GPU node scale-up and no TensorRT bootstrap Job (Triton serves ONNX Runtime and FIL on CPU)"
+fi # LEARNER_MODE -eq 0 (GPU scale-up, Step 8a)
 
 # Step 8b: apply Triton + ARTF containers + orchestrator. The Model Optimizer is
 # NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
@@ -3750,41 +4168,7 @@ log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat 
 _APPLIED_MANIFESTS=(triton-deployment.yaml triton-internal-nlb.yaml artf-containers-deployment.yaml orchestrator-deployment.yaml orchestrator-internal-nlb.yaml triton-hpa.yaml)
 for manifest in "${_APPLIED_MANIFESTS[@]}"; do
   PROCESSED="/tmp/${CLUSTER_NAME}-${manifest}"
-  sed -e "s|__STACK_NAME__|${STACK_NAME}|g" \
-      -e "s|__REGION__|${AWS_REGION}|g" \
-      -e "s|__REGISTRY__|${REGISTRY}|g" \
-      -e "s|__IMAGE_TAG__|${IMAGE_TAG}|g" \
-      -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
-      -e "s|__TRITON_ROLE_ARN__|${TRITON_ROLE_ARN}|g" \
-      -e "s|__OPTIMIZER_ROLE_ARN__|${OPTIMIZER_ROLE_ARN}|g" \
-      -e "s|__ARTF_NODE_ROLE__|${ARTF_NODE_ROLE}|g" \
-      -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
-      -e "s|__ARTF_MUTATIONS_REQUIRED_SCOPE__|${ARTF_MUTATIONS_REQUIRED_SCOPE}|g" \
-      -e "s|__PARAMETER_STORE_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store|g" \
-      -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
-      -e "s|__CONTAINER_REGISTRY_TABLE__|${CONTAINER_REGISTRY_TABLE}|g" \
-      -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
-      -e "s|__NCF_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-ncf-deal-manager|g" \
-      -e "s|__YIELD_FLOOR_MODEL_GROUP__|${YIELD_FLOOR_MODEL_GROUP}|g" \
-      -e "s|__YIELD_MARGIN_MODEL_GROUP__|${YIELD_MARGIN_MODEL_GROUP}|g" \
-      -e "s|__SAGEMAKER_TRAINING_ROLE_ARN__|arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}|g" \
-      -e "s|__TRAINING_DATA_BUCKET__|${TRAINING_DATA_BUCKET}|g" \
-      -e "s|__TRAINING_IMAGE_REGISTRY__|${REGISTRY}|g" \
-      -e "s|__XGBOOST_TRAINING_IMAGE_URI__|${XGBOOST_TRAINING_IMAGE_URI}|g" \
-      -e "s|__FEEDBACK_STREAM_NAME__|${FEEDBACK_STREAM_NAME}|g" \
-      -e "s|__DEAL_YIELD_FEEDBACK_STREAM_NAME__|${DEAL_YIELD_FEEDBACK_STREAM_NAME}|g" \
-      -e "s|__OUTCOME_SIMULATOR_ENABLED__|${OUTCOME_SIMULATOR_ENABLED}|g" \
-      -e "s|__OUTCOME_SIMULATOR_WIN_RATE__|${OUTCOME_SIMULATOR_WIN_RATE}|g" \
-      -e "s|__OUTCOME_SIMULATOR_IMPRESSION_RATE__|${OUTCOME_SIMULATOR_IMPRESSION_RATE}|g" \
-      -e "s|__OUTCOME_SIMULATOR_CLICK_RATE__|${OUTCOME_SIMULATOR_CLICK_RATE}|g" \
-      -e "s|__OUTCOME_SIMULATOR_CONVERSION_RATE__|${OUTCOME_SIMULATOR_CONVERSION_RATE}|g" \
-      -e "s|__OUTCOME_SIMULATOR_CONVERSION_VALUE__|${OUTCOME_SIMULATOR_CONVERSION_VALUE}|g" \
-      -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
-      -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
-      -e "s|__NCF_MODEL_LABEL__|${NCF_MODEL_LABEL}|g" \
-      "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
-  grep -q '__NCF_MODEL_LABEL__' "${PROCESSED}" \
-    && fail 3 "${manifest} still has an unsubstituted __NCF_MODEL_LABEL__"
+  render_manifest "${manifest}" "${PROCESSED}"
   quiet "kubectl apply ${manifest}" kubectl apply -f "${PROCESSED}"
 done
 log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"
@@ -3888,6 +4272,7 @@ quiet "deploy_cognito.py grant-ui-api-invoke" \
 # =========================================================================
 # Step 8.5: Schedule GPU node group shutdown at 8pm ET daily
 # =========================================================================
+if [[ "${LEARNER_MODE}" -eq 0 ]]; then
 step "Step 8.5: Configuring GPU scheduled shutdown (8pm ET daily)"
 
 # Find the ASG backing the GPU node group
@@ -3917,6 +4302,9 @@ if [[ -n "${GPU_ASG_NAME}" && "${GPU_ASG_NAME}" != "None" ]]; then
 else
   warn "Could not find GPU ASG — skipping scheduled shutdown setup"
 fi
+else
+  log "  Learner mode: no GPU node group, so no scheduled GPU shutdown (Step 8.5 skipped)"
+fi # LEARNER_MODE -eq 0 (Step 8.5)
 
 ok "Kubernetes workloads deployed"
 fi # START_AT <= 3 (Phase 3)
@@ -4434,6 +4822,35 @@ fi
 say ""
 print_demo_credentials
 say ""
+if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+say "  Deployment mode: LEARNER (no GPUs). Not ARTF-compliant for production workloads."
+say ""
+say "  NVIDIA Triton Inference Server:"
+say "    EKS Cluster:   ${CLUSTER_NAME}"
+say "    Triton Image:  nvcr.io/nvidia/tritonserver:24.08-py3"
+say "    Device:        CPU (cpu-services, c5.2xlarge)"
+say "    Models:        s3://${MODEL_BUCKET}/triton-models/"
+say "    Backend:       ONNX Runtime and FIL on CPU (no TensorRT compile)"
+say ""
+say "  Models served by Triton:"
+say "    dlrm_bid_shader            -- DLRM, ONNX Runtime on CPU"
+say "    ncf_deal_manager           -- NeuMF, ONNX Runtime on CPU"
+say "    deal_yield_manager_floor   -- XGBoost, FIL on CPU"
+say "    deal_yield_manager_margin  -- XGBoost, FIL on CPU"
+say ""
+say "  Containers (via orchestrator):"
+say "    Bid Pricer              -- BID_SHADE"
+say "    Audience Activator      -- ACTIVATE_SEGMENTS (rule-based, no Triton)"
+say "    Deal Scorer             -- ACTIVATE_DEALS / SUPPRESS_DEALS"
+say "    Signals Enricher        -- ADD_METRICS"
+say ""
+say "  Prebid Server is deployed (Step 12): the Auction Theater's live auction runs through it."
+say ""
+say "  The UI shows a learner-mode notice on every page load; the Governance tab is"
+say "  disabled (training, retraining and promotion require GPUs) and the Adaptive"
+say "  Bidding agent is not deployed."
+say ""
+else
 say "  NVIDIA Triton Inference Server:"
 say "    EKS Cluster:   ${CLUSTER_NAME}"
 say "    Triton Image:  nvcr.io/nvidia/tritonserver:24.08-py3"
@@ -4477,6 +4894,7 @@ case "${_bootstrap_status}" in
     ;;
 esac
 say ""
+fi
 say "  Monitoring:"
 say "    kubectl port-forward svc/triton-inference-server 8002:8002"
 say "    curl localhost:8002/metrics  # Prometheus metrics"
