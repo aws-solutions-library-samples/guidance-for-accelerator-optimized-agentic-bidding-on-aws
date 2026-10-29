@@ -62,9 +62,11 @@ SELLERSTATUS_NAMES = {
 CAMPAIGN_FIELDS = frozenset({
     "campaign_id", "campaign_name", "adomain", "creative_id", "width", "height",
     "declared_cpm", "deal_ids", "open_market", "target_categories", "media_type",
-    "duration", "audience_uplift", "note", "status",
+    "duration", "audience_uplift", "note", "status", "target_content_ids",
 })
-CAMPAIGN_REQUIRED = CAMPAIGN_FIELDS - {"note", "duration", "audience_uplift", "status"}
+CAMPAIGN_REQUIRED = CAMPAIGN_FIELDS - {"note", "duration", "audience_uplift", "status", "target_content_ids"}
+#: Prefix the demand endpoint matches in imp.metric[].type for content targeting.
+CONTENT_ID_PREFIX = "cid:"
 MEDIA_TYPES = ("banner", "video")
 
 CAMPAIGN_ACTIVE = "active"
@@ -322,6 +324,14 @@ def validate_campaign(
         problems.append(f"{where}: open_market must be true or false")
     if "target_categories" in campaign:
         _check_str_list(problems, where, "target_categories", campaign["target_categories"], NAME_MAX)
+    if "target_content_ids" in campaign:
+        content_ids = campaign["target_content_ids"]
+        _check_str_list(problems, where, "target_content_ids", content_ids, NAME_MAX)
+        if isinstance(content_ids, list) and any(
+            isinstance(c, str) and (not c.startswith(CONTENT_ID_PREFIX) or c == CONTENT_ID_PREFIX)
+            for c in content_ids
+        ):
+            problems.append(f"{where}: target_content_ids entries must look like '{CONTENT_ID_PREFIX}<id>'")
     if "status" in campaign and campaign["status"] not in CAMPAIGN_STATUSES:
         problems.append(f"{where}: status must be one of {list(CAMPAIGN_STATUSES)}")
 

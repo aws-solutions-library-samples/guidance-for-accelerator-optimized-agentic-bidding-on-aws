@@ -47,8 +47,10 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "deploy_control_plane.sh needs bash" >&
 #
 # Options:
 #   --prefix NAME               Stack prefix (or STACK_PREFIX env)
-#   --region REGION             AWS region (default: $AWS_REGION or us-east-1)
-#   --profile NAME              AWS CLI profile (default: $AWS_PROFILE, else "default")
+#   --region REGION             AWS region (default: $AWS_REGION, else the region deploy.sh
+#                               remembered for --prefix, else us-east-1)
+#   --profile NAME              AWS CLI profile (default: $AWS_PROFILE, else the profile
+#                               deploy.sh remembered for --prefix, else "default")
 #   --user-pool-id ID           Cognito user pool (default: read from the Prebid stack)
 #   --control-advertisers LIST  Comma-separated advertiser/seller domains the deploy's
 #                               client may act for. Default '*' (every record).
@@ -59,6 +61,14 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "deploy_control_plane.sh needs bash" >&
 #   --yes                       Accept the cost note without prompting (standalone only)
 #   --verbose                   Stream narration to the terminal under deploy.sh
 #   --destroy                   Remove the runtime, the stack and the ECR repository
+#   --connection-info           Deploy nothing. Read what an agent needs to connect from
+#                               AWS (not from a local file) and print it: the MCP endpoint
+#                               URL, runtime ARN, token endpoint, client id, scopes, issuer
+#                               and discovery URL, plus an MCP client config snippet.
+#     --json                    ...as one JSON object instead
+#     --token                   ...and mint a fresh access token (about 60 min) for the
+#                               config snippet. Reads the client secret from Cognito to do
+#                               so; prints the token, never the secret.
 #
 # Exit codes: 0 done; 1 failed; 2 prerequisites missing (deploy_prebid.sh warns and
 # continues on 2, fails on 1).
@@ -68,7 +78,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 BASE_NAME="${BASE_NAME:-nvidia-artf-recommenders}"
 USER_POOL_ID="${USER_POOL_ID:-}"
@@ -79,6 +89,9 @@ START_AT=1
 SKIP_BUILD=0
 ASSUME_YES=0
 DESTROY=0
+CONNECTION_INFO=0
+INFO_JSON=0
+INFO_TOKEN=0
 VERBOSE="${VERBOSE:-0}"
 DEPLOY_PROFILE="${AWS_PROFILE:-}"
 #: Set by deploy_prebid.sh (which inherits it from deploy.sh). Narration goes there.
@@ -99,7 +112,17 @@ for arg in "$@"; do
     --yes)                   ASSUME_YES=1 ;;
     --verbose)               VERBOSE=1 ;;
     --destroy)               DESTROY=1 ;;
+    --connection-info)       CONNECTION_INFO=1 ;;
+    --json)                  INFO_JSON=1 ;;
+    --token)                 INFO_TOKEN=1 ;;
     --prefix|--region|--profile|--user-pool-id|--control-advertisers|--tag|--image|--start-at) ;;
+    # deploy.sh's flags, given here by mistake. Named, because "unknown argument" does
+    # not say that this script only adds the control plane to a stack that has Prebid.
+    --with-prebid|--no-prebid|--learner-mode|--no-learner-mode|--with-control-plane|--no-control-plane)
+      printf "'%s' is a deploy.sh flag. This script installs only the control plane, onto a stack\n" "${arg}" >&2
+      printf "that already has Prebid. Either run:\n  ./deploy_control_plane.sh --prefix <prefix> [--profile NAME]\n" >&2
+      printf "or deploy (or update) everything, the control plane included:\n  ./deploy.sh --prefix <prefix> %s\n" "${arg}" >&2
+      exit 1 ;;
     -h|--help) awk '/^# ={10,}/{n++; next} n==1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)
       case "${_PREV_ARG}" in
@@ -116,6 +139,34 @@ for arg in "$@"; do
   esac
   _PREV_ARG="${arg}"
 done
+# Profile and region: an explicit flag, then the environment, then what deploy.sh
+# remembered for this prefix in .deploy-state.json, then the defaults. The same
+# order deploy.sh uses, so a prefix deployed with --profile X is not silently
+# looked for in another account.
+_remembered() {  # _remembered <key>
+  [[ -n "${STACK_PREFIX}" && -f "${SCRIPT_DIR}/.deploy-state.json" ]] || return 0
+  python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))["deployments"][sys.argv[2]]["remembered"]
+    v = d.get(sys.argv[3])
+    print(v if v else "")
+except Exception:
+    pass' "${SCRIPT_DIR}/.deploy-state.json" "${STACK_PREFIX}" "$1" 2>/dev/null || true
+}
+_PROFILE_FROM=""; _REGION_FROM=""
+_REMEMBERED_PROFILE="$(_remembered profile)"
+if [[ -n "${DEPLOY_PROFILE}" && -n "${_REMEMBERED_PROFILE}" && "${DEPLOY_PROFILE}" != "${_REMEMBERED_PROFILE}" ]]; then
+  printf '\033[0;33m[control-plane][warn]\033[0m profile %s (from --profile or AWS_PROFILE) differs from %s, the profile deploy.sh remembered for %s. If the stack is in the other account, preflight will not find it; pass --profile %s.\n' \
+    "${DEPLOY_PROFILE}" "${_REMEMBERED_PROFILE}" "${STACK_PREFIX}" "${_REMEMBERED_PROFILE}" >&2
+fi
+if [[ -z "${DEPLOY_PROFILE}" ]]; then
+  DEPLOY_PROFILE="$(_remembered profile)"; [[ -n "${DEPLOY_PROFILE}" ]] && _PROFILE_FROM=" (remembered for ${STACK_PREFIX})"
+fi
+if [[ -z "${AWS_REGION}" ]]; then
+  AWS_REGION="$(_remembered region)"; [[ -n "${AWS_REGION}" ]] && _REGION_FROM=" (remembered for ${STACK_PREFIX})"
+fi
+AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_REGION
 export AWS_PROFILE="${DEPLOY_PROFILE:-default}"
 
 if ! [[ "${START_AT}" =~ ^[1-5]$ ]]; then echo "--start-at must be 1 to 5" >&2; exit 1; fi
@@ -149,6 +200,13 @@ RUNTIME_NAME="$(printf '%s' "${STACK_NAME}_control" | tr '-' '_')"
 SCOPE_PREFIX="artf-control"
 RECORD_FILE="${REPO_ROOT}/.control-plane-deployment.json"
 PYTHON="${PYTHON:-python3}"
+# The interpreter the printed verify commands name. The deploy venv has mcp and
+# certifi; a bare python3 may have neither.
+if [[ -x "${SCRIPT_DIR}/.deploy-venv/bin/python" ]]; then
+  CONNECT_PYTHON="${SCRIPT_DIR}/.deploy-venv/bin/python"
+else
+  CONNECT_PYTHON="${PYTHON}"
+fi
 
 stack_output() {
   aws cloudformation describe-stacks --stack-name "$1" --region "${AWS_REGION}" \
@@ -159,6 +217,13 @@ runtime_field() {  # runtime_field <name> <field>
     --query "agentRuntimes[?agentRuntimeName=='$1'].$2 | [0]" --output text 2>/dev/null \
     | sed 's/^None$//'
 }
+# The AgentCore streamable-HTTP URL for a runtime: the ARN percent-encoded into the
+# PATH (colons and the slash). Same construction as scripts/control_plane_connect.py.
+mcp_url_for() {  # mcp_url_for <runtime-arn> <region>
+  printf 'https://bedrock-agentcore.%s.amazonaws.com/runtimes/%s/invocations?qualifier=DEFAULT' \
+    "$2" "$(printf '%s' "$1" | sed -e 's/:/%3A/g' -e 's#/#%2F#g')"
+}
+
 # Content hash of everything that goes into the image, so an unchanged source is
 # not rebuilt and a changed one is never mistaken for the previous image.
 source_hash() {
@@ -166,6 +231,108 @@ source_hash() {
     find control_plane -type f -name '*.py' -print0 | sort -z | xargs -0 cat; \
     cat Dockerfile.control-plane requirements-control-plane.txt ) | shasum -a 256 | cut -c1-16
 }
+
+# ============================================================ CONNECTION INFO
+# Everything read live from AWS, so it works from any machine with credentials for
+# the account, not only the one that ran the deploy. Deploys nothing.
+if [[ "${CONNECTION_INFO}" -eq 1 ]]; then
+  _v() { local x; x="$(stack_output "$1" "$2")"; [[ "${x}" == "None" ]] && x=""; printf '%s' "${x}"; }
+  CI_RUNTIME_ARN="$(runtime_field "${RUNTIME_NAME}" agentRuntimeArn)"
+  CI_CLIENT_ID="$(_v "${CP_STACK}" ControlClientId)"
+  CI_SCOPES="$(_v "${CP_STACK}" ControlScopes)"
+  CI_ISSUER="$(_v "${CP_STACK}" TokenIssuer)"
+  CI_DISCOVERY="$(_v "${CP_STACK}" DiscoveryUrl)"
+  CI_TOKEN_ENDPOINT="$(_v "${PREBID_STACK}" TokenEndpoint)"
+  CI_POOL="${USER_POOL_ID:-${CI_ISSUER##*/}}"
+  if [[ -z "${CI_RUNTIME_ARN}" || -z "${CI_CLIENT_ID}" ]]; then
+    printf 'The control plane is not deployed for prefix %s in %s (no runtime %s or no stack %s).\n' \
+      "${STACK_PREFIX:-<none>}" "${AWS_REGION}" "${RUNTIME_NAME}" "${CP_STACK}" >&2
+    printf 'Deploy it: ./deploy.sh --prefix %s --with-prebid   (or ./deploy_control_plane.sh --prefix %s)\n' \
+      "${STACK_PREFIX}" "${STACK_PREFIX}" >&2
+    exit 1
+  fi
+  CI_MCP_URL="$(mcp_url_for "${CI_RUNTIME_ARN}" "${AWS_REGION}")"
+  CI_TOKEN=""; CI_TOKEN_EXPIRES=""
+  if [[ "${INFO_TOKEN}" -eq 1 ]]; then
+    # The secret is read into this process only, handed to python on stdin, and never
+    # printed; only the resulting short-lived access token is shown.
+    _secret="$(aws cognito-idp describe-user-pool-client --user-pool-id "${CI_POOL}" --client-id "${CI_CLIENT_ID}" \
+      --region "${AWS_REGION}" --query 'UserPoolClient.ClientSecret' --output text 2>/dev/null || true)"
+    [[ -n "${_secret}" && "${_secret}" != "None" ]] || { echo "could not read the client secret (needs cognito-idp:DescribeUserPoolClient)" >&2; exit 1; }
+    _tok="$(printf '%s' "${_secret}" | "${PYTHON}" -c '
+import base64, json, sys, urllib.parse, urllib.request
+endpoint, client_id, scopes, scripts = sys.argv[1:5]
+sys.path.insert(0, scripts)
+from control_plane_connect import tls_context
+secret = sys.stdin.read()
+basic = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
+req = urllib.request.Request(endpoint, method="POST",
+    data=urllib.parse.urlencode({"grant_type": "client_credentials", "scope": scopes}).encode(),
+    headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"})
+with urllib.request.urlopen(req, timeout=15, context=tls_context()) as r:
+    body = json.loads(r.read())
+print(body["access_token"], body.get("expires_in", ""))
+' "${CI_TOKEN_ENDPOINT}" "${CI_CLIENT_ID}" "${CI_SCOPES}" "${SCRIPT_DIR}/scripts")" || { echo "token request to ${CI_TOKEN_ENDPOINT} failed" >&2; exit 1; }
+    unset _secret
+    CI_TOKEN="${_tok%% *}"; CI_TOKEN_EXPIRES="${_tok##* }"
+  fi
+  "${PYTHON}" - "${INFO_JSON}" "${CI_MCP_URL}" "${CI_RUNTIME_ARN}" "${AWS_REGION}" "${CI_TOKEN_ENDPOINT}" \
+      "${CI_CLIENT_ID}" "${CI_SCOPES}" "${CI_ISSUER}" "${CI_DISCOVERY}" "${CI_POOL}" "${CI_TOKEN}" "${CI_TOKEN_EXPIRES}" "${CONNECT_PYTHON}" "${SCRIPT_DIR}" <<'PY'
+import json, sys
+(as_json, url, arn, region, token_ep, client_id, scopes, issuer, discovery, pool, token, expires,
+ connect_python, script_dir) = sys.argv[1:15]
+secret_cmd = (f"aws cognito-idp describe-user-pool-client --user-pool-id {pool} --client-id {client_id} "
+              f"--region {region} --query UserPoolClient.ClientSecret --output text")
+client_cfg = {"mcpServers": {"artf-control-plane": {
+    "url": url,
+    "headers": {"Authorization": f"Bearer {token or '<access token>'}"},
+}}}
+info = {
+    "mcp_url": url, "transport": "streamable-http", "runtime_arn": arn, "region": region,
+    "oauth": {"grant_type": "client_credentials", "token_endpoint": token_ep, "client_id": client_id,
+              "client_auth": "HTTP Basic (client_id:client_secret)", "scopes": scopes.split(),
+              "issuer": issuer, "discovery_url": discovery, "client_secret_command": secret_cmd},
+    "mcp_client_config": client_cfg,
+}
+if token:
+    info["access_token"] = token
+    info["access_token_expires_in"] = int(expires) if expires.isdigit() else expires
+if as_json == "1":
+    print(json.dumps(info, indent=2))
+    sys.exit(0)
+print(f"""
+Campaign/deals MCP control plane: connection details ({region})
+
+  MCP endpoint (streamable HTTP)
+    {url}
+  Runtime ARN      {arn}
+
+  OAuth 2.0 client_credentials
+    Token endpoint {token_ep}
+    Client id      {client_id}
+    Client auth    HTTP Basic with client_id:client_secret
+    Scopes         {scopes}
+    Issuer         {issuer}
+    Discovery URL  {discovery}
+    Client secret  not printed; read it with:
+                   {secret_cmd}
+
+  Every MCP request carries:  Authorization: Bearer <access token>
+  Tokens last about 60 minutes; fetch a new one from the token endpoint when it expires.
+""")
+if token:
+    print(f"  Access token (expires in {expires}s):\n    {token}\n")
+print("  MCP client config (clients that take a URL and headers):")
+print("    " + json.dumps(client_cfg, indent=2).replace("\n", "\n    "))
+if not token:
+    print("\n  Add --token to fill in a freshly minted access token.")
+print("\n  Verify the whole path (token, authorizer, container, tools):")
+print(f"    {connect_python} {script_dir}/scripts/control_plane_connect.py --runtime-arn {arn} \\")
+print(f"      --token-endpoint {token_ep} --client-id {client_id} --client-secret \"$({secret_cmd})\" \\")
+print("      --call-tool list_campaigns")
+PY
+  exit 0
+fi
 
 # ===================================================================== DESTROY
 if [[ "${DESTROY}" -eq 1 ]]; then
@@ -234,7 +401,7 @@ REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 SRC_HASH="$(source_hash)"
 IMAGE_TAG="${IMAGE_TAG:-src-${SRC_HASH}}"
 IMAGE_URI="${IMAGE_URI:-${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}}"
-log "  account ${ACCOUNT_ID}, region ${AWS_REGION}, pool ${USER_POOL_ID}"
+log "  account ${ACCOUNT_ID}, profile ${AWS_PROFILE}${_PROFILE_FROM}, region ${AWS_REGION}${_REGION_FROM}, pool ${USER_POOL_ID}"
 log "  runtime ${RUNTIME_NAME}, stack ${CP_STACK}, image ${IMAGE_URI}"
 
 # Standalone, the cost note is shown and confirmed here. Under deploy.sh the Prebid
@@ -377,6 +544,7 @@ record = {
     "region": "${AWS_REGION}",
     "runtime_name": "${RUNTIME_NAME}",
     "runtime_arn": "${RUNTIME_ARN}",
+    "mcp_url": "$(mcp_url_for "${RUNTIME_ARN}" "${AWS_REGION}")",
     "ecr_repository": "${ECR_REPO}",
     "image": "${IMAGE_URI}",
     "deals_table": "${DEALS_TABLE}",
@@ -399,17 +567,23 @@ cat <<EOF
   Campaign/deals control plane deployed.
     Runtime      ${RUNTIME_NAME}
     Runtime ARN  ${RUNTIME_ARN}
+    MCP URL      $(mcp_url_for "${RUNTIME_ARN}" "${AWS_REGION}")
     Client id    ${CLIENT_ID}   (scopes: ${CONTROL_SCOPES})
     Token URL    ${TOKEN_ENDPOINT}
+
+  Full connection details, from any machine with access to the account:
+    ${SCRIPT_DIR}/deploy_control_plane.sh${STACK_PREFIX:+ --prefix ${STACK_PREFIX}} --region ${AWS_REGION} --connection-info [--token] [--json]
 
   Seeded campaigns are PAUSED until activated through the control plane. Verify the
   path and activate one (the secret is read from the app client at run time):
 
     export CLIENT_SECRET=\$(aws cognito-idp describe-user-pool-client --user-pool-id ${USER_POOL_ID} \\
       --client-id ${CLIENT_ID} --region ${AWS_REGION} --query UserPoolClient.ClientSecret --output text)
-    python3 ${SCRIPT_DIR}/scripts/control_plane_connect.py --runtime-arn ${RUNTIME_ARN} \\
+    ${CONNECT_PYTHON} ${SCRIPT_DIR}/scripts/control_plane_connect.py --runtime-arn ${RUNTIME_ARN} \\
       --token-endpoint ${TOKEN_ENDPOINT} --client-id ${CLIENT_ID} --client-secret "\$CLIENT_SECRET" \\
       --call-tool list_campaigns
-    python3 ${SCRIPT_DIR}/scripts/control_plane_connect.py ... --call-tool activate_campaign --arg campaign_id=camp-cedar
+    ${CONNECT_PYTHON} ${SCRIPT_DIR}/scripts/control_plane_connect.py --runtime-arn ${RUNTIME_ARN} \\
+      --token-endpoint ${TOKEN_ENDPOINT} --client-id ${CLIENT_ID} --client-secret "\$CLIENT_SECRET" \\
+      --call-tool activate_campaign --arg campaign_id=camp-cedar
 
 EOF

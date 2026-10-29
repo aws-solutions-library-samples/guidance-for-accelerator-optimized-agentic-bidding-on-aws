@@ -81,7 +81,7 @@ fi
 #                                               # Prebid without the campaign/deals MCP control plane
 #   ./deploy.sh --prefix dv1                   # FULL stack incl. Part 2 closed-loop (default)
 #   ./deploy.sh --no-retraining                # Part 1 only (skip NeMo-RL, Model Registry, Glue ETL, agents)
-#   ./deploy.sh --model-id global.anthropic.claude-opus-4-8  # override the agents' Bedrock model
+#   ./deploy.sh --model-id global.anthropic.claude-opus-5-5  # override the agents' Bedrock model
 #   ./deploy.sh --local-build                  # build images locally with Docker (requires ~30 GB free disk)
 #   ./deploy.sh --ngc-key KEY                  # NGC key stored automatically (for NeMo builds)
 #   ./deploy.sh --ui-only                      # redeploy frontend only (fast)
@@ -224,10 +224,11 @@ _DEPLOY_ARGV=("$@")
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
 # Auction Theater caption model. The `global.` inference profile is available in
-# every region, so this needs no per-region variation. Haiku 4.5 supports
-# INFERENCE_PROFILE only -- the bare model id is not a usable alternative.
+# every region, so this needs no per-region variation. Haiku 5.5 has no
+# in-Region endpoint on bedrock-runtime, so the bare model id is not a usable
+# alternative.
 # Override to a us./eu./au./jp. profile for in-geography routing.
-CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID:-global.anthropic.claude-haiku-4-5-20251001-v1:0}"
+CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID:-global.anthropic.claude-haiku-5-5}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 STACK_NAME="${STACK_NAME:-nvidia-artf-recommenders}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo latest)}"
@@ -266,7 +267,7 @@ LOCAL_BUILD=0
 NGC_SECRET="${NGC_SECRET:-}"
 NGC_KEY="${NGC_KEY:-}"
 # Bedrock model id for the Part 2 reasoning agents (Adaptive Bidding + Governance).
-# Model access is automatic, so this defaults to the Claude Opus 4.8 GLOBAL
+# Model access is automatic, so this defaults to the Claude Opus 5.5 GLOBAL
 # cross-region inference profile (set below). Override with BEDROCK_MODEL_ID /
 # --model-id, or per-agent with ADAPTIVE_BIDDING_MODEL_ID / GOVERNANCE_MODEL_ID.
 # Forwarded to deploy_closed_loop.sh in Step 11.
@@ -441,11 +442,11 @@ if [[ "${WITH_PREBID}" -eq 1 ]]; then
 fi
 
 # Resolve the Bedrock model id for the Part 2 reasoning agents. Model access is
-# automatic, so default to the Claude Opus 4.8 GLOBAL cross-region inference profile,
+# automatic, so default to the Claude Opus 5.5 GLOBAL cross-region inference profile,
 # which routes to all commercial regions and works from any source region.
 # Overridable via BEDROCK_MODEL_ID / --model-id.
 if [[ -z "${BEDROCK_MODEL_ID}" ]]; then
-  BEDROCK_MODEL_ID="global.anthropic.claude-opus-4-8"
+  BEDROCK_MODEL_ID="global.anthropic.claude-opus-5-5"
 fi
 # Per-agent overrides fall back to the shared model id (mirrors deploy_closed_loop.sh).
 ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID:-${BEDROCK_MODEL_ID}}"

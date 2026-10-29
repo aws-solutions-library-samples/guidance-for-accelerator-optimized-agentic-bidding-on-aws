@@ -139,7 +139,7 @@ DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups
 with a **genesis (v1)** starter version per model type, the two Glue ETL jobs
 (every 6 hours), the training image (built asynchronously into the shared
 `artf-nemo-rl-training` ECR repository), both AgentCore agent runtimes
-backed by `global.anthropic.claude-opus-4-8` (change with `--model-id`), and the
+backed by `global.anthropic.claude-opus-5-5` (change with `--model-id`), and the
 EventBridge schedules: the Adaptive Bidding Agent every 24 hours (the
 `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml`)
 and retraining every 24 hours. [GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps) lists
@@ -198,7 +198,7 @@ The following is in addition to Part 1's base cost (see [README.md](README.md#co
 | AWS Glue | 2 jobs × 10 G.1X workers, every 6 hours, ~5 min per run | ~$88 |
 | Amazon DynamoDB | 3 tables, on-demand | ~$5 |
 | Amazon SageMaker Training | up to 4 jobs/day on ml.g5.2xlarge ($1.515/h), ~30 min each when the data passes the gate; about $5/month when every job stops at the gate | up to ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus (`global.anthropic.claude-opus-4-8`), every 24 hours, ~10K in / 1K out tokens per call ($5 / $25 per million) | ~$2 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus (`global.anthropic.claude-opus-5-5`), every 24 hours, ~10K in / 1K out tokens per call ($4 / $20 per million) | ~$2 |
 | Amazon Bedrock (Governance Agent) | Same model, invoked on model registration only | ~$10 |
 | Amazon Bedrock AgentCore | Runtime consumption for both agents | ~$1 |
 | Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC secret, 2 schedules, VPC proxy function, alerts topic | ~$2 |

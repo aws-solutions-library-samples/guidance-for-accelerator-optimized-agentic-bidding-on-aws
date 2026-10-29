@@ -417,7 +417,7 @@ Deploy options (each flag's default is in parentheses):
 ./deploy.sh --prefix dv1 --skip-cluster     # reuse the existing EKS cluster
 ./deploy.sh --prefix dv1 --maxGPUs 5        # GPU node group maximum (default 3)
 ./deploy.sh --prefix dv1 --artf-on-gpu      # run the ARTF containers on the GPU node (default: CPU node group)
-./deploy.sh --prefix dv1 --model-id ID      # Bedrock model for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --model-id ID      # Bedrock model for both agents (default: global.anthropic.claude-opus-5-5)
 ./deploy.sh --prefix dv1 --start-at 3       # force a starting phase, 1-5 (default: probe AWS, run what is missing)
 ./deploy.sh --prefix dv1 --export-only      # only export and upload the models
 ./deploy.sh --prefix dv1 --ui-only          # only redeploy the frontend

@@ -103,6 +103,38 @@ def _targets(campaign: Campaign, categories: tuple[str, ...]) -> bool:
     return any(c in campaign.target_categories for c in categories)
 
 
+CONTENT_ID_PREFIX = "cid:"
+
+
+def _content_ids_of(imp: dict) -> tuple[str, ...]:
+    """Content identifiers on the impression: ``imp.metric[].type`` values with the ``cid:`` prefix.
+
+    The ADD_CIDS container appends them through the ARTF applier, which accepts that
+    intent only on ``/imp/{impId}/metric``. The prefix is kept, so a campaign targets
+    ``cid:premium-drama-finale``.
+    """
+    out = []
+    for metric in (imp or {}).get("metric") or []:
+        if not isinstance(metric, dict):
+            continue
+        mtype = metric.get("type")
+        if isinstance(mtype, str) and mtype.startswith(CONTENT_ID_PREFIX):
+            out.append(mtype)
+    return tuple(out)
+
+
+def _targets_content(campaign: Campaign, content_ids: tuple[str, ...]) -> bool:
+    """Whether the campaign's content-id targeting matches.
+
+    No target list means no restriction. Unlike categories, a campaign that names
+    content ids needs one of them on the impression: an absent signal does not
+    match, because the campaign is bought on that signal.
+    """
+    if not campaign.target_content_ids:
+        return True
+    return any(c in campaign.target_content_ids for c in content_ids)
+
+
 def _media_types_of(imp: dict) -> tuple[str, ...]:
     """The media types the impression actually offers a slot for.
 
@@ -131,6 +163,7 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
     deals = _deals_on(imp)
     deals_by_id = {d.get("id"): d for d in deals if d.get("id")}
     categories = _categories_of(imp)
+    content_ids = _content_ids_of(imp)
     media_types = _media_types_of(imp)
 
     candidates: list[Candidate] = []
@@ -159,7 +192,7 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
 
         if not matching:
             if campaign.open_market:
-                if not _targets(campaign, categories):
+                if not (_targets(campaign, categories) and _targets_content(campaign, content_ids)):
                     candidates.append(
                         Candidate(campaign, None, ExclusionReason.NOT_TARGETED)
                     )
@@ -193,7 +226,7 @@ def evaluate(imp: dict, catalog: CampaignCatalog) -> tuple[Candidate, ...]:
             continue
 
         deal = live[0]
-        if not _targets(campaign, categories):
+        if not (_targets(campaign, categories) and _targets_content(campaign, content_ids)):
             candidates.append(Candidate(campaign, deal, ExclusionReason.NOT_TARGETED))
             continue
 

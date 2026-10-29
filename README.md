@@ -332,7 +332,7 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 | AWS Glue | 2 ETL jobs × 10 G.1X workers, each on a `cron(0 */6 * * ? *)` schedule (4 runs/day), ~5 min per run at $0.44/DPU-h | Part 2 | ~$88 |
 | Amazon DynamoDB | `parameter-store`, `audit-trail`, `user-features` (on-demand) | Part 2 | ~$5 |
 | Amazon SageMaker Training | up to 4 jobs per daily `rate(24 hours)` trigger on `ml.g5.2xlarge` at $1.515/h, ~30 min each when the data passes the trainer's gate (about $5 when every job stops at the gate) | Part 2 | up to ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-4-8` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation ($5 / $25 per million) | Part 2 | ~$2 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus via the `global.anthropic.claude-opus-5-5` inference profile, invoked every 24 hours (30 invocations/mo) at ~10K input / 1K output tokens per invocation ($4 / $20 per million) | Part 2 | ~$2 |
 | Amazon Bedrock (Governance Agent) | same model, invoked on model registration events only | Part 2 | ~$10 |
 | Amazon Bedrock AgentCore | runtime consumption for both agents ($0.1276/vCPU-h, $0.0169/GB-h, billed per second), ~30 s per invocation | Part 2 | ~$1 |
 | AWS Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC key secret ($0.40), 2 schedules, `vpc-optimizer-proxy` Lambda, alerts topic | Part 2 | ~$2 |
@@ -343,7 +343,7 @@ Estimate for a default `./deploy.sh --prefix <p>` run in `us-east-1`, priced fro
 
 - **GPU hours.** The deploy installs one scheduled action: the GPU node group scales to zero at 8:00 PM America/New_York every day. Nothing scales it back up automatically; the **Start GPUs** button in the UI does. 260 hours per month corresponds to starting it each weekday morning. Running it 24/7 makes the GPU line $734 and the total roughly **$1,945**. Leaving it stopped makes the GPU line $0.
 - **CPU nodes.** The `cpu-services` node group starts at 3 nodes (minimum 2, maximum 8, `deployment/eks/cluster-config.yaml`). There is no Cluster Autoscaler in this deployment, so the node count only changes when you change it. Dropping to the minimum of 2 saves $248.
-- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count, about $0.075 per invocation at ~10K input and ~1K output tokens: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. The schedule can also be disabled with the AWS CLI, which takes this line to zero without a teardown (see [pausing scheduled components](GUIDANCE-part2.md#pausing-scheduled-components)). Model choice is `--model-id` (default `global.anthropic.claude-opus-4-8`); a smaller model lowers the per-token rate.
+- **Agent cadence is the largest variable.** The Adaptive Bidding Agent runs once every 24 hours by default. The cadence is the `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml` (default `rate(24 hours)`), which feeds the EventBridge Scheduler schedule `<prefix>-adaptive-bidding-scheduler`. To change it, edit the parameter default in that template and re-run `deploy.sh --prefix <p> --start-at 5`, or pass a different `ParameterValue` for `AdaptiveBiddingScheduleRate` in the `deploy_cfn_stack` call for the governance-eventbridge stack in `deployment/deploy_closed_loop.sh`. The Bedrock line scales linearly with the invocation count, about $0.075 per invocation at ~10K input and ~1K output tokens: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. The schedule can also be disabled with the AWS CLI, which takes this line to zero without a teardown (see [pausing scheduled components](GUIDANCE-part2.md#pausing-scheduled-components)). Model choice is `--model-id` (default `global.anthropic.claude-opus-5-5`); a smaller model lowers the per-token rate.
 - **SageMaker training** starts every day from the first day, because the genesis model versions are registered as Approved. A job with no or unfit data ends at the trainer's dataset gate after a minute or two of billing, so this line sits near $5 until datasets pass the gate and grows toward ~$91 as they do.
 - **Part 1 only.** `--no-retraining` removes every Part 2 row: about **$1,225/month** scheduled, **$1,700/month** with the GPU on 24/7.
 - **Prebid variant.** `--with-prebid` adds about $0.40/month standing (one more Secrets Manager secret); Prebid Server, the artfhouse demand service and the bidder simulator run in the existing cluster and add no nodes or load balancers. It also deploys the [campaign/deals MCP control plane](#managing-campaigns-and-deals-with-an-agent) unless `--no-control-plane`: one AgentCore runtime billed per second only while a tool call's session runs ($0.1276/vCPU-h, $0.0169/GB-h), so well under $1/month at demonstration volume (1,000 tool calls of about 1 s CPU and 30 s at 0.25 GB is about $0.07) and $0 when idle, plus one small ECR repository. Its Cognito resource server, app client and IAM role have no standing charge. See [its cost note](#cost-1). AgentCore rates are from the [AgentCore pricing page](https://aws.amazon.com/bedrock/agentcore/pricing/) Runtime example, read 2026-10-23.
@@ -364,7 +364,7 @@ brew install jq eksctl kubectl                   # or your Linux package manager
 docker buildx version                            # only needed for --local-build
 ```
 
-**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-4-8` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region. Check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
+**AWS account requirements:** permission to create Amazon EKS clusters, EC2 instances (including `g5` GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, AWS CodeBuild projects, CloudFront distributions, Cognito user and identity pools, DynamoDB tables, Lambda functions, Amazon Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles. The default Part 2 deploy additionally needs Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager and SNS, plus Amazon Bedrock access to the Claude model behind `global.anthropic.claude-opus-5-5` (Anthropic models require a one-time use-case form in the Bedrock console). A `g5.xlarge` (NVIDIA A10G) service quota in your target Region. Check the *Running On-Demand G and VT instances* quota in the [Service Quotas console](https://console.aws.amazon.com/servicequotas/) before deploying; the GPU node group also accepts `g5.2xlarge` and `g5.4xlarge` when the smaller size is unavailable.
 
 **NVIDIA NGC API key:** required by default, since Part 2 (closed-loop retraining) is on unless you pass `--no-retraining`; it is used only to pull the gated NeMo-RL base image, and is stored once in Secrets Manager as `<prefix>-nvidia-artf-recommenders-ngc-api-key`. `nvcr.io/nvidia/tritonserver` itself is a public image and needs no key. See the [Quick start](#quick-start) above for how to get one.
 
@@ -392,7 +392,7 @@ Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the c
 ./deploy.sh --prefix dv1 --skip-cluster    # reuse the existing EKS cluster
 ./deploy.sh --prefix dv1 --maxGPUs 5       # GPU node group maximum size (default 3; the group starts at 1 node)
 ./deploy.sh --prefix dv1 --artf-node-role inference   # schedule the ARTF containers on the GPU node (default: services, the CPU node group); --artf-on-gpu is the same thing
-./deploy.sh --prefix dv1 --model-id ID     # Bedrock model or inference profile for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --model-id ID     # Bedrock model or inference profile for both agents (default: global.anthropic.claude-opus-5-5)
 ./deploy.sh --prefix dv1 --start-at 3      # force a starting phase, 1-5 (default: probe AWS and run whatever is missing)
 ./deploy.sh --prefix dv1 --export-only     # only export the ONNX/XGBoost models and upload them to S3
 ./deploy.sh --prefix dv1 --ui-only         # only rebuild and redeploy the frontend
@@ -402,7 +402,7 @@ Every flag below has a default; a plain `./deploy.sh --prefix dv1` deploys the c
 DEPLOY_NO_SPINNER=1 ./deploy.sh --prefix dv1   # hold the progress line still (no animation)
 AWS_REGION=us-west-2 ./deploy.sh --prefix dv1  # deploy to a different Region (default: us-east-1)
 ADAPTIVE_BIDDING_MODEL_ID=... GOVERNANCE_MODEL_ID=... ./deploy.sh --prefix dv1   # per-agent model override (default: the --model-id value)
-CAPTION_INFERENCE_PROFILE_ID=... ./deploy.sh --prefix dv1   # model the frontend uses for captions (default: global.anthropic.claude-haiku-4-5-20251001-v1:0)
+CAPTION_INFERENCE_PROFILE_ID=... ./deploy.sh --prefix dv1   # model the frontend uses for captions (default: global.anthropic.claude-haiku-5-5)
 DEMO_USER_EMAIL=you@example.com ./deploy.sh --prefix dv1    # demo Cognito user (default: admin@example.com)
 ```
 
@@ -892,8 +892,12 @@ The switch is `PREBID_AUCTION_URL`, set on the orchestrator by `deploy_prebid.sh
 > **On a fresh deploy with the control plane, activate the buyers first.** Seeded campaigns start `paused`, so until one is activated every campaign declines with `campaign_paused` and the second pass below has no deal buyer. Activate the one this walkthrough uses (and any others you want bidding) with the control plane:
 >
 > ```bash
-> python3 deployment/scripts/control_plane_connect.py ... --call-tool activate_campaign --arg campaign_id=camp-cedar
+> deployment/.deploy-venv/bin/python deployment/scripts/control_plane_connect.py --runtime-arn <runtime ARN> \
+>   --token-endpoint <token endpoint> --client-id <client id> --client-secret "$CLIENT_SECRET" \
+>   --call-tool activate_campaign --arg campaign_id=camp-cedar
 > ```
+>
+> `deploy_control_plane.sh --connection-info` prints the values. All four connection arguments are required on every call.
 >
 > The connection values are in [Managing campaigns and deals with an agent](#managing-campaigns-and-deals-with-an-agent). The demand service sees the change within its 30 second refresh. A stack deployed with `--no-control-plane` seeds campaigns active and needs no step.
 
@@ -982,26 +986,42 @@ With `--with-prebid`, `deploy_prebid.sh` Step 9 runs `deployment/deploy_control_
 
 A write reaches the bid path within one 30 second refresh of the demand service and the Deal Scorer, with no restart; every write response says so (`visible_within_seconds: 30`). Ids are lowercase letters, digits and hyphens, at most 64 characters.
 
-**Connecting.** The deploy prints these values (never the secret) and records them in `.control-plane-deployment.json`:
+**Connecting.** One command prints everything an agent or MCP client needs, read live from AWS so it works from any machine with credentials for the account:
 
 ```bash
-R=us-east-1; P=<prefix>
-CP=$(cat .control-plane-deployment.json)
-export RUNTIME_ARN=$(echo "$CP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtime_arn"])')
-export TOKEN_ENDPOINT=$(echo "$CP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token_endpoint"])')
-export CLIENT_ID=$(echo "$CP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["control_client_id"])')
-export POOL_ID=$(echo "$CP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_pool_id"])')
-# The secret lives on the app client, never in a stack output or a file
-export CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id "$POOL_ID" \
-  --client-id "$CLIENT_ID" --region "$R" --query 'UserPoolClient.ClientSecret' --output text)
+cd deployment
+./deploy_control_plane.sh --prefix <prefix> --connection-info            # human-readable
+./deploy_control_plane.sh --prefix <prefix> --connection-info --json     # for scripts
+./deploy_control_plane.sh --prefix <prefix> --connection-info --token    # also mint a ~60 min access token
+```
 
-# token -> AgentCore -> container -> tools, each step reported on its own
-python3 deployment/scripts/control_plane_connect.py --runtime-arn "$RUNTIME_ARN" \
-  --token-endpoint "$TOKEN_ENDPOINT" --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
+It deploys nothing. Add `--profile` and `--region` if they are not your defaults. What it prints:
+
+| Item | What it is |
+|---|---|
+| MCP endpoint | `https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<runtime ARN, percent-encoded>/invocations?qualifier=DEFAULT`, streamable HTTP. There is no AgentCore Gateway in front; the client talks to the runtime directly |
+| Runtime ARN | the `<stack>_control` AgentCore runtime |
+| Token endpoint | `https://<domain>.auth.<region>.amazoncognito.com/oauth2/token`, the Cognito hosted domain the Prebid stack created |
+| Client id | the `<prefix>-artf-control` app client |
+| Client auth | HTTP Basic with `client_id:client_secret`, `grant_type=client_credentials` |
+| Scopes | `artf-control/campaigns:read artf-control/campaigns:write artf-control/deals:read artf-control/deals:write` |
+| Issuer, discovery URL | the user pool's, as AgentCore's authorizer validates them |
+| Client secret | never printed; the command to read it from the app client (`cognito-idp:DescribeUserPoolClient`) is |
+| MCP client config | an `mcpServers` snippet with the URL and an `Authorization: Bearer` header, for clients that take a URL and headers |
+
+Every MCP request carries `Authorization: Bearer <access token>`. Tokens last about 60 minutes, so a long-running agent fetches a new one from the token endpoint when it expires; a static config snippet with a pasted token stops working after an hour. The same values are in `.control-plane-deployment.json` on the machine that ran the deploy (never the secret).
+
+Verify the whole path (token, authorizer, container, tools), each step reported on its own; `--connection-info` prints this command with your values filled in:
+
+```bash
+python3 deployment/scripts/control_plane_connect.py --runtime-arn <runtime ARN> \
+  --token-endpoint <token endpoint> --client-id <client id> \
+  --client-secret "$(aws cognito-idp describe-user-pool-client --user-pool-id <pool> \
+      --client-id <client id> --query UserPoolClient.ClientSecret --output text)" \
   --call-tool list_campaigns --arg status=paused
 ```
 
-`control_plane_connect.py` needs the `mcp` package (`pip install mcp`). An agent framework needs the same two things it does: a token from the Cognito token endpoint (`grant_type=client_credentials`, the client as HTTP Basic, scope `artf-control/campaigns:read artf-control/campaigns:write artf-control/deals:read artf-control/deals:write`), and the streamable-HTTP URL `https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<percent-encoded runtime ARN>/invocations?qualifier=DEFAULT` with `authorization: Bearer <token>`.
+`control_plane_connect.py` needs the `mcp` package (`pip install mcp`; the deploy venv at `deployment/.deploy-venv` has it) and verifies TLS against `certifi`'s CA bundle, so a python.org macOS Python without its certificates installed still works. It is also a working example of the token fetch and the streamable-HTTP connection an agent framework makes.
 
 **Three clients, never merged.**
 

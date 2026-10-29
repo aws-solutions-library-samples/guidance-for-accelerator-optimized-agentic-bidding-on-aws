@@ -1901,11 +1901,16 @@ test_control_plane_gate() {
   out="$(_cp_run "${D}/deploy_control_plane.sh" --nope)"; rc=$?
   assert_eq "${rc}" "1" "deploy_control_plane.sh exits 1 on an unknown flag"
   assert_contains "${out}" "unknown argument '--nope'" "deploy_control_plane.sh names the unknown flag"
+  out="$(_cp_run "${D}/deploy_control_plane.sh" --prefix abc --with-prebid)"; rc=$?
+  assert_eq "${rc}" "1" "deploy_control_plane.sh refuses a deploy.sh flag"
+  assert_contains "${out}" "'--with-prebid' is a deploy.sh flag" "and says which script the flag belongs to"
+  assert_contains "${out}" "./deploy.sh --prefix <prefix> --with-prebid" "and gives the deploy.sh command"
   out="$(_cp_run "${D}/deploy_control_plane.sh" --start-at 9)"; rc=$?
   assert_eq "${rc}" "1" "deploy_control_plane.sh rejects an out-of-range --start-at"
   out="$(_cp_run "${D}/deploy_control_plane.sh" --help)"; rc=$?
   assert_eq "${rc}" "0" "deploy_control_plane.sh --help exits 0"
   assert_contains "${out}" "--no-control-plane" "the help names the opt-out that reaches it from deploy_prebid.sh"
+  assert_contains "${out}" "--connection-info" "the help documents the connection-info mode"
   assert_contains "${out}" "Exit codes" "the help documents the exit-code contract deploy_prebid.sh relies on"
 
   src="$(cat "${D}/deploy_control_plane.sh")"
@@ -1913,10 +1918,18 @@ test_control_plane_gate() {
   assert_contains "${src}" 'customJWTAuthorizer' "the runtime is registered with an inbound JWT authorizer"
   assert_contains "${src}" 'ARTF_CONTROL_TOKEN_ISSUER=' "the runtime gets the issuer the container requires at startup"
   assert_contains "${src}" 'ARTF_CONTROL_CLIENT_ENTITLEMENTS=' "the runtime gets the client entitlement map"
+  assert_contains "${src}" 'if [[ "${CONNECTION_INFO}" -eq 1 ]]; then' "connection-info returns before any deploy step"
+  assert_contains "${src}" '"mcp_url": "$(mcp_url_for' "the record file carries the MCP URL"
+  # The URL helper must match the Python verifier byte for byte.
+  local arn='arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/x_control-Ab1' sh_url py_url
+  eval "$(sed -n '/^mcp_url_for() {/,/^}/p' "${D}/deploy_control_plane.sh")"
+  sh_url="$(mcp_url_for "${arn}" us-east-1)"
+  py_url="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import control_plane_connect as c; print(c.mcp_url(sys.argv[2], "us-east-1"))' "${D}/scripts" "${arn}")"
+  assert_eq "${sh_url}" "${py_url}" "the shell and Python MCP URLs agree"
   # The secret is printed as a command for the OPERATOR to run (escaped in a heredoc),
   # never resolved by the script or written to its record.
   assert_contains "${src}" '"secret": "on the Cognito app client only; never written here"' "the record file carries no secret"
-  assert_not_contains "${src}" 'CLIENT_SECRET="$(aws' "the deploy script never resolves the client secret itself"
+  assert_not_contains "${src}" 'CLIENT_SECRET="$(aws' "the deploy path never resolves the client secret (only --connection-info --token reads it, to mint a token)"
 
   # Comments in the template explain WHY these actions are absent, and necessarily
   # name them; strip comments so the assertions see only what is declared.

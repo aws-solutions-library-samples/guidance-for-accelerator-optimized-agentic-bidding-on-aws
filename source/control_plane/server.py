@@ -30,9 +30,12 @@ Environment (set by deployment/deploy_control_plane.sh on the runtime):
   ARTF_CONTROL_PRICE_CEILING       max campaign CPM incl. uplift, default 50
   ARTF_CONTROL_LOG_LEVEL           default INFO
   AWS_REGION                       the table's and the pool's region
-"""
-from __future__ import annotations
 
+NO ``from __future__ import annotations`` HERE. FastMCP evaluates each tool's
+annotations against this module's globals to find the ``Context`` parameter, and
+``Context`` is imported inside ``create_server``. As a string the annotation does not
+resolve, and the server fails at startup with InvalidSignature.
+"""
 import json
 import logging
 import os

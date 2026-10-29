@@ -23,6 +23,7 @@ import json
 import sys
 import time
 import types
+import typing
 
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -102,6 +103,10 @@ class FakeFastMCP:
 
     def tool(self, **_kwargs):
         def register(fn):
+            # The real SDK evaluates the annotations to find the Context parameter;
+            # an annotation that does not resolve fails the server at startup.
+            hints = typing.get_type_hints(fn)
+            assert hints.get("ctx") is not None, f"{fn.__name__}: ctx has no resolvable annotation"
             self.tools[fn.__name__] = fn
             return fn
         return register

@@ -38,6 +38,7 @@ import asyncio
 import base64
 import json
 import os
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -61,6 +62,24 @@ def step(number: int, text: str) -> None:
     print(f"\n[{number}/4] {text}")
 
 
+def tls_context() -> ssl.SSLContext:
+    """A verifying TLS context for the token request.
+
+    A python.org build of Python on macOS ships no CA bundle until its "Install
+    Certificates" step runs, so the default context fails every HTTPS request with
+    CERTIFICATE_VERIFY_FAILED. The MCP leg already trusts certifi's bundle (through
+    httpx), so the token leg uses it too. SSL_CERT_FILE or SSL_CERT_DIR, when set,
+    win, so a corporate proxy's CA still works.
+    """
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return ssl.create_default_context()
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def fetch_token(token_endpoint: str, client_id: str, client_secret: str, scopes: str) -> dict:
     """An access token from the Cognito hosted token endpoint.
 
@@ -76,7 +95,7 @@ def fetch_token(token_endpoint: str, client_id: str, client_secret: str, scopes:
         headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310 - https endpoint from the caller
+    with urllib.request.urlopen(request, timeout=15, context=tls_context()) as response:  # noqa: S310 - https endpoint from the caller
         return json.loads(response.read())
 
 
@@ -207,6 +226,17 @@ async def connect_and_list(url: str, token: str, call_tool: Optional[str], tool_
             return 0
 
 
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """The innermost exceptions of a (possibly nested) exception group, in order."""
+    nested = getattr(exc, "exceptions", None)
+    if not nested:
+        return [exc]
+    leaves: list[BaseException] = []
+    for inner in nested:
+        leaves.extend(_leaf_exceptions(inner))
+    return leaves
+
+
 def explain_http_error(exc: urllib.error.HTTPError) -> None:
     body = exc.read().decode(errors="replace")[:400]
     print(f"      HTTP {exc.code}: {body}", file=sys.stderr)
@@ -241,6 +271,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE", help="One argument for --call-tool; repeatable")
     args = parser.parse_args(argv)
 
+    secret = (args.client_secret or "").strip()
+    if not secret or secret == "None":
+        print(
+            f"error: --client-secret is {'empty' if not secret else 'the string None'}. The shell variable\n"
+            "  holding it was never set, or the AWS CLI call that read it had no credentials for the\n"
+            "  account (it prints None when the client has no secret visible to it). Read it with:\n"
+            "    export CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id POOL \\\n"
+            "      --client-id CLIENT --region REGION --query UserPoolClient.ClientSecret --output text)\n"
+            "  adding --profile NAME if your credentials are not the default profile.",
+            file=sys.stderr,
+        )
+        return 2
+    args.client_secret = secret
+
     try:
         tool_args = parse_tool_args(args.tool_args, args.arg)
     except ValueError as exc:
@@ -260,6 +304,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     except urllib.error.URLError as exc:
         print(f"      could not reach {args.token_endpoint}: {exc.reason}", file=sys.stderr)
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+            print(
+                "\n      This Python has no CA bundle it can verify Cognito's certificate with.\n"
+                "      pip install certifi (or run the deploy venv's python, which has it), or\n"
+                "      point SSL_CERT_FILE at a CA bundle. On a python.org macOS install, running\n"
+                "      'Install Certificates.command' in its Applications folder also fixes it.",
+                file=sys.stderr,
+            )
         return 1
     token = payload.get("access_token")
     if not token:
@@ -288,8 +340,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("error: the mcp package is required. pip install mcp", file=sys.stderr)
         return 2
     except Exception as exc:  # noqa: BLE001
-        message = str(exc)
-        print(f"      connection failed: {type(exc).__name__}: {message[:300]}", file=sys.stderr)
+        # The MCP client runs inside an anyio TaskGroup, so a failure arrives as an
+        # ExceptionGroup whose own text says nothing. Report the leaves instead.
+        leaves = _leaf_exceptions(exc)
+        for leaf in leaves:
+            print(f"      connection failed: {type(leaf).__name__}: {str(leaf)[:300]}", file=sys.stderr)
+        message = " ".join(f"{type(leaf).__name__} {leaf}" for leaf in leaves)
         if "401" in message or "Unauthorized" in message:
             print(
                 "\n      A 401 from AgentCore means its inbound authorizer rejected the token.\n"

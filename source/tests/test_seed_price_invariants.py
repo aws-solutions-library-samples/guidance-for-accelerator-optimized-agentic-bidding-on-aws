@@ -309,3 +309,16 @@ def test_courtside_is_eligible_only_on_banner_basic():
         and _courtside_eligible(_request_with_library_deals(path.name))
     ]
     assert eligible == ["banner-basic.json"]
+
+
+# ------------------------------------------------- the CTV content-id scenario
+def test_ctv_drama_finale_prices_survive_the_yield_worst_case_and_beat_amt():
+    campaign = CAMPAIGNS["camp-ctv-drama-auto"]
+    deal = LIBRARY["deal-ctv-drama-open-auto"]
+    request = _sample("ctv-drama-finale.json")["bid_request"]
+    imp_floor = float(request["imp"][0]["bidfloor"])
+    assert deal.at == 1
+    assert campaign.declared_cpm >= 1.5 * deal.bidfloor
+    assert campaign.declared_cpm >= worst_case_floor(deal.bidfloor, deal.at)
+    assert campaign.declared_cpm > AMT_PRICE["video"] > imp_floor
+    assert campaign.declared_cpm < TOP_PRICE_BUCKET

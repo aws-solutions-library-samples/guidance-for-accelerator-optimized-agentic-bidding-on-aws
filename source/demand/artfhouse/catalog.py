@@ -72,6 +72,11 @@ class Campaign:
     #: What this buyer pays extra when the user carries one of its target audience
     #: segments. None means the campaign prices on content only.
     audience_uplift: Optional["AudienceUplift"] = None
+    #: Content identifiers it will bid on, compared with the ``cid:`` metric types an
+    #: ADD_CIDS container appends to ``imp.metric``. Empty means no content
+    #: restriction. Unlike categories, an impression with no content identifier
+    #: does NOT match a campaign that names one.
+    target_content_ids: tuple[str, ...] = field(default_factory=tuple)
     #: ``active`` or ``paused``. A paused campaign is still CONSIDERED for every
     #: impression (so the offers column can say why it made no offer) but never
     #: bids. Written by the seeder and changed by the campaign/deals control
@@ -81,6 +86,7 @@ class Campaign:
     @property
     def paused(self) -> bool:
         return self.status == CAMPAIGN_PAUSED
+
 
     def price_for(self, segment_ids: tuple[str, ...]) -> float:
         """The CPM this campaign offers to a user carrying ``segment_ids``.
@@ -151,6 +157,7 @@ def campaigns_from_records(records: Iterable[dict]) -> tuple[Campaign, ...]:
             target_categories=tuple(str(c) for c in record.get("target_categories") or ()),
             media_type=str(record.get("media_type") or "banner"),
             duration=int(duration) if duration is not None else None,
+            target_content_ids=tuple(str(c) for c in record.get("target_content_ids") or ()),
             audience_uplift=(
                 AudienceUplift(
                     segment_ids=tuple(str(s) for s in uplift["segment_ids"]),
