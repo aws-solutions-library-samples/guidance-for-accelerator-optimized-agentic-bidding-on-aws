@@ -72,7 +72,7 @@ cd guidance-for-accelerator-optimized-agentic-bidding-on-aws/deployment
 
 `deploy.sh` stores the key in AWS Secrets Manager and reuses it automatically on later runs of the same prefix, so you only need to pass `--ngc-key` once. With no other flags it provisions, in `us-east-1`: an EKS cluster with one `g5.xlarge` GPU node and three `c5.2xlarge` CPU nodes in private subnets, NVIDIA Triton Inference Server, the six bidding containers, the orchestrator, a React frontend behind CloudFront with Cognito sign-in, an Amazon Bedrock AgentCore MCP runtime, and the Part 2 closed-loop learning stack (feedback pipeline, Glue ETL, SageMaker Model Registry, two Bedrock-backed agent runtimes and their schedules). Container images build on AWS CodeBuild, so Docker is not needed on your machine. It takes roughly 30 to 40 minutes. When it finishes, it prints a URL and a demo login. Open the URL in your browser.
 
-To deploy only the real-time bidding path, which needs no NGC key, see [Deploying Part 1 on its own](#deploying-part-1-on-its-own).
+To deploy only the real-time bidding path, which needs no NGC key, use the [`guidance-part-1` branch](https://github.com/aws-solutions-library-samples/guidance-for-accelerator-optimized-agentic-bidding-on-aws/tree/guidance-part-1).
 
 Deploying with a named AWS CLI profile rather than your shell's default? Pass it once; it is remembered for the prefix:
 
@@ -126,7 +126,33 @@ Pass `--verbose` to see every underlying command instead of just the step summar
 | **2/5: Building containers & provisioning infrastructure** | Builds and pushes any container image whose source has changed (remotely via AWS CodeBuild by default, or locally with `--local-build`) **at the same time** it creates the EKS cluster: Kubernetes 1.31 across three Availability Zones, a `gpu-inference` node group (1 node, `g5.xlarge` with `g5.2xlarge`/`g5.4xlarge` as fallbacks, all NVIDIA A10G) and a `cpu-services` node group (3 `c5.2xlarge` nodes), both in private subnets behind one NAT gateway per AZ. The two don't depend on each other, so running them in parallel is roughly half the wait of doing them one after another. Then installs the NVIDIA Kubernetes device plugin and sets up the IAM/IRSA roles Triton, the Model Optimizer, and the orchestrator need. |
 | **3/5: Deploying workloads** | Provisions the Cognito user pool, app client and identity pool, then applies the Kubernetes manifests for Triton (behind an internal-only load balancer), the six ARTF containers, the orchestrator (a ClusterIP Service for in-cluster callers plus an internal-only NLB for the UI API proxy; no public address) and their Horizontal Pod Autoscalers. Kicks off a one-shot Kubernetes Job that compiles the base TensorRT engines on the GPU node. This runs in the background and does **not** block the rest of the deploy; Triton picks the compiled engines up automatically once they're ready (see the "Confirm everything is healthy" note below). Deploys the `<prefix>-ui-api-proxy` Lambda that carries the browser's `/api/*` calls into the VPC, and creates the GPU node group's nightly scheduled shutdown (desired and minimum size set to 0 at 8:00 PM America/New_York every day; the **Start GPUs** button in the UI brings the node back). |
 | **4/5: Setting up access** | Deploys the React frontend (S3 + CloudFront) and creates the demo admin user in Cognito. |
-| **5/5: Registering agents** | Registers the Amazon Bedrock AgentCore MCP runtime (skip it with `--skip-agentcore`), then, unless you passed `--no-retraining`, deploys the entire Part 2 closed-loop stack: the bid-outcome and deal-yield feedback pipelines (two Kinesis streams, two Firehose delivery streams, a KMS key), the two Glue ETL jobs, the DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups (seeded with genesis model versions), the NeMo-RL training container (built asynchronously; this is the long build the NGC key is for), the Adaptive Bidding and Governance AgentCore agent runtimes, their EventBridge invocation schedules, and a final frontend rebuild wired with the real agent ARNs. |
+| **5/5: Registering agents** | Step 10 registers the Amazon Bedrock AgentCore MCP runtime (skip it with `--skip-agentcore`). Step 11 deploys the Part 2 closed-loop stack by running `deploy_closed_loop.sh`, which has seven steps of its own, [listed below](#phase-5-in-detail-part-2-closed-loop-learning). Step 11 is skipped when Part 2 is off (`--learner-mode` or `--no-retraining`). |
+
+#### Phase 5 in detail: Part 2 closed-loop learning
+
+`deploy_closed_loop.sh` deploys in dependency order. Most of its steps are one CloudFormation stack named `<prefix>-<name>`, so a failure names the stack that failed and a re-run updates it in place.
+
+| Step | Creates | What it does |
+|------|---------|--------------|
+| **1. Feedback pipeline** | `<prefix>-feedback-pipeline` | Kinesis Data Streams and Amazon Data Firehose delivery streams for bid outcomes and deal-yield outcomes, delivered to S3 as Parquet under a KMS key, and the Glue database that catalogs them. |
+| **2. Glue ETL** | `<prefix>-glue-etl` | Two feature-engineering Glue jobs, one for bid outcomes and one for deal yield, each on a schedule, and the training-data bucket they write to. |
+| **3. Closed-loop core** | `<prefix>-closed-loop-core` | The DynamoDB parameter store, audit trail and user-features tables, a DAX cluster, the training-alerts SNS topic, the SageMaker training execution role, and a SageMaker Model Package Group for each of the four models (Bid Pricer, Deal Scorer, Yield Optimizer floor and margin). It then registers a genesis version of each model from the artifacts Phase 1 uploaded, so the first retraining job has a model to start from. If registration fails, the deploy warns and continues, and the registry stays empty until a re-run. |
+| **4. AgentCore security** | `<prefix>-agentcore-security` | A least-privilege execution role for each agent, a manual-override role, and the policy that lets the Governance agent approve a model version. Deployed before the runtimes so each runtime is created with its own role. |
+| **4b. NeMo-RL training image** | ECR repository `artf-nemo-rl-training` | The SageMaker training container, built on the NVIDIA NeMo base image, which is what the NGC key is for. On CodeBuild the build starts asynchronously and takes 15 to 50 minutes while the rest of the steps continue; with `--local-build` it builds with Docker on the deploying machine. The image is tagged with a hash of `source/training/container/`, so only a change there rebuilds it. If the build has not finished when the script ends, it says so; only retraining jobs need the image. The repository is not prefixed and is shared by every deployment in the account. |
+| **5. AgentCore runtimes** | Two AgentCore runtimes, `<prefix>-vpc-proxy` | The Adaptive Bidding and Model Promotion Governance agents, as HTTP-protocol runtimes using the `--model-id` model, and a VPC proxy Lambda the Governance agent uses to reach Triton and the orchestrator inside the VPC. The step stops early if the `model-optimizer` image is missing from ECR, because the promotion jobs the Governance agent launches could not pull it. Skipped with `--skip-agentcore`. |
+| **6. Invocation paths** | `<prefix>-governance-eventbridge` | The EventBridge Scheduler schedule that runs the Adaptive Bidding agent (every 24 hours by default), the rule that invokes the Governance agent when a model is registered, the schedule that starts SageMaker retraining jobs, and the rule that registers the trained model when a job completes. Deployed after Step 5 so it holds the real runtime ARNs. |
+| **7. UI rewiring** | Cognito identity pool role, frontend | Grants the signed-in user's role `InvokeAgentRuntime` on the two runtimes only, then rebuilds and redeploys the frontend with their ARNs. Until this step the UI shows the agents as not deployed. |
+
+A Part 2 failure does not stop the deploy. `deploy.sh` prints the last 15 lines of the closed-loop output and the state of its stacks, names the log file, and ends with `Phase 5/5 incomplete` instead of the success line. Part 2 is never on the bid path: the Bid Pricer reads its parameters from the DynamoDB parameter store at inference time, and the agents only write to it.
+
+#### After Phase 5: Prebid Server and the control plane
+
+Two more steps run after the five phases and have no phase number. Both run only when Prebid is on, which `--with-prebid` and `--learner-mode` both turn on.
+
+| Step | What happens |
+|------|---------------|
+| **12. Prebid Server** | Runs `deploy_prebid.sh`, which deploys Prebid Server as a second ARTF host with the artfhouse demand service and the bidder simulator, plus a Cognito domain, resource servers and a machine-to-machine app client. Its own Step 9 installs the campaign/deals control plane unless you pass `--no-control-plane`. Step 12 runs whenever Phase 5 runs, and also on a re-run that skips Phase 5 if the Prebid sources or the deals seed changed since the last successful Step 12. |
+| **12b. Control plane** | Runs `deploy_control_plane.sh` on its own, but only when Step 12 did not run and the control plane runtime is missing. A re-run can then install the control plane without redeploying Prebid. See [Managing campaigns and deals with an agent](#managing-campaigns-and-deals-with-an-agent). |
 
 **Cost while it's running:** approximately **$1,470/month** at `us-east-1` on-demand prices with the default settings and the included nightly GPU shutdown (about **$1,945/month** if the GPU node runs 24/7). That figure includes Part 2 (closed-loop learning), which deploys by default; about half of it is the three-node CPU node group. The Adaptive Bidding Agent calls Amazon Bedrock once every 24 hours by default, so it is a small line at that cadence; see [Cost](#cost) for what it becomes if you shorten the interval. Part 1 alone (`--no-retraining`) is about **$1,225/month**. See [Cost](#cost) for the line items and the assumptions behind them. Deploy, try it, and [tear it down](#cleanup) when you're done. A short session costs a few dollars.
 
@@ -443,6 +469,7 @@ What changes in learner mode:
 - **Adaptive Bidding is unavailable.** Its agent belongs to Part 2, so learner mode does not deploy it. The learner-mode notice says so, and the Adaptive Bidding tab reports that the agent is not deployed in learner mode.
 - **The Governance tab is disabled.** It stays visible in the header, marked "(unavailable in learner mode)", and the orchestrator answers its API with HTTP 409. The Container Health panel shows Triton readiness on CPU in place of the GPU start and stop controls.
 - **Prebid Server is deployed,** as with `--with-prebid`, because the Auction Theater's live auction needs it: without Prebid Server the orchestrator answers the Theater's `POST /v1/auction/run` with HTTP 501. `--no-prebid` is refused in learner mode. The Prebid pods request CPU and memory only and run on the `cpu-services` nodes.
+- **The campaign/deals MCP control plane is deployed with Prebid Server,** as in a standard `--with-prebid` deploy, so an agent can manage campaigns and deals in the deals table (see [Managing campaigns and deals with an agent](#managing-campaigns-and-deals-with-an-agent)). It runs on Amazon Bedrock AgentCore, not on the cluster, so learner mode does not change it. `--no-control-plane` leaves it out, and the choice is remembered for the prefix.
 - **The UI API proxy Lambda reserves 5 concurrent executions instead of 20.** Workshop Studio accounts allow at most 10 reserved concurrent executions across all functions, so the template default of 20 fails there.
 - **Latency is CPU latency.** DLRM and NCF on CPU are slower than TensorRT on a GPU, so load-test results from a learner deployment are not comparable with GPU results.
 
@@ -460,9 +487,10 @@ Switching back with `--no-learner-mode` returns to the prefix's own Prebid choic
 - 32 On-Demand Standard vCPUs (4 x c5.2xlarge; Service Quotas code `L-1216C47A`). The deploy checks this quota and warns if it is lower.
 - AWS CodeBuild for the remote image builds, or `--local-build` with Docker and about 30 GB of free disk.
 - Amazon ECR, Amazon S3, Amazon CloudFront, Amazon Cognito user and identity pools, Amazon DynamoDB, an AWS Lambda function in the VPC (the UI API proxy), internal Network Load Balancers, and IAM roles and customer-managed policies.
-- Amazon Bedrock access to the Claude Haiku 4.5 global inference profile for the Auction Theater captions. Anthropic models need the one-time use-case form in each account.
+- Amazon Bedrock access to the Claude Haiku 5.5 global inference profile for the Auction Theater captions. Anthropic models need the one-time use-case form in each account.
 - The Amazon Bedrock AgentCore MCP runtime in Phase 5, unless you pass `--skip-agentcore`.
 - For Prebid Server (Step 12): its CloudFormation stack, which adds a Cognito user pool domain, resource servers and a machine-to-machine app client, IAM roles, and a Secrets Manager secret for the client credentials.
+- For the campaign/deals control plane (Step 9 of `deploy_prebid.sh`), unless you pass `--no-control-plane`: Amazon Bedrock AgentCore with an MCP runtime, and Docker with buildx on the deploying machine to build its small arm64 image. Without Docker the step is skipped with a warning and Prebid still deploys.
 ### Deals and campaigns: the deals table
 Every deal and every demand-side campaign lives in one DynamoDB table, `<stack>-deals` (for example `stg-nvidia-artf-recommenders-deals`). Nothing is defined in code: `source/demand/artfhouse/catalog.py` and `source/shared/deal_library.py` (read by the Deal Scorer and the orchestrator) build their objects from the table's records.
 
@@ -613,32 +641,27 @@ An Amazon EKS cluster (Kubernetes 1.31, three Availability Zones, all nodes in p
 
 ### Deploying Part 1 on its own
 
-The real-time path deploys without the closed-loop stack, and without an NGC key, when you pass `--no-retraining`:
-
-```bash
-./deploy.sh --prefix dv1 --no-retraining
-```
-
-All five phases still run; Phase 5 registers the MCP runtime and skips the closed-loop stack. The choice is remembered for the prefix, so later runs of the same prefix stay Part 1 only. To add the closed loop afterwards, re-run with `--with-retraining` (plus `--ngc-key` once), or run `./deploy_closed_loop.sh --prefix dv1` against the existing stack as described in [GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps). Part 1 alone costs about $1,225/month on the nightly GPU schedule; see [Cost](#cost).
+Instructions for deploying the real-time bidding path without the closed-loop stack are kept in the [`guidance-part-1` branch](https://github.com/aws-solutions-library-samples/guidance-for-accelerator-optimized-agentic-bidding-on-aws/tree/guidance-part-1). Follow the README on that branch to deploy Part 1 only. This README describes the combined deployment.
 
 ### How the orchestrator sequences the containers
 
-Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
+Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in up to five stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
 
 | Stage | Containers | Intents | What the next stage sees |
 |-------|------------|---------|--------------------------|
-| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ADD_CIDS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
+| 0 content | ARTF Template (inactive by default), or any registry container claiming `ADD_CIDS` | `ADD_CIDS` | `cid:` content ids on `imp.metric`; runs only when such a container is active and `ADD_CIDS` is an applicable intent |
+| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
 | 2 deals | Deal Scorer | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | matched deals added to `imp.pmp.deals`, poor-fit deals marked suppressed |
 | 3 yield | Yield Optimizer Floor, Yield Optimizer Margin | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | deal floors adjusted, only for deals now in the request; `imp.bidfloor` is left as the publisher set it |
 | 4 price | Bid Pricer | `BID_SHADE` | `seatbid[].bid[].price` shaded; runs only when the request carries a `bid_response` |
 
 Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
 
-With Prebid Server as the host, the hook calls the orchestrator over gRPC at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
+With Prebid Server as the host, the hook calls the orchestrator over gRPC at `processed-auction-request`, stages 0 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
 
 ![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
 
-When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The envelope, handler and stage order are the same; only the caller's lifecycle and documents differ (this host POSTs `/v1/mutations`, where Prebid's hook uses gRPC by default):
+When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. Every stage with an active container runs, and the host applies the complete list to both documents itself. The envelope, handler and stage order are the same; only the caller's lifecycle and documents differ (this host POSTs `/v1/mutations`, where Prebid's hook uses gRPC by default):
 
 ![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
 

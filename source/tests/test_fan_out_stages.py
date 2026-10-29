@@ -307,6 +307,63 @@ def test_an_attached_container_runs_in_the_stage_of_its_earliest_intent(monkeypa
     assert deals_stage.containers == ["ncf-deal-manager", "partner-deals"]
 
 
+def _cids_container(active=True):
+    from orchestrator.container_registry import REGISTRY_PARTITION
+    return {
+        "registry": REGISTRY_PARTITION, "name": "artf-template", "intents": ["ADD_CIDS"],
+        "endpoint": "http://artf-template:8081", "active": active,
+    }
+
+
+def _cids():
+    return [Mutation(intent=Intent.ADD_CIDS, op=Operation.ADD, path="/imp/imp-1/metric",
+                     add_metrics=AddMetricsPayload(metric=[
+                         Metric(type="cid:premium-drama-finale", value=1.0, vendor="iris.tv"),
+                     ]))]
+
+
+def _run_with_records(monkeypatch, recorder, records, applicable=None):
+    entries, _ = merge_registry(oapp.CONTAINERS, records)
+    monkeypatch.setattr(oapp, "_effective_registry", lambda: (entries, []))
+    monkeypatch.setattr(oapp, "_call_container_timed", recorder)
+    return asyncio.run(oapp._fan_out_staged(
+        ENVELOPE, json.dumps(ENVELOPE).encode(), applicable, timeout_s=1.0,
+    ))
+
+
+def test_an_add_cids_container_runs_in_stage_0_and_the_audience_activator_sees_its_content_ids(monkeypatch):
+    rec = Recorder({"artf-template": _cids()})
+    result = _run_with_records(monkeypatch, rec, [_cids_container()])
+    assert [name for name, _ in rec.seen][0] == "artf-template"
+    assert rec.batches[0] == ["artf-template"]
+    assert [(s.stage, s.name) for s in result.stages][:2] == [(0, "content"), (1, "enrich")]
+    assert result.stages[0].containers == ["artf-template"]
+    assert result.stages[0].applied == 1 and result.stages[0].rejected == []
+    # Stage 1 sees the content id stage 0 wrote; stage 0 itself saw the original.
+    for name in ("widedeep-segment-activator", "metrics-enricher"):
+        metrics = dict(rec.seen)[name]["bid_request"]["imp"][0].get("metric", [])
+        assert [m["type"] for m in metrics] == ["cid:premium-drama-finale"]
+    assert "metric" not in dict(rec.seen)["artf-template"]["bid_request"]["imp"][0]
+
+
+def test_stage_0_does_not_run_when_no_add_cids_container_is_active(monkeypatch):
+    rec = Recorder({})
+    result = _run_with_records(monkeypatch, rec, [_cids_container(active=False)])
+    assert "artf-template" not in [name for name, _ in rec.seen]
+    assert [s.name for s in result.stages] == ["enrich", "deals", "yield", "price"]
+
+
+def test_stage_0_does_not_run_when_add_cids_is_not_an_applicable_intent(monkeypatch):
+    rec = Recorder({})
+    result = _run_with_records(
+        monkeypatch, rec, [_cids_container()], applicable=["ACTIVATE_SEGMENTS"],
+    )
+    assert [name for name, _ in rec.seen] == ["widedeep-segment-activator"]
+    assert [s.name for s in result.stages] == ["enrich"]
+    by_name = {i.name: i for i in result.invocations}
+    assert by_name["artf-template"].status == STATUS_SKIPPED
+
+
 def test_the_flattened_response_mutations_are_in_stage_order(monkeypatch):
     rec = Recorder({
         "dlrm-bid-shader": [],

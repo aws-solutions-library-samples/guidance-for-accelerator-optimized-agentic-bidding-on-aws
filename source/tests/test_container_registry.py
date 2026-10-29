@@ -771,8 +771,8 @@ class TestFanOut:
         then the entries that were not called, in registry order.
 
         CODE_TWO puts the shader (stage 4) before the enricher (stage 1); the two
-        store records carry ADD_CIDS (stage 1) and merge in name order. So the
-        called order is enricher, aa, zz, shader, and the disabled record comes last.
+        store records carry ADD_CIDS (stage 0) and merge in name order. So the
+        called order is aa, zz, enricher, shader, and the disabled record comes last.
         """
         pytest.importorskip("grpc")
         from orchestrator import app as oapp
@@ -791,7 +791,7 @@ class TestFanOut:
         monkeypatch.setattr(oapp, "_call_container_timed", fake_call)
 
         invocations = asyncio.run(oapp._fan_out({"id": "r"}, b"{}", None, timeout_s=1.0))
-        assert [i.name for i in invocations] == ["metrics-enricher", "aa", "zz", "dlrm-bid-shader", "off"]
+        assert [i.name for i in invocations] == ["aa", "zz", "metrics-enricher", "dlrm-bid-shader", "off"]
         assert {i.name for i in invocations} == {e.name for e in entries}
 
     def test_a_disabled_container_does_not_suppress_other_mutations(self, monkeypatch):

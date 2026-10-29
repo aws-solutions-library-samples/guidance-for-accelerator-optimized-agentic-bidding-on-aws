@@ -722,8 +722,9 @@ async def _fan_out_staged(
 ) -> FanOutResult:
     """Call the containers in stage order, applying each stage's mutations before the next.
 
-    Stages are defined in shared/artf_stages.py: enrichment, deals, yield,
-    pricing. Within a stage the containers run in parallel and all see the same
+    Stages are defined in shared/artf_stages.py: content ids (stage 0, only
+    when an ADD_CIDS container is active and the intent applies), enrichment,
+    deals, yield, pricing. Within a stage the containers run in parallel and all see the same
     working request; between stages the orchestrator applies the mutations that
     came back (shared/artf_applier.py) so stage N+1 is asked about the request
     stage N produced. That is what lets the Deal Scorer score with the segments
