@@ -44,7 +44,7 @@
           {
             "id": "iris-tv",
             "name": "iris.tv",
-            "ext": {"segtax": 504},
+            "ext": {"segtax": 501},
             "segment": [{"id": "iris_8a92b23a77"}]
           }
         ]
