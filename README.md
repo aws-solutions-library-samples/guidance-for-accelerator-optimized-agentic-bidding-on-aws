@@ -645,23 +645,22 @@ Instructions for deploying the real-time bidding path without the closed-loop st
 
 ### How the orchestrator sequences the containers
 
-Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in up to five stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
+Calling all six containers at once would hand every container the same unmodified request, so a yield model could never price a deal the Deal Scorer had just activated, and the Bid Pricer could never see the floors the yield models set. The orchestrator therefore runs the containers in four stages, each stage's containers in parallel, and between stages it applies the mutations just returned to a working copy of the request (`source/shared/artf_applier.py`, the same five write targets and all-or-nothing rule as the Prebid hook's `ArtfMutationApplier.java`):
 
 | Stage | Containers | Intents | What the next stage sees |
 |-------|------------|---------|--------------------------|
-| 0 content | ARTF Template (inactive by default), or any registry container claiming `ADD_CIDS` | `ADD_CIDS` | `cid:` content ids on `imp.metric`; runs only when such a container is active and `ADD_CIDS` is an applicable intent |
-| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
+| 1 enrich | Signals Enricher, Audience Activator | `ADD_METRICS`, `ADD_CIDS`, `ACTIVATE_SEGMENTS` | `imp.metric` and `user.data` populated |
 | 2 deals | Deal Scorer | `ACTIVATE_DEALS`, `SUPPRESS_DEALS` | matched deals added to `imp.pmp.deals`, poor-fit deals marked suppressed |
 | 3 yield | Yield Optimizer Floor, Yield Optimizer Margin | `ADJUST_DEAL_FLOOR`, `ADJUST_DEAL_MARGIN` | deal floors adjusted, only for deals now in the request; `imp.bidfloor` is left as the publisher set it |
 | 4 price | Bid Pricer | `BID_SHADE` | `seatbid[].bid[].price` shaded; runs only when the request carries a `bid_response` |
 
 Each stage gets the time remaining under the request's `tmax`, floored at 10 ms; a container that overruns is reported `timeout` and the next stage still runs. The reply lists mutations in stage order and carries `metadata.stages` (name, containers, `latency_ms`, `budget_ms`, `applied`, `rejected`), which is what the UI's latency breakdown and the stage badges on the pipeline read. A container you attach from the store (see [Attaching a container built outside this guidance](#attaching-a-container-built-outside-this-guidance)) is placed in the stage of the earliest intent it registers.
 
-With Prebid Server as the host, the hook calls the orchestrator over gRPC at `processed-auction-request`, stages 0 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
+With Prebid Server as the host, the hook calls the orchestrator over gRPC at `processed-auction-request`, stages 1 to 3 run, and Prebid applies the returned list itself before its bidders see the request. Stage 4 is inert on that path because no `seatbid` exists yet:
 
 ![Orchestrator stage order with Prebid Server as the host](docs/infographics/orchestrator-stages-prebid.svg)
 
-When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. Every stage with an active container runs, and the host applies the complete list to both documents itself. The envelope, handler and stage order are the same; only the caller's lifecycle and documents differ (this host POSTs `/v1/mutations`, where Prebid's hook uses gRPC by default):
+When the host is a publisher's ad server or an SSP rather than Prebid, it calls once at the bid-response lifecycle with both the bid request and the bid response it already holds. All four stages run, and the host applies the complete list to both documents itself. The envelope, handler and stage order are the same; only the caller's lifecycle and documents differ (this host POSTs `/v1/mutations`, where Prebid's hook uses gRPC by default):
 
 ![Orchestrator stage order with a publisher ad server or SSP as the host](docs/infographics/orchestrator-stages-adserver.svg)
 
