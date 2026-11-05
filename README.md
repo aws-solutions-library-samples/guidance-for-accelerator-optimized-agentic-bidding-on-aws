@@ -1036,7 +1036,7 @@ Authorization on the orchestrator is a **list of mechanisms**, any one of which 
 
 #### Managing campaigns and deals with an agent
 
-With `--with-prebid`, `deploy_prebid.sh` Step 9 runs `deployment/deploy_control_plane.sh`, which deploys an **MCP control plane** for the deals table: an **Amazon Bedrock AgentCore Runtime with `serverProtocol=MCP`** whose front door is **OAuth 2.0 `client_credentials`**. An external agent manages campaigns and deals with a client id and secret and no AWS credentials. It is the same design as the [Guidance for Embedding a Prebid DSP on AWS](https://github.com/aws-solutions-library-samples/guidance-for-embedding-prebid-dsp-on-aws) control plane, adapted to this table's record shapes. `--no-control-plane` leaves it out; the choice is remembered for the prefix.
+With `--with-prebid`, `deploy_prebid.sh` Step 9 runs `deployment/deploy_control_plane.sh`, which deploys an **MCP control plane** for the deals table: an **Amazon Bedrock AgentCore Runtime with `serverProtocol=MCP`** whose front door is **OAuth 2.0 `client_credentials`**. An external agent manages campaigns and deals with a client id and secret and no AWS credentials. `--no-control-plane` leaves it out; the choice is remembered for the prefix.
 
 **Ten tools.**
 
