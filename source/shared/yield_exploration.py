@@ -16,6 +16,11 @@ exists to train the next model version on. It continues to apply (at the same
 small epsilon) once a real trained model exists -- standard explore/exploit
 behavior for a live bandit, not a genesis-only workaround.
 
+Demo scenario runs (``ext.model_params.explore=True``) use a different rule:
+every deal the model would leave unchanged is probed, and every deal the model
+already moves is left alone. At epsilon 0.1 a two-deal scenario returned no
+mutation about four runs in five, which read as a broken container.
+
 This is disclosed, not fabricated: the caller marks any response containing an
 explored deal with a ":explore" suffix on model_version, so
 DealYieldOutcomeEvents and later analyses can distinguish "the model's own
@@ -78,30 +83,34 @@ def resolve_effective_epsilon(
     is_load_test: bool,
     explore_override: bool | None,
     configured_epsilon: float,
+    *,
+    prediction: float,
+    no_op_value: float,
 ) -> float:
-    """Decide whether exploration is armed for this specific request.
+    """Exploration probability for ONE deal, given the model's prediction for it.
 
     Two independent ways a caller can arm it:
-    - ``is_load_test``: the orchestrator's load-test invocation path set the
-      X-Load-Test header (see shared/load_test_context.py) -- structurally
-      load-test-only, never live auction traffic.
-    - ``explore_override``: the caller set ``ext.model_params.explore``
-      explicitly (True or False). The demo Scenario card's Explore toggle uses
-      this, defaulting to True so a single scenario Send against an untrained
-      model can also produce a real mutation, not just a load test.
+    - ``explore_override=True``: the caller set ``ext.model_params.explore``.
+      Every demo scenario that runs a yield model sets it. A deal whose
+      prediction is the no-op value is probed with probability 1.0, so a
+      scenario run against an untrained model always returns a mutation. A
+      deal whose prediction already moves the floor or margin is left alone
+      (0.0), so a trained model's recommendation passes through unperturbed.
+    - ``is_load_test``: the orchestrator's load-test path set the X-Load-Test
+      header (see shared/load_test_context.py). Load tests keep the
+      epsilon-greedy rate from ``configured_epsilon`` for every deal, which is
+      what spreads the training data around the model's predictions.
 
-    An explicit ``explore_override=False`` always wins, so a user who has since
-    trained a real model can force exploration off and see that model's
-    unperturbed prediction. Otherwise either signal being "on" arms epsilon.
-    Neither signal set (real production traffic hitting this same endpoint,
-    with no override and no load-test header) always resolves to 0.0 -- this is
-    what keeps exploration off by default for traffic the container cannot
-    otherwise identify as load-test or demo-originated, REGARDLESS of how
-    the epsilon env var is configured.
+    An explicit ``explore_override=False`` always wins and resolves to 0.0.
+    Neither signal set (real production traffic hitting this same endpoint)
+    always resolves to 0.0, regardless of how the epsilon env var is
+    configured.
     """
     if explore_override is False:
         return 0.0
-    if is_load_test or explore_override is True:
+    if explore_override is True:
+        return 1.0 if prediction == no_op_value else 0.0
+    if is_load_test:
         return configured_epsilon
     return 0.0
 
@@ -114,6 +123,7 @@ def apply_exploration(
     bound: float,
     clamp_min: float,
     clamp_max: float,
+    min_step: float = 0.0,
 ) -> tuple[float, bool]:
     """Possibly perturbs one scalar prediction for one deal.
 
@@ -132,6 +142,10 @@ def apply_exploration(
         bound: Perturbs ``value`` by Uniform(-bound, +bound) before clamping.
         clamp_min: Hard lower safety clamp applied after perturbation.
         clamp_max: Hard upper safety clamp applied after perturbation.
+        min_step: Smallest perturbation magnitude. With ``min_step > 0`` the
+            step is a random sign times Uniform(min_step, bound), so an
+            explored value can never land on (or round back to) its input.
+            Capped at ``bound``.
 
     Returns:
         (value, explored). ``explored`` is True iff a perturbation was actually
@@ -141,6 +155,10 @@ def apply_exploration(
     if epsilon <= 0.0 or rng.random() >= epsilon:
         return value, False
 
-    explored = value + rng.uniform(-bound, bound)
+    if min_step > 0.0:
+        sign = -1.0 if rng.random() < 0.5 else 1.0
+        explored = value + sign * rng.uniform(min(min_step, bound), bound)
+    else:
+        explored = value + rng.uniform(-bound, bound)
     explored = max(clamp_min, min(clamp_max, explored))
     return explored, True

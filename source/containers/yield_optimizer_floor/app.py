@@ -51,15 +51,18 @@ USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 # emits a mutation, so it can never generate the outcome data needed to learn
 # anything else.
 #
-# epsilon defaults to 0.1 but only takes effect on requests that are
-# load-test-originated or that explicitly opt in via ext.model_params.explore
-# (see resolve_effective_epsilon). A prior version read this epsilon
+# epsilon (default 0.1) applies to load-test requests. A request that opts in
+# via ext.model_params.explore (every demo scenario that runs a yield model)
+# probes each deal the model would leave unchanged instead; see
+# resolve_effective_epsilon. Other traffic never explores. A prior version read this epsilon
 # unconditionally with a disabled (0.0) default, which meant a freshly deployed
 # stack could NEVER produce a yield mutation for the genesis model -- confirmed
 # live: every load test produced exactly 0 mutations, so no outcome event was
 # ever emitted and the training pipeline had nothing to bootstrap from.
 _EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.1"))
 _EXPLORATION_FLOOR_BOUND = float(os.environ.get("YIELD_EXPLORATION_FLOOR_BOUND", "0.05"))
+# A probe moves the multiplier by at least 1%, so the rounded bidfloor changes.
+_EXPLORATION_FLOOR_MIN_STEP = 0.01
 # Module-level so tests can substitute a seeded random.Random() for
 # deterministic assertions, without monkeypatching the `random` module itself.
 _exploration_rng = random.Random()
@@ -87,6 +90,12 @@ def _min_deal_floor(deal: dict) -> Optional[float]:
     if not math.isfinite(value) or value < 0:
         return None
     return value
+
+
+def _adjusted_bidfloor(original: float, multiplier: float, minimum: Optional[float]) -> float:
+    """The scaled floor, never negative (BR-7) and never under the deal's minimum."""
+    adjusted = max(0.0, round(original * multiplier, 4))
+    return adjusted if minimum is None else max(minimum, adjusted)
 
 
 def _is_suppressed(deal: dict) -> bool:
@@ -117,11 +126,8 @@ def mutate(req: RTBRequest) -> RTBResponse:
     request_time = datetime.now(timezone.utc)
     bid_request = req.bid_request or {}
 
-    effective_epsilon = resolve_effective_epsilon(
-        get_is_load_test(),
-        parse_explore_override(req.model_params),
-        _EXPLORATION_EPSILON,
-    )
+    is_load_test = get_is_load_test()
+    explore_override = parse_explore_override(req.model_params)
 
     mutations: list[Mutation] = []
     served_model_version = ""
@@ -145,12 +151,15 @@ def mutate(req: RTBRequest) -> RTBResponse:
             floor_multiplier, explored = apply_exploration(
                 floor_multiplier,
                 rng=_exploration_rng,
-                epsilon=effective_epsilon,
+                epsilon=resolve_effective_epsilon(
+                    is_load_test, explore_override, _EXPLORATION_EPSILON,
+                    prediction=floor_multiplier, no_op_value=1.0,
+                ),
                 bound=_EXPLORATION_FLOOR_BOUND,
                 clamp_min=FLOOR_MULTIPLIER_MIN,
                 clamp_max=FLOOR_MULTIPLIER_MAX,
+                min_step=_EXPLORATION_FLOOR_MIN_STEP,
             )
-            any_explored = any_explored or explored
 
             # BR-3/BR-4: a multiplier of exactly 1.0 is "no change" and must
             # never become a mutation -- emitting a no-op REPLACE would put a
@@ -160,16 +169,19 @@ def mutate(req: RTBRequest) -> RTBResponse:
                 continue
 
             original_bidfloor = float(deal.get("bidfloor", 0.0) or 0.0)
-            # BR-7: a bidfloor can never go negative.
-            adjusted_bidfloor = max(0.0, round(original_bidfloor * floor_multiplier, 4))
             # The deal's own minimum (terms.ext.mindealfloor in the deals table,
             # carried on the request as deal.ext.mindealfloor): the optimizer may
             # move the floor, never under it.
             minimum = _min_deal_floor(deal)
-            if minimum is not None:
-                adjusted_bidfloor = max(minimum, adjusted_bidfloor)
-                if adjusted_bidfloor == original_bidfloor:
-                    continue  # BR-3: the clamp undid the move, so there is no change.
+            adjusted_bidfloor = _adjusted_bidfloor(original_bidfloor, floor_multiplier, minimum)
+            if explored and minimum is not None and adjusted_bidfloor == original_bidfloor:
+                # A downward probe on a deal already at its minimum: probe
+                # upward by the same step instead of returning nothing.
+                floor_multiplier = 2.0 - floor_multiplier
+                adjusted_bidfloor = _adjusted_bidfloor(original_bidfloor, floor_multiplier, minimum)
+            if minimum is not None and adjusted_bidfloor == original_bidfloor:
+                continue  # BR-3: the clamp undid the move, so there is no change.
+            any_explored = any_explored or explored
             mutations.append(Mutation(
                 intent=Intent.ADJUST_DEAL_FLOOR, op=Operation.REPLACE,
                 path=f"/imp/{imp_id}/deals/{deal_id}",

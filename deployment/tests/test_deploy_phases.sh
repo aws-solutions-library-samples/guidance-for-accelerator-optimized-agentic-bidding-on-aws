@@ -2373,8 +2373,93 @@ test_learner_phase_structure() {
 }
 
 # =========================================================================
+# NetworkPolicy enforcement on the VPC CNI (deploy_prebid.sh)
+# =========================================================================
+# The demand service's Prebid-only NetworkPolicy was applied but inert on tr3
+# because the vpc-cni add-on ran without enableNetworkPolicy. New clusters get it
+# from cluster-config.yaml; existing ones are switched on by deploy_prebid.sh, and
+# a cluster that still does not enforce fails the run instead of warning.
+# Scenario stubs live in named functions: bash 3.2 misparses `case ... )` inside
+# $( ... ), which is where the assertions capture output.
+_np_stub_common() {
+  CLUSTER_NAME=c; AWS_REGION=us-east-1; KUBECTL=(kubectl)
+  log() { echo "LOG $*"; }; _run() { "$@"; }; sleep() { :; }
+  fail() { echo "FAIL $*"; exit 1; }
+}
+_np_scenario_off_to_on() {
+  set -u; eval "${NP_FN_SRC}"; _np_stub_common
+  kubectl() {
+    echo "kubectl $*" >>"${NP_CALLS}"
+    if [[ "$*" == *"get daemonset aws-node"* ]]; then
+      if [[ "$(cat "${NP_CALLS}.state" 2>/dev/null)" == on ]]; then echo '["--enable-network-policy=true"]'
+      else echo '["--enable-network-policy=false"]'; fi
+    fi
+    return 0
+  }
+  aws() {
+    echo "aws $*" >>"${NP_CALLS}"
+    if [[ "$*" == *addon.configurationValues* ]]; then echo '{"env":{"WARM_IP_TARGET":"2"}}'
+    elif [[ "$*" == *addon.serviceAccountRoleArn* ]]; then echo 'arn:aws:iam::1:role/cni'
+    elif [[ "$*" == *update-addon* ]]; then echo 'upd-1'; echo on >"${NP_CALLS}.state"
+    elif [[ "$*" == *describe-update* ]]; then echo 'Successful'; fi
+  }
+  ensure_network_policy_enforcement
+}
+_np_scenario_already_on() {
+  set -u; eval "${NP_FN_SRC}"; _np_stub_common
+  kubectl() { echo '["--enable-network-policy=true"]'; }
+  aws() { echo "aws $*" >>"${NP_CALLS}"; }
+  ensure_network_policy_enforcement
+}
+_np_scenario_update_fails() {
+  set -u; eval "${NP_FN_SRC}"; _np_stub_common
+  kubectl() { echo '["--enable-network-policy=false"]'; }
+  aws() {
+    echo "aws $*" >>"${NP_CALLS}"
+    if [[ "$*" == *addon.configurationValues* || "$*" == *addon.serviceAccountRoleArn* ]]; then echo 'None'
+    elif [[ "$*" == *update-addon* ]]; then echo 'upd-2'
+    elif [[ "$*" == *describe-update* ]]; then echo 'Failed'; fi
+  }
+  ensure_network_policy_enforcement
+  echo "continued"
+}
+test_network_policy_enforcement() {
+  local prebid_sh="${SCRIPT_DIR}/../deploy_prebid.sh" out rc
+  assert_contains "$(cat "${SCRIPT_DIR}/../eks/cluster-config.yaml")" 'enableNetworkPolicy: "true"' \
+    "cluster-config.yaml enables NetworkPolicy on the vpc-cni add-on"
+  assert_not_contains "$(cat "${prebid_sh}")" "is applied but inert" "deploy_prebid.sh no longer just warns about an inert policy"
+  assert_contains "$(sed -n '/^deploy_artfhouse_demand() {/,/^}/p' "${prebid_sh}")" "ensure_network_policy_enforcement" \
+    "the demand service deploy ensures enforcement"
+  NP_FN_SRC="$(sed -n '/^_np_agent_enforcing() {/,/^}/p; /^ensure_network_policy_enforcement() {/,/^}/p' "${prebid_sh}")"
+  NP_CALLS="$(mktemp)"
+
+  out="$( (_np_scenario_off_to_on) 2>&1)"; rc=$?
+  assert_eq "${rc}" "0" "enforcement is switched on when off"
+  assert_contains "$(cat "${NP_CALLS}")" '--configuration-values {"env":{"WARM_IP_TARGET":"2"},"enableNetworkPolicy":"true"}' \
+    "existing add-on configuration is kept and enableNetworkPolicy added"
+  assert_contains "$(cat "${NP_CALLS}")" "--service-account-role-arn arn:aws:iam::1:role/cni" "the add-on's IRSA role is kept"
+  assert_contains "$(cat "${NP_CALLS}")" "--resolve-conflicts PRESERVE" "conflicts are preserved"
+  assert_contains "$(cat "${NP_CALLS}")" "rollout status daemonset/aws-node" "waits for aws-node to roll out"
+  assert_contains "${out}" "VPC CNI now enforces NetworkPolicy" "reports enforcement"
+
+  : >"${NP_CALLS}"
+  ( _np_scenario_already_on ) >/dev/null 2>&1; rc=$?
+  assert_eq "${rc}" "0" "already enforcing succeeds"
+  assert_eq "$(grep -c 'update-addon' "${NP_CALLS}")" "0" "no add-on update when already enforcing"
+
+  : >"${NP_CALLS}"; rm -f "${NP_CALLS}.state"
+  out="$( (_np_scenario_update_fails) 2>&1)"; rc=$?
+  assert_eq "${rc}" "1" "a failed add-on update fails the run"
+  assert_contains "${out}" "ended Failed" "the failure names the update status"
+  assert_not_contains "${out}" "continued" "nothing runs after the failure"
+  assert_not_contains "$(cat "${NP_CALLS}")" "--service-account-role-arn" "no role argument when the add-on has none"
+  assert_contains "$(cat "${NP_CALLS}")" '--configuration-values {"enableNetworkPolicy":"true"}' "empty configuration becomes enableNetworkPolicy only"
+  rm -f "${NP_CALLS}" "${NP_CALLS}.state"
+}
+# =========================================================================
 # Run all tests
 # =========================================================================
+test_network_policy_enforcement
 test_k8s_rollout
 test_cluster_config_private_nodes
 test_unknown_args_rejected

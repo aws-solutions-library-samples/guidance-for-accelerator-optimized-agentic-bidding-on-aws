@@ -14,6 +14,7 @@ import DemoToggle from "./components/DemoToggle";
 import AnnotationOverlay from "./components/AnnotationOverlay";
 import useDemoAnimation from "./animation/useDemoAnimation";
 import DemoSequenceOrchestrator from "./animation/DemoSequenceOrchestrator";
+import { applyTunerToPayload } from "./utils/scenarioPayload.js";
 import {
   ComparisonProvider,
   useComparison,
@@ -79,7 +80,9 @@ function AppContent() {
   const demoSubmitFn = useCallback(async (scenario) => {
     const resp = await fetch(`/samples/${scenario.file}?t=${Date.now()}`);
     if (!resp.ok) throw new Error(`Failed to load sample: ${scenario.file}`);
-    const payload = await resp.json();
+    // No tuner values: the payload as shipped, plus the yield explore opt-in
+    // every scenario Send carries.
+    const payload = applyTunerToPayload(await resp.json(), scenario);
     setLastPayload(payload);
     const result = await submitScenario(payload, "REST");
     return result;
