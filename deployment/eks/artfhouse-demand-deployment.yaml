@@ -131,9 +131,9 @@ spec:
       targetPort: http
       protocol: TCP
 ---
-# Only the Prebid pods may reach the demand service. Enforced only when the cluster's
-# CNI enforces NetworkPolicy (VPC CNI: enableNetworkPolicy); deploy_prebid.sh reports
-# whether it does.
+# Only the Prebid pods may reach the demand service. Enforced by the VPC CNI with
+# enableNetworkPolicy, which eks/cluster-config.yaml sets and deploy_prebid.sh turns on
+# (and verifies) for existing clusters before applying this file.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

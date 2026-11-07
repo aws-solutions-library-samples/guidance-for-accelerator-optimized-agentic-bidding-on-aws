@@ -623,14 +623,16 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/ncf-deal-manager-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-floor-*'
                   - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/deal-yield-manager-margin-*'
+              # IAM checks ListModelPackages against model-package/<group>/*. A
+              # group ARN here denied every scheduled run.
               - Effect: Allow
                 Action:
                   - 'sagemaker:ListModelPackages'
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DLRMModelPackageGroupName}'
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${NCFModelPackageGroupName}'
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerFloorModelPackageGroupName}'
-                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/${DealYieldManagerMarginModelPackageGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DLRMModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${NCFModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DealYieldManagerFloorModelPackageGroupName}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package/${DealYieldManagerMarginModelPackageGroupName}/*'
               - Effect: Allow
                 Action:
                   - 'iam:PassRole'
@@ -805,6 +807,9 @@ Resources:
               }
               for metric_name, value in metrics.items():
                   customer_metadata[f'metric_{metric_name}'] = str(value)
+              # An empty value (e.g. window_days on XGBoost jobs) fails
+              # create_model_package with ParamValidationError. Omit it.
+              customer_metadata = {k: v for k, v in customer_metadata.items() if v}
 
               if shape == "xgboost":
                   training_image = os.environ.get('XGBOOST_TRAINING_IMAGE_URI', '')
@@ -939,10 +944,8 @@ Resources:
         # Same action set and GetAuthorizationToken-on-* split that
         # closed_loop_cfn.yaml's training role already uses. Scoped to
         # repositories in this account, which covers the NeMo-RL training image
-        # the DLRM/NCF model packages reference. The xgboost-shaped model types
-        # reference an AWS-published SageMaker image in a different account
-        # (XGBoostTrainingImageUri), which an account-scoped ARN cannot cover --
-        # if yield registration ever fails on image validation, that is why.
+        # the DLRM/NCF model packages reference. Yield packages reference the
+        # AWS-owned sagemaker-xgboost image, whose account varies by region.
         - PolicyName: ReadTrainingImageForRegistration
           PolicyDocument:
             Version: '2012-10-17'
@@ -959,6 +962,14 @@ Resources:
                   - 'ecr:BatchCheckLayerAvailability'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:DescribeImages'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchCheckLayerAvailability'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:*:repository/sagemaker-xgboost'
         - PolicyName: EmitModelPackageGroupChanged
           PolicyDocument:
             Version: '2012-10-17'

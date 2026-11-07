@@ -121,6 +121,11 @@ addons:
   - name: vpc-cni
     attachPolicyARNs:
       - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+    # Enforce Kubernetes NetworkPolicy (standard mode). Without it the demand
+    # service's Prebid-only policy is applied but inert. deploy_prebid.sh turns
+    # this on for clusters created before this line existed.
+    configurationValues: |-
+      enableNetworkPolicy: "true"
   - name: coredns
   - name: kube-proxy
 

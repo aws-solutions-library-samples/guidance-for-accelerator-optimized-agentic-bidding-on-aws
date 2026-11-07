@@ -605,6 +605,65 @@ deploy_amt_simulator() {
 }
 
 # ---------------------------------------------------------------------------
+# ensure_network_policy_enforcement -- make the VPC CNI enforce NetworkPolicy.
+#
+# The demand service's NetworkPolicy (Prebid pods only) is inert unless the VPC CNI
+# runs its node agent with --enable-network-policy=true, which the EKS add-on does
+# only with configurationValues enableNetworkPolicy=true. eks/cluster-config.yaml
+# sets that for new clusters; this turns it on for clusters created before it did.
+# Standard enforcement mode: only pods a NetworkPolicy selects are restricted.
+# Existing configuration values and the add-on's IRSA role are kept. Fails the run
+# if enforcement cannot be confirmed.
+# ---------------------------------------------------------------------------
+_np_agent_enforcing() {
+  local args
+  args="$("${KUBECTL[@]}" get daemonset aws-node -n kube-system \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")].args}' 2>/dev/null || echo '')"
+  [[ "${args}" == *"--enable-network-policy=true"* ]]
+}
+
+ensure_network_policy_enforcement() {
+  if _np_agent_enforcing; then
+    log "  VPC CNI enforces NetworkPolicy"
+    return 0
+  fi
+  local current role merged update_id upd_status="" waited=0
+  current="$(aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --addon-name vpc-cni \
+    --region "${AWS_REGION}" --query 'addon.configurationValues' --output text 2>/dev/null)" \
+    || fail "The vpc-cni EKS add-on was not found on ${CLUSTER_NAME}. NetworkPolicy enforcement needs the managed add-on with enableNetworkPolicy=true."
+  role="$(aws eks describe-addon --cluster-name "${CLUSTER_NAME}" --addon-name vpc-cni \
+    --region "${AWS_REGION}" --query 'addon.serviceAccountRoleArn' --output text 2>/dev/null || echo '')"
+  merged="$(python3 -c '
+import json, sys
+raw = sys.argv[1].strip()
+cfg = {} if raw in ("", "None") else json.loads(raw)
+cfg["enableNetworkPolicy"] = "true"
+print(json.dumps(cfg, separators=(",", ":")))' "${current}" 2>/dev/null)" \
+    || fail "The vpc-cni add-on's configurationValues are not JSON (${current}); add enableNetworkPolicy: \"true\" to them by hand, then re-run."
+
+  log "  Enabling NetworkPolicy enforcement on the vpc-cni add-on (aws-node pods restart one node at a time)"
+  local role_args=()
+  [[ -n "${role}" && "${role}" != "None" ]] && role_args=(--service-account-role-arn "${role}")
+  update_id="$(aws eks update-addon --cluster-name "${CLUSTER_NAME}" --addon-name vpc-cni \
+    --region "${AWS_REGION}" --configuration-values "${merged}" --resolve-conflicts PRESERVE \
+    ${role_args[@]+"${role_args[@]}"} --query 'update.id' --output text)" \
+    || fail "aws eks update-addon vpc-cni failed; NetworkPolicy is not enforced."
+  while [[ "${waited}" -lt 900 ]]; do
+    upd_status="$(aws eks describe-update --name "${CLUSTER_NAME}" --addon-name vpc-cni \
+      --update-id "${update_id}" --region "${AWS_REGION}" --query 'update.status' --output text 2>/dev/null || echo '')"
+    [[ "${upd_status}" == "Successful" || "${upd_status}" == "Failed" || "${upd_status}" == "Cancelled" ]] && break
+    sleep 15; waited=$((waited + 15))
+  done
+  [[ "${upd_status}" == "Successful" ]] \
+    || fail "vpc-cni add-on update ${update_id} ended ${upd_status:-unknown after ${waited}s}. See: aws eks describe-update --name ${CLUSTER_NAME} --addon-name vpc-cni --update-id ${update_id} --region ${AWS_REGION}"
+  _run "${KUBECTL[@]}" rollout status daemonset/aws-node -n kube-system --timeout=600s \
+    || fail "aws-node did not finish rolling out after enabling NetworkPolicy."
+  _np_agent_enforcing \
+    || fail "vpc-cni update succeeded but the node agent still runs without --enable-network-policy=true."
+  log "  VPC CNI now enforces NetworkPolicy"
+}
+
+# ---------------------------------------------------------------------------
 # deploy_artfhouse_demand -- the artfhouse seat's demand service, in-cluster.
 #
 # A Deployment, ClusterIP Service, ServiceAccount (IRSA, read-only on the deals
@@ -639,23 +698,13 @@ deploy_artfhouse_demand() {
   if [[ ${#KUBECTL[@]} -eq 1 ]]; then
     resolve_kube_context || fail "No usable kubectl context; cannot apply the demand service."
   fi
+  # Before the apply, so the rollout wait below runs with enforcement on and catches
+  # a policy that blocks the kubelet's health probes.
+  ensure_network_policy_enforcement
   "${KUBECTL[@]}" apply -f "${processed}" >/dev/null || fail "kubectl apply failed for the demand service"
   ROLLOUT_KUBECTL=("${KUBECTL[@]}")
   wait_rollout artfhouse-demand "${NAMESPACE}" 300 || ROLLOUT_FAILURES+=("${ROLLOUT_FAILURE}")
-
-  # Whether the NetworkPolicy is enforced. The VPC CNI enforces NetworkPolicy only
-  # with enableNetworkPolicy, which runs the node agent with
-  # --enable-network-policy=true. Reported, not assumed.
-  local np_args
-  np_args="$("${KUBECTL[@]}" get daemonset aws-node -n kube-system \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")].args}' 2>/dev/null || echo '')"
-  if [[ "${np_args}" == *"--enable-network-policy=true"* ]]; then
-    log "  NetworkPolicy enforced: only Prebid pods can reach the demand service"
-  else
-    warn "This cluster's CNI does not enforce NetworkPolicy (VPC CNI enableNetworkPolicy is off)."
-    warn "artfhouse-demand-from-prebid-only is applied but inert; any pod can reach the"
-    warn "demand Service. Requests still need a valid Prebid token with artf-demand/bid:read."
-  fi
+  log "  NetworkPolicy enforced: only Prebid pods can reach the demand service"
 }
 
 # ---------------------------------------------------------------------------

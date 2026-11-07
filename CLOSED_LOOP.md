@@ -42,9 +42,12 @@ real, disclosed feedback its Glue ETL job needs to build labeled training data:
   the shipped manifests) the container perturbs its own prediction by a small,
   bounded amount. This breaks a model that has converged to "no change" out of a
   cold-start deadlock, since a constant recommendation never produces the
-  mutation an outcome event needs. Exploration applies only to load-test
-  requests and to requests that set `ext.model_params.explore`; other traffic
-  gets the unperturbed prediction. Every exploratory response carries a
+  mutation an outcome event needs. That epsilon applies to load-test requests.
+  Requests that set `ext.model_params.explore` (every demo scenario that runs a
+  yield model) probe every deal the model would leave unchanged, by at least 1%
+  of the floor or 0.005 of margin, and pass a prediction that already moves the
+  value through unchanged. Other traffic gets the unperturbed prediction. Every
+  exploratory response carries a
   `:explore` suffix on its `model_version`, so training data can separate probes
   from the model's own recommendations.
 

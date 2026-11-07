@@ -1,5 +1,6 @@
 import { useState, useRef } from "react";
 import { DEAL_SCORER_TRAINING_DISCLOSURE, scenarioUsesDealScorer } from "../utils/dealScorerTraining.js";
+import { YIELD_EXPLORATION_DISCLOSURE, scenarioUsesYieldOptimizer } from "../utils/scenarioPayload.js";
 
 const AGE_RANGES = ["18–24", "25–34", "35–44", "45–54", "55–64", "65+"];
 
@@ -129,7 +130,7 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "finance-news.json",
-    controls: ["bidFloor", "explore"],
+    controls: ["bidFloor"],
     defaults: { bidFloor: 2.2 },
   },
   {
@@ -155,7 +156,7 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "parenting-narrative.json",
-    controls: ["bidFloor", "segThreshold", "explore"],
+    controls: ["bidFloor", "segThreshold"],
     defaults: { bidFloor: 2.6 },
   },
   {
@@ -176,7 +177,7 @@ export const SCENARIOS = [
       { cls: "yield", label: "ADJUST_DEAL_MARGIN" },
     ],
     file: "yield-optimizer.json",
-    controls: ["bidFloor", "explore"],
+    controls: ["bidFloor"],
     defaults: { bidFloor: 6.0 },
   },
   {
@@ -205,7 +206,7 @@ export const SCENARIOS = [
     // numDeals was dropped from this card: it sliced the pre-declared deal list,
     // and the fixture now offers a single remnant deal (the rest come from the
     // Deal Scorer's library at run time, which a request-side slider cannot reach).
-    controls: ["bidFloor", "ageRange", "segThreshold", "explore"],
+    controls: ["bidFloor", "ageRange", "segThreshold"],
     defaults: { bidFloor: 8.0 },
   },
   {
@@ -299,7 +300,7 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "ridesharer-airport-evening.json",
-    controls: ["bidFloor", "segThreshold", "explore"],
+    controls: ["bidFloor", "segThreshold"],
     defaults: { bidFloor: 5.0 },
   },
   {
@@ -308,7 +309,7 @@ export const SCENARIOS = [
     name: "RideSharer: Midday Ride, Lower the Floor",
     page: "An in-app full-screen banner on a short midday ride.",
     audience: "Local riders near RideSharer Eats restaurants.",
-    demand: "Basil & Brine Kitchen and Maple Corner Noodle House bid under the $12.00 floor, so nothing sells without ARTF. With ARTF and Explore on, the Yield Optimizer lowers the floor at run time so one can clear.",
+    demand: "Basil & Brine Kitchen and Maple Corner Noodle House bid under the $12.00 floor, so nothing sells without ARTF. With ARTF, the Yield Optimizer sets the floor at run time, and a bid clears only if the floor comes down far enough.",
     models: [
       { key: "widedeep_segment_activator", label: "Audience Activator", rulesBased: true },
       { key: "ncf_deal_manager", label: "NCF Deal Manager" },
@@ -324,7 +325,7 @@ export const SCENARIOS = [
       { cls: "metric", label: "ADD_METRICS" },
     ],
     file: "ridesharer-suburban-midday.json",
-    controls: ["bidFloor", "segThreshold", "explore"],
+    controls: ["bidFloor", "segThreshold"],
     defaults: { bidFloor: 5.0 },
   },
 
@@ -457,12 +458,6 @@ export const TUNER_DEFAULTS = {
   shadeFactor: 0.65,
   convValue: 12,
   segThreshold: 0.55,
-  // Yield Optimizer's bounded exploration (see shared/yield_exploration.py's
-  // resolve_effective_epsilon) -- on by default so a scenario Send against the
-  // still-untrained genesis model can produce a real mutation instead of always
-  // 0. Once a real model has been trained at least once, the user can flip this
-  // off to see that model's unperturbed prediction.
-  explore: false,
 };
 
 /**
@@ -508,7 +503,6 @@ export default function ScenarioCard({
   const [shadeFactor, setShadeFactor] = useState(() => initialTunerValue(scenario, "shadeFactor")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
   const [convValue, setConvValue] = useState(() => initialTunerValue(scenario, "convValue")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
   const [segThreshold, setSegThreshold] = useState(() => initialTunerValue(scenario, "segThreshold")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
-  const [explore, setExplore] = useState(() => initialTunerValue(scenario, "explore")); // nosemgrep: react-props-in-state seed value only; ScenarioPicker keys the card by scenario id so a new scenario remounts it
 
   const controls = scenario.controls || [];
 
@@ -519,7 +513,6 @@ export default function ScenarioCard({
     shadeFactor,
     convValue,
     segThreshold,
-    explore,
   });
 
   const handleSend = (e) => {
@@ -562,6 +555,11 @@ export default function ScenarioCard({
       {scenarioUsesDealScorer(scenario) ? (
         <p className="scenario-disclosure" data-testid="scenario-deal-scorer-disclosure">
           {DEAL_SCORER_TRAINING_DISCLOSURE}
+        </p>
+      ) : null}
+      {scenarioUsesYieldOptimizer(scenario) ? (
+        <p className="scenario-disclosure" data-testid="scenario-yield-exploration-disclosure">
+          {YIELD_EXPLORATION_DISCLOSURE}
         </p>
       ) : null}
       <div className="tags">
@@ -625,23 +623,6 @@ export default function ScenarioCard({
               <input type="range" min="0.3" max="0.8" step="0.05" value={segThreshold}
                 onChange={(e) => setSegThreshold(parseFloat(e.target.value))} />
               <span className="tuner-value">{segThreshold.toFixed(2)}</span>
-            </div>
-          )}
-          {controls.includes("explore") && (
-            <div className="tuner-row tuner-row-toggle">
-              <label htmlFor={`explore-toggle-${scenario.id}`}>
-                Explore
-                <span className="tuner-hint">
-                  {" "}(perturbs the prediction so an untrained model can still produce a mutation — turn off once trained)
-                </span>
-              </label>
-              <input
-                id={`explore-toggle-${scenario.id}`}
-                type="checkbox"
-                checked={explore}
-                onChange={(e) => setExplore(e.target.checked)}
-                data-testid="yield-explore-toggle"
-              />
             </div>
           )}
           <div className="tuner-actions">

@@ -57,6 +57,9 @@ logger = logging.getLogger(__name__)
 # SageMaker paths
 SM_CHANNEL_TRAINING = os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/training")
 SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
+# SageMaker copies the first 1024 characters of this file into the job's
+# FailureReason. Without it the reason reads "AlgorithmError: , exit code: 1".
+SM_FAILURE_FILE = "/opt/ml/output/failure"
 SM_HP_FILE = "/opt/ml/input/config/hyperparameters.json"
 
 # Model architecture registry. widedeep_segment_activator is intentionally
@@ -1276,5 +1279,27 @@ def main():
     logger.info("=" * 60)
 
 
+def write_failure_reason(exc: BaseException, path: str | None = None) -> None:
+    """Record an unhandled exception where SageMaker reads FailureReason from."""
+    path = path or SM_FAILURE_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{type(exc).__name__}: {exc}")
+    except OSError:
+        logger.exception("Could not write failure reason to %s", path)
+
+
+def run() -> int:
+    """Run main(); on an unhandled exception log it, record it, return 1."""
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 - every failure must reach FailureReason
+        logger.exception("Training failed")
+        write_failure_reason(exc)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(run())

@@ -5,8 +5,9 @@
 # Pinned to the versions the embedded DSP guidance's control plane runs on, which
 # were read off a working install there (mcp 1.29.0 is the version its
 # headers_from_context was verified against; see server.py). boto3/botocore are
-# a matched pair. cryptography backs the token verifier in auth.py.
+# a matched pair. cryptography backs the token verifier in auth.py; it is held
+# at >=46.0.5 for GHSA-r6ph-v2qm-q3c2 (CVE-2026-26007).
 mcp==1.29.0
 boto3==1.43.39
 botocore==1.43.39
-cryptography==46.0.2
+cryptography==46.0.7

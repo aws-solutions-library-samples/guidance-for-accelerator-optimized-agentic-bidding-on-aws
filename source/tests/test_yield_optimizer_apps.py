@@ -238,15 +238,28 @@ class TestExplorationGate:
 
 @BOTH
 class TestExploreOverride:
-    """The ext.model_params.explore channel the scenario card's Explore toggle
-    uses to arm exploration on a single Send, without needing a load test."""
+    """The ext.model_params.explore channel every demo scenario with a yield
+    model sets, so a single Send returns a mutation without a load test."""
 
-    def test_explore_true_alone_is_sufficient(self, case, monkeypatch):
+    @pytest.mark.parametrize("seed", range(25))
+    def test_explore_true_probes_every_no_op_deal(self, case, monkeypatch, seed):
+        """The configured load-test epsilon does not apply here: every deal the
+        model would leave unchanged gets a probe, on every run."""
         case.patch_predict(monkeypatch, case.no_op)
+        monkeypatch.setattr(case.app, "_EXPLORATION_EPSILON", 0.1)
+        monkeypatch.setattr(case.app, "_exploration_rng", random.Random(seed))
+        resp = case.app.mutate(_req(ext={"model_params": {"explore": True}}))
+        assert len(resp.mutations) == 2
+        assert resp.metadata.model_version.endswith(":explore")
+
+    def test_explore_true_leaves_a_real_recommendation_unperturbed(self, case, monkeypatch):
+        case.patch_predict(monkeypatch, case.changed)
         case.force_exploration(monkeypatch)
         resp = case.app.mutate(_req(ext={"model_params": {"explore": True}}))
-        assert len(resp.mutations) > 0
-        assert resp.metadata.model_version.endswith(":explore")
+        assert len(resp.mutations) == 2
+        assert not resp.metadata.model_version.endswith(":explore")
+        baseline = case.app.mutate(_req())
+        assert [m.adjust_deal for m in resp.mutations] == [m.adjust_deal for m in baseline.mutations]
 
     def test_explore_false_wins_even_during_a_load_test(self, case, monkeypatch):
         case.patch_predict(monkeypatch, case.no_op)
@@ -284,6 +297,20 @@ class TestFloorSpecificRules:
         resp = floor_app.mutate(_req())
         assert resp.mutations
         assert all(m.adjust_deal.bidfloor >= 0.0 for m in resp.mutations)
+
+    @pytest.mark.parametrize("seed", range(25))
+    def test_probe_on_a_deal_at_its_minimum_moves_up_instead_of_vanishing(self, monkeypatch, seed):
+        """A downward probe the deal's own minimum would undo is mirrored upward."""
+        FLOOR.patch_predict(monkeypatch, 1.0)
+        monkeypatch.setattr(floor_app, "_exploration_rng", random.Random(seed))
+        resp = floor_app.mutate(_req(
+            bid_request={"imp": [{"id": "imp-1", "pmp": {"deals": [
+                {"id": "d", "bidfloor": 4.0, "at": 2, "ext": {"mindealfloor": 4.0}},
+            ]}}]},
+            ext={"model_params": {"explore": True}},
+        ))
+        assert len(resp.mutations) == 1
+        assert resp.mutations[0].adjust_deal.bidfloor > 4.0
 
     def test_a_missing_bidfloor_is_treated_as_zero_not_an_error(self, monkeypatch):
         FLOOR.patch_predict(monkeypatch, 1.5)
