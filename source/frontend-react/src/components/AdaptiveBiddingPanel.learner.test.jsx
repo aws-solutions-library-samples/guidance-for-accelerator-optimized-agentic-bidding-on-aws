@@ -1,9 +1,10 @@
 /**
  * @vitest-environment jsdom
  *
- * AdaptiveBiddingPanel when the Adaptive Bidding agent is not deployed: in a
- * learner-mode deployment the agent node says it is not deployed in learner
- * mode; in a standard deployment the existing message is unchanged.
+ * AdaptiveBiddingPanel when the Adaptive Bidding agent is not deployed. Learner
+ * mode deploys the agent, so a learner bundle with no runtime ARN says to re-run
+ * the learner deploy (not --with-retraining, which learner mode refuses); in a
+ * standard deployment the existing message is unchanged.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React from 'react';
@@ -70,9 +71,11 @@ async function runScenario() {
 }
 
 describe('agentUnavailableReason', () => {
-  it('names learner mode for the Adaptive Bidding agent only', () => {
+  it('names the learner deploy for the Adaptive Bidding agent only', () => {
     expect(agentUnavailableReason('adaptive', { deploymentMode: 'learner' })).toBe(ADAPTIVE_LEARNER_UNAVAILABLE);
-    expect(ADAPTIVE_LEARNER_UNAVAILABLE).toContain('not deployed in learner mode');
+    expect(ADAPTIVE_LEARNER_UNAVAILABLE).toContain('./deploy.sh --learner-mode');
+    expect(ADAPTIVE_LEARNER_UNAVAILABLE).not.toContain('--no-learner-mode');
+    expect(ADAPTIVE_LEARNER_UNAVAILABLE).not.toContain('--with-retraining');
     expect(agentUnavailableReason('adaptive', { deploymentMode: 'standard' })).toContain('Agent not deployed');
     expect(agentUnavailableReason('adaptive')).toContain('Agent not deployed');
     expect(agentUnavailableReason('governance', { deploymentMode: 'learner' })).toContain('Agent not deployed');
@@ -80,7 +83,7 @@ describe('agentUnavailableReason', () => {
 });
 
 describe('AdaptiveBiddingPanel with no Adaptive Bidding agent', () => {
-  it('says the agent is not deployed in learner mode', async () => {
+  it('says to re-run the learner deploy', async () => {
     mode = 'learner';
     const text = await runScenario();
     expect(text).toContain(ADAPTIVE_LEARNER_UNAVAILABLE);

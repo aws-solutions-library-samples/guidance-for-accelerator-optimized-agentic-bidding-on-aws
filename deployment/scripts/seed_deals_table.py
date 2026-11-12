@@ -5,7 +5,7 @@ Run by deploy.sh Phase 1 Step 1.5 after the ``<stack>-deals`` stack is up:
 
     seed_deals_table.py --table <stack>-deals --role-arn <DealsSeedRoleArn> \\
         --seed deployment/seed/deals_and_campaigns.json --region <region> \\
-        --origin-prefix "<stack prefix>" [--campaign-status paused --skip-managed]
+        --origin-prefix "<stack prefix>" [--campaign-status paused|active --skip-managed]
 
 The seed holds IAB Tech Lab Deals API v1.0 Deal objects and the demand
 endpoint's campaign records. Every deal's ``origin`` is stored in the seed as
@@ -20,9 +20,9 @@ the campaign/deals control plane applies to every tool call. One validator for
 both writers, so an agent cannot write what the seed could not.
 
 Campaign status. ``--campaign-status`` is written onto every campaign item.
-deploy.sh passes ``paused`` when the control plane is being deployed, so that
-activating a campaign is a step taken through the control plane, and ``active``
-otherwise, so a stack without a control plane bids as it always has.
+deploy.sh passes ``paused`` for a learner-mode deployment with the control plane,
+so that activating a campaign is a step the learner takes through the control
+plane, and ``active`` otherwise, so the stack has deal buyers once it is deployed.
 
 Control-plane edits. With ``--skip-managed`` every put carries the condition
 ``attribute_not_exists(managed_by)``: an item the control plane has written is
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", default=None, help="AWS profile for the identity that assumes the role")
     parser.add_argument(
         "--campaign-status", choices=list(records.CAMPAIGN_STATUSES), default=records.CAMPAIGN_ACTIVE,
-        help="status written onto every seeded campaign (paused when a control plane will activate them)",
+        help="status written onto every seeded campaign (paused when the learner activates them through the control plane)",
     )
     parser.add_argument(
         "--skip-managed", action="store_true",

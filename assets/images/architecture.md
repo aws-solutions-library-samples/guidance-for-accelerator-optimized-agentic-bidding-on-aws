@@ -82,8 +82,8 @@ refresh. An external agent connects with OAuth 2.0 `client_credentials` for a
 dedicated Cognito app client: AgentCore's inbound JWT authorizer accepts only that
 client and its four `artf-control` scopes, and the container verifies the token
 again and applies per-advertiser and per-seller entitlement. The Prebid host's
-own client holds no control scope. Seeded campaigns start paused when the control
-plane is deployed, so activating one is a tool call.
+own client holds no control scope. In a learner-mode deployment, seeded campaigns
+start paused, so activating one is a tool call; a standard deployment seeds them active.
 
 A **React frontend** is hosted on Amazon S3 and delivered through Amazon CloudFront;
 Amazon Cognito provides user-pool authentication (SRP, admin-created users, no

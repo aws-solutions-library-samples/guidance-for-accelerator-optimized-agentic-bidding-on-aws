@@ -90,8 +90,9 @@ fi
 #   ./deploy.sh --maxGPUs 5                     # cap GPU node group max size at 5 (default 3)
 #   ./deploy.sh --artf-node-role inference      # co-locate ARTF model containers on the GPU node
 #                                               # (default: services / CPU nodes; --artf-on-gpu = shorthand)
-#   ./deploy.sh --learner-mode                 # no GPUs: Triton on CPU nodes, Part 1 only, Governance tab
-#                                               # disabled. NOT for ARTF-compliant production workloads.
+#   ./deploy.sh --learner-mode                 # no GPUs: Triton on CPU nodes, Part 1 plus the Adaptive
+#                                               # Bidding agent; no retraining, Governance tab disabled.
+#                                               # NOT for ARTF-compliant production workloads.
 #                                               # Deploys Prebid Server for the Auction Theater
 #                                               # (--no-prebid is refused); --ngc-key is ignored.
 #   ./deploy.sh --no-learner-mode              # back to the standard GPU deployment (both remembered)
@@ -266,8 +267,8 @@ WITH_PREBID=0
 CONTROL_PLANE=1
 CONTROL_PLANE_EFFECTIVE=0
 # Learner mode (--learner-mode) is OFF by default: no GPU node group, Triton on the
-# CPU node group serving FIL and ONNX Runtime models, Part 2 off, Governance tab
-# disabled in the UI. Remembered per prefix; --no-learner-mode switches back. See
+# CPU node group serving FIL and ONNX Runtime models, retraining and Governance off
+# (the Adaptive Bidding agent is still deployed), Governance tab disabled in the UI. Remembered per prefix; --no-learner-mode switches back. See
 # validate_learner_mode below.
 LEARNER_MODE=0
 # Scope the orchestrator requires of a MACHINE credential on POST /v1/mutations.
@@ -444,12 +445,12 @@ fi
 # what it implies. Called here, on the parsed flags, and again after remembered
 # values are restored (a restored value has not been checked yet).
 #
-# Learner mode is Part 1 only. Every Part 2 component except the Adaptive Bidding
-# agent trains or promotes on GPUs (NeMo-RL on NGC images, scheduled retraining on
-# GPU training instances, TensorRT promotion Jobs), and the Auction Theater uses
-# none of them. So WITH_RETRAINING is forced to 0, which is the tested
-# --no-retraining configuration. _WITH_RETRAINING_CHOICE keeps the operator's own
-# value, which is what gets remembered, so --no-learner-mode later restores Part 2.
+# Learner mode deploys Part 1 plus the Adaptive Bidding agent. Every other Part 2
+# component trains or promotes on GPUs (NeMo-RL on NGC images, scheduled retraining
+# on GPU training instances, TensorRT promotion Jobs). So WITH_RETRAINING is forced
+# to 0, and Step 11 runs deploy_closed_loop.sh --adaptive-only instead of the full
+# closed loop. _WITH_RETRAINING_CHOICE keeps the operator's own value, which is
+# what gets remembered, so --no-learner-mode later restores Part 2.
 #
 # Prebid Server is forced ON the same way: the Auction Theater's live auction is
 # POST /v1/auction/run, which the orchestrator answers with 501 unless Prebid
@@ -500,7 +501,7 @@ validate_learner_mode() {
   fi
   if [[ "${_LEARNER_NOTED}" -eq 0 ]]; then
     _LEARNER_NOTED=1
-    printf '  Learner mode: no GPUs. Triton serves on the CPU node group; Part 2 (retraining, Governance, the Adaptive Bidding agent) is off; Prebid Server is deployed for the Auction Theater. Not for ARTF-compliant production workloads.\n'
+    printf '  Learner mode: no GPUs. Triton serves on the CPU node group; retraining and Governance are off; the Adaptive Bidding agent is deployed; Prebid Server is deployed for the Auction Theater. Not for ARTF-compliant production workloads.\n'
     if [[ "${_GIVEN_MAXGPUS}" -ne 0 ]]; then
       printf '\033[0;33m[warn]\033[0m %s\n' "--maxGPUs has no effect in learner mode (there is no GPU node group to size)."
     fi
@@ -2911,13 +2912,20 @@ fi
 DEALS_SEED_ROLE_ARN="$(_cfn_output "${DEALS_STACK}" DealsSeedRoleArn)"
 [[ -n "${DEALS_SEED_ROLE_ARN}" ]] || fail 1 "${DEALS_STACK} has no DealsSeedRoleArn output."
 log "  Deals table stack ready: ${DEALS_STACK} (table ${DEALS_TABLE})"
-# With the control plane, seeded campaigns are written PAUSED (activating one is a
-# step taken through the control plane) and items the control plane has already
-# written are left alone (--skip-managed). Without it, the seed behaves as it always
-# has: every campaign active, every record rewritten.
+# With the control plane, items it has already written are left alone
+# (--skip-managed), so a campaign paused or activated through it keeps that state
+# across a redeploy. In learner mode the other seeded campaigns are written PAUSED,
+# because activating one through the control plane is a step the learner takes. In
+# a standard deployment they are written active, so the Auction Theater has deal
+# buyers as soon as the deploy finishes. Without the control plane, every campaign
+# is active and every record rewritten.
 SEED_STATUS_ARGS=()
 if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then
-  SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)
+  if [[ "${LEARNER_MODE}" -eq 1 ]]; then
+    SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)
+  else
+    SEED_STATUS_ARGS=(--campaign-status active --skip-managed)
+  fi
 fi
 "${PYTHON}" "${SCRIPT_DIR}/scripts/seed_deals_table.py" \
   --table "${DEALS_TABLE}" \
@@ -4469,10 +4477,18 @@ fi
 
 # =========================================================================
 # Step 11 (optional): Deploy closed-loop retraining infrastructure
+#
+# Learner mode forces WITH_RETRAINING=0 but still runs this step, with
+# deploy_closed_loop.sh --adaptive-only: the Adaptive Bidding agent tunes bid
+# parameters with a Bedrock model and needs no training or GPU.
 # =========================================================================
-if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
+if [[ "${WITH_RETRAINING}" -eq 1 || "${LEARNER_MODE}" -eq 1 ]]; then
   log ""
-  step "Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)"
+  if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
+    step "Step 11: Deploying closed-loop retraining infrastructure (--with-retraining)"
+  else
+    step "Step 11: Deploying the Adaptive Bidding agent (learner mode)"
+  fi
   log ""
 
   # Resolve VPC, subnets, and node role from the EKS cluster for the closed-loop stack
@@ -4498,11 +4514,17 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   if [[ "${LOCAL_BUILD}" -eq 1 ]]; then
     CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --local-build"
   fi
-  if [[ -n "${NGC_SECRET}" ]]; then
-    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-secret ${NGC_SECRET}"
-  fi
-  if [[ -n "${NGC_KEY}" ]]; then
-    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-key ${NGC_KEY}"
+  # NGC values are passed only with retraining on. Learner mode has already
+  # cleared them, and --adaptive-only builds nothing NGC-based.
+  if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
+    if [[ -n "${NGC_SECRET}" ]]; then
+      CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-secret ${NGC_SECRET}"
+    fi
+    if [[ -n "${NGC_KEY}" ]]; then
+      CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --ngc-key ${NGC_KEY}"
+    fi
+  else
+    CLOSED_LOOP_ARGS="${CLOSED_LOOP_ARGS} --adaptive-only"
   fi
   # One --verbose on this script turns on the child too. Without this pass-through,
   # deploy_closed_loop.sh's newly gated log() would hide its detail even from
@@ -4536,6 +4558,7 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID}" \
   ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID}" \
   GOVERNANCE_MODEL_ID="${GOVERNANCE_MODEL_ID}" \
+  CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID}" \
   PATH="${PYTHON_BIN_DIR:+${PYTHON_BIN_DIR}:}${PATH}" \
   bash "${SCRIPT_DIR}/deploy_closed_loop.sh" ${CLOSED_LOOP_ARGS} 2>&1 \
     | tee -a "${_CL_TEE[@]}"
@@ -4567,7 +4590,11 @@ if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
   # first). The orchestrator is never wired to the agents — the browser invokes them
   # directly via SigV4 (FR-6).
 
-  log "  Closed-loop retraining infrastructure deployed."
+  if [[ "${WITH_RETRAINING}" -eq 1 ]]; then
+    log "  Closed-loop retraining infrastructure deployed."
+  else
+    log "  Adaptive Bidding agent deployed (learner mode: no retraining, no Governance)."
+  fi
 else
   log ""
   log "  Skipping closed-loop retraining (pass --with-retraining to enable)."

@@ -141,9 +141,14 @@ export function isAgentCoreConfigured() {
   return isAdaptiveConfigured();
 }
 
-/** Shown for the Adaptive Bidding agent in a learner-mode deployment, which is Part 1 only. */
+/**
+ * Shown for the Adaptive Bidding agent in a learner-mode deployment whose bundle has
+ * no runtime ARN. Learner mode deploys the agent (deploy.sh Step 11, --adaptive-only),
+ * so a missing ARN means that step has not completed. --with-retraining, named in
+ * the generic message below, is refused in learner mode.
+ */
 export const ADAPTIVE_LEARNER_UNAVAILABLE =
-  "The Adaptive Bidding agent is not deployed in learner mode. Deploy with --no-learner-mode to use it.";
+  "The Adaptive Bidding agent is not deployed yet. Re-run ./deploy.sh --learner-mode to deploy it, then reload this page.";
 
 /**
  * Human-readable reason an agent isn't invokable, or null if it is.

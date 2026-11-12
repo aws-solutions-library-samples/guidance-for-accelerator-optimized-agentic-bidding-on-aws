@@ -54,8 +54,8 @@ export default function LearnerModeNotice({ onAcknowledge }) {
             Inference runs on CPUs instead of GPUs: Triton Inference Server serves the
             models on the cluster&apos;s CPU nodes. The Governance tab is unavailable
             because training, retraining and promotion require GPUs. Adaptive Bidding is
-            also unavailable: learner mode deploys Part 1 only, so the Adaptive Bidding
-            agent is not deployed.
+            available: its agent tunes bid parameters with a Bedrock model and needs no
+            training.
           </p>
         </div>
         <div className="learner-notice-actions">

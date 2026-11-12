@@ -177,3 +177,58 @@ def test_cli_passes_the_learner_flag(monkeypatch, argv, expected):
     monkeypatch.setattr(deploy_status, "boto3", object())
     deploy_status.main(["--prefix", "t", "--shell", *argv])
     assert seen["learner"] is expected
+
+
+# --- Phase 5: learner mode still deploys the Adaptive Bidding agent ---------------
+
+def _phase5_stacks(*, learner, retraining):
+    p = _probe(learner=learner, retraining=retraining)
+    seen = []
+    p._stack_check = lambda name, label=None: seen.append(name) or {"name": name, "status": OK, "detail": ""}
+    p._agent_runtimes = lambda: []
+    p.phase5()
+    return seen
+
+
+def test_phase5_learner_expects_only_the_adaptive_bidding_stacks():
+    assert _phase5_stacks(learner=True, retraining=False) == [
+        "t-feedback-pipeline", "t-closed-loop-core", "t-agentcore-security"]
+
+
+def test_phase5_default_expects_every_closed_loop_stack():
+    assert _phase5_stacks(learner=False, retraining=True) == [
+        "t-feedback-pipeline", "t-glue-etl", "t-closed-loop-core",
+        "t-agentcore-security", "t-governance-eventbridge"]
+
+
+def test_phase5_no_retraining_expects_no_closed_loop_stack():
+    assert _phase5_stacks(learner=False, retraining=False) == []
+
+
+class FakeAgentCore:
+    def __init__(self, names):
+        self.names = names
+
+    def list_agent_runtimes(self, **kwargs):
+        return {"agentRuntimes": [{"agentRuntimeName": n, "status": "READY"} for n in self.names]}
+
+
+def _runtime_checks(*, learner, retraining, names):
+    p = _probe(learner=learner, retraining=retraining)
+    p.agentcore = True
+    client = FakeAgentCore(names)
+    p._client = lambda service: client if service == "bedrock-agentcore-control" else None
+    return {c["name"]: c["status"] for c in p._agent_runtimes()}
+
+
+def test_learner_expects_the_adaptive_bidding_runtime_and_not_governance():
+    checks = _runtime_checks(learner=True, retraining=False, names=["t_mcp"])
+    assert checks == {"agent runtime t_mcp": OK, "agent runtime *AdaptiveBiddingStrategyAgent": MISSING}
+    checks = _runtime_checks(learner=True, retraining=False,
+                             names=["t_mcp", "t_AdaptiveBiddingStrategyAgent"])
+    assert checks == {"agent runtime t_mcp": OK, "agent runtime t_AdaptiveBiddingStrategyAgent": OK}
+
+
+def test_no_retraining_outside_learner_mode_expects_only_the_mcp_runtime():
+    checks = _runtime_checks(learner=False, retraining=False, names=["t_mcp"])
+    assert checks == {"agent runtime t_mcp": OK}
