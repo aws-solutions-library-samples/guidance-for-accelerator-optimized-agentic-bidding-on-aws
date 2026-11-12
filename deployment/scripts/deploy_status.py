@@ -157,6 +157,13 @@ CLOSED_LOOP_STACKS = (
     "agentcore-security",
     "governance-eventbridge",
 )
+# The subset deploy_closed_loop.sh --adaptive-only creates, which is what a learner
+# deployment (Part 1 plus the Adaptive Bidding agent) has.
+LEARNER_CLOSED_LOOP_STACKS = (
+    "feedback-pipeline",
+    "closed-loop-core",
+    "agentcore-security",
+)
 
 
 def phase_status(checks: List[Dict[str, Any]]) -> str:
@@ -1063,10 +1070,11 @@ class Probe:
     # -- Phase 5: closed loop + agents -----------------------------------
 
     def phase5(self) -> List[Dict[str, Any]]:
-        if not self.retraining:
-            checks = self._agent_runtimes()
-            return checks
-        return self._closed_loop_stacks() + self._agent_runtimes()
+        if self.retraining:
+            return self._closed_loop_stacks() + self._agent_runtimes()
+        if self.learner:
+            return self._closed_loop_stacks(LEARNER_CLOSED_LOOP_STACKS) + self._agent_runtimes()
+        return self._agent_runtimes()
 
     def _stack_check(self, name: str, label: Optional[str] = None) -> Dict[str, Any]:
         """One CloudFormation stack as a check line: OK / IN_PROGRESS / FAILED / MISSING."""
@@ -1090,8 +1098,8 @@ class Probe:
             return self._check(title, OK, st)
         return self._check(title, FAILED, st)
 
-    def _closed_loop_stacks(self) -> List[Dict[str, Any]]:
-        return [self._stack_check(prefixed(self.prefix, base)) for base in CLOSED_LOOP_STACKS]
+    def _closed_loop_stacks(self, bases: Tuple[str, ...] = CLOSED_LOOP_STACKS) -> List[Dict[str, Any]]:
+        return [self._stack_check(prefixed(self.prefix, base)) for base in bases]
 
     def _agent_runtimes(self) -> List[Dict[str, Any]]:
         rp = runtime_prefix(self.prefix)
@@ -1102,6 +1110,8 @@ class Probe:
         wanted_suffixes = ["_mcp"]
         if self.retraining:
             wanted_suffixes += ["AdaptiveBiddingStrategyAgent", "ModelPromotionGovernanceAgent"]
+        elif self.learner:
+            wanted_suffixes += ["AdaptiveBiddingStrategyAgent"]
         if self.skip_agentcore_effective():
             return [self._check("agent runtimes", OK, "skipped (--skip-agentcore)")]
 

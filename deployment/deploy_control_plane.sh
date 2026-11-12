@@ -21,8 +21,8 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "deploy_control_plane.sh needs bash" >&
 #
 # What it writes to: the stack's existing deals table (<stack>-deals). The runtime
 # is the first thing in this deployment that can change a record; everything else
-# reads. The seeder is told about it by deploy.sh (--campaign-status paused
-# --skip-managed), not by this script.
+# reads. The seeder is told about it by deploy.sh (--skip-managed, and
+# --campaign-status paused in learner mode or active otherwise), not by this script.
 #
 # DOCKER. The rest of the Prebid path never builds locally so that --with-prebid
 # works on a machine without Docker. This step does: the control-plane image is
@@ -574,8 +574,9 @@ cat <<EOF
   Full connection details, from any machine with access to the account:
     ${SCRIPT_DIR}/deploy_control_plane.sh${STACK_PREFIX:+ --prefix ${STACK_PREFIX}} --region ${AWS_REGION} --connection-info [--token] [--json]
 
-  Seeded campaigns are PAUSED until activated through the control plane. Verify the
-  path and activate one (the secret is read from the app client at run time):
+  In a learner-mode deployment, seeded campaigns are PAUSED until activated through
+  the control plane; otherwise deploy.sh seeds them active. Verify the path and
+  activate one (the secret is read from the app client at run time):
 
     export CLIENT_SECRET=\$(aws cognito-idp describe-user-pool-client --user-pool-id ${USER_POOL_ID} \\
       --client-id ${CLIENT_ID} --region ${AWS_REGION} --query UserPoolClient.ClientSecret --output text)

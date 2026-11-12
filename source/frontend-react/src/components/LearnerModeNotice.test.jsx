@@ -52,8 +52,9 @@ describe('LearnerModeNotice', () => {
     );
     expect(text).toContain('Governance tab is unavailable');
     const flat = text.replace(/\s+/g, ' ');
-    expect(flat).toContain('Adaptive Bidding is also unavailable');
-    expect(flat).toContain('the Adaptive Bidding agent is not deployed');
+    expect(flat).toContain('Adaptive Bidding is available');
+    expect(flat).toContain('needs no training');
+    expect(flat).not.toContain('Adaptive Bidding is also unavailable');
   });
 
   it('is a labelled modal dialog', () => {

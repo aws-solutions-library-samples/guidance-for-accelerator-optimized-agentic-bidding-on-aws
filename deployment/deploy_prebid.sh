@@ -2187,7 +2187,7 @@ fi
 # After the host is up, because the control plane needs the hosted domain and the
 # token endpoint this stack created. A failure here is a warned skip, not a failed
 # Prebid deploy: the host serves auctions without it. Seeded campaigns were written
-# paused only if deploy.sh knew the control plane would deploy (its seeder flags).
+# paused only for a learner-mode deploy.sh run with the control plane (its seeder flags).
 # =============================================================================
 CONTROL_PLANE_STATUS="not deployed (--no-control-plane)"
 if [[ "${WITH_CONTROL_PLANE}" -eq 1 ]]; then

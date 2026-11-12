@@ -1004,6 +1004,18 @@ test_private_ui_api_path() {
   assert_not_contains "${cl}" "orchestrator-url" "deploy_closed_loop.sh is no longer given an orchestrator URL"
   assert_not_contains "${cl}" "get svc orchestrator" "deploy_closed_loop.sh does not look for an orchestrator load balancer (Triton's internal NLB lookup is unrelated)"
   assert_contains "${cl}" 'VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}' "the Step 7 rebuild carries the proxy ARN"
+  # The Step 7 heredoc replaces .env.production, so it must write every variable
+  # deploy.sh's own UI build writes.
+  local vite_var
+  for vite_var in $(sed -n 's/^\(VITE_[A-Z_]*\)=.*/\1/p' "${SCRIPT_DIR}/../deploy.sh" | sort -u); do
+    assert_contains "${cl}" "${vite_var}=" "the Step 7 rebuild writes ${vite_var}, as deploy.sh's UI build does"
+  done
+  assert_contains "$(cat "${SCRIPT_DIR}/../deploy.sh")" 'CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID}" \' "deploy.sh passes the caption profile to deploy_closed_loop.sh"
+  # The standalone fallback reads the last build's value, and a missing file does not trip set -e/pipefail.
+  assert_contains "${cl}" '"${REACT_ENV}" 2>/dev/null | tail -n 1 || true)"' "the caption fallback read cannot trip set -e/pipefail"
+  local cap_out; cap_out="$(bash -c 'set -euo pipefail; REACT_ENV=/nonexistent/.env.production
+    v="$(sed -n "s/^VITE_CAPTION_INFERENCE_PROFILE_ID=//p" "${REACT_ENV}" 2>/dev/null | tail -n 1 || true)"; echo "OK[${v}]"' 2>&1)"
+  assert_eq "${cap_out}" "OK[]" "the caption fallback survives a missing .env.production"
 
   # --- deploy_frontend.py: CloudFront is static-only ------------------------
   local fe; fe="$(cat "${SCRIPT_DIR}/../scripts/deploy_frontend.py")"
@@ -1914,8 +1926,7 @@ test_control_plane_gate() {
   # The effective bit is set ONLY inside the WITH_PREBID block, so a deploy without
   # Prebid never seeds campaigns paused and never passes the flag anywhere.
   assert_contains "${src}" $'if [[ "${WITH_PREBID}" -eq 1 ]]; then\n  ARTF_MUTATIONS_REQUIRED_SCOPE="artf-orchestrator/mutations:write"\n  CONTROL_PLANE_EFFECTIVE="${CONTROL_PLANE}"\nfi' "CONTROL_PLANE_EFFECTIVE is derived from WITH_PREBID"
-  assert_contains "${src}" 'SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)' "deploy.sh seeds campaigns paused when the control plane deploys"
-  assert_contains "${src}" 'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then' "the paused seed is gated on the effective bit"
+  assert_contains "${src}" $'if [[ "${CONTROL_PLANE_EFFECTIVE}" -eq 1 ]]; then\n  if [[ "${LEARNER_MODE}" -eq 1 ]]; then\n    SEED_STATUS_ARGS=(--campaign-status paused --skip-managed)\n  else\n    SEED_STATUS_ARGS=(--campaign-status active --skip-managed)\n  fi\nfi' "with the control plane, campaigns are seeded paused in learner mode and active otherwise, leaving managed items alone"
   assert_contains "${src}" 'PREBID_ARGS="${PREBID_ARGS} --no-control-plane"' "deploy.sh passes --no-control-plane through to deploy_prebid.sh"
   assert_contains "${src}" 'deploy_control_plane.sh" ${STACK_PREFIX:+--prefix "${STACK_PREFIX}"}' "deploy.sh --destroy removes the control plane"
   assert_contains "${src}" 'deployment/control_plane_cfn.yaml deployment/deploy_control_plane.sh' "control-plane files are part of the Prebid fingerprint"
@@ -2110,16 +2121,37 @@ test_learner_mode_flags() {
   _lm_order "_reuse LEARNER_MODE < NGC restore < re-validation < ngcSecretName record" \
     "${reuse_line}" "$(_lm_line '_REMEMBERED_NGC="$(state_read')" "${reval_line}" "$(_lm_line '"ngcSecretName=${STACK_NAME}-ngc-api-key"')"
   # The only paths a key takes to a child: build_images' NGC_FLAG (built from the
-  # two variables only) and Step 11, which runs only with retraining on (never in
-  # learner mode, which forces WITH_RETRAINING=0).
+  # two variables only) and Step 11's NGC pass-through, which sits under its own
+  # WITH_RETRAINING guard. Step 11 also runs in learner mode (for the Adaptive
+  # Bidding agent), where WITH_RETRAINING is forced to 0 and --adaptive-only is
+  # passed instead.
   assert_eq "$(grep -c 'NGC_FLAG=(--ngc-key "${NGC_KEY}")' "${DEPLOY_SH}")" "1" "build_images passes --ngc-key only from NGC_KEY"
   assert_eq "$(grep -c 'NGC_FLAG=(--ngc-secret "${NGC_SECRET}")' "${DEPLOY_SH}")" "1" "build_images passes --ngc-secret only from NGC_SECRET"
   assert_eq "$(grep -c 'NGC_FLAG=(' "${DEPLOY_SH}")" "3" "NGC_FLAG has no other source (empty, key, secret)"
   assert_eq "$(awk '
-      /^if \[\[ "\$\{WITH_RETRAINING\}" -eq 1 \]\]; then$/ { g=1 }
-      g && /^(else|fi)/ { g=0 }
+      /^  if \[\[ "\$\{WITH_RETRAINING\}" -eq 1 \]\]; then$/ { g=1 }
+      g && /^  (else|fi)$/ { g=0 }
       /CLOSED_LOOP_ARGS=.*--ngc-(key|secret)/ { print (g ? "guarded" : "unguarded") }
     ' "${DEPLOY_SH}" | sort -u)" "guarded" "Step 11's NGC pass-through sits inside the WITH_RETRAINING -eq 1 block"
+  # Step 11 runs in learner mode too, and passes --adaptive-only on the non-retraining branch.
+  assert_eq "$(grep -c '^if \[\[ "${WITH_RETRAINING}" -eq 1 || "${LEARNER_MODE}" -eq 1 \]\]; then$' "${DEPLOY_SH}")" "1" "Step 11 runs with retraining on or in learner mode"
+  assert_eq "$(awk '
+      /^  if \[\[ "\$\{WITH_RETRAINING\}" -eq 1 \]\]; then$/ { g=1 }
+      g && /^  else$/ { e=1 }
+      g && /^  fi$/ { g=0; e=0 }
+      /CLOSED_LOOP_ARGS=.*--adaptive-only/ { print (e ? "else-branch" : "elsewhere") }
+    ' "${DEPLOY_SH}")" "else-branch" "--adaptive-only is passed only when retraining is off"
+  local cl_src; cl_src="$(cat "${D}/deploy_closed_loop.sh")"
+  assert_contains "${cl_src}" '--adaptive-only)   ADAPTIVE_ONLY=1 ;;' "deploy_closed_loop.sh accepts --adaptive-only"
+  assert_contains "${cl_src}" 'if [[ "${START_AT}" -le 2 && "${ADAPTIVE_ONLY}" -eq 0 ]]; then' "--adaptive-only skips Glue ETL"
+  assert_contains "${cl_src}" 'log "  Step 4b (NeMo-RL training container) skipped: --adaptive-only' "--adaptive-only skips the NeMo-RL build"
+  assert_contains "${cl_src}" 'log "  Step 5b (Model Promotion Governance agent) skipped: --adaptive-only."' "--adaptive-only skips the Governance agent"
+  assert_contains "${cl_src}" '_AGENT_BUILD_SELECT=(--only adaptive-bidding-agent)' "--adaptive-only builds only the Adaptive Bidding image in CodeBuild"
+  # The NeMo outputs are read by the final check, so they are set before the Step 4b gate.
+  _lm_order "NEMO_BUILD_ID is set before the Step 4b gate" \
+    "$(grep -n '^NEMO_BUILD_ID=""$' "${D}/deploy_closed_loop.sh" | cut -d: -f1)" \
+    "$(grep -n 'Step 4b (NeMo-RL training container) skipped' "${D}/deploy_closed_loop.sh" | cut -d: -f1)" \
+    "$(grep -n '^if \[\[ -n "${NEMO_BUILD_ID}" && ! -f "${NEMO_OUTPUTS}" \]\]; then$' "${D}/deploy_closed_loop.sh" | cut -d: -f1)"
   assert_eq "$(grep -c 'NGC_KEY\|NGC_SECRET' "${D}/deploy_prebid.sh")" "0" "deploy_prebid.sh reads no NGC variable"
   assert_eq "$(grep -c '^NGC_SECRET=""$' "${D}/codebuild/remote_build.sh")" "1" "remote_build.sh resets NGC_SECRET instead of reading the environment"
   assert_eq "$(grep -c '^NGC_KEY=""$' "${D}/codebuild/remote_build.sh")" "1" "remote_build.sh resets NGC_KEY instead of reading the environment"
