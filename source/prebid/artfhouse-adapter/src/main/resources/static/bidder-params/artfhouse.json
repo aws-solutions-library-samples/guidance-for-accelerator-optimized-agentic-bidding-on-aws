@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "artfhouse Adapter Params",
+  "description": "Parameters accepted by the artfhouse adapter. There are none, deliberately: the demand endpoint selects campaigns from its own catalog (FR-16) and reads deals from imp.pmp.deals, so the impression names no placement, no site and no seat. A required parameter invented to look conventional would be a field nothing reads. An empty object is the correct and complete params for this bidder.",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

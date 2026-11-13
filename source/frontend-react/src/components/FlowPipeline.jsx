@@ -24,7 +24,7 @@ const AGENT_NODES = [
   },
   {
     id: "dlrm",
-    label: "DLRM Bid Shader",
+    label: "Bid Pricer",
     intents: ["BID_SHADE"],
     model: "DLRM (Deep Learning Recommendation Model)",
     logo: nvidiaLogo,
@@ -33,7 +33,7 @@ const AGENT_NODES = [
   },
   {
     id: "ncf",
-    label: "NCF Deal Manager",
+    label: "Deal Scorer",
     intents: ["ACTIVATE_DEALS", "SUPPRESS_DEALS"],
     model: "Neural Collaborative Filtering (NeuMF)",
     logo: nvidiaLogo,
@@ -42,20 +42,38 @@ const AGENT_NODES = [
   },
   {
     id: "widedeep",
-    label: "Wide & Deep Activator",
+    label: "Audience Activator",
     intents: ["ACTIVATE_SEGMENTS"],
-    model: "Wide & Deep (Cheng et al. 2016)",
-    logo: nvidiaLogo,
+    model: "Logic",
+    logo: null,
     color: "#6366f1",
     type: "agent",
   },
   {
     id: "metrics",
-    label: "Metrics Enricher",
+    label: "Signals Enricher",
     intents: ["ADD_METRICS"],
     model: "Rule-based (viewability + brand safety)",
     logo: null,
     color: "#0891b2",
+    type: "agent",
+  },
+  {
+    id: "yield-floor",
+    label: "Yield Optimizer — Floor",
+    intents: ["ADJUST_DEAL_FLOOR"],
+    model: "XGBoost (Triton FIL backend)",
+    logo: nvidiaLogo,
+    color: "#be185d",
+    type: "agent",
+  },
+  {
+    id: "yield-margin",
+    label: "Yield Optimizer — Margin",
+    intents: ["ADJUST_DEAL_MARGIN"],
+    model: "XGBoost (Triton FIL backend)",
+    logo: nvidiaLogo,
+    color: "#be185d",
     type: "agent",
   },
   {
@@ -69,12 +87,19 @@ const AGENT_NODES = [
   },
 ];
 
-// Map stop IDs from orchestrator response to our node IDs
+// Map CONTAINER names from the orchestrator response to our node IDs.
+//
+// Used for `metadata.stages[].containers`, which the orchestrator reports by
+// container name. The stop lookups below also pass it `s.id`, which normalizer.js
+// already emits as a stop id; those lookups miss and the `|| s.id` fallback
+// resolves the node, which is harmless.
 const STOP_ID_MAP = {
   "dlrm-bid-shader": "dlrm",
   "widedeep-segment-activator": "widedeep",
   "ncf-deal-manager": "ncf",
   "metrics-enricher": "metrics",
+  "yield-optimizer-floor": "yield-floor",
+  "yield-optimizer-margin": "yield-margin",
 };
 
 /**
@@ -107,6 +132,21 @@ export default function FlowPipeline({ result, loading, error }) {
   const [hoveredNode, setHoveredNode] = useState(null);
 
   const timeData = useMemo(() => computeTimeLayout(result), [result]);
+
+  // Which sequential stage each agent ran in, from the orchestrator's own
+  // account (metadata.stages, container names). Empty on the bypassed baseline
+  // pass and on an orchestrator that predates staging; the rows then carry no
+  // stage badge, which is the truthful rendering of "no stages were reported".
+  const stageByAgent = useMemo(() => {
+    const map = {};
+    for (const stage of result?.stages ?? []) {
+      for (const name of stage.containers ?? []) {
+        const nodeId = STOP_ID_MAP[name] || name;
+        if (!(nodeId in map)) map[nodeId] = { stage: stage.stage, name: stage.name };
+      }
+    }
+    return map;
+  }, [result]);
 
   // Mutations grouped by source agent
   const mutationsByAgent = useMemo(() => {
@@ -200,12 +240,24 @@ export default function FlowPipeline({ result, loading, error }) {
                 : 0;
               const hasMutations = mutationsByAgent[node.id]?.length > 0;
               const status = stop?.status || "idle";
+              // "no_mutations" means the container was reached and ran, and chose
+              // not to mutate. That is a container that participated, so it is
+              // rendered active alongside "ok" — treating it as inactive would
+              // read as "did not run", which is a different thing.
+              const ran = status === "ok" || status === "no_mutations";
+              // Mutations this container produced that another container's
+              // higher-priority claim replaced. It ran and computed a value that
+              // the bid path did not use, which is neither "contributed" nor
+              // "did not run" and has to be visible as its own thing.
+              const superseded = stop?.superseded ?? 0;
+              const stageInfo = node.type === "agent" ? stageByAgent[node.id] : undefined;
 
               return (
                 <div
                   key={node.id}
-                  className={`agent-row ${status === "ok" ? "agent-row--active" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
+                  className={`agent-row ${ran ? "agent-row--active" : ""} ${superseded > 0 ? "agent-row--superseded" : ""} ${node.type === "endpoint" ? "agent-row--endpoint" : ""}`}
                   data-node={node.id}
+                  data-superseded={superseded > 0 ? superseded : undefined}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                 >
@@ -217,6 +269,15 @@ export default function FlowPipeline({ result, loading, error }) {
 
                   {/* Agent name */}
                   <div className="agent-row-name" style={{ color: node.color }}>
+                    {stageInfo && (
+                      <span
+                        className="agent-stage-badge"
+                        data-testid={`flow-stage-${node.id}`}
+                        title={`Ran in stage ${stageInfo.stage} (${stageInfo.name}); its mutations were applied before stage ${stageInfo.stage + 1} ran`}
+                      >
+                        {stageInfo.stage}
+                      </span>
+                    )}
                     {node.label}
                     {/* Tooltip */}
                     {node.type === "agent" && (
@@ -259,6 +320,19 @@ export default function FlowPipeline({ result, loading, error }) {
                             ))}
                           </div>
                         )}
+                        {superseded > 0 && (
+                          <span
+                            className="agent-superseded-tag"
+                            data-testid={`flow-superseded-${node.id}`}
+                            title={
+                              superseded === 1
+                                ? "1 mutation was computed but overridden by a higher-priority container"
+                                : `${superseded} mutations were computed but overridden by a higher-priority container`
+                            }
+                          >
+                            {superseded} overridden
+                          </span>
+                        )}
                       </>
                     )}
                     {node.type === "endpoint" && (
@@ -284,7 +358,7 @@ export default function FlowPipeline({ result, loading, error }) {
             <span>{timeData.maxLatency.toFixed(0)}ms</span>
           </div>
 
-          <TotalLatency latencyMs={result?.totalLatencyMs} browserElapsedMs={result?.browserElapsedMs} stops={result?.stops} />
+          <TotalLatency latencyMs={result?.totalLatencyMs} stops={result?.stops} stages={result?.stages} />
         </div>
       )}
     </div>

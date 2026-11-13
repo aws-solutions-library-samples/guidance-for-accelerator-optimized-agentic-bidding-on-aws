@@ -1,0 +1,98 @@
+{
+  "format": "ncf-sample-cohorts/1",
+  "generator_seed": 20261007,
+  "members_per_cohort": 60,
+  "noise_rate": 0.05,
+  "cohorts": [
+    {
+      "id": "sports-espn",
+      "scenario_users": ["user-789"],
+      "sample": "banner-basic.json",
+      "activate": ["deal-sports-premium-espn"],
+      "suppress": [],
+      "keep": ["deal-remnant-open-espn"],
+      "not_activated": [],
+      "winner": {"campaign": "camp-courtside", "deal": "deal-sports-premium-espn"}
+    },
+    {
+      "id": "finance-ledger",
+      "scenario_users": ["user-finance-01"],
+      "sample": "finance-news.json",
+      "activate": ["deal-finance-pmp"],
+      "suppress": [],
+      "keep": ["deal-remnant-open-ledger"],
+      "not_activated": ["deal-home-premium-ledger"],
+      "winner": {"campaign": "camp-harbour", "deal": "deal-finance-pmp"}
+    },
+    {
+      "id": "home-hearth",
+      "scenario_users": ["user-home-01"],
+      "sample": "home-lifestyle.json",
+      "activate": ["deal-home-premium", "deal-retail-run"],
+      "suppress": ["deal-remnant-open-hearth"],
+      "keep": [],
+      "not_activated": ["deal-auto-brand"],
+      "winner": {"campaign": "camp-cedar", "deal": "deal-home-premium"}
+    },
+    {
+      "id": "parenting-weekly",
+      "scenario_users": ["user-parenting-01"],
+      "sample": "parenting-narrative.json",
+      "activate": ["deal-parenting-premium", "deal-family-network"],
+      "suppress": ["deal-remnant-open-parenting"],
+      "keep": [],
+      "not_activated": [],
+      "winner": {"campaign": "camp-brightstart", "deal": "deal-parenting-premium"}
+    },
+    {
+      "id": "auto-cnn",
+      "scenario_users": ["user-eco-303"],
+      "sample": "isv-ecosystem.json",
+      "activate": ["deal-premium-auto", "deal-standard-auto"],
+      "suppress": [],
+      "keep": [],
+      "not_activated": [],
+      "winner": {"campaign": "camp-autoline-premium", "deal": "deal-premium-auto"}
+    },
+    {
+      "id": "video-streaming",
+      "scenario_users": ["user-456"],
+      "sample": "video-deals.json",
+      "activate": ["deal-premium-video", "deal-standard-video"],
+      "suppress": [],
+      "keep": ["deal-remnant"],
+      "not_activated": [],
+      "winner": {"campaign": "camp-skyline-video", "deal": "deal-premium-video"}
+    },
+    {
+      "id": "yield-sports",
+      "scenario_users": ["user-yield-303"],
+      "sample": "yield-optimizer.json",
+      "activate": ["deal-guaranteed-premium"],
+      "suppress": [],
+      "keep": ["deal-open-midtier", "deal-open-remnant"],
+      "not_activated": [],
+      "winner": {"campaign": "camp-meridian-guaranteed", "deal": "deal-guaranteed-premium"}
+    },
+    {
+      "id": "ridesharer-airport",
+      "scenario_users": ["user-ridesharer-airport-01"],
+      "sample": "ridesharer-airport-evening.json",
+      "activate": [],
+      "suppress": [],
+      "keep": ["deal-ridesharer-airport-open-travel", "deal-ridesharer-airport-open-luggage"],
+      "not_activated": ["deal-ridesharer-eats-open-kitchen", "deal-ridesharer-eats-open-noodles"],
+      "winner": null
+    },
+    {
+      "id": "ridesharer-midday",
+      "scenario_users": ["user-ridesharer-midday-01"],
+      "sample": "ridesharer-suburban-midday.json",
+      "activate": [],
+      "suppress": [],
+      "keep": ["deal-ridesharer-eats-open-kitchen", "deal-ridesharer-eats-open-noodles"],
+      "not_activated": ["deal-ridesharer-airport-open-travel", "deal-ridesharer-airport-open-luggage"],
+      "winner": null
+    }
+  ]
+}

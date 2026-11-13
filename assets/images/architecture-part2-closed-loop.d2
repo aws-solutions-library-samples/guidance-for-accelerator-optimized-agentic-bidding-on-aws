@@ -1,13 +1,12 @@
-# Part 2 — Closed-Loop Learning
-# Simplifies the Part 1 real-time path into a single block and adds the two
-# feedback loops: a batch retraining loop and an agentic parameter-tuning loop,
-# plus governed zero-downtime deployment. SageMaker is intentionally not shown;
-# the training step is represented as generic GPU retraining.
+# Part 2: Closed-Loop Learning
+# Simplifies the Part 1 real-time path into a single block and adds the
+# batch retraining loop, the governed canary rollout, and the agentic
+# parameter-tuning loop. Training runs on Amazon SageMaker.
 
 direction: down
 
 title: |md
-  # Accelerator-Optimized Agentic Bidding — Part 2: Closed-Loop Learning
+  # Accelerator-Optimized Agentic Bidding, Part 2: Closed-Loop Learning
 | {
   near: top-center
   style.font-size: 28
@@ -26,23 +25,23 @@ aws: "AWS Cloud" {
   style.bold: true
   grid-columns: 2
 
-  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 4 ARTF containers" {
+  rtb: "Real-Time Bidding (Amazon EKS)\nOrchestrator + 6 ARTF containers (staged pipeline)" {
     style.fill: "#FDEBD0"
     style.stroke: "#ED7100"
-    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n3 ONNX models" {
+    triton: "NVIDIA Triton (GPU A10G or G7e (Blackwell))\n2 TensorRT engines (stable/canary router) + 2 XGBoost (FIL)" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
   }
 
-  params: "Parameter Store (DynamoDB)\nshade_factor · conversion_value" {
+  params: "Parameter Store (DynamoDB)\nshade_factor, conversion_value\n(bounds + max delta enforced)" {
     shape: cylinder
     style.fill: "#F7D9F9"
     style.stroke: "#C925D1"
   }
 
-  feedback: "Feedback Data Pipeline" {
+  feedback: "Feedback Data Pipeline (Bid Pricer)" {
     style.stroke: "#8C4FFF"
     style.font-size: 20
     direction: right
@@ -53,7 +52,7 @@ aws: "AWS Cloud" {
       style.fill: "#E4F2DD"
       style.stroke: "#3F8624"
     }
-    glue: "AWS Glue ETL\nFeature Engineering"
+    glue: "AWS Glue ETL (every 6 h)\nDe-duplicate + label"
     s3train: "Amazon S3\nTraining Data" {
       shape: cylinder
       style.fill: "#E4F2DD"
@@ -62,40 +61,83 @@ aws: "AWS Cloud" {
     kds -> kdf -> s3raw -> glue -> s3train
   }
 
-  retrain: "Batch Retraining Loop (GPU)" {
+  yield_feedback: "Feedback Data Pipeline (Yield Optimizer)\nSeparate stream and table: different event shape" {
+    style.stroke: "#8C4FFF"
+    style.font-size: 20
+    direction: right
+    kds: "Kinesis Data Stream\nDeal Yield Outcomes"
+    kdf: "Kinesis Data Firehose\nBuffer + partition"
+    s3raw: "Amazon S3\nRaw Deal Yield Outcomes (Parquet)" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    glue: "AWS Glue ETL (every 6 h)\nFloor + Margin Labeling"
+    s3train: "Amazon S3\nFloor + Margin Training Data" {
+      shape: cylinder
+      style.fill: "#E4F2DD"
+      style.stroke: "#3F8624"
+    }
+    kds -> kdf -> s3raw -> glue -> s3train
+  }
+
+  bootstrap: "Yield Optimizer Bootstrap Sources\n(no live win/loss signal yet)" {
+    style.stroke: "#8C4FFF"
+    style.font-size: 18
+    style.stroke-dash: 3
+    loadtest: "Load Test traffic\nsource=load_test (labelled sample outcome)"
+    explore: "Bounded Exploration (in-container)\nepsilon 0.1 on load-test traffic, :explore suffix"
+  }
+
+  retrain: "Batch Retraining Loop (GPU): Bid Pricer" {
     style.stroke: "#76b900"
     direction: down
     style.font-size: 20
-    nemo: "NVIDIA NeMo-RL\nRL policy optimization" {
+    nemo: "Amazon SageMaker training (daily)\nPyTorch on NVIDIA NeMo Framework image\nsupervised fit + shading-policy search" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
-    registry: "Model Registry\nVersioned artifacts + lineage" {
+    registry: "SageMaker Model Registry\nDLRM + NCF package groups" {
       shape: cylinder
     }
     nemo -> registry: "register new version"
   }
 
+  yield_retrain: "Batch Retraining Loop: Yield Optimizer" {
+    style.stroke: "#76b900"
+    direction: down
+    style.font-size: 20
+    xgb: "Amazon SageMaker (daily)\nBuilt-in XGBoost training (floor + margin)" {
+      style.fill: "#76b900"
+      style.stroke: "#5a8c00"
+      style.font-color: "#000000"
+    }
+    registry: "SageMaker Model Registry\nFloor + margin package groups" {
+      shape: cylinder
+    }
+    xgb -> registry: "register new version"
+  }
+
   agents: "Amazon Bedrock AgentCore Runtimes" {
     style.stroke: "#ED7100"
-    gov: "Model Governance Agent\nA/B test + approval gate"
-    bsa: "Bid Shading Strategy Agent\ntunes pricing parameters"
+    gov: "Model Promotion Governance Agent\nWelch t-test + SPRT, guardrails, audit trail (DynamoDB)"
+    bsa: "Adaptive Bidding Strategy Agent\nevery 24 h (default), bounded parameter updates"
   }
 
   deploy: "Zero-Downtime Deployment" {
     style.stroke: "#76b900"
     direction: down
-    nim: "NVIDIA NIM\nTensorRT optimization" {
+    optimizer: "Model Optimizer (one-shot EKS Job)\nTensorRT trtexec ONNX to .plan (FP16), not a NIM" {
       style.fill: "#76b900"
       style.stroke: "#5a8c00"
       style.font-color: "#000000"
     }
-    canary: "Canary Deployer\nProgressive rollout"
-    nim -> canary: "optimized model"
+    canary: "Canary Deployer\nTriton-side router: 5%, then promote / reject / rollback"
+    optimizer -> canary: "optimized model"
   }
 
-  events: "Amazon EventBridge\nRule + Scheduler" {
+  events: "Amazon EventBridge\nRules + Scheduler" {
     style.fill: "#FBD7E8"
     style.stroke: "#E7157B"
   }
@@ -110,22 +152,31 @@ exchange -> aws.rtb: "OpenRTB BidRequest"
 aws.rtb -> exchange: "RTBResponse (mutations)"
 
 # Feedback collection
-aws.rtb -> aws.feedback.kds: "bid outcomes (win/loss, price, CTR)"
+aws.rtb -> aws.feedback.kds: "bid outcomes (win/loss, price, response)"
+aws.rtb -> aws.yield_feedback.kds: "deal yield outcomes (floor/margin)"
 
 # Batch retraining
 aws.feedback.s3train -> aws.retrain.nemo: "labeled training data"
 aws.retrain.registry -> aws.events: "new version registered"
 
+aws.yield_feedback.s3train -> aws.yield_retrain.xgb: "labeled floor + margin data"
+aws.yield_retrain.registry -> aws.events: "new version registered"
+
+# Bootstrap sources feed the yield feedback pipeline until a live
+# win/loss signal path exists
+aws.bootstrap.loadtest -> aws.yield_feedback.kds: "sample outcome"
+aws.bootstrap.explore -> aws.rtb.triton: "perturbed prediction"
+
 # Governance + deployment
 aws.events -> aws.agents.gov: "invoke (rule)"
-aws.agents.gov -> aws.deploy.nim: "approved"
-aws.deploy.canary -> aws.rtb.triton: "canary → promote"
+aws.agents.gov -> aws.deploy.optimizer: "compile"
+aws.deploy.canary -> aws.rtb.triton: "canary, then promote"
 
 # Agentic parameter-tuning loop
 aws.rtb -> aws.cw: "metrics"
-aws.events -> aws.agents.bsa: "invoke (every 5 min)"
+aws.events -> aws.agents.bsa: "invoke (every 24 h)"
 aws.cw -> aws.agents.bsa: "win rate, cost, revenue"
 aws.agents.bsa -> aws.params: "update params"
-aws.params -> aws.rtb: "read at inference" {
+aws.params -> aws.rtb: "read at inference\n(when PARAMETER_STORE_TABLE is set)" {
   style.stroke-dash: 4
 }

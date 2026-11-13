@@ -1,0 +1,27 @@
+# The artfhouse demand service, run in-cluster next to Prebid Server.
+#
+# Built by deploy_prebid.sh Step 5 on the same CodeBuild run as the Prebid image,
+# from a context holding this file and source/demand/. Deployed by digest
+# (deployment/eks/artfhouse-demand-deployment.yaml).
+#
+# Versions match the orchestrator image's (source/Dockerfile.orchestrator) running
+# set, pinned here so a rebuild is reproducible.
+# From ECR Public rather than Docker Hub, as the amt simulator does, so CodeBuild
+# does not hit Docker Hub pull limits.
+FROM public.ecr.aws/docker/library/python:3.12-slim
+
+RUN pip install --no-cache-dir \
+    "starlette==1.7.0" "uvicorn[standard]==0.54.0" "boto3==1.43.110" \
+    "python-jose[cryptography]==3.3.0"
+
+WORKDIR /app
+COPY demand /app/demand
+
+RUN useradd --uid 10001 --no-create-home demand
+USER 10001
+
+EXPOSE 8080
+# Keep-alive held well past Prebid's pooled-connection idle time, so the adapter's
+# connections are reused rather than re-opened per auction.
+CMD ["uvicorn", "demand.artfhouse.server:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--timeout-keep-alive", "75", "--no-access-log"]

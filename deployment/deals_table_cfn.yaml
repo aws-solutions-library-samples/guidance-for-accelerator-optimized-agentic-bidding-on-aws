@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deals table for the ARTF stack. Holds IAB Tech Lab Deals API v1.0 Deal
+  records and the demand endpoint's campaign records, keyed by record_type and
+  id. Seeded by deployment/scripts/seed_deals_table.py from
+  deployment/seed/deals_and_campaigns.json on every deploy.sh run, through the
+  put-only seeding role defined here. Read-only grants for the three readers
+  (the demand Lambda role, the Deal Scorer pod role and the orchestrator's
+  services node role) live with those identities.
+
+Parameters:
+  TableName:
+    Type: String
+    Description: Table name, ${STACK_NAME}-deals as set by deploy.sh.
+    AllowedPattern: '[a-zA-Z0-9_.-]{3,255}'
+
+Resources:
+  DealsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    # The contents are reproducible from the seed file, so the table goes with
+    # its stack on --destroy rather than being retained.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: record_type
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: record_type
+          KeyType: HASH
+        - AttributeName: id
+          KeyType: RANGE
+      # SSEEnabled with no KMSMasterKeyId uses the AWS managed key aws/dynamodb.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Assumed by deploy.sh to write the seed. Put-only: it cannot read or delete,
+  # so a record removed from the seed file stays until deleted by hand.
+  DealsSeedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Writes the deals seed into the deals table (put only).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-deals-seed
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt DealsTable.Arn
+
+Outputs:
+  DealsTableName:
+    Value: !Ref DealsTable
+  DealsTableArn:
+    Value: !GetAtt DealsTable.Arn
+  DealsSeedRoleArn:
+    Value: !GetAtt DealsSeedRole.Arn

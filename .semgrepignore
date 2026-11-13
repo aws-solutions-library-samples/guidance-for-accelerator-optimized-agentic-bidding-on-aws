@@ -1,0 +1,8 @@
+# package-dependencies-check: source/frontend-react/package-lock.json is committed, so the
+# unpinned ranges in package.json are resolved to exact versions at install time.
+source/frontend-react/package.json
+
+# A repo .semgrepignore replaces semgrep's built-in default list, which excludes test
+# directories. Restore that default so test fixtures are not scanned as production code.
+tests/
+test/

@@ -1,0 +1,5 @@
+boto3
+pydantic
+starlette
+uvicorn[standard]
+strands-agents

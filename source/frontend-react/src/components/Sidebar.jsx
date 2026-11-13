@@ -1,61 +1,29 @@
 import { useState, useCallback } from "react";
-import ScenarioCard, { SCENARIOS } from "./ScenarioCard";
-import LoadTestPanel from "./LoadTestPanel";
+import ScenarioPicker from "./ScenarioPicker";
+import { loadScenarioPayload } from "../utils/scenarioPayload.js";
 
-const AGE_YOB_MAP = [
-  { yobMin: 2002, yobMax: 2008 },
-  { yobMin: 1992, yobMax: 2001 },
-  { yobMin: 1982, yobMax: 1991 },
-  { yobMin: 1972, yobMax: 1981 },
-  { yobMin: 1962, yobMax: 1971 },
-  { yobMin: 1940, yobMax: 1961 },
-];
-
-function applyTunerToPayload(payload, scenario, params) {
-  const patched = JSON.parse(JSON.stringify(payload));
-  const br = patched.bid_request || patched;
-  const imp0 = br?.imp?.[0];
-
-  if (imp0 && params.bidFloor != null) {
-    imp0.bidfloor = params.bidFloor;
-  }
-
-  if (br?.user && params.ageRange != null) {
-    const range = AGE_YOB_MAP[params.ageRange] || AGE_YOB_MAP[1];
-    br.user.yob = Math.round((range.yobMin + range.yobMax) / 2);
-  }
-
-  if (scenario.id === "video-deals" && imp0?.pmp?.deals && params.numDeals != null) {
-    const original = imp0.pmp.deals;
-    if (params.numDeals <= original.length) {
-      imp0.pmp.deals = original.slice(0, params.numDeals);
-    }
-  }
-
-  // Model parameters
-  const modelParams = {};
-  if (params.shadeFactor != null && scenario.controls?.includes("shadeFactor")) {
-    modelParams.shade_factor = params.shadeFactor;
-  }
-  if (params.convValue != null && scenario.controls?.includes("convValue")) {
-    modelParams.conversion_value = params.convValue;
-  }
-  if (params.segThreshold != null && scenario.controls?.includes("segThreshold")) {
-    modelParams.segment_threshold = params.segThreshold;
-  }
-  if (Object.keys(modelParams).length > 0) {
-    // Nonstandard signaling travels through the ARTF `ext` object, not as a
-    // top-level field, per the spec's extension convention.
-    patched.ext = { ...(patched.ext || {}), model_params: modelParams };
-  }
-
-  return patched;
-}
-
-export default function Sidebar({ onResult, submit, onLoadTestChange, demoActive = false }) {
+/**
+ * The sidebar is now only the scenario picker.
+ *
+ * The load-test launcher used to live here; it moved to the Governance page as
+ * Step 1, alongside its own results view, so the two halves of the load test are
+ * on one screen instead of split across two.
+ *
+ * `collapsed` narrows it to a rail instead of unmounting it. It used to be
+ * unmounted while the Theater was open, which made the Theater read as a separate
+ * page rather than a view inside this application. The picker stays MOUNTED when
+ * collapsed — hidden with CSS, not conditionally rendered — so the selected
+ * scenario and its tuner values survive expanding and collapsing.
+ */
+export default function Sidebar({
+  submit,
+  onOpenTheater,
+  demoActive = false,
+  collapsed = false,
+  onToggleCollapse,
+}) {
   const [activeScenario, setActiveScenario] = useState(null);
   const [runningScenario, setRunningScenario] = useState(null);
-  const [loadTestRunning, setLoadTestRunning] = useState(false);
 
   const handleSelect = useCallback((scenario) => {
     setActiveScenario(scenario.id);
@@ -67,12 +35,7 @@ export default function Sidebar({ onResult, submit, onLoadTestChange, demoActive
       setActiveScenario(scenario.id);
 
       try {
-        const resp = await fetch(`/samples/${scenario.file}?t=${Date.now()}`);
-        if (!resp.ok) throw new Error(`Failed to load sample: ${scenario.file}`);
-        const rawPayload = await resp.json();
-
-        const payload = applyTunerToPayload(rawPayload, scenario, params);
-        console.log("[Sidebar] Sending with params:", params, "ext.model_params:", payload.ext?.model_params);
+        const payload = await loadScenarioPayload(scenario, params);
         await submit(payload);
       } catch (err) {
         console.error("Scenario send failed:", err);
@@ -83,22 +46,44 @@ export default function Sidebar({ onResult, submit, onLoadTestChange, demoActive
     [submit]
   );
 
+  // The Theater fetches and patches the payload itself (useTheaterRun.start takes
+  // the scenario plus its params), so this only has to hand the pair upward.
+  const handleOpenTheater = useCallback(
+    (scenario, params) => {
+      setActiveScenario(scenario.id);
+      onOpenTheater?.(scenario, params);
+    },
+    [onOpenTheater]
+  );
+
   return (
-    <aside className="app-sidebar">      
-    <LoadTestPanel onRunningChange={setLoadTestRunning} onResultChange={onLoadTestChange} />
-      <label className="sidebar-label">Scenarios</label>
-      <div className="scenarios">
-        {SCENARIOS.map((scenario) => (
-          <ScenarioCard
-            key={scenario.id}
-            scenario={scenario}
-            isActive={activeScenario === scenario.id}
-            isLoading={runningScenario === scenario.id}
-            disabled={loadTestRunning || demoActive}
-            onSelect={handleSelect}
-            onSend={handleSend}
-          />
-        ))}
+    <aside className={`app-sidebar${collapsed ? " app-sidebar--collapsed" : ""}`}>
+      {onToggleCollapse ? (
+        <button
+          type="button"
+          className="app-sidebar-toggle"
+          onClick={onToggleCollapse}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? "Expand scenarios" : "Collapse scenarios"}
+          title={collapsed ? "Expand scenarios" : "Collapse scenarios"}
+          data-testid="sidebar-toggle"
+        >
+          <span className="app-sidebar-toggle-chevron" aria-hidden="true">
+            {collapsed ? "›" : "‹"}
+          </span>
+          <span className="app-sidebar-toggle-label">Scenarios</span>
+        </button>
+      ) : null}
+
+      <div className="app-sidebar-body" {...(collapsed ? { hidden: true } : {})} /* nosemgrep: react-props-spreading spreads a single known attribute, hidden, conditionally */>
+        <ScenarioPicker
+          activeScenarioId={activeScenario}
+          runningScenarioId={runningScenario}
+          disabled={demoActive}
+          onSelect={handleSelect}
+          onSend={handleSend}
+          onOpenTheater={handleOpenTheater}
+        />
       </div>
     </aside>
   );

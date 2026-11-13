@@ -1,0 +1,33 @@
+# Dockerfile.control-plane: the campaign/deals MCP control plane for Bedrock
+# AgentCore Runtime. Built by deploy.sh's build_image_local "control-plane" key,
+# invoked from deployment/deploy_control_plane.sh.
+#
+# ARM64. AgentCore Runtime requires linux/arm64 container images, so the build is
+# `docker buildx build --platform linux/arm64`. An amd64 image is accepted by ECR
+# and then fails to start on AgentCore, which is a slow way to learn this.
+#
+# The image carries ONLY source/control_plane and its pinned dependencies. It has
+# no Triton client, no torch, no orchestrator code and no ARTF container code; its
+# one job is to read and write the deals table on behalf of a verified caller.
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-control-plane.txt /app/requirements-control-plane.txt
+RUN pip install --no-cache-dir -r /app/requirements-control-plane.txt
+
+COPY control_plane /app/control_plane
+
+# The build context keeps the host's file modes; normalize before dropping root.
+RUN chmod -R a+rX /app \
+    && useradd --uid 10002 --create-home --shell /usr/sbin/nologin control
+USER 10002
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+# AgentCore expects the MCP streamable-HTTP endpoint at 0.0.0.0:8000/mcp.
+EXPOSE 8000
+
+ENTRYPOINT ["python", "-m", "control_plane.server"]

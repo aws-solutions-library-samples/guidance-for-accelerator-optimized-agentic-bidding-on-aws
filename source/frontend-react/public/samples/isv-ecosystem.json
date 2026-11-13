@@ -3,7 +3,7 @@
   "tmax": 100,
   "lifecycle": "LIFECYCLE_PUBLISHER_BID_REQUEST",
   "originator": {"type": "TYPE_EXCHANGE", "id": "exchange-ecosystem-demo-001"},
-  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "BID_SHADE", "ADD_METRICS", "ADD_CIDS"],
+  "applicable_intents": ["ACTIVATE_SEGMENTS", "ACTIVATE_DEALS", "ADD_METRICS", "ADD_CIDS"],
   "bid_request": {
     "id": "auction-eco-001",
     "imp": [
@@ -13,11 +13,8 @@
         "bidfloor": 4.00,
         "bidfloorcur": "USD",
         "pmp": {
-          "private_auction": true,
-          "deals": [
-            {"id": "deal-premium-auto", "bidfloor": 6.00, "at": 1},
-            {"id": "deal-standard-auto", "bidfloor": 3.50, "at": 2}
-          ]
+          "private_auction": 1,
+          "deals": []
         }
       },
       {

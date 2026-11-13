@@ -1,0 +1,365 @@
+package org.prebid.server.bidder.artfhouse;
+
+import com.iab.openrtb.request.BidRequest;
+import com.iab.openrtb.request.Deal;
+import com.iab.openrtb.request.Imp;
+import com.iab.openrtb.request.Pmp;
+import com.iab.openrtb.response.Bid;
+import com.iab.openrtb.response.BidResponse;
+import com.iab.openrtb.response.SeatBid;
+import io.vertx.core.MultiMap;
+import io.vertx.core.http.HttpHeaders;
+import io.vertx.core.http.HttpMethod;
+import org.prebid.server.bidder.Bidder;
+import org.prebid.server.bidder.model.BidderBid;
+import org.prebid.server.bidder.model.BidderCall;
+import org.prebid.server.bidder.model.BidderError;
+import org.prebid.server.bidder.model.HttpRequest;
+import org.prebid.server.bidder.model.PriceFloorInfo;
+import org.prebid.server.bidder.model.Result;
+import org.prebid.server.hooks.modules.artf.client.TokenCache;
+import org.prebid.server.json.JacksonMapper;
+import org.prebid.server.proto.openrtb.ext.response.BidType;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * The {@code artfhouse} bid adapter. TRANSLATION ONLY (FR-14).
+ *
+ * <p>Campaign selection, deal matching and pricing all live in the demand endpoint. This
+ * class decides nothing about demand: it forwards the enriched bid request, and maps the
+ * response back into {@link BidderBid}s. An adapter that decided anything would duplicate
+ * the endpoint and make the party separation the demonstration exists to show untrue.
+ *
+ * <h2>What the endpoint expects and returns</h2>
+ *
+ * It speaks OpenRTB in both directions, which is why this adapter is thin. It reads
+ * {@code imp.id}, {@code imp.bidfloor}, {@code imp.pmp.deals[]} (including
+ * {@code deal.ext.artf.suppressed}) and {@code imp.ext.artf.categories[]}, and returns a
+ * complete bid response with a single {@code seatbid} whose seat is {@code artfhouse} --
+ * one bid per eligible campaign, no aliases (FR-11).
+ *
+ * <h2>Each deal bid carries the floor Prebid holds it to</h2>
+ *
+ * A bid with a {@code dealid} gets a {@code PriceFloorInfo} of max(impression floor, that
+ * deal's floor), read from the request this call sent ({@link #dealFloorInfo}). It is a
+ * fact copied from the request, not a demand decision: the endpoint already refuses to
+ * bid below the same floor. Prebid compares a deal bid with it when the request turns on
+ * {@code ext.prebid.floors.enforcement.floorDeals}, which the orchestrator's auction
+ * route does.
+ *
+ * <h2>Prices are NOT mirrored onto the request</h2>
+ *
+ * FR-15 reads as though each campaign's declared CPM should travel on the request in an
+ * {@code imp.ext} field. It does not, and that was settled deliberately (OPEN-1): the
+ * catalog is the single source of truth for price, and mirroring prices would create a
+ * second source of truth for the same fact that would eventually disagree. FR-15's actual
+ * purpose -- that {@code bidfloor} keeps meaning a floor and a price is never smuggled
+ * into it -- holds precisely because the price never travels on the request at all.
+ *
+ * <h2>One bid per campaign only survives if the request asks for it</h2>
+ *
+ * Prebid keeps <b>one</b> bid per impression per seat unless the request carries
+ * {@code ext.prebid.multibid} naming this bidder with a {@code maxbids}
+ * ({@code BidResponseCreator.limitMultiBid}, default limit 1). This adapter cannot set
+ * that -- it is request-side. Without it the response is well formed and shows a single
+ * campaign, which looks correct, so the requirement is recorded in
+ * {@code prebid_config_template.yaml} rather than left to be discovered.
+ *
+ * <h2>The endpoint's exclusions cannot cross this contract</h2>
+ *
+ * {@code ext.artf.excluded[]} -- campaigns considered and never offered -- has no route out
+ * of this class. {@code makeBids} returns bids, and {@code CompositeBidderResponse} carries
+ * bids, errors, FLEDGE configs and IGI with <b>no channel for a response-level
+ * {@code ext}</b>. An excluded campaign has no bid to attach it to.
+ *
+ * <p>It is not destroyed. Prebid copies each bidder's raw response into
+ * {@code ext.debug.httpcalls.artfhouse[].responsebody}, so the block survives verbatim --
+ * but only when debug is enabled, and debug <b>is</b> account-gated
+ * ({@code BidResponseCreator.java:1047}, {@code DebugResolver.isDebugAllowedByAccount}).
+ * That is a stricter gate than the one on hook analytics tags, which need only
+ * {@code ext.prebid.trace}.
+ *
+ * <p>FR-30 depends on those exclusions being renderable, so the consequence is worth
+ * stating: read them from the debug block or from the endpoint directly, never from
+ * {@code seatbid}, where they will never appear.
+ */
+public class ArtfhouseBidder implements Bidder<BidRequest> {
+
+    /**
+     * The scope the demand endpoint's Cognito authorizer requires. Distinct from the
+     * orchestrator's scope: these are two different endpoints with two different
+     * authorities, and one credential that opened both would defeat the point of scoping
+     * either.
+     */
+    public static final String DEMAND_SCOPE = "artf-demand/bid:read";
+
+    /** Currency of an attached deal floor when neither the deal nor the impression names one. */
+    private static final String DEFAULT_FLOOR_CURRENCY = "USD";
+
+    private final String endpointUrl;
+    private final JacksonMapper mapper;
+    private final TokenCache tokenCache;
+
+    public ArtfhouseBidder(String endpointUrl, JacksonMapper mapper, TokenCache tokenCache) {
+        this.endpointUrl = Objects.requireNonNull(endpointUrl);
+        this.mapper = Objects.requireNonNull(mapper);
+        this.tokenCache = Objects.requireNonNull(tokenCache);
+    }
+
+    @Override
+    public Result<List<HttpRequest<BidRequest>>> makeHttpRequests(BidRequest request) {
+        // Read synchronously from memory. makeHttpRequests is a synchronous method on a
+        // Vert.x-based server, so acquiring a token here would block an event-loop
+        // thread -- which is why TokenCache serves from memory and renews on a timer.
+        final String token = tokenCache.current().orElse(null);
+        if (token == null) {
+            // NEVER an unauthenticated call. The endpoint is not exempted from
+            // authentication (FR-39, SECURITY-08), and a request without the bearer
+            // token would be refused by the authorizer anyway -- reporting the missing
+            // credential is more useful than reporting the 401 it would cause.
+            // The reason names the cache's state, never the token (SECURITY-12).
+            return Result.withError(BidderError.failedToRequestBids(
+                    "artfhouse: no credential available for scope %s (%s)"
+                            .formatted(DEMAND_SCOPE, tokenCache.describe())));
+        }
+
+        final MultiMap headers = MultiMap.caseInsensitiveMultiMap()
+                .add(HttpHeaders.CONTENT_TYPE, "application/json")
+                .add(HttpHeaders.ACCEPT, "application/json")
+                .add(HttpHeaders.AUTHORIZATION, "Bearer " + token);
+
+        // The request is forwarded UNCHANGED. Everything the endpoint needs -- the deals
+        // the ARTF hook wrote, the floors it adjusted, the categories -- is already on it,
+        // and rewriting any of it here would put the contract in two places.
+        return Result.withValue(HttpRequest.<BidRequest>builder()
+                .method(HttpMethod.POST)
+                .uri(endpointUrl)
+                .headers(headers)
+                .impIds(impIds(request))
+                .body(mapper.encodeToBytes(request))
+                .payload(request)
+                .build());
+    }
+
+    @Override
+    public Result<List<BidderBid>> makeBids(BidderCall<BidRequest> httpCall, BidRequest bidRequest) {
+        final int status = httpCall.getResponse().getStatusCode();
+
+        // 204, or a 200 with nothing in it, means NO CAMPAIGN WISHED TO OFFER. That is a
+        // demand decision, not a fault, and reporting it as an error would mark the seat
+        // as failing every time the floors did their job.
+        if (status == 204) {
+            return Result.empty();
+        }
+        if (status != 200) {
+            return Result.withError(BidderError.badServerResponse(
+                    "artfhouse: demand endpoint returned HTTP %d".formatted(status)));
+        }
+
+        final String body = httpCall.getResponse().getBody();
+        if (body == null || body.isBlank()) {
+            return Result.empty();
+        }
+
+        final BidResponse bidResponse;
+        try {
+            bidResponse = mapper.decodeValue(body, BidResponse.class);
+        } catch (Exception e) {
+            return Result.withError(BidderError.badServerResponse(
+                    "artfhouse: demand response could not be parsed: " + e.getClass().getSimpleName()));
+        }
+        if (bidResponse == null || bidResponse.getSeatbid() == null || bidResponse.getSeatbid().isEmpty()) {
+            // The endpoint OMITS seatbid rather than sending it empty, precisely so this
+            // reads as "no offers" and not as a seat that offered nothing.
+            return Result.empty();
+        }
+
+        return extractBids(bidResponse, sentRequest(httpCall, bidRequest));
+    }
+
+    /**
+     * The request this call sent: the bidder request carried on the call, which holds the
+     * deals and deal floors the ARTF hook wrote, else the request Prebid passed in.
+     */
+    private static BidRequest sentRequest(BidderCall<BidRequest> httpCall, BidRequest bidRequest) {
+        final HttpRequest<BidRequest> sent = httpCall.getRequest();
+        final BidRequest payload = sent != null ? sent.getPayload() : null;
+        return payload != null ? payload : bidRequest;
+    }
+
+    /**
+     * The floor Prebid compares a deal bid with: max({@code imp.bidfloor}, {@code bidfloor}
+     * of the request deal whose id equals {@code bid.dealid}). It is the rule the demand
+     * endpoint applies before it bids ({@code source/demand/artfhouse/floors.py}), so a bid
+     * the endpoint made is never below it.
+     *
+     * <p>Prebid's enforcer reads this {@code PriceFloorInfo} for a bid when it is set, and
+     * enforces a floor on a deal bid only when the request turns on
+     * {@code ext.prebid.floors.enforcement.floorDeals}. A deal floor mutation writes the
+     * deal's floor only, so without this Prebid would hold a deal bid to the impression
+     * floor.
+     *
+     * <p>Null for a bid without a {@code dealid}, for a bid whose impression is not on the
+     * request, and when neither floor is set: Prebid then keeps its own impression floor.
+     * A missing deal, or a deal without a floor, leaves the impression floor. The currency
+     * is the deal's {@code bidfloorcur}, else the impression's, else USD.
+     *
+     * <p>The max compares the two amounts without currency conversion, so it assumes the
+     * impression and the deal floor share a currency. Every floor the deals seed and the
+     * scenario samples carry is USD.
+     */
+    static PriceFloorInfo dealFloorInfo(BidRequest request, Bid bid) {
+        final String dealId = bid.getDealid();
+        if (dealId == null || dealId.isBlank()) {
+            return null;
+        }
+        final Imp imp = findImp(request, bid.getImpid());
+        if (imp == null) {
+            return null;
+        }
+        final Deal deal = findDeal(imp, dealId);
+        final BigDecimal impFloor = imp.getBidfloor();
+        final BigDecimal dealFloor = deal != null ? deal.getBidfloor() : null;
+        final BigDecimal floor;
+        if (impFloor == null) {
+            floor = dealFloor;
+        } else if (dealFloor == null) {
+            floor = impFloor;
+        } else {
+            floor = impFloor.max(dealFloor);
+        }
+        if (floor == null) {
+            return null;
+        }
+        return PriceFloorInfo.of(floor, floorCurrency(deal, imp));
+    }
+
+    private static Imp findImp(BidRequest request, String impId) {
+        if (request == null || request.getImp() == null || impId == null) {
+            return null;
+        }
+        for (Imp imp : request.getImp()) {
+            if (imp != null && impId.equals(imp.getId())) {
+                return imp;
+            }
+        }
+        return null;
+    }
+
+    private static Deal findDeal(Imp imp, String dealId) {
+        final Pmp pmp = imp.getPmp();
+        if (pmp == null || pmp.getDeals() == null) {
+            return null;
+        }
+        for (Deal deal : pmp.getDeals()) {
+            if (deal != null && dealId.equals(deal.getId())) {
+                return deal;
+            }
+        }
+        return null;
+    }
+
+    private static String floorCurrency(Deal deal, Imp imp) {
+        if (deal != null && deal.getBidfloorcur() != null && !deal.getBidfloorcur().isBlank()) {
+            return deal.getBidfloorcur();
+        }
+        if (imp.getBidfloorcur() != null && !imp.getBidfloorcur().isBlank()) {
+            return imp.getBidfloorcur();
+        }
+        return DEFAULT_FLOOR_CURRENCY;
+    }
+
+    /**
+     * The media type of a bid, taken from what the bid DECLARES.
+     *
+     * <p>OpenRTB 2.6 {@code bid.mtype} is the field for this: 1 banner, 2 video, 3 audio,
+     * 4 native. This was previously hardcoded to {@code banner}, which was correct only
+     * for as long as the demand endpoint's catalog held nothing else. Once it carried
+     * video creatives for the video deals the scenarios declare, a hardcoded type meant a
+     * video bid was announced to the auction as a banner -- so it would have been placed
+     * in, or rejected from, the wrong slot for a reason no log would explain.
+     *
+     * <p>An absent or unrecognised {@code mtype} falls back to banner, which is what every
+     * bid from this endpoint was before the field existed, so an older endpoint paired with
+     * a newer adapter keeps working rather than losing its bids.
+     */
+    private static BidType resolveBidType(Bid bid) {
+        final Integer mtype = bid.getMtype();
+        if (mtype == null) {
+            return BidType.banner;
+        }
+        return switch (mtype) {
+            case 2 -> BidType.video;
+            case 3 -> BidType.audio;
+            case 4 -> BidType.xNative;
+            default -> BidType.banner;
+        };
+    }
+
+    /**
+     * Map the response's single seatbid to {@link BidderBid}s.
+     *
+     * <p>The currency comes from the response, not from an assumption. The endpoint states
+     * what it prices in and rejects a request asking for anything else, so silently
+     * reinterpreting it here could only ever misreport a price.
+     */
+    private Result<List<BidderBid>> extractBids(BidResponse bidResponse, BidRequest request) {
+        final List<BidderBid> bids = new ArrayList<>();
+        final List<BidderError> errors = new ArrayList<>();
+        final String currency = bidResponse.getCur();
+
+        for (SeatBid seatBid : bidResponse.getSeatbid()) {
+            if (seatBid == null || seatBid.getBid() == null) {
+                continue;
+            }
+            for (Bid bid : seatBid.getBid()) {
+                if (bid == null) {
+                    continue;
+                }
+                // bid.ext.prebid.artf carries the campaign identity, and it is passed
+                // through UNTOUCHED. The Theater reads it to label a row, and OpenRTB's
+                // bid object has no campaign field, so rewriting or normalising it here
+                // would put that contract in two places.
+                bids.add(BidderBid.builder()
+                        .bid(bid)
+                        .seat(seatBid.getSeat())
+                        .type(resolveBidType(bid))
+                        .bidCurrency(currency)
+                        .priceFloorInfo(dealFloorInfo(request, bid))
+                        .build());
+            }
+        }
+
+        // A well-formed response whose seatbid contained no usable bid is worth saying
+        // out loud: it is not "no offers", it is a response this adapter could not read.
+        if (bids.isEmpty()) {
+            errors.add(BidderError.badServerResponse(
+                    "artfhouse: response carried a seatbid with no usable bids"));
+        }
+
+        return Result.of(bids, errors);
+    }
+
+    /**
+     * Impression ids this request covers, so Prebid can attribute a timeout to the right
+     * impressions rather than to the whole auction.
+     */
+    private static Set<String> impIds(BidRequest request) {
+        final Set<String> ids = new LinkedHashSet<>();
+        if (request.getImp() != null) {
+            for (Imp imp : request.getImp()) {
+                if (imp != null && imp.getId() != null) {
+                    ids.add(imp.getId());
+                }
+            }
+        }
+        return ids;
+    }
+
+}

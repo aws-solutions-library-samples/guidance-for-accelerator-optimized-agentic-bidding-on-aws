@@ -1,7 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import DeltaLabel from "./DeltaLabel";
 import nvidiaLogo from "../logos/Nvidia_logo.svg";
-import { authFetch } from "../authFetch.js";
+import { authFetch, isProxyTransport } from "../authFetch.js";
+
+// Progress transport. Through the UI API proxy Lambda (deployed stacks) the
+// panel polls GET /api/v1/loadtest/{id}: a synchronous Invoke returns one payload,
+// so the proxy refuses the SSE stream with 406 and there is no point requesting it.
+// Each poll is one signed invoke (about 180 ms measured), so 1 s keeps the counters
+// and bid bubbles moving without doubling the invoke count. With plain fetch (local
+// dev, port-forward) the SSE stream is tried first and polling is the fallback.
+export const POLL_INTERVAL_MS = 1000;
+// Consecutive non-OK polls before the panel treats the test as gone. One miss
+// is tolerated so a transient answer from a replica that does not (yet) know the
+// test cannot end the live view by itself.
+export const POLL_MISS_LIMIT = 3;
 
 const PRESETS = [
   { value: "100", label: "100", requests: 100 },
@@ -17,11 +29,79 @@ const DURATIONS = [
   { value: 120, label: "2m" },
 ];
 
+// Model types selectable for outcome/version capture (target_model_type).
+// Only model types with a real training pipeline are offered — the whole point
+// of capturing outcomes is to produce training data, so a container you cannot
+// train on has nothing to capture for. This mirrors the Governance panel's
+// TRAINING_MODEL_TYPES (the authoritative backend set is
+// orchestrator.training_trigger.TRAINABLE_MODEL_TYPES): dlrm_bid_shader and the
+// Yield Optimizer's two independently-trained sub-models are trainable today.
+// ncf_deal_manager has a training pipeline but is parked (its outcome events
+// carry no deal_id yet), so it is shown disabled rather than removed. The
+// rule-based containers (Audience Activator / widedeep_segment_activator and
+// Signals Enricher / metrics_enricher) have no training pipeline at all and are
+// intentionally not listed. Internal keys match the orchestrator's
+// model-architecture naming (RENAME_MAP.md); labels are the job-oriented
+// display names used elsewhere in the UI.
+const TARGET_MODEL_TYPES = [
+  { value: "dlrm_bid_shader", label: "Bid Pricer", trainable: true },
+  { value: "deal_yield_manager_floor", label: "Yield Optimizer — Floor", trainable: true },
+  { value: "deal_yield_manager_margin", label: "Yield Optimizer — Margin", trainable: true },
+  { value: "ncf_deal_manager", label: "Deal Scorer (future)", trainable: false },
+];
+
+// The select has no empty ("None") option, so the state must start on a real
+// option value. Defaulting to "" made the browser paint the first option
+// ("Bid Pricer") while the value stayed empty — so target_model_type was never
+// sent and runs silently captured no outcomes (leaving them ineligible for
+// comparison and training) even though the UI looked like a model was picked.
+// Derived from the list so it cannot drift if the order/entries change.
+const DEFAULT_TARGET_MODEL_TYPE =
+  (TARGET_MODEL_TYPES.find((m) => m.trainable) || {}).value || "";
+
+// Traffic scenarios mirror the backend registry in orchestrator/loadtest.py
+// (TRAFFIC_SCENARIO_KEYS). Each shapes the SYNTHETIC requests this run
+// generates — the mix of publisher domains, IAB content categories, devices,
+// PMP deals and bid-floor ranges — to model a recognisable demand shape. This
+// changes the request inputs the pipeline processes; it does not replay real
+// traffic recorded during that event.
+const SCENARIOS = [
+  {
+    value: "baseline",
+    label: "Typical mixed traffic",
+    detail: "Broad, balanced mix of publishers, content categories and devices.",
+  },
+  {
+    value: "black_friday",
+    label: "Black Friday — retail surge",
+    detail: "Retail/commerce publishers, shopping & personal-finance content, mobile-heavy, elevated deal floors.",
+  },
+  {
+    value: "nfl_sunday",
+    label: "NFL Sunday — primetime sports",
+    detail: "Sports publishers, automotive & food advertisers, second-screen mobile/desktop mix, elevated floors.",
+  },
+  {
+    value: "holiday_season",
+    label: "Holiday season — Christmas shopping",
+    detail: "Broad retail, travel & gifting across shopping/travel/food content, mobile-leaning, sustained demand.",
+  },
+  {
+    value: "late_night_longtail",
+    label: "Late-night long-tail",
+    detail: "Off-peak news & entertainment browsing, thinner demand and lower floors.",
+  },
+];
+
 /**
  * LoadTestPanel — UI for running server-side load tests against the ARTF pipeline.
  *
- * Connects to POST /v1/loadtest to start a test, then opens an EventSource on
- * GET /v1/loadtest/{id}/stream to receive real-time progress events (every 500ms).
+ * Connects to POST /v1/loadtest to start a test, then follows progress over one
+ * of two transports: GET /v1/loadtest/{id}/stream (server-sent events every
+ * 500 ms, plain-fetch builds) or GET /v1/loadtest/{id} polled every
+ * POLL_INTERVAL_MS (proxy builds, and the fallback when the stream fails). The
+ * orchestrator computes both from the same live counters, so the panel shows the
+ * same numbers either way.
  *
  * Props:
  *   onRunningChange(isRunning: boolean) — called when load test starts/stops,
@@ -30,11 +110,19 @@ const DURATIONS = [
 export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   const [preset, setPreset] = useState("100");
   const [duration, setDuration] = useState(10);
+  // Traffic scenario shaping the synthetic requests generated this run.
+  const [scenario, setScenario] = useState("baseline");
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [elapsedDisplay, setElapsedDisplay] = useState(0);
+  // Outcome-capture targeting (FR-2/FR-3). "" means no target selected — the
+  // run behaves exactly as before (no BidShadingOutcomeEvent emission, no version
+  // capture). Selecting a model type + "challenger" forces that container's
+  // traffic onto its canary variant for this run only.
+  const [targetModelType, setTargetModelType] = useState(DEFAULT_TARGET_MODEL_TYPE);
+  const [targetVariant, setTargetVariant] = useState("current");
 
   // Notify parent of result/progress changes for main area display
   useEffect(() => {
@@ -93,17 +181,25 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
     }
   }, [resetToIdle]);
 
-  // Polling fallback: fetch test status every 2s when SSE is unavailable
+  // Poll transport: GET /api/v1/loadtest/{id} every POLL_INTERVAL_MS. The
+  // orchestrator merges its live counters into the body while state is
+  // "running", so each tick carries real completed/rps/latency numbers.
   const startPolling = useCallback((testId) => {
     if (pollRef.current) return;
+    let misses = 0;
     pollRef.current = setInterval(async () => {
       try {
         const r = await authFetch(`/api/v1/loadtest/${testId}`);
         if (!r.ok) {
-          // Test gone (404) — completed and cleaned up
-          resetToIdle();
+          // A non-OK poll usually means the test expired and was cleaned up, but
+          // one bad answer is not proof: a replica that joined mid-run can miss
+          // a test for a tick while its sibling list catches up. Give up only
+          // after POLL_MISS_LIMIT consecutive misses.
+          misses += 1;
+          if (misses >= POLL_MISS_LIMIT) resetToIdle();
           return;
         }
+        misses = 0;
         const data = await r.json();
         if (data.state === "complete" || data.state === "error" || data.state === "cancelled") {
           setResult(data);
@@ -124,7 +220,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       } catch (_) {
         // Network error — keep polling
       }
-    }, 2000);
+    }, POLL_INTERVAL_MS);
   }, [resetToIdle]);
 
   const startTest = useCallback(async () => {
@@ -147,16 +243,36 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       const resp = await authFetch("/api/v1/loadtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ preset, seed: 42, duration_s: duration }),
+        body: JSON.stringify({
+          preset,
+          seed: 42,
+          duration_s: duration,
+          scenario,
+          ...(targetModelType ? { target_model_type: targetModelType, target_variant: targetVariant } : {}),
+        }),
       });
 
       if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(resp.status === 409 ? "A load test is already running" : `HTTP ${resp.status}: ${body}`);
+        const body = await resp.json().catch(() => ({}));
+        if (resp.status === 409) throw new Error("A load test is already running");
+        if (resp.status === 422 && body.reason === "no_canary_supported") {
+          throw new Error(body.error || "No canary supported for this model type");
+        }
+        if (resp.status === 422 && body.reason === "no_canary_staged") {
+          throw new Error(body.error || "No canary is currently staged for this model type");
+        }
+        throw new Error(`HTTP ${resp.status}: ${body.error || JSON.stringify(body)}`);
       }
 
       const { id } = await resp.json();
       testIdRef.current = id;
+
+      // Behind the UI API proxy the stream request would be refused (406), so go
+      // straight to polling instead of spending an invoke and a tick to learn that.
+      if (isProxyTransport()) {
+        startPolling(id);
+        return;
+      }
 
       // Open SSE stream using fetch (supports Authorization header, unlike EventSource)
       const abortController = new AbortController();
@@ -222,7 +338,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
       setError(err.message);
       resetToIdle();
     }
-  }, [preset, duration, stopTest, resetToIdle, startPolling]);
+  }, [preset, duration, scenario, targetModelType, targetVariant, stopTest, resetToIdle, startPolling]);
 
   const totalRequests = PRESETS.find((p) => p.value === preset)?.requests || 0;
   const completedPct = progress ? ((progress.completed / progress.total) * 100).toFixed(1) : 0;
@@ -234,6 +350,31 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
         {running && (
           <span className="loadtest-elapsed">{elapsedDisplay}s</span>
         )}
+      </div>
+
+      {/* Traffic scenario — shapes the synthetic requests this run generates
+          (publisher / content category / device / deal / floor mix). This
+          changes the request inputs the pipeline processes; it does not replay
+          real traffic recorded during that event. */}
+      <div className="loadtest-scenario" aria-label="Traffic scenario">
+        <label className="loadtest-scenario-label">
+          Traffic scenario:
+          <select
+            className="loadtest-scenario-select"
+            value={scenario}
+            onChange={(e) => setScenario(e.target.value)}
+            disabled={running}
+            aria-label="Traffic scenario for synthetic request generation"
+            data-testid="loadtest-scenario-select"
+          >
+            {SCENARIOS.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
+            ))}
+          </select>
+        </label>
+        <p className="loadtest-scenario-detail" data-testid="loadtest-scenario-detail">
+          {SCENARIOS.find((s) => s.value === scenario)?.detail}
+        </p>
       </div>
 
       {/* Preset selector */}
@@ -279,6 +420,47 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
             {d.label}
           </label>
         ))}
+      </div>
+
+      {/* Outcome-capture targeting (FR-2/FR-3) — optional. Selecting a model
+          type enables real BidShadingOutcomeEvent emission + model-version capture
+          for this run; "Challenger" additionally forces that container's
+          traffic onto its canary variant for this run only. */}
+      <div className="loadtest-target" aria-label="Outcome capture targeting">
+        <label className="loadtest-target-label">
+          Capture outcomes for:
+          <select
+            className="loadtest-target-select"
+            value={targetModelType}
+            onChange={(e) => setTargetModelType(e.target.value)}
+            disabled={running}
+            aria-label="Target model type for outcome capture"
+            data-testid="loadtest-target-model-select"
+          >
+            {/*<option value="">None (latency/throughput only)</option>*/}
+            {TARGET_MODEL_TYPES.map((m) => (
+              <option key={m.value} value={m.value} disabled={!m.trainable}>{m.label}</option>
+            ))}
+          </select>
+        </label>
+        {targetModelType && (
+          <div className="loadtest-target-variant" role="radiogroup" aria-label="Target variant">
+            {["current", "challenger"].map((v) => (
+              <label key={v} className={`loadtest-target-variant-option ${targetVariant === v ? "active" : ""}`}>
+                <input
+                  type="radio"
+                  name="loadtest-target-variant"
+                  value={v}
+                  checked={targetVariant === v}
+                  onChange={() => setTargetVariant(v)}
+                  disabled={running}
+                  data-testid={`loadtest-target-variant-${v}`}
+                />
+                {v === "current" ? "Current (stable)" : "Challenger (canary)"}
+              </label>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Run / Stop buttons */}
@@ -545,18 +727,34 @@ function MetricItem({ label, value, highlight, delta }) {
 }
 
 function ContainerBreakdown({ containers }) {
+  // Keyed by the unchanged internal container name the orchestrator returns —
+  // see RENAME_MAP.md.
   const CONTAINER_NAMES = [
     "dlrm-bid-shader",
     "widedeep-segment-activator",
     "ncf-deal-manager",
     "metrics-enricher",
+    "yield-optimizer-floor",
+    "yield-optimizer-margin",
   ];
 
   const CONTAINER_LOGOS = {
     "dlrm-bid-shader": nvidiaLogo,
-    "widedeep-segment-activator": nvidiaLogo,
+    "widedeep-segment-activator": null,
     "ncf-deal-manager": nvidiaLogo,
-    "metrics-enricher": nvidiaLogo,
+    "metrics-enricher": null,
+    "yield-optimizer-floor": nvidiaLogo,
+    "yield-optimizer-margin": nvidiaLogo,
+  };
+
+  // Job-oriented display labels shown instead of the raw internal name.
+  const CONTAINER_LABELS = {
+    "dlrm-bid-shader": "Bid Pricer",
+    "widedeep-segment-activator": "Audience Activator",
+    "ncf-deal-manager": "Deal Scorer",
+    "metrics-enricher": "Signals Enricher",
+    "yield-optimizer-floor": "Yield Optimizer — Floor",
+    "yield-optimizer-margin": "Yield Optimizer — Margin",
   };
 
   const rows = containers && containers.length > 0
@@ -579,9 +777,18 @@ function ContainerBreakdown({ containers }) {
           {rows.map((c) => (
             <tr key={c.name}>
               <td className="loadtest-breakdown-logo">
-                <img src={CONTAINER_LOGOS[c.name]} alt="" className="loadtest-container-logo" />
+                {/* A store-defined container has no logo, and inventing one would
+                    misattribute its provenance. The cell stays empty. */}
+                {CONTAINER_LOGOS[c.name] && (
+                  <img src={CONTAINER_LOGOS[c.name]} alt="" className="loadtest-container-logo" />
+                )}
               </td>
-              <td className="loadtest-breakdown-name">{c.name}</td>
+              {/* display_name from the response first: a store-defined
+                  container's name is not known at build time, so
+                  CONTAINER_LABELS cannot resolve it. */}
+              <td className="loadtest-breakdown-name">
+                {c.display_name || CONTAINER_LABELS[c.name] || c.name}
+              </td>
               <td>{c.avg_latency_ms != null ? `${c.avg_latency_ms.toFixed(1)}ms` : "—"}</td>
               <td>{c.total_mutations != null ? c.total_mutations.toLocaleString() : "—"}</td>
             </tr>

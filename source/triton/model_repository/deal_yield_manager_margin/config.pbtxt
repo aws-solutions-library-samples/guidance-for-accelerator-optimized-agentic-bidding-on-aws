@@ -1,0 +1,59 @@
+# Deal Yield Manager -- MARGIN sub-model. XGBoost regressor served via
+# Triton's FIL (Forest Inference Library) backend, for ADJUST_DEAL_MARGIN.
+# =============================================================================
+# See deal_yield_manager_floor/config.pbtxt for the full correction note --
+# this is the sibling single-target FIL model for the margin-value target.
+
+name: "deal_yield_manager_margin"
+backend: "fil"
+max_batch_size: 64
+
+input [
+  {
+    name: "input__0"
+    data_type: TYPE_FP32
+    dims: [ 7 ]
+  }
+]
+
+output [
+  {
+    name: "output__0"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+parameters [
+  { key: "model_type", value: { string_value: "xgboost_json" } },
+  { key: "output_class", value: { string_value: "false" } },
+  { key: "algo", value: { string_value: "ALGO_AUTO" } },
+  { key: "storage_type", value: { string_value: "AUTO" } }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+# Warm-up: Triton runs this request on each instance at load and reports the
+# model not ready until it completes (Triton r24.08 model_configuration.md,
+# "Model Warmup"; ModelWarmup in common/protobuf/model_config.proto). dims are
+# the declared input dims (before reshape), without the batch dimension. Batch 1
+# only: this model has no profile in deployment/optimizer-bootstrap.json and the
+# yield container sends one row per deal.
+model_warmup [
+  {
+    name: "zero_batch1"
+    batch_size: 1
+    inputs {
+      key: "input__0"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 7 ]
+        zero_data: true
+      }
+    }
+  }
+]

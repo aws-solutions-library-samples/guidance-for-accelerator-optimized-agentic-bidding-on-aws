@@ -1,0 +1,45 @@
+# Model Optimizer Service (the design's model-optimization role, TensorRT-based)
+# =============================================================================
+#
+# Compiles newly-trained ONNX recommender models (DLRM, NCF, Wide&Deep) into
+# optimized TensorRT engine plans that Triton loads as new canary versions.
+# Runs OUT-OF-BAND during model promotion — it is NOT in the ARTF real-time
+# serving path (the ARTF containers only ever call in-cluster Triton).
+#
+# This is a real NVIDIA TensorRT toolchain (trtexec), NOT a stock NVIDIA NIM
+# container — no stock NIM exists for these custom recommender models. TensorRT
+# is the same engine NIM is built on.
+#
+# Base image: NVIDIA TensorRT 24.08 — pinned to match the Triton serving image
+# (nvcr.io/nvidia/tritonserver:24.08-py3) so engines built here are loadable by
+# Triton's tensorrt_plan backend. Pulling this image requires an NGC login
+# (handled by the CodeBuild buildspec using the NGC API key secret).
+#
+# amd64 only: engines are GPU-architecture-specific and must be built on the
+# same NVIDIA A10G (g5.xlarge, x86_64) the ARTF Triton server runs on.
+
+FROM nvcr.io/nvidia/tensorrt:24.08-py3
+
+WORKDIR /app
+
+# trtexec ships in the TensorRT container but is not on PATH by default.
+ENV TRTEXEC_PATH=/usr/src/tensorrt/bin/trtexec
+
+COPY optimizer/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY optimizer/ /app/optimizer/
+
+# Same non-root user as the ARTF containers (source/Dockerfile), with the UID
+# stated so it matches the runAsUser that model-optimizer-bootstrap-job.yaml
+# pins; the kubelet cannot verify runAsNonRoot against a named USER. The
+# service writes only to tempfile.mkdtemp() under /tmp, so /app stays root-owned
+# and read-only. Normalize modes first: the build context keeps the host's file
+# modes, and a non-world-readable source file would be unreadable to appuser.
+RUN chmod -R a+rX /app && adduser --disabled-password --no-create-home --uid 1000 appuser
+USER appuser
+
+# HTTP service on 8080 (POST /v1/optimize, GET /health)
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "optimizer.app"]
