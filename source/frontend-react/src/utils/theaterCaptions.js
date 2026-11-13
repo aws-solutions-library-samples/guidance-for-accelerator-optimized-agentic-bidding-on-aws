@@ -99,6 +99,18 @@ export function hookReportSentence(report) {
   return HOOK_REPORT_SENTENCE[report.outcome] ?? null;
 }
 
+/**
+ * Says that the with-ARTF auction shown is a rerun, when useTheaterRun ran the
+ * request again after the hook did not answer in time. Null when it ran once.
+ */
+export function hookRetrySentence(report) {
+  // No digits: captionValidation rejects a number the beat does not carry.
+  const n = report?.retriedAfter?.length ?? 0;
+  if (n === 0) return null;
+  const earlier = n === 1 ? "the first auction" : "earlier auctions";
+  return `The ARTF hook did not answer in time on ${earlier}, so the Theater ran the request again.`;
+}
+
 /** One phrase per value, in the beat's own order. */
 function valuePhrases(values) {
   return (values ?? []).map((v) => {
@@ -206,14 +218,16 @@ export function mutationNarration(beat, context) {
     // The hook's report said why nothing could be shown: say that, not "no
     // container mutated", which would claim the containers answered.
     const reportSentence = n === 0 ? hookReportSentence(beat.artfReport) : null;
-    if (reportSentence) return { ...base, text: reportSentence };
+    const retrySentence = hookRetrySentence(beat.artfReport);
+    const withRetry = (text) => (retrySentence ? `${text} ${retrySentence}` : text);
+    if (reportSentence) return { ...base, text: withRetry(reportSentence) };
     return {
       ...base,
-      // Unchanged wording: this exact string is the run's headline count and is
-      // pinned by test.
-      text: n === 0
+      // Unchanged wording when the auction ran once: this exact string is the
+      // run's headline count and is pinned by test.
+      text: withRetry(n === 0
         ? "No container mutated this request."
-        : `${n} ${n === 1 ? "container" : "containers"} mutated this request.`,
+        : `${n} ${n === 1 ? "container" : "containers"} mutated this request.`),
     };
   }
 

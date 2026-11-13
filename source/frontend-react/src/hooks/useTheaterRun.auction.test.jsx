@@ -328,6 +328,92 @@ describe("useTheaterRun auction leg", () => {
     expect(latest.result.stops.every((st) => st.mutations.length === 0)).toBe(true);
   });
 
+  describe("rerunning the with-ARTF auction when the hook did not answer in time", () => {
+    const hookReport = (outcome, extra = {}) => ({
+      ...LIVE_RESPONSE,
+      artf_meta: {
+        ...LIVE_RESPONSE.artf_meta,
+        extension_point: { available: true, outcome, correlation_id: `cid-${outcome}`, ...extra },
+      },
+    });
+    const MUTATED = hookReport("mutations_returned", {
+      correlation_id: "cid-ok",
+      response: {
+        id: "tid-1",
+        mutations: [{ intent: 1, op: 1, path: "/user/data", ids: { id: ["seg-1"] }, disposition: "applied" }],
+        metadata: {
+          containers: [{
+            name: "widedeep-segment-activator", status: "ok", latency_ms: 3,
+            mutations: [{ intent: 1, op: 1, path: "/user/data", ids: { id: ["seg-1"] }, disposition: "applied" }],
+          }],
+        },
+      },
+    });
+
+    // Answers each with-ARTF call with the next body in `sequence`, repeating the last.
+    function installSequence(sequence) {
+      const calls = installFetch({});
+      let i = 0;
+      const base = global.fetch;
+      global.fetch = vi.fn(async (url, init) => {
+        if (String(url).includes("artf=on")) {
+          calls.push({ url: String(url), init });
+          const body = sequence[Math.min(i, sequence.length - 1)];
+          i += 1;
+          return { ok: true, status: 200, json: async () => body };
+        }
+        return base(url, init);
+      });
+      return calls;
+    }
+    const withArtfCalls = (calls) => auctionCalls(calls).filter((c) => c.url.includes("artf=on"));
+
+    it("runs it again after a hook timeout and builds the run from the rerun", async () => {
+      const calls = installSequence([hookReport("timeout"), MUTATED]);
+      await run();
+      expect(latest.status).toBe(RUN_READY);
+      expect(withArtfCalls(calls)).toHaveLength(2);
+      expect(latest.result.artfReport.outcome).toBe("mutations_returned");
+      expect(latest.result.artfReport.retriedAfter).toEqual([{ outcome: "timeout", correlationId: "cid-timeout" }]);
+      expect(latest.bidResponse.artf_meta.extension_point.correlation_id).toBe("cid-ok");
+      expect(latest.result.stops.some((st) => st.mutations.length > 0)).toBe(true);
+    });
+
+    it("runs it again after a transport failure", async () => {
+      const calls = installSequence([hookReport("transport_failure"), MUTATED]);
+      await run();
+      expect(withArtfCalls(calls)).toHaveLength(2);
+      expect(latest.result.artfReport.retriedAfter.map((r) => r.outcome)).toEqual(["transport_failure"]);
+    });
+
+    it("stops after MAX_HOOK_RETRIES reruns and reports the last auction's outcome", async () => {
+      const { MAX_HOOK_RETRIES } = await import("./useTheaterRun.js");
+      const calls = installSequence([hookReport("timeout")]);
+      await run();
+      expect(latest.status).toBe(RUN_READY);
+      expect(withArtfCalls(calls)).toHaveLength(MAX_HOOK_RETRIES + 1);
+      expect(latest.result.artfReport.outcome).toBe("timeout");
+      expect(latest.result.artfReport.retriedAfter).toHaveLength(MAX_HOOK_RETRIES);
+    });
+
+    it("does not rerun when the hook answered, or skipped for budget", async () => {
+      for (const body of [MUTATED, hookReport("skipped_insufficient_budget")]) {
+        const calls = installSequence([body]);
+        await run();
+        expect(withArtfCalls(calls)).toHaveLength(1);
+        expect(latest.result.artfReport.retriedAfter).toEqual([]);
+        act(() => root.unmount());
+        root = createRoot(container);
+      }
+    });
+
+    it("never reruns the baseline", async () => {
+      const calls = installSequence([hookReport("timeout"), MUTATED]);
+      await run();
+      expect(auctionCalls(calls).filter((c) => c.url.includes("artf=off"))).toHaveLength(1);
+    });
+  });
+
   it("falls back to /v1/mutations only when Prebid is not deployed", async () => {
     const body = { error: "prebid_not_deployed", detail: "Prebid Server is not deployed." };
     installFetch({ auctionStatus: 501, auctionBody: body, baselineStatus: 501, baselineBody: body });

@@ -547,14 +547,15 @@ Outputs:
         - !Sub '${StackPrefix}-DealYieldManagerMarginModelPackageGroupName'
         - 'DealYieldManagerMarginModelPackageGroupName'
 
+  # Conditional, not an empty-string fallback: CloudFormation rejects an export
+  # with an empty value and rolls the stack back. deploy_closed_loop.sh
+  # --adaptive-only (learner mode) passes no TrainingDataBucketName.
   SageMakerTrainingExecutionRoleArn:
+    Condition: HasTrainingBuckets
     Description: >-
-      Execution role ARN for SageMaker training jobs (empty if
+      Execution role ARN for SageMaker training jobs (absent if
       TrainingDataBucketName/ModelBucketName were not provided).
-    Value: !If
-      - HasTrainingBuckets
-      - !GetAtt SageMakerTrainingExecutionRole.Arn
-      - ''
+    Value: !GetAtt SageMakerTrainingExecutionRole.Arn
     Export:
       Name: !If
         - HasStackPrefix

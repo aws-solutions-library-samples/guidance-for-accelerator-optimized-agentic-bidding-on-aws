@@ -153,3 +153,4 @@ aidlc/diagnostics/
 .kiro/agents/aidlc-scoped-review-*.md
 # END AI-DLC:gitignore
 _AGENTS.md
+aidlc
