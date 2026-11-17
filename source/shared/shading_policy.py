@@ -52,6 +52,11 @@ CURVATURE_BOUNDS = (0.2, 2.0)
 #: The previous hardcoded default (`EST_SHADE_FACTOR` in the shader container).
 _GENESIS_SLOPE = 0.65
 
+#: The conversion value the shader prices against when neither the request nor the
+#: parameter store supplies one. Read by the shader, the outcome emitter and the
+#: trainer's policy search so the three agree on what `ev` was computed from.
+DEFAULT_CONVERSION_VALUE = 12.0
+
 #: Bumped when the parameter set itself changes shape, so a model carrying policy
 #: parameters can be checked against the code that will apply them. Adding a fourth
 #: coefficient is a version change; retuning the three is not.

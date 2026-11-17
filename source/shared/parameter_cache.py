@@ -151,7 +151,10 @@ class ParameterCache:
             self._alarm_emitted = False
 
         except Exception as exc:
-            # Graceful degradation: keep using cached values
+            # Graceful degradation: keep using cached values, and wait a TTL before
+            # the next read. Retrying on every call would put two failing DynamoDB
+            # round trips on every bid while the table is missing or unreachable.
+            self._last_refresh_time = now
             self._consecutive_errors += 1
             logger.warning(
                 "ParameterCache refresh failed (consecutive_errors=%d): %s",

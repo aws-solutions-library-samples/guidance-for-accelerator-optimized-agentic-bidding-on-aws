@@ -550,7 +550,7 @@ class TestBootstrapSpecAndDeployScript:
     def test_the_spec_declares_an_expected_version_for_both_dlrm_entries(self) -> None:
         raw = (REPO_ROOT / "deployment" / "optimizer-bootstrap.json").read_text()
         spec = json.loads(
-            raw.replace("__FEATURE_SPEC_VERSION__", "1").replace(
+            raw.replace("__FEATURE_SPEC_VERSION__", "1").replace("__NCF_ID_HASH_VERSION__", "2").replace(
                 "__MODEL_BUCKET__", "bucket"
             )
         )
@@ -562,11 +562,11 @@ class TestBootstrapSpecAndDeployScript:
             )
 
     def test_ncf_declares_none(self) -> None:
-        """NCF's vector is not versioned; claiming a DLRM version for it would be
-        a check that means nothing."""
+        """NCF has no DLRM feature spec; it is checked on its id-hash version
+        instead (TestNcfIdHashVersion)."""
         raw = (REPO_ROOT / "deployment" / "optimizer-bootstrap.json").read_text()
         spec = json.loads(
-            raw.replace("__FEATURE_SPEC_VERSION__", "1").replace(
+            raw.replace("__FEATURE_SPEC_VERSION__", "1").replace("__NCF_ID_HASH_VERSION__", "2").replace(
                 "__MODEL_BUCKET__", "bucket"
             )
         )
@@ -590,10 +590,88 @@ class TestBootstrapSpecAndDeployScript:
         """An unsubstituted placeholder would upload invalid JSON, and the optimizer
         would fail to parse its own spec at a point far from the cause."""
         text = (REPO_ROOT / "deployment" / "deploy.sh").read_text()
-        assert "still has an unsubstituted __FEATURE_SPEC_VERSION__" in text
+        assert "still has an unsubstituted version placeholder" in text
+        assert "__(FEATURE_SPEC|NCF_ID_HASH)_VERSION__" in text
 
     def test_deploy_sh_uploads_the_manifest_next_to_the_onnx(self) -> None:
         """The gate reads it from there; uploading the ONNX alone would make every
         bootstrap refuse."""
         text = (REPO_ROOT / "deployment" / "deploy.sh").read_text()
         assert "onnx-source/${m}/manifest.json" in text
+
+
+# ---------------------------------------------------------------------------
+# The Deal Scorer's id hash: recorded, and enforced the same way
+# ---------------------------------------------------------------------------
+
+
+class TestNcfIdHashVersion:
+    """`ncf_ids.bucket` decides which embedding row an id uses. A model trained
+    under one hash and served under another scores every id against the wrong row,
+    so the hash version is recorded in the manifest and checked before compiling."""
+
+    def _run(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: dict | None):
+        import optimizer.app as app
+
+        onnx = _write_artifact(tmp_path / "m", manifest)
+        built = []
+        monkeypatch.setattr(app, "_resolve_onnx", lambda uri, workdir: str(onnx))
+        monkeypatch.setattr(
+            app,
+            "_build_engine",
+            lambda onnx_path, engine_path, *a, **k: (
+                built.append("engine"), Path(engine_path).write_bytes(b"x")
+            ),
+        )
+        monkeypatch.setattr(app, "_upload", lambda *a, **k: None)
+        from shared import ncf_ids
+
+        body = {
+            "source_model_uri": "s3://bucket/ncf/model.tar.gz",
+            "output_uri": "s3://bucket/out/model.plan",
+            "model_name": "ncf_deal_manager",
+            "precision": "fp16",
+            "expected_id_hash_version": ncf_ids.ID_HASH_VERSION,
+        }
+        return body, built
+
+    def test_a_model_from_the_previous_hash_is_refused(self, tmp_path, monkeypatch):
+        body, built = self._run(tmp_path, monkeypatch, {"id_hash_version": 1})
+        with pytest.raises(OptimizeRequestError, match="id-hash version 1"):
+            run_optimize(body)
+        assert built == []
+
+    def test_a_manifest_that_predates_the_field_is_refused(self, tmp_path, monkeypatch):
+        body, built = self._run(tmp_path, monkeypatch, {"model_type": "ncf_deal_manager"})
+        with pytest.raises(OptimizeRequestError, match="declares no 'id_hash_version'"):
+            run_optimize(body)
+        assert built == []
+
+    def test_the_current_hash_compiles_and_is_reported(self, tmp_path, monkeypatch):
+        from shared import ncf_ids
+
+        body, built = self._run(
+            tmp_path, monkeypatch, {"id_hash_version": ncf_ids.ID_HASH_VERSION}
+        )
+        result = run_optimize(body)
+        assert result["id_hash_version"] == ncf_ids.ID_HASH_VERSION
+        assert result["feature_spec_version"] is None
+        assert built == ["engine"]
+
+    def test_both_ncf_producers_record_the_version(self) -> None:
+        for rel in ("training/container/train.py", "training/ncf_sample/build.py"):
+            text = (SOURCE_DIR / rel).read_text()
+            assert '"id_hash_version": ncf_ids.ID_HASH_VERSION' in text, rel
+
+    def test_the_bootstrap_spec_checks_the_ncf_entry(self) -> None:
+        raw = (REPO_ROOT / "deployment" / "optimizer-bootstrap.json").read_text()
+        spec = json.loads(
+            raw.replace("__FEATURE_SPEC_VERSION__", "1")
+            .replace("__NCF_ID_HASH_VERSION__", "2")
+            .replace("__MODEL_BUCKET__", "bucket")
+        )
+        by_name = {m["model_name"]: m for m in spec["models"]}
+        assert by_name["ncf_deal_manager"]["expected_id_hash_version"] == 2
+        assert "__NCF_ID_HASH_VERSION__" in raw
+        text = (REPO_ROOT / "deployment" / "deploy.sh").read_text()
+        assert "ncf_ids.ID_HASH_VERSION" in text

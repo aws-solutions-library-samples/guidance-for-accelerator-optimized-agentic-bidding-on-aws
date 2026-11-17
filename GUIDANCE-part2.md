@@ -71,7 +71,7 @@ A TensorRT-served version trained from the Governance page's **Train from load t
 
 **3. Agentic parameter-tuning loop.** Once every 24 hours by default, EventBridge Scheduler invokes a Lambda function that calls the Adaptive Bidding Strategy Agent (an AgentCore runtime). The agent reads win rate, ROI, prices paid, and sample counts from the `ARTF/BidOutcome` CloudWatch namespace, reads the current parameters from the DynamoDB parameter store, and asks a Bedrock model whether to adjust them. If the Bedrock model is unavailable, the invocation fails rather than falling back to a formula. Every write is checked against hard bounds (`shade_factor` 0.3 to 0.95, `conversion_value` 1.0 to 50.0), a maximum change per update (0.05 and 2.5), and an optimistic-concurrency version check, all enforced by the parameter store.
 
-The bid pricer container can read these parameters at inference time through a 60-second in-process cache, but only when its pod sets `PARAMETER_STORE_TABLE`. The shipped bid-pricer manifest (`deployment/eks/artf-containers-deployment.yaml`) does not set it, so the deployed container uses its built-in defaults (`shade_factor` 0.65, `conversion_value` 12.0) unless a request overrides them.
+The bid pricer container reads these parameters at inference time through a 60-second in-process cache. `deploy.sh` sets `PARAMETER_STORE_TABLE` on its pod and gives it a service account (`bid-pricer-sa`) with `GetItem` on the parameter-store table only. A request's `model_params` still override the stored values, and with `--no-retraining` the container uses its built-in defaults (`shade_factor` 0.65, `conversion_value` 12.0).
 
 ### Architecture
 
@@ -174,7 +174,7 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 - **No always-on optimizer GPU:** Optimization runs only when a version is promoted or bootstrapped
 - **Consumption-billed agents:** Both AgentCore runtimes and the Lambda shims incur cost only when invoked
 - **Pausable schedules:** The agent and retraining schedules can be disabled without a teardown (see [Pausing scheduled components](#pausing-scheduled-components))
-- **Early exit on unfit data:** A training job with missing or unfit data ends at the dataset gate after a few billable minutes
+- **Early exit on unfit data:** A training job with missing or unfit data ends at the dataset gate. A NeMo-RL job still bills about 8 minutes, mostly downloading its training image; an XGBoost job about 80 seconds
 
 ### Sustainability
 
@@ -264,32 +264,19 @@ Use `--state ENABLED` and `aws glue start-trigger` to resume. The templates decl
 
 ## Cost Estimation
 
-The following costs are in addition to the Part 1 base cost (see [GUIDANCE.md](GUIDANCE.md#cost-estimation)), for the default schedules in `us-east-1` at public on-demand rates current when this was written (730 hours per month).
+Part 2 adds about **$205/month** to Part 1 at its default schedules once training data passes
+the trainer's dataset gate, and about $105/month while every training job stops at the gate.
+With Part 1, the default deploy is about **$1,495/month** on the nightly GPU shutdown schedule
+(about $1,970/month with the GPU node on 24/7). The line items, and the assumptions that move them,
+are in the single cost table in [README.md](README.md#cost).
 
-| AWS Service | Dimensions (defaults) | Cost [USD/month] |
-|-------------|-----------------------|--------------------|
-| Amazon Kinesis Data Streams | 2 provisioned streams × 2 shards, $0.015 per shard-hour | $44 |
-| Amazon Data Firehose, Amazon S3, AWS KMS | 2 delivery streams ($0.029/GB), raw-outcomes, training-data, and scripts buckets, 1 customer-managed key ($1) | ~$3 |
-| AWS Glue | 2 jobs × 10 G.1X workers, 4 runs/day each, ~5 minutes per run at $0.44 per DPU-hour | ~$88 |
-| Amazon DynamoDB | 3 tables (parameter store, audit trail, user features), on-demand | ~$5 |
-| Amazon SageMaker Training | Up to 4 jobs per daily trigger on `ml.g5.2xlarge` ($1.515/h); ~30 minutes each when the data passes the gate (shown), about $5/month when every job stops at the gate | up to ~$91 |
-| Amazon Bedrock (Adaptive Bidding Agent) | `global.anthropic.claude-opus-4-8`, 30 invocations/month, ~10K input and ~1K output tokens each ($5 / $25 per million) | ~$2 |
-| Amazon Bedrock (Governance Agent) | Same model; invoked on model registration only | ~$10 |
-| Amazon Bedrock AgentCore | Runtime consumption for both agents, $0.0895 per vCPU-hour and $0.00945 per GB-hour, ~30 s per invocation | ~$1 |
-| AWS Secrets Manager, Amazon EventBridge Scheduler, AWS Lambda, Amazon SNS | NGC key secret ($0.40), 2 schedules, invocation and proxy functions, alerts topic | ~$2 |
-| **Estimated Total** | | **~$245/month** |
-
-What moves the total:
-
-- **Agent cadence.** The Bedrock line is about $0.075 per invocation and scales linearly with `AdaptiveBiddingScheduleRate`: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. Change the template default and re-run `deploy.sh --prefix <p> --start-at 5`, or pass the parameter in the governance-eventbridge `deploy_cfn_stack` call in `deployment/deploy_closed_loop.sh`.
-- **Model choice.** `--model-id` selects the model for both agents; a smaller model lowers the per-token rate.
-- **Training data.** The trigger starts jobs every day from the first day, because the genesis versions are Approved. Jobs with no or unfit data end at the dataset gate after a minute or two of billing, so the SageMaker line sits near $5 until datasets pass the gate.
-- **Pausing.** With both schedules disabled, the Bedrock and SageMaker lines drop to zero. The Kinesis shards ($44), the KMS key, DynamoDB storage, and the Glue runs (unless their triggers are stopped) remain.
-- **No DAX cluster is deployed.** The parameter client reads DynamoDB through an in-process cache; a DAX cluster is used only if you provision one and set `DAX_ENDPOINT`.
-
-### Combined Total (Part 1 + Part 2)
-
-The default `deploy.sh` run deploys both parts. Combined with Part 1's ~$1,225/month on the nightly GPU schedule (~$1,700 with the GPU on 24/7; see [GUIDANCE.md](GUIDANCE.md#cost-estimation)), expect roughly **$1,470/month** (**$1,945** with the GPU on 24/7). See [README.md](README.md#cost) for the combined line-item table.
+The largest variables are the agent cadence (`AdaptiveBiddingScheduleRate`; about $0.075 per
+Adaptive Bidding Agent invocation, so $657/month at `rate(5 minutes)`) and SageMaker training
+(about $15/month while jobs stop at the gate, about $104/month once all four pass, capped at about
+$737/month by the 4-hour job limit). Pausing the schedules takes the Bedrock and SageMaker lines to
+zero; the Kinesis shards ($44), the KMS key, DynamoDB storage and the Glue runs (unless their
+triggers are stopped) remain. No DAX cluster is deployed; the parameter cache reads DynamoDB
+directly unless you provision one and set `DAX_ENDPOINT`.
 
 ## Related Content
 

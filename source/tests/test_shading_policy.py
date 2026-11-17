@@ -10,6 +10,7 @@ than by the examples someone happened to write down.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -248,7 +249,7 @@ class TestSerialisation:
 class TestSingleCallSite:
     def test_shader_uses_the_policy(self):
         source = (_SOURCE / "containers" / "dlrm_bid_shader" / "app.py").read_text()
-        assert "from shared.shading_policy import ShadingPolicy" in source
+        assert re.search(r"from shared\.shading_policy import [^\n]*\bShadingPolicy\b", source)
         assert "policy.price(" in source
 
     def test_shader_no_longer_computes_a_price_inline(self):

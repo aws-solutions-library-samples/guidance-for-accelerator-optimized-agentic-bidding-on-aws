@@ -238,7 +238,7 @@ def test_after_a_promotion_the_next_bootstrap_leaves_it(s3: FakeS3, tmp_path: Pa
 
 def _spec() -> dict:
     raw = (REPO_ROOT / "deployment" / "optimizer-bootstrap.json").read_text()
-    return json.loads(raw.replace("__FEATURE_SPEC_VERSION__", "1").replace("__MODEL_BUCKET__", BUCKET))
+    return json.loads(raw.replace("__FEATURE_SPEC_VERSION__", "1").replace("__NCF_ID_HASH_VERSION__", "2").replace("__MODEL_BUCKET__", BUCKET))
 
 
 def test_only_the_ncf_entry_rebuilds_on_source_change() -> None:

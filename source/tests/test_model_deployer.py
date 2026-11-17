@@ -210,6 +210,35 @@ class TestModelOptimizer:
         assert payload["input_profiles"]["dense_features"]["max"] == [64, 4]
 
     @pytest.mark.asyncio
+    async def test_dlrm_request_carries_the_feature_spec_version(self):
+        """A retrained DLRM is checked against the serving feature spec."""
+        from shared import dlrm_features
+
+        client = MockHttpClient({f"{OPTIMIZER_ENDPOINT}/v1/optimize": _ok_json({})})
+        await self._make_optimizer(client).optimize(
+            model_artifact_uri=f"s3://{MODEL_BUCKET}/models/dlrm/model.tar.gz",
+            model_name="dlrm_bid_shader",
+        )
+        assert (
+            client.calls[0].json_body["expected_feature_spec_version"]
+            == dlrm_features.FEATURE_SPEC_VERSION
+        )
+
+    @pytest.mark.asyncio
+    async def test_ncf_request_carries_the_id_hash_version(self):
+        """NCF is checked on the id hash that maps ids to embedding rows."""
+        from shared import ncf_ids
+
+        client = MockHttpClient({f"{OPTIMIZER_ENDPOINT}/v1/optimize": _ok_json({})})
+        await self._make_optimizer(client).optimize(
+            model_artifact_uri=f"s3://{MODEL_BUCKET}/models/ncf/model.onnx",
+            model_name="ncf_deal_manager",
+        )
+        body = client.calls[0].json_body
+        assert "expected_feature_spec_version" not in body
+        assert body["expected_id_hash_version"] == ncf_ids.ID_HASH_VERSION
+
+    @pytest.mark.asyncio
     async def test_optimize_custom_config_overrides_defaults(self):
         client = MockHttpClient({
             f"{OPTIMIZER_ENDPOINT}/v1/optimize": _ok_json({}),

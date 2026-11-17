@@ -7,8 +7,8 @@ its acceptance gate (training/ncf_sample/), and the SageMaker trainer
 training/stage_shared.sh). Training and serving hash ids with the same function and
 decide with the same thresholds, so they cannot drift.
 
-NCF sees only two ids: a user bucket and an item (deal) bucket, each the md5 of the
-id modulo the embedding table size.
+NCF sees only two ids: a user bucket and an item (deal) bucket, each the SHA-256 of
+the id modulo the embedding table size.
 """
 from __future__ import annotations
 
@@ -36,9 +36,16 @@ MODEL_LABEL_RE = r"^ncf-neumf-sample-[0-9a-f]{12}$"
 _MODEL_LABEL = re.compile(MODEL_LABEL_RE)
 
 
+#: Which hash `bucket` applies. Recorded in every NCF manifest and checked by the
+#: Model Optimizer before it compiles a model, because a model trained under one
+#: hash scores every id against the wrong embedding row under another, and nothing
+#: else fails. 1 was MD5; 2 is SHA-256. Bump it whenever `bucket` changes.
+ID_HASH_VERSION = 2
+
+
 def bucket(value: str, n: int = NB_USERS) -> int:
-    """The embedding row for an id: md5 of the UTF-8 id, modulo ``n``."""
-    return int(hashlib.md5(value.encode(), usedforsecurity=False).hexdigest(), 16) % n  # nosec B324
+    """The embedding row for an id: SHA-256 of the UTF-8 id, modulo ``n``."""
+    return int(hashlib.sha256(value.encode()).hexdigest(), 16) % n
 
 
 def is_model_label(value: object) -> bool:

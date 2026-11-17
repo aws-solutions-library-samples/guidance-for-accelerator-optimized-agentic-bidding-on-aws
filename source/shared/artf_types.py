@@ -182,6 +182,8 @@ class ContainerInvocationModel(BaseModel):
     # (latency_ms, which includes the network and client stack) and the
     # container's measurement of itself. None when not reported.
     timing: dict[str, float] | None = None
+    # The container's metadata.applied_params, passed through unaltered.
+    applied_params: dict[str, float] | None = None
 
 
 class ConflictModel(BaseModel):
@@ -260,6 +262,10 @@ class Metadata(BaseModel):
     # auth/parse/fan_out/merge/emit. Absent (None) when the server did not time
     # the request. The segment set is defined in shared/hop_timing.py.
     timing: dict[str, float] | None = None
+    # The pricing parameters a container applied (the bid shader reports
+    # shade_factor and conversion_value), so the outcome event records the values
+    # used rather than re-deriving them. None for containers with no parameters.
+    applied_params: dict[str, float] | None = None
 
 
 class RTBResponse(BaseModel):

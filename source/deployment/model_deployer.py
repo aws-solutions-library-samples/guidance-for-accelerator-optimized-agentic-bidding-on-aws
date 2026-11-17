@@ -95,6 +95,24 @@ _MODEL_INPUT_PROFILES: dict[str, dict[str, dict[str, list[int]]]] = {
 }
 
 
+def _expected_manifest_versions(model_name: str) -> dict[str, int]:
+    """The manifest versions the optimizer must find before compiling a model.
+
+    The DLRM is checked on its feature-spec version, NCF on the version of the id
+    hash that maps users and deals to embedding rows. The yield models never come
+    through the optimizer.
+    """
+    if model_name == "dlrm_bid_shader":
+        from shared import dlrm_features
+
+        return {"expected_feature_spec_version": dlrm_features.FEATURE_SPEC_VERSION}
+    if model_name == "ncf_deal_manager":
+        from shared import ncf_ids
+
+        return {"expected_id_hash_version": ncf_ids.ID_HASH_VERSION}
+    return {}
+
+
 class ModelOptimizationError(Exception):
     """Raised when model optimization fails."""
 
@@ -185,6 +203,9 @@ class ModelOptimizer:
         }
         if profiles:
             payload["input_profiles"] = profiles
+        # The optimizer refuses an artifact whose manifest declares a different
+        # feature-spec or id-hash version, before it spends a GPU on the compile.
+        payload.update(_expected_manifest_versions(model_name))
 
         url = f"{self._optimizer_endpoint}/v1/optimize"
 

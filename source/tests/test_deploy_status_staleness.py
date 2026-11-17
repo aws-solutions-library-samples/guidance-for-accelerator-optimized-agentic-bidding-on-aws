@@ -294,6 +294,6 @@ def test_constants_match_deploy_sh_and_the_bootstrap_spec():
     root = Path(__file__).resolve().parents[2] / "deployment"
     deploy = (root / "deploy.sh").read_text()
     assert f'PHASE1_MARKER_KEY="{PHASE1_MARKER_KEY}"' in deploy
-    spec = json.loads((root / "optimizer-bootstrap.json").read_text().replace("__FEATURE_SPEC_VERSION__", "1"))
+    spec = json.loads((root / "optimizer-bootstrap.json").read_text().replace("__FEATURE_SPEC_VERSION__", "1").replace("__NCF_ID_HASH_VERSION__", "2"))
     ncf = [m for m in spec["models"] if m["model_name"] == "ncf_deal_manager"][0]
     assert ncf["output_uri"].endswith("/" + NCF_ENGINE_KEY)

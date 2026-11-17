@@ -532,6 +532,7 @@ def manifest(fp: str, spec: Mapping, train_report: Mapping, generator_stats: Map
         },
         "nb_users": ncf_ids.NB_USERS,
         "nb_items": ncf_ids.NB_ITEMS,
+        "id_hash_version": ncf_ids.ID_HASH_VERSION,
         "triton_input_names": list(INPUT_NAMES),
         "triton_output_names": [OUTPUT_NAME],
         "thresholds": {"activate": ncf_ids.ACTIVATE_THRESHOLD, "suppress": ncf_ids.SUPPRESS_THRESHOLD},

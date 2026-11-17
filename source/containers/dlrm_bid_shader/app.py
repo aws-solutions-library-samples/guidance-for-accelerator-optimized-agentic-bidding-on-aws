@@ -31,15 +31,15 @@ logger = logging.getLogger(__name__)
 USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 
 from shared import dlrm_features as features
-from shared.shading_policy import ShadingPolicy
+from shared.shading_policy import DEFAULT_CONVERSION_VALUE, GENESIS_POLICY, ShadingPolicy
 
 EMBEDDING_DIM = 16
 #: Shape comes from the feature spec rather than from constants declared here,
 #: so the model cannot be built for a width the spec does not produce.
 NUM_DENSE = features.DENSE_WIDTH
 NUM_SPARSE = features.CATEGORICAL_WIDTH
-SHADE_FACTOR = 0.65
-EST_CONVERSION_VALUE = 12.0
+SHADE_FACTOR = GENESIS_POLICY.slope
+EST_CONVERSION_VALUE = DEFAULT_CONVERSION_VALUE
 
 # ---------------------------------------------------------------------------
 # Parameter Cache — lazy initialization controlled by PARAMETER_STORE_TABLE
@@ -311,6 +311,10 @@ def mutate(req: RTBRequest) -> RTBResponse:
             # inside the policy, so the ordering of the floor and the cap cannot
             # differ between here and anything else that prices a bid.
             shaded = policy.price(ev, floor=floor, original_bid=original_price)
+            # A floor above the bid makes the clamp return the floor, which would
+            # raise the buyer's price. Shading only lowers a bid.
+            if shaded > original_price:
+                continue
             if abs(shaded - original_price) > 0.01:
                 mutations.append(Mutation(
                     intent=Intent.BID_SHADE, op=Operation.REPLACE,
@@ -331,6 +335,10 @@ def mutate(req: RTBRequest) -> RTBResponse:
         metadata=Metadata(
             api_version="1.0",
             model_version=resolved_model_version,
+            applied_params={
+                "shade_factor": float(shade_factor),
+                "conversion_value": float(conversion_value),
+            },
         ),
     )
 

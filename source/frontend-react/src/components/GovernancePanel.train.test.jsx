@@ -192,6 +192,53 @@ describe('Train step', () => {
     expect(train.body).toMatchObject({ model_type: 'dlrm_bid_shader', run_id: 'lt-old', confirmed: true });
   });
 
+  describe('ETL never succeeded', () => {
+    const EMPTY_INPUT = 'AnalysisException: Unable to infer schema for Parquet. It must be specified manually.';
+    function etl(overrides) {
+      return {
+        configured: true,
+        job_name: 'riv-feature-engineering-etl',
+        never_succeeded: true,
+        consecutive_failures: 6,
+        last_error: { started_on: '2026-11-14T18:00:00+00:00', message: EMPTY_INPUT },
+        no_input_data: true,
+        captured_load_tests: 0,
+        ...overrides,
+      };
+    }
+
+    it('points to a missing load test when the input is empty and none has run', async () => {
+      trainable = { runs: [], pending: [], etl: etl() };
+      await openTrainStep();
+      const banner = q('governance-train-etl-no-input');
+      expect(banner).not.toBeNull();
+      expect(q('governance-train-etl-broken')).toBeNull();
+      expect(banner.textContent).toContain('No load test has captured outcomes for this model');
+      expect(banner.textContent).toContain('expected on a new deployment');
+      expect(banner.textContent).not.toContain('waiting will not change that');
+      expect(q('governance-train-etl-error').textContent).toContain('Unable to infer schema for Parquet');
+    });
+
+    it('points to Firehose when load tests captured outcomes but the input is still empty', async () => {
+      trainable = { runs: [], pending: [], etl: etl({ captured_load_tests: 2 }) };
+      await openTrainStep();
+      const banner = q('governance-train-etl-no-input');
+      expect(banner.textContent).toContain('2 load tests have captured outcomes');
+      expect(banner.textContent).toContain('Firehose');
+      expect(banner.textContent).not.toContain('expected on a new deployment');
+    });
+
+    it('keeps the broken-job message for any other failure', async () => {
+      trainable = {
+        runs: [], pending: [],
+        etl: etl({ no_input_data: false, last_error: { message: 'AccessDeniedException' } }),
+      };
+      await openTrainStep();
+      expect(q('governance-train-etl-no-input')).toBeNull();
+      expect(q('governance-train-etl-broken').textContent).toContain('waiting will not change that');
+    });
+  });
+
   it('says so when no run has captured outcomes for the model', async () => {
     trainable = { runs: [], pending: [] };
     await openTrainStep();

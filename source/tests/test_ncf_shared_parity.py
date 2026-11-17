@@ -60,8 +60,8 @@ def app():
     return module
 
 
-def _reference_md5_bucket(value: str, n: int) -> int:
-    return int(hashlib.md5(value.encode(), usedforsecurity=False).hexdigest(), 16) % n
+def _reference_sha256_bucket(value: str, n: int) -> int:
+    return int(hashlib.sha256(value.encode()).hexdigest(), 16) % n
 
 
 # --------------------------------------------------------------- hash parity
@@ -74,9 +74,9 @@ def test_the_container_hash_is_the_shared_hash(app):
 @seed(HYPOTHESIS_SEED)
 @_PROPERTY
 @given(st.one_of(st.sampled_from(SEED_DEALS), st.text(min_size=0, max_size=40)))
-def test_bucket_matches_md5_mod_2000(value):
-    """PBT-05 oracle: the documented hash, md5 of the UTF-8 id modulo the table size."""
-    assert ncf_ids.bucket(value) == _reference_md5_bucket(value, 2000)
+def test_bucket_matches_sha256_mod_2000(value):
+    """PBT-05 oracle: the documented hash, SHA-256 of the UTF-8 id modulo the table size."""
+    assert ncf_ids.bucket(value) == _reference_sha256_bucket(value, 2000)
     assert 0 <= ncf_ids.bucket(value, ncf_ids.NB_ITEMS) < ncf_ids.NB_ITEMS
 
 

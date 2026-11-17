@@ -115,12 +115,14 @@ over it:
 price = clamp(base + slope × expected_value ^ curvature, bid_floor, original_bid)
 ```
 
-The three coefficients live in `source/shared/shading_policy.py`. The container
-can read pricing parameters at serving time from the DynamoDB parameter store
-when its pod sets `PARAMETER_STORE_TABLE`; the shipped bid-pricer manifest does
-not set it, so the deployed container uses its built-in values. The shipped
-values (`base=0.0, slope=0.65, curvature=1.0`) reduce the curve to `min(original_bid, expected_value × 0.65)` floored at the
-publisher's bidfloor, which is the straight-line case. Raising `curvature` above
+The three coefficients live in `source/shared/shading_policy.py`. When Part 2 is
+deployed, the container reads `shade_factor` (the slope) and `conversion_value`
+from the DynamoDB parameter store through a 60-second cache, so the Adaptive
+Bidding Agent's updates reach the bid path. With `--no-retraining` it uses its
+built-in values (0.65 and 12.0). The shipped values (`base=0.0, slope=0.65,
+curvature=1.0`) reduce the curve to `min(original_bid, expected_value × 0.65)`
+floored at the bid floor, which is the straight-line case. A bid already below
+its floor is left unchanged. Raising `curvature` above
 1 bids proportionally less on low-value impressions and more on high-value ones;
 `base` sets a floor the policy will not shade below.
 
@@ -131,12 +133,13 @@ away from the probability head so that search cannot quietly undo the
 calibration.
 
 **Features:** four dense (`bid_floor`, `hour_norm`, `is_weekend`, `has_video`)
-and three categorical (`site_domain`, `device_type`, `geo_country`, with vocabs
-of 10000 / 32 / 256). The vector is defined once in
+and three categorical (`site_domain`, `device_type`, `geo_country`, SHA-256
+hashed into vocabs of 10000 / 32 / 256). The vector is defined once in
 `source/shared/dlrm_features.py` and imported by both the trainer and the serving
 container, so the two cannot disagree about what position two means. It is
-versioned: a served artifact carries its `feature_spec_version`, and the
-promotion path refuses a model whose version it cannot interpret.
+versioned: a trained artifact carries its `feature_spec_version` (currently 2)
+in its manifest, and the Model Optimizer refuses to compile a model, at deploy
+or at promotion, whose version does not match.
 
 **Model (implementation detail):** A Deep Learning Recommendation Model (DLRM),
 168,881 parameters. A bottom MLP (4→32→16) lifts the dense features into
@@ -144,9 +147,12 @@ embedding space; three `nn.Embedding` tables (dim=16) encode the categoricals; a
 dot-product interaction layer captures feature crosses; a top MLP (22→64→32→1)
 produces a logit. The sigmoid is applied by the export wrapper rather than inside
 the top MLP, so the trained network and the served graph share one definition of
-the probability. Served by Triton as model `dlrm_bid_shader` (ONNX backend, max
-batch size 64, 2× GPU instances, dynamic batching with preferred sizes
-[8, 16, 32] and 500μs max queue delay).
+the probability. The container calls Triton model `dlrm_bid_shader`, a Python
+backend router that splits traffic between `dlrm_bid_shader_stable` and
+`dlrm_bid_shader_canary`. Both are TensorRT engines (max batch size 64, 2 GPU
+instances, dynamic batching with preferred sizes [8, 16, 32] and 500 μs max
+queue delay). Full detail, including known gaps, is in
+[DLRM_BID_SHADING.md](DLRM_BID_SHADING.md).
 
 #### Audience Activator: audience segment activation (ACTIVATE_SEGMENTS)
 
@@ -190,6 +196,14 @@ batching, GPU instances). The deploy trains it on sample interactions generated
 from the deal book (`source/training/ncf_sample/`), not observed outcomes, and
 stops if the trained model misses a scenario's activate, suppress or keep
 targets. The served version is labelled `ncf-neumf-sample-<12 hex>`.
+
+User and deal ids reach their 2,000-row embedding tables through one function,
+`ncf_ids.bucket` (SHA-256 of the id, modulo the table size), which the
+container, the sample generator and the SageMaker trainer all call. A model is
+only valid for the hash it was trained under, so every NCF manifest records
+`id_hash_version`, and the Model Optimizer refuses to compile a Deal Scorer
+whose version differs from `ID_HASH_VERSION` in `source/shared/ncf_ids.py`.
+Change the hash, bump that version, and retrain.
 
 #### Signals Enricher: quality signal enrichment (ADD_METRICS)
 
@@ -399,7 +413,7 @@ This single command runs five phases:
 | Phase | What | AWS resources created (defaults) |
 |-------|------|----------------------------------|
 | 1 | Prepare models | 9 ECR repositories (`<stack>-*`), DynamoDB tables `<stack>-loadtest-history` and `<stack>-container-registry` (on-demand), ONNX export of DLRM/NCF and the genesis XGBoost models, S3 model bucket `<stack>-triton-models-<id>` |
-| 2 | Build images and provision the cluster, in parallel | CodeBuild stack `<stack>-codebuild` (x86 and arm64 projects) and source bucket; EKS cluster `<stack>-triton` (Kubernetes 1.31, 3 AZs, private nodes, 3 NAT gateways) with node groups `gpu-inference` (1 × g5.xlarge, min 1, max `--maxGPUs`, default 3) and `cpu-services` (3 × c5.2xlarge, min 2, max 8); NVIDIA device plugin; IRSA roles for Triton and the Model Optimizer |
+| 2 | Build images and provision the cluster, in parallel | CodeBuild stack `<stack>-codebuild` (x86 and arm64 projects) and source bucket; EKS cluster `<stack>-triton` (Kubernetes 1.35, 3 AZs, private nodes, 3 NAT gateways) with node groups `gpu-inference` (1 × g5.xlarge, min 1, max `--maxGPUs`, default 3) and `cpu-services` (3 × c5.2xlarge, min 2, max 8); NVIDIA device plugin; IRSA roles for Triton and the Model Optimizer |
 | 3 | Deploy workloads | Cognito user pool, app client and identity pool; Triton with an internal NLB; the six ARTF containers, the orchestrator (ClusterIP plus the `orchestrator-internal` internal NLB) and HPAs; a one-shot TensorRT bootstrap Job; the `<prefix>-ui-api-proxy` Lambda stack pointed at that NLB and verified with one request; the GPU node group's nightly scheduled shutdown (desired and minimum 0 at 8:00 PM America/New_York) |
 | 4 | Set up access | Frontend bucket `<stack>-frontend-<id>`, CloudFront distribution (S3 origin only), demo Cognito user `admin@example.com` |
 | 5 | Register agents | Bedrock AgentCore MCP runtime `<stack>_mcp` (unless `--skip-agentcore`); then, unless `--no-retraining`, `deploy_closed_loop.sh` provisions Part 2 ([GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps)); then, only with `--with-prebid`, `deploy_prebid.sh` adds Prebid Server as a second ARTF host |
@@ -450,19 +464,19 @@ The default deployment (1 GPU node, 3 CPU nodes) is designed for demos and devel
 ### Scaling Architecture
 
 - **Pod autoscaling (automatic, Horizontal Pod Autoscalers).** The orchestrator runs 2 to 10 pods on CPU utilization above 70%. Each of the six ARTF containers runs 2 to 5 pods on CPU above 70% (the `artf-template` placeholder runs 1 to 5). Triton runs 1 to 4 pods on GPU utilization above 75% or CPU above 80%. HPAs place new pods only where node capacity already exists.
-- **Node scaling (manual).** No Cluster Autoscaler or Karpenter is installed. The `gpu-inference` node group is created with 1 node (minimum 1, maximum `--maxGPUs`, default 3) and the `cpu-services` node group with 3 `c5.2xlarge` nodes (minimum 2, maximum 8). To add capacity, scale the node group (`eksctl scale nodegroup` or the Auto Scaling console) or edit `deployment/eks/cluster-config.yaml` before deploying; a Triton pod that needs a GPU no node offers stays Pending until you do. The only automatic node-count change in the deployment is the nightly scheduled action that sets the GPU group to 0 at 8:00 PM America/New_York.
+- **Node scaling (manual).** No Cluster Autoscaler or Karpenter is installed. The `gpu-inference` node group is created with 1 node (minimum 1, maximum `--maxGPUs`, default 3) and the `cpu-services` node group with 3 `c5.2xlarge` nodes (minimum 2, maximum 8). To add capacity, scale the node group (`eksctl scale nodegroup` or the Auto Scaling console) or edit `deployment/eks/cluster-config.yaml` before deploying; a Triton pod that needs a GPU no node offers stays Pending until you do. Outside a deploy, the only automatic node-count change is the nightly scheduled action that sets the GPU group to 0 at 8:00 PM America/New_York. During a deploy, `deploy.sh` scales the GPU group to 2 for the bootstrap compile Job and back to 1 when the Job completes. The UI's **Start GPUs** button sets it to 1.
 - **Triton dynamic batching (automatic).** Preferred batch sizes 8, 16 and 32, maximum batch 64, maximum queue delay 500 microseconds, 2 GPU instances per model.
 
 ### Production Scaling Scenarios
 
-Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g5.xlarge $1.006/h, g5.2xlarge $1.212/h, g5.4xlarge $1.624/h, c5.2xlarge $0.34/h, c5.4xlarge $0.68/h, 730 h), with every node running 24/7 and three NAT gateways ($99). They exclude Part 2, data processing and storage.
+Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g5.xlarge $1.006/h, g5.2xlarge $1.212/h, g5.4xlarge $1.624/h, c5.2xlarge $0.34/h, c5.4xlarge $0.68/h, 730 h), with every node running 24/7 and three NAT gateways ($99). They exclude Part 2, the two internal Network Load Balancers ($33), the three NAT gateway public IPv4 addresses ($11), data processing, logs and storage. The control-plane figure assumes a Kubernetes version in standard support; extended support adds $365/month.
 
 | Scenario | QPS | GPU nodes | CPU nodes | Triton pods | Orchestrator pods | Est. monthly compute |
 |----------|-----|-----------|-----------|-------------|-------------------|----------------------|
 | Demo / Dev (shipped default) | <100 | 1 × g5.xlarge | 3 × c5.2xlarge | 1 | 2 | ~$1,650 |
-| Small DSP | 1K to 10K | 2 × g5.xlarge | 4 × c5.2xlarge | 2 | 4 | ~$2,640 |
-| Mid-market DSP | 10K to 100K | 3 × g5.xlarge | 6 × c5.2xlarge | 3 to 4 | 6 to 8 | ~$3,870 |
-| Large DSP | 100K to 500K | 6 × g5.2xlarge | 8 × c5.2xlarge | 6 | 10+ | ~$7,470 |
+| Small DSP | 1K to 10K | 2 × g5.xlarge | 4 × c5.2xlarge | 2 | 4 | ~$2,633 |
+| Mid-market DSP | 10K to 100K | 3 × g5.xlarge | 6 × c5.2xlarge | 3 to 4 | 6 to 8 | ~$3,864 |
+| Large DSP | 100K to 500K | 6 × g5.2xlarge | 8 × c5.2xlarge | 6 | 10+ | ~$7,466 |
 | Enterprise DSP | 500K to 1M+ | 12 × g5.4xlarge | 16 × c5.4xlarge | 12 | 20+ | ~$22,340 |
 
 ### Instance Type Selection Guide
@@ -479,43 +493,19 @@ Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g
 
 ## Cost Estimation
 
-### EKS Production Path (GPU): Part 1 only
+The line-item estimate for a default deploy is in [README.md](README.md#cost), the single cost
+table for both parts. In summary, at `us-east-1` on-demand rates current when it was written:
 
-All line items below are Part 1 (the real-time bidding path) as the default
-`deploy.sh` run creates it in `us-east-1`, at public on-demand rates current
-when this was written (730 hours per month). The GPU line is shown both ways:
-on the included nightly shutdown schedule (about 260 GPU hours per month if
-the node is started each weekday morning) and running 24/7.
-`deploy.sh` deploys Part 2 by default as well; see [README.md](README.md#cost)
-for both parts in one table.
+- **Part 1 only** (`--no-retraining`): about **$1,290/month** on the included nightly GPU shutdown
+  schedule, about $1,765/month with the GPU node on 24/7.
+- **Default deploy** (Part 1 and Part 2): about **$1,495/month**, about $1,970/month with the GPU
+  node on 24/7.
 
-| Resource | Configuration | Part | Est. monthly cost |
-|----------|---------------|------|-------------------|
-| EKS cluster | 1 control plane | Part 1 | $73 |
-| GPU node (g5.xlarge, $1.006/h) | 1 instance, ~260 h on the nightly shutdown schedule | Part 1 | $262 (24/7: $734) |
-| CPU nodes (c5.2xlarge, $0.34/h) | 3 instances, 24/7 (`cpu-services` desired 3, min 2, max 8) | Part 1 | $745 |
-| NAT gateways | 3 (one per AZ) at $0.045/h, plus $0.045 per GB processed | Part 1 | $99 + data |
-| Network Load Balancer (internal, Triton) | 1 at $0.0225/h, plus LCU usage | Part 1 | $16 + LCU |
-| EBS (gp3, $0.08/GB-mo) | 100 GB GPU node volume + 3 × 50 GB CPU node volumes | Part 1 | $20 |
-| S3 (models + frontend), CloudFront, Cognito | Low-traffic demo | Part 1 | <$2 |
-| DynamoDB (`loadtest-history`, `container-registry`) | On-demand | Part 1 | <$2 |
-| Lambda (UI API proxy), CloudWatch Logs, ECR storage | Per-invocation and per-GB; idle when the UI is closed | Part 1 | <$5 |
-| Bedrock AgentCore MCP runtime | Consumption-billed; idle unless an agent calls `extend_rtb` | Part 1 | <$2 |
-| **Part 1 total (estimate)** | | | **~$1,225/month (24/7 GPU: ~$1,700)** |
-
-The CPU node group, not the GPU, is the largest fixed line: the three
-`c5.2xlarge` nodes run around the clock. Scale `cpu-services` to its minimum
-of 2 to save about $248/month. For demos: deploy, test, then
-`./deploy.sh --prefix <p> --destroy` immediately. A 2-hour demo session with
-the default node groups costs approximately $5 of compute.
-
-Part 2 (closed-loop learning, deployed by default alongside Part 1) adds
-roughly $245/month at its default schedules (the Adaptive Bidding Agent runs
-once every 24 hours by default; shortening that cadence is what moves the
-Bedrock line); see
-[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for its line items and
-the knobs that reduce it, or [README.md](README.md#cost) for both parts
-combined in one table.
+The CPU node group, not the GPU, is the largest fixed line: the three `c5.2xlarge` nodes run around
+the clock. Scale `cpu-services` to its minimum of 2 to save about $248/month. For demos: deploy,
+test, then `./deploy.sh --prefix <p> --destroy` immediately. A two-hour session with the default
+node groups costs about $5 of running infrastructure, plus about $20 to $25 of CodeBuild time on a
+first deploy.
 
 ## Amazon Bedrock AgentCore Integration
 

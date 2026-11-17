@@ -106,6 +106,21 @@ def test_same_value_lands_in_the_same_slot_from_either_side():
     )
 
 
+@pytest.mark.parametrize("feature", F.CATEGORICAL_COLUMNS)
+def test_the_hash_is_sha256_of_the_normalised_value(feature):
+    """Pins the algorithm. Changing it moves every value to another embedding slot,
+    so it must come with a FEATURE_SPEC_VERSION bump; this test fails first."""
+    import hashlib
+
+    for value in ("example.com", "4", "USA"):
+        digest = hashlib.sha256(value.strip().lower().encode()).hexdigest()
+        expected = 1 + int(digest, 16) % (F.VOCAB_SIZES[feature] - 1)
+        assert F.hash_to_idx(value, feature) == expected
+    assert F.FEATURE_SPEC_VERSION == 2, (
+        "the reference above is the version-2 hash; update both together"
+    )
+
+
 def test_hashing_is_case_and_whitespace_insensitive():
     assert F.hash_to_idx("Example.COM", "site_domain") == F.hash_to_idx(
         "  example.com  ", "site_domain"

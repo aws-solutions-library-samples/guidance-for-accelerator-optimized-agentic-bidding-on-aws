@@ -211,7 +211,7 @@ which `deploy.sh` registers by default (`--skip-agentcore` omits it).
   provisions the ECR repositories and two DynamoDB tables, exports and uploads the
   ONNX and XGBoost models to S3, builds and pushes the images on AWS CodeBuild
   (default) or with local Docker (`--local-build`) while it creates or reuses the
-  EKS cluster (Kubernetes 1.31, three AZs, private nodes behind one NAT gateway per
+  EKS cluster (Kubernetes 1.35, three AZs, private nodes behind one NAT gateway per
   AZ; `gpu-inference` node group of 1 `g5.xlarge`, min 1, max `--maxGPUs` default 3;
   `cpu-services` node group of 3 `c5.2xlarge`, min 2, max 8), installs the NVIDIA
   device plugin and IRSA roles, creates the Cognito pools, applies the manifests

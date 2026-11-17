@@ -1,7 +1,9 @@
 /**
  * @vitest-environment jsdom
  *
- * One-click "Compare current vs. retrained" flow in the Governance panel.
+ * One-click "Compare & Assess" flow in the Governance panel. The user picks only
+ * the baseline load test; the challenger side is always a fresh load test of the
+ * latest version on that baseline's inputs.
  *
  * Verifies the real orchestration entry + honest failure handling without a
  * live backend: for DLRM (the default model) the challenger canary is already
@@ -28,7 +30,7 @@ vi.mock('../agentCoreClient.js', () => ({
 // exercises only GovernancePanel's own one-click logic.
 vi.mock('./LoadTestSweepStatus.jsx', () => ({ default: () => null }));
 
-import GovernancePanel from './GovernancePanel.jsx';
+import GovernancePanel, { replayInputs } from './GovernancePanel.jsx';
 
 // Enable React's act() environment so async state updates flush deterministically.
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -42,11 +44,13 @@ const CONTROL_RUN = {
   timestamp: '2026-01-01T00:00:00Z',
   scenario: 'nfl_sunday',
   preset: '10k',
+  seed: 42,
+  duration_s: 10,
 };
 
 let calls;
 
-function defaultHandler(loadtestResponder) {
+function defaultHandler(loadtestResponder, controlRun = CONTROL_RUN) {
   return (url, opts = {}) => {
     const method = (opts.method || 'GET').toUpperCase();
     calls.push({ url, method, body: opts.body ? JSON.parse(opts.body) : null });
@@ -55,7 +59,7 @@ function defaultHandler(loadtestResponder) {
     if (url.includes('/closed-loop/models')) return Promise.resolve(jsonResp({ versions: [] }));
     if (url.includes('/governance/eligible-runs')) {
       if (url.includes('role=current')) {
-        return Promise.resolve(jsonResp({ runs: [CONTROL_RUN], most_recent: CONTROL_RUN }));
+        return Promise.resolve(jsonResp({ runs: [controlRun], most_recent: controlRun }));
       }
       return Promise.resolve(jsonResp({ runs: [], most_recent: null }));
     }
@@ -96,7 +100,36 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('one-click Compare current vs. retrained (DLRM)', () => {
+async function openTestVersionsStep() {
+  await act(async () => { root.render(<GovernancePanel />); });
+  await flush();
+  const step4 = container.querySelector('[data-testid="governance-step-test-versions"]');
+  await act(async () => { step4.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+  await flush();
+}
+
+describe('one-click Compare & Assess (DLRM)', () => {
+  it('offers one baseline picker and one compare button, with no challenger picker', async () => {
+    fetchHandler = defaultHandler(() => jsonResp({}));
+    await openTestVersionsStep();
+
+    expect(container.querySelector('[data-testid="governance-current-run-select"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="governance-challenger-run-select"]')).toBeNull();
+    expect(container.querySelector('[data-testid="governance-compare-button"]')).toBeNull();
+    const btn = container.querySelector('[data-testid="governance-compare-retrained-button"]');
+    expect(btn.textContent).toContain('Compare & Assess');
+    expect(calls.some((c) => c.url.includes('role=challenger'))).toBe(false);
+  });
+
+  it('flags a baseline recorded before seed and duration were stored', async () => {
+    const legacy = { id: 'lt-cur', timestamp: '2026-01-01T00:00:00Z', scenario: 'nfl_sunday', preset: '10k' };
+    fetchHandler = defaultHandler(() => jsonResp({}), legacy);
+    await openTestVersionsStep();
+    const note = container.querySelector('[data-testid="governance-replay-legacy"]');
+    expect(note).toBeTruthy();
+    expect(note.textContent).toContain('seed, duration_s');
+  });
+
   it('surfaces a 409 honestly and does NOT stage a canary for DLRM', async () => {
     fetchHandler = defaultHandler(() =>
       jsonResp({ error: 'busy', reason: 'busy' }, { ok: false, status: 409 })
@@ -138,6 +171,26 @@ describe('one-click Compare current vs. retrained (DLRM)', () => {
       scenario: 'nfl_sunday',
       preset: '10k',
       seed: 42,
+      duration_s: 10,
     });
+    expect(container.querySelector('[data-testid="governance-replay-legacy"]')).toBeNull();
+  });
+});
+
+describe('replayInputs', () => {
+  it('replays every recorded input of the baseline run', () => {
+    const r = replayInputs({ preset: '100k', scenario: 'late_night', seed: 7, duration_s: 60 });
+    expect(r.inputs).toEqual({ preset: '100k', scenario: 'late_night', seed: 7, duration_s: 60 });
+    expect(r.missing).toEqual([]);
+  });
+
+  it('fills legacy defaults and names the fields an older record lacks', () => {
+    const r = replayInputs({ preset: '1k', scenario: 'baseline' });
+    expect(r.inputs).toEqual({ preset: '1k', scenario: 'baseline', seed: 42, duration_s: 30 });
+    expect(r.missing).toEqual(['seed', 'duration_s']);
+  });
+
+  it('keeps a recorded seed of 0', () => {
+    expect(replayInputs({ preset: '1k', scenario: 'baseline', seed: 0, duration_s: 10 }).inputs.seed).toBe(0);
   });
 });

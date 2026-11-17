@@ -126,6 +126,8 @@ class ContainerCallOutcome:
     # ``latency_ms`` leaves the transport share -- the number a protocol change
     # can move.
     timing: dict[str, float] | None = None
+    # metadata.applied_params on the container's response, passed through.
+    applied_params: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)

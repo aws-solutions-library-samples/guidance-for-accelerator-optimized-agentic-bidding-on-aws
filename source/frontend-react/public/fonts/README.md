@@ -1,10 +1,10 @@
-# Fonts — Amazon Ember (self-hosted)
+# Fonts: Amazon Ember (self-hosted, not included)
 
-The UI uses **Amazon Ember** (Alexa/Echo brand typeface) per `styleguide.md` / FR-13.
+The UI is styled for **Amazon Ember**. The font files are not included in this repo.
 These are **proprietary Amazon fonts**. The `@font-face` rules in `src/index.css`
 reference the TrueType (`.ttf`) files below by their exact names; if a file is absent
 the UI falls back to the system font stack (`font-display: swap`), so the app still
-works — it just won't render in Amazon Ember.
+works; it does not render in Amazon Ember.
 
 Vite serves `public/` at the site root, so these resolve at `/fonts/<name>.ttf`.
 
@@ -32,6 +32,6 @@ use **Amazon Ember** at weight 700/800.
 Source the fonts from the **Amazon Type Library / brand portal** (Amazon's in-house
 typeface, usable across Amazon products).
 
-**Licensing note:** this is a public AWS Guidance repo and the UI serves these files to
-end users' browsers (redistribution). Only include the font here if that is
-license-permitted for your distribution of this repo.
+**Licensing note:** the UI serves these files to end users' browsers, which is
+redistribution. `.gitignore` excludes them so they are never committed; add them only
+to a deployment whose license permits it.

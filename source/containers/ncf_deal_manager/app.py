@@ -116,7 +116,7 @@ else:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-#: The id hash training and serving share (md5 mod 2000).
+#: The id hash training and serving share (SHA-256 mod 2000).
 _h = ncf_ids.bucket
 
 

@@ -26,9 +26,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from shared.artf_types import RTBRequest, RTBResponse
+from shared.artf_types import ContainerInvocationModel, Intent, RTBRequest, RTBResponse
 from shared.feedback_collector import FeedbackCollector, fire_and_forget_emit
 from shared.feedback_models import BidShadingOutcomeEvent
+from shared.shading_policy import DEFAULT_CONVERSION_VALUE, GENESIS_POLICY
 
 logger = logging.getLogger(__name__)
 
@@ -186,9 +187,9 @@ def emit_bid_outcome(
         the real bid-serving path other than the default.
     model_version : str | None
         The resolved served model version for this request (e.g. from the
-        container's response metadata). Falls back to a static placeholder
-        if not provided, so this call never fails when the caller doesn't
-        have a resolved version available.
+        container's response metadata). When not provided, the bid shader's
+        own reported version from ``resp.metadata.containers`` is used, and
+        ``unknown`` when the shader did not run.
     """
     if _feedback_collector is None:
         return
@@ -197,7 +198,14 @@ def emit_bid_outcome(
         event = _build_bid_outcome_event(
             req, resp, start_time, source=source, model_version=model_version
         )
-
+    except BidBelowFloor as exc:
+        # Cannot trade, so there is no outcome to learn from.
+        logger.info("No bid outcome event for %s: %s", req.id, exc)
+        return
+    except Exception:
+        logger.warning("Failed to build bid outcome event", exc_info=True)
+        return
+    try:
         # Register the bid so a later signal can find it.
         #
         # SignalAssociator.register_bid had NO production caller — only a test — so
@@ -352,6 +360,66 @@ def _load_test_context(bid_request: dict | None) -> dict:
     }
 
 
+#: The bid shader's container name in the orchestrator's registry.
+_BID_SHADER_CONTAINER = "bid-pricer"
+
+
+class BidBelowFloor(ValueError):
+    """The bid's price is under the impression floor, so it cannot trade."""
+
+
+def _bid_shader_invocation(resp: RTBResponse) -> ContainerInvocationModel | None:
+    """The bid shader's invocation record: the one that proposed a BID_SHADE
+    mutation, else the one registered under the shader's name."""
+    invocations = (resp.metadata.containers if resp.metadata else None) or []
+    for inv in invocations:
+        if any(m.intent == Intent.BID_SHADE for m in inv.mutations):
+            return inv
+    for inv in invocations:
+        if inv.name == _BID_SHADER_CONTAINER:
+            return inv
+    return None
+
+
+def _bid_prices(req: RTBRequest, resp: RTBResponse, bid_floor: float) -> tuple[float, float]:
+    """(original_price, shaded_price) for the bid this event describes.
+
+    The bid is the one the BID_SHADE mutation targets (path
+    ``/seatbid/<seat>/bid/<bid id>``), else the first bid in the response.
+    """
+    shade = next(
+        (m for m in resp.mutations if m.intent == Intent.BID_SHADE and m.adjust_bid),
+        None,
+    )
+    bids = [
+        (seatbid.get("seat", "unknown"), bid)
+        for seatbid in (req.bid_response or {}).get("seatbid", []) or []
+        for bid in seatbid.get("bid", []) or []
+    ]
+    target = None
+    if shade is not None:
+        target = next(
+            (bid for seat, bid in bids if shade.path == f"/seatbid/{seat}/bid/{bid.get('id', '')}"),
+            None,
+        )
+    if target is None and bids:
+        target = bids[0][1]
+    if target is None:
+        return bid_floor, bid_floor
+
+    original_price = float(target.get("price", 0.0) or 0.0)
+    if original_price < bid_floor:
+        raise BidBelowFloor(
+            f"bid price {original_price} is below the floor {bid_floor}"
+        )
+    shaded_price = (
+        float(shade.adjust_bid.price)
+        if shade is not None and shade.adjust_bid.price
+        else original_price
+    )
+    return original_price, shaded_price
+
+
 def _build_bid_outcome_event(
     req: RTBRequest,
     resp: RTBResponse,
@@ -373,40 +441,35 @@ def _build_bid_outcome_event(
     version (e.g. read from the container's response metadata, which itself
     resolves it from the Triton router's served_variant/served_model_version
     outputs — see source/containers/*/app.py and
-    source/triton/router/model.py). Falls back to a static placeholder if
-    not provided, so this never fails for callers that don't have a
-    resolved version available yet.
+    source/triton/router/model.py). If
+    not provided, the bid shader's reported version is used, else ``unknown``.
     """
     bid_request = req.bid_request or {}
     imp_list = bid_request.get("imp", [{}])
     first_imp = imp_list[0] if imp_list else {}
     bid_floor = first_imp.get("bidfloor", 0.0)
 
-    # Extract model parameters used (from ext.model_params if available)
+    shader = _bid_shader_invocation(resp)
+
+    # The parameters the shader applied, as it reported them. When it did not run
+    # or did not report them, the request's overrides, then the shader's defaults.
     model_params = req.model_params or {}
-    shade_factor_used = float(model_params.get("shade_factor", 0.65))
+    applied = (shader.applied_params if shader is not None else None) or {}
+    shade_factor_used = float(
+        applied.get("shade_factor", model_params.get("shade_factor", GENESIS_POLICY.slope))
+    )
     conversion_value_estimate_used = float(
-        model_params.get("conversion_value", 5.0)
+        applied.get(
+            "conversion_value",
+            model_params.get("conversion_value", DEFAULT_CONVERSION_VALUE),
+        )
     )
 
-    # Compute original_price from mutations: look for BID_SHADE adjust_bid mutations
-    original_price = bid_floor
-    shaded_price = bid_floor
-    for mutation in resp.mutations:
-        if mutation.adjust_bid and mutation.adjust_bid.price:
-            shaded_price = mutation.adjust_bid.price
-            # Original is the unshaded price (shaded_price / shade_factor)
-            if shade_factor_used > 0:
-                original_price = shaded_price / shade_factor_used
-            else:
-                original_price = shaded_price
-            break
-
-    # Ensure price ordering: original_price >= shaded_price >= bid_floor
-    original_price = max(original_price, shaded_price)
-    shaded_price = max(shaded_price, bid_floor)
-    original_price = max(original_price, bid_floor)
-
+    # Prices come from the bid itself. original_price is the price on the bid
+    # response; shaded_price is the BID_SHADE mutation's price for that bid, or
+    # the original price when the shader left the bid alone. A request with no
+    # bid (a publisher bid request) records the floor for both.
+    original_price, shaded_price = _bid_prices(req, resp, bid_floor)
     # Extract user identity info for hashing
     user_data = bid_request.get("user", {})
     user_id_raw = (
@@ -451,7 +514,7 @@ def _build_bid_outcome_event(
     return BidShadingOutcomeEvent(
         request_id=request_id,
         timestamp=time.time(),
-        model_version=model_version or "orchestrator-v1",
+        model_version=model_version or (shader.model_version if shader is not None else "") or "unknown",
         source=source,
         original_price=original_price,
         shaded_price=shaded_price,

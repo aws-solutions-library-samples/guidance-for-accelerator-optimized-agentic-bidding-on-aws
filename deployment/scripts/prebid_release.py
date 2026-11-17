@@ -157,6 +157,12 @@ class CostDisclosure:
         return not self.unknown_components
 
 
+#: 730 h x 60 / 55 renewals per hour x $0.00225 per token request. The token lifetime
+#: is AccessTokenValidity in prebid_cfn.yaml; the renew-ahead margin is
+#: TokenCache.RENEW_AHEAD_MS in the artf-hook module.
+_M2M_TOKEN_MONTHLY_USD = round(730 * 60 / 55 * 0.00225, 2)
+
+
 def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostDisclosure:
     """The marginal monthly cost of adding this stack to an existing cluster.
 
@@ -190,6 +196,15 @@ def build_cost_disclosure(additional_node_monthly_usd: Optional[float]) -> CostD
                 monthly_usd=0.0,
                 basis="no standing charge for these resources",
                 source="AWS Cognito pricing: no charge for a user pool domain",
+            ),
+            CostComponent(
+                name="Cognito M2M token requests",
+                monthly_usd=_M2M_TOKEN_MONTHLY_USD,
+                basis=(
+                    "one Prebid Server replica renews its 60-minute client_credentials "
+                    "token 5 minutes early: about 796 requests a month"
+                ),
+                source="AWS Cognito pricing, M2M token requests, $0.00225 each (first tier)",
             ),
             CostComponent(
                 name="ECR image storage",

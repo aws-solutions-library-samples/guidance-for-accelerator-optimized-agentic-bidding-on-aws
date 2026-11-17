@@ -49,6 +49,9 @@ spec:
         app: artf
         model: dlrm
     spec:
+      # IRSA (deploy.sh Step 8a.1): GetItem on the parameter-store table, so the
+      # Adaptive Bidding Agent's shade_factor and conversion_value reach the bid path.
+      serviceAccountName: bid-pricer-sa
       nodeSelector:
         role: __ARTF_NODE_ROLE__
       tolerations:
@@ -87,6 +90,12 @@ spec:
               value: "triton-inference-server:8001"
             - name: USE_TRITON
               value: "true"
+            # Empty when Part 2 is not deployed: the container then prices with its
+            # built-in defaults (shade_factor 0.65, conversion_value 12.0).
+            - name: PARAMETER_STORE_TABLE
+              value: "__BID_PRICER_PARAMETER_STORE_TABLE__"
+            - name: AWS_REGION
+              value: "__REGION__"
           # A 500m CPU limit means 50ms of CPU per 100ms CFS period: once a
           # request exhausts it the pod is throttled until the next period,
           # adding latency in 100ms multiples. That compounded with the

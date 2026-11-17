@@ -32,7 +32,7 @@ from shared.artf_types import (
 from shared.feedback_models import BidShadingOutcomeEvent
 
 
-def _bid_shade_mutation(price: float, seat: int = 0, bid_id: str = "b1") -> Mutation:
+def _bid_shade_mutation(price: float, seat: int | str = 0, bid_id: str = "b1") -> Mutation:
     """A BID_SHADE mutation shaped the way the shader container emits one.
 
     `intent` is an IntEnum and `op`/`path` are required -- passing
@@ -65,6 +65,7 @@ class TestBuildBidShadingOutcomeEvent:
                 "site": {"domain": "example.com"},
                 "device": {"devicetype": 2},
             },
+            bid_response={"seatbid": [{"seat": "0", "bid": [{"id": "b1", "price": 5.0}]}]},
             ext={"model_params": {"shade_factor": 0.7, "conversion_value": 10.0}},
         )
         mutation = _bid_shade_mutation(3.5)
@@ -76,7 +77,8 @@ class TestBuildBidShadingOutcomeEvent:
         assert event.shade_factor_used == 0.7
         assert event.conversion_value_estimate_used == 10.0
         assert event.shaded_price == 3.5
-        assert event.original_price >= event.shaded_price
+        # The bid's own price, not shaded_price / shade_factor.
+        assert event.original_price == 5.0
         assert event.bid_floor == 1.0
         assert event.site_domain == "example.com"
         assert event.device_type == "2"
@@ -121,7 +123,7 @@ class TestBuildBidShadingOutcomeEvent:
         assert event.user_id_hash == "unknown"
 
     def test_default_model_params_when_ext_missing(self):
-        """Default shade_factor=0.65 and conversion_value=5.0 when no ext."""
+        """The shader's defaults (0.65, 12.0) when nothing reports or overrides them."""
         req = RTBRequest(
             id="550e8400-e29b-41d4-a716-446655440000",
             bid_request={"imp": [{"bidfloor": 1.0}]},
@@ -130,7 +132,7 @@ class TestBuildBidShadingOutcomeEvent:
 
         event = self._build(req, resp)
         assert event.shade_factor_used == 0.65
-        assert event.conversion_value_estimate_used == 5.0
+        assert event.conversion_value_estimate_used == 12.0
 
     def test_price_ordering_enforced(self):
         """original_price >= shaded_price >= bid_floor is always maintained."""
@@ -184,8 +186,8 @@ class TestBuildBidShadingOutcomeEvent:
         )
         assert event.source == "load_test"
 
-    def test_model_version_default_placeholder(self):
-        """Without an explicit model_version, the placeholder is used."""
+    def test_model_version_unknown_without_a_shader(self):
+        """No caller version and no shader invocation records ``unknown``."""
         req = RTBRequest(
             id="550e8400-e29b-41d4-a716-446655440000",
             bid_request={"imp": [{"bidfloor": 1.0}]},
@@ -193,7 +195,53 @@ class TestBuildBidShadingOutcomeEvent:
         resp = RTBResponse(id=req.id, mutations=[])
 
         event = self._build(req, resp)
-        assert event.model_version == "orchestrator-v1"
+        assert event.model_version == "unknown"
+
+    def test_the_shader_invocation_supplies_version_and_parameters(self):
+        """The shader's reported model_version and applied_params win over the request."""
+        from shared.artf_types import ContainerInvocationModel
+
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 0.5}]},
+            bid_response={"seatbid": [{"seat": "s", "bid": [{"id": "b9", "price": 4.0}]}]},
+            ext={"model_params": {"shade_factor": 0.9}},
+        )
+        mutation = _bid_shade_mutation(2.6, seat="s", bid_id="b9")
+        resp = RTBResponse(
+            id=req.id,
+            mutations=[mutation],
+            metadata=Metadata(containers=[ContainerInvocationModel(
+                name="bid-pricer", status="ok", latency_ms=1.0, mutations=[mutation],
+                model_version="dlrm-v7-canary",
+                applied_params={"shade_factor": 0.65, "conversion_value": 10.0},
+            )]),
+        )
+        event = self._build(req, resp)
+        assert event.model_version == "dlrm-v7-canary"
+        assert event.shade_factor_used == 0.65
+        assert event.conversion_value_estimate_used == 10.0
+        assert (event.original_price, event.shaded_price) == (4.0, 2.6)
+
+    def test_an_unshaded_bid_records_its_own_price_for_both(self):
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 0.5}]},
+            bid_response={"seatbid": [{"seat": "s", "bid": [{"id": "b1", "price": 3.0}]}]},
+        )
+        event = self._build(req, RTBResponse(id=req.id, mutations=[]))
+        assert (event.original_price, event.shaded_price) == (3.0, 3.0)
+
+    def test_a_bid_below_the_floor_builds_no_event(self):
+        from orchestrator.feedback_integration import BidBelowFloor
+
+        req = RTBRequest(
+            id="550e8400-e29b-41d4-a716-446655440000",
+            bid_request={"imp": [{"bidfloor": 2.0}]},
+            bid_response={"seatbid": [{"seat": "s", "bid": [{"id": "b1", "price": 1.5}]}]},
+        )
+        with pytest.raises(BidBelowFloor):
+            self._build(req, RTBResponse(id=req.id, mutations=[]))
 
     def test_model_version_resolved_value_used(self):
         """A caller-supplied model_version overrides the placeholder."""

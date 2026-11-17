@@ -664,3 +664,18 @@ class TestDLRMIntegration:
 
         assert shade_factor == 0.65
         assert conversion_value == 12.0
+
+
+class TestFailureBackoff:
+    """A failed read is retried after the TTL, not on the next call."""
+
+    def test_a_failure_is_not_retried_within_the_ttl(self, mock_boto3):
+        mock_table, _ = mock_boto3
+        mock_table.get_item.side_effect = Exception("ResourceNotFoundException")
+
+        cache = ParameterCache(table_name="test-table", region="us-east-1", ttl_seconds=60.0)
+        assert cache.get_shade_factor() == 0.65
+        assert cache.get_shade_factor() == 0.65
+        assert cache.get_conversion_value() == 12.0
+        assert mock_table.get_item.call_count == 1
+        assert cache.consecutive_errors == 1

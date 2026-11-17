@@ -27,7 +27,7 @@ completeness):
       [5] device_type
       [6] geo_country
 
-Each categorical hashes into its own vocabulary size (VOCAB_SIZES) rather than
+Each categorical is SHA-256 hashed into its own vocabulary size (VOCAB_SIZES) rather than
 a single shared constant, so the collision rate of each is a chosen property.
 
 Held out by design:
@@ -55,7 +55,8 @@ from typing import Any, Mapping, Sequence
 #: A trained model records this in its manifest; a serving build refuses a
 #: model whose recorded version it does not recognise, because matching widths
 #: are not evidence that both sides mean the same thing by position two.
-FEATURE_SPEC_VERSION = 1
+#: 1 hashed categoricals with MD5; 2 hashes them with SHA-256.
+FEATURE_SPEC_VERSION = 2
 
 #: Versions a build produced from THIS source can serve. Currently the one it
 #: emits, and nothing else -- there is no back-compatibility shim, because an
@@ -161,7 +162,7 @@ def hash_to_idx(value: Any, feature: str) -> int:
     text = str(value).strip().lower()
     if not text:
         return UNKNOWN_INDEX
-    digest = hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()  # nosec B324
+    digest = hashlib.sha256(text.encode()).hexdigest()
     return 1 + (int(digest, 16) % (vocab - 1))
 
 

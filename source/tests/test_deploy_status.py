@@ -263,7 +263,7 @@ def test_orchestrator_internal_nlb_ok_when_hostname_assigned():
     check = _svc_probe(_proc(0, svc))._orchestrator_internal_nlb()
     assert check["name"] == "service orchestrator-internal"
     assert check["status"] == OK
-    assert "a1b2-123.elb.us-east-1.amazonaws.com" in check["detail"]
+    assert check["detail"] == "internal NLB a1b2-123.elb.us-east-1.amazonaws.com"
 
 
 def test_orchestrator_internal_nlb_in_progress_without_hostname():

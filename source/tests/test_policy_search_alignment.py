@@ -264,8 +264,10 @@ class TestAcceptanceGate:
         preds = np.full(len(df), 0.4)
         report = train.search_policy_parameters(df, preds, {})
 
+        # Each of the three is rounded to 6 decimals on its own, so their difference
+        # can disagree with the rounded improvement by up to two half-units.
         assert report["policy_improvement"] == pytest.approx(
-            report["policy_best_score"] - report["policy_genesis_score"], abs=1e-6
+            report["policy_best_score"] - report["policy_genesis_score"], abs=1.5e-6
         )
         assert report["policy_improvement"] >= 0.0
 
@@ -406,3 +408,28 @@ class TestExistingRefusalsStillHold:
 
         assert report["policy_searched"] is False
         assert "no won rows" in report["policy_skipped_reason"]
+
+
+class TestConversionValueTheSearchPricesAgainst:
+    """The search prices each row with the conversion value the shader applied."""
+
+    def _genesis_score(self, df: pd.DataFrame, hp: dict) -> float:
+        preds = np.full(len(df), 0.4)
+        return train.search_policy_parameters(df, preds, hp)["policy_genesis_score"]
+
+    def test_the_recorded_per_row_value_is_used(self):
+        df = _scorable_df()
+        low = self._genesis_score(df.assign(conversion_value_estimate_used=1.0), {})
+        high = self._genesis_score(df.assign(conversion_value_estimate_used=20.0), {})
+        # A higher value bids higher, wins more rows and pays more for them.
+        assert low != high
+
+    def test_without_the_column_the_shader_default_applies(self):
+        from shared.shading_policy import DEFAULT_CONVERSION_VALUE
+
+        df = _scorable_df()
+        implicit = self._genesis_score(df, {})
+        explicit = self._genesis_score(
+            df.assign(conversion_value_estimate_used=DEFAULT_CONVERSION_VALUE), {}
+        )
+        assert implicit == explicit

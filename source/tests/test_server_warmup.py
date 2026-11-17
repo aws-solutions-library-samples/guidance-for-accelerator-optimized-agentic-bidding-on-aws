@@ -492,7 +492,7 @@ def test_model_warmup_inputs_match_declared_inputs(name):
 def _bootstrap_opt_batches() -> dict:
     """Engine name -> the opt batch of its input profiles in deployment/optimizer-bootstrap.json."""
     text = (SOURCE_DIR.parent / "deployment" / "optimizer-bootstrap.json").read_text()
-    spec = json.loads(text.replace("__FEATURE_SPEC_VERSION__", "0"))
+    spec = json.loads(text.replace("__FEATURE_SPEC_VERSION__", "0").replace("__NCF_ID_HASH_VERSION__", "0"))
     batches = {}
     for model in spec["models"]:
         engine = model["output_uri"].split("/triton-models/", 1)[1].split("/", 1)[0]

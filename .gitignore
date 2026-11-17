@@ -66,9 +66,10 @@ source/triton/onnx_export/
 deployment/.ncf-cache/
 
 # --- Amazon Ember (proprietary) brand fonts ---
-# Fetched at deploy time from an authorized source (AMAZON_EMBER_FONT_BASE_URL);
-# proprietary, must NOT be committed to this public repo. See
+# Not redistributable in this repo. Place licensed copies here locally; without
+# them the UI falls back to the system font stack. See
 # source/frontend-react/public/fonts/README.md.
+source/frontend-react/public/fonts/*.ttf
 source/frontend-react/public/fonts/*.woff2
 
 # --- Deployment-state files ---
@@ -91,32 +92,11 @@ deployment/.deploy-*.log
 # --- Kiro ---
 .kiro/
 source/triton/onnx_export
-gtm
-aidlc-docs
-deployment/guidance-for-accelerator-optimized-agentic-bidding-on-aws.code-workspace
-Triton Publisher Yield Models.md
-ARTF — SSP_Publisher Intents.md
-deployment/output.txt
 
 # Written by deploy_prebid.sh step 8: a record of ONE deployment (cluster, ECR repo,
 # image digest, endpoints, account-specific names). Local state, not source -- committing
 # it would put one operator's account details in every other operator's checkout.
 .prebid-deployment.json
 
-# Editor workspace files and the retired composability docs (kept locally as a backup).
+# Editor workspace files.
 *.code-workspace
-composability-documentation
-_bk_composability-documentation
-
-# Scratch Playwright capture script and MCP browser snapshots (contain a live stack URL).
-.cap2x.js
-.playwright-mcp/
-.agents
-.agents/tasks/ridesharer-preexisting-changes.txt
-assets/images/.$reference-architecture-slides.svg.dtmp
-assets/images/reference-architecture-slides-1 - Part 1: real-time ARTF bidstream path.drawio.svg
-assets/images/reference-architecture-slides-1 - Part 1.svg
-assets/images/reference-architecture-slides-2 - Part 2: closed-loop learning.drawio.svg
-assets/images/reference-architecture-slides.drawio
-assets/images/reference-architecture-slides.svg
-assets/images/reference-architecture-full.md

@@ -267,45 +267,84 @@ def _read_manifest(onnx_path: str, source_model_uri: str) -> dict[str, Any] | No
     return loaded
 
 
-def _require_feature_spec_version(
-    onnx_path: str, source_model_uri: str, expected: int
+#: What each manifest version field describes, for the refusal message.
+_VERSION_FIELD_MEANING = {
+    "feature_spec_version": (
+        "feature-spec version",
+        "A vector of the same width with different meaning per position produces a "
+        "working engine and wrong predictions.",
+    ),
+    "id_hash_version": (
+        "id-hash version",
+        "Ids hashed differently land on different embedding rows, so every id is "
+        "scored against another id's embedding and nothing fails.",
+    ),
+}
+
+
+def _require_manifest_version(
+    onnx_path: str, source_model_uri: str, field: str, expected: int
 ) -> int:
-    """Refuse unless the artifact declares exactly `expected`.
+    """Refuse unless the artifact's manifest declares exactly `expected` for `field`.
 
     Returns the declared version so the caller can report it. Absent is refused,
     not waved through: an artifact with no manifest was produced by something whose
-    feature contract is unknown, which is the case this check exists for.
+    contract is unknown, which is the case this check exists for.
     """
+    label, consequence = _VERSION_FIELD_MEANING[field]
     manifest = _read_manifest(onnx_path, source_model_uri)
     if manifest is None:
         raise OptimizeRequestError(
-            f"{source_model_uri} has no {MANIFEST_FILENAME}, so the feature-spec "
-            f"version it was built against is unknown. Expected "
-            f"{expected}. Refusing to compile an engine whose feature contract "
-            "cannot be established — matching input names and widths do not "
-            "establish it."
+            f"{source_model_uri} has no {MANIFEST_FILENAME}, so the {label} it was "
+            f"built against is unknown. Expected {expected}. Refusing to compile an "
+            "engine whose contract cannot be established; matching input names and "
+            "widths do not establish it."
         )
-    declared = manifest.get("feature_spec_version")
+    declared = manifest.get(field)
     if declared is None:
         raise OptimizeRequestError(
             f"{MANIFEST_FILENAME} beside {source_model_uri} declares no "
-            f"'feature_spec_version'. Expected {expected}."
+            f"'{field}'. Expected {expected}."
         )
     if not isinstance(declared, int) or isinstance(declared, bool):
         raise OptimizeRequestError(
             f"{MANIFEST_FILENAME} beside {source_model_uri} declares "
-            f"feature_spec_version {declared!r}, which is not an integer."
+            f"{field} {declared!r}, which is not an integer."
         )
     if declared != expected:
         raise OptimizeRequestError(
-            f"{source_model_uri} was built against feature-spec version "
-            f"{declared}; this deployment serves version {expected}. Refusing to "
-            "compile it. A vector of the same width with different meaning per "
-            "position produces a working engine and wrong predictions. Retrain "
-            f"against version {expected}, or deploy a build that serves "
-            f"version {declared}."
+            f"{source_model_uri} was built against {label} {declared}; this "
+            f"deployment serves version {expected}. Refusing to compile it. "
+            f"{consequence} Retrain against version {expected}, or deploy a build "
+            f"that serves version {declared}."
         )
     return declared
+
+
+def _require_feature_spec_version(
+    onnx_path: str, source_model_uri: str, expected: int
+) -> int:
+    """The DLRM feature-spec check (see `_require_manifest_version`)."""
+    return _require_manifest_version(
+        onnx_path, source_model_uri, "feature_spec_version", expected
+    )
+
+
+def _require_id_hash_version(
+    onnx_path: str, source_model_uri: str, expected: int
+) -> int:
+    """The NCF id-hash check (see `_require_manifest_version`)."""
+    return _require_manifest_version(
+        onnx_path, source_model_uri, "id_hash_version", expected
+    )
+
+
+def _expected_version(body: dict, field: str) -> int | None:
+    """An `expected_<field>` from a request or bootstrap entry, validated."""
+    value = body.get(f"expected_{field}")
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+        raise OptimizeRequestError(f"expected_{field} must be an integer; got {value!r}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +441,8 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
     calibration_cache_uri = body.get("calibration_cache_uri")
     max_batch_size = int(body.get("max_batch_size", 1))
     input_profiles = body.get("input_profiles")
-    expected_feature_spec_version = body.get("expected_feature_spec_version")
+    expected_feature_spec_version = _expected_version(body, "feature_spec_version")
+    expected_id_hash_version = _expected_version(body, "id_hash_version")
 
     if not source_model_uri or not output_uri or not model_name:
         raise OptimizeRequestError(
@@ -435,27 +475,23 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
             "Use precision 'fp16' or supply a calibration cache."
         )
 
-    if expected_feature_spec_version is not None and (
-        not isinstance(expected_feature_spec_version, int)
-        or isinstance(expected_feature_spec_version, bool)
-    ):
-        raise OptimizeRequestError(
-            "expected_feature_spec_version must be an integer; got "
-            f"{expected_feature_spec_version!r}"
-        )
-
     workdir = tempfile.mkdtemp(prefix="trt-opt-")
     try:
         onnx_path = _resolve_onnx(source_model_uri, workdir)
 
         # Before spending a GPU on the compile, and before anything can serve the
-        # result. Omitting expected_feature_spec_version skips the check, for the
-        # models that have no feature-spec contract to check (the yield models are
-        # tree-based and never come through here; NCF's vector is not versioned).
+        # result. The DLRM is checked on its feature-spec version, NCF on its
+        # id-hash version; a request that names neither skips both (the yield
+        # models are tree-based and never come through here).
         declared_feature_spec_version = None
         if expected_feature_spec_version is not None:
             declared_feature_spec_version = _require_feature_spec_version(
                 onnx_path, source_model_uri, expected_feature_spec_version
+            )
+        declared_id_hash_version = None
+        if expected_id_hash_version is not None:
+            declared_id_hash_version = _require_id_hash_version(
+                onnx_path, source_model_uri, expected_id_hash_version
             )
 
         calib_cache_path = None
@@ -496,6 +532,7 @@ def run_optimize(body: dict[str, Any]) -> dict[str, Any]:
             # None when the caller asked for no check, so a reader can tell
             # "verified against version 1" from "not checked".
             "feature_spec_version": declared_feature_spec_version,
+            "id_hash_version": declared_id_hash_version,
         }
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -628,7 +665,8 @@ def _bootstrap_one(entry: dict) -> None:
     max_workspace_size = int(entry.get("max_workspace_size", 4 * 1024 * 1024 * 1024))
     input_profiles = entry.get("input_profiles")
 
-    expected_feature_spec_version = entry.get("expected_feature_spec_version")
+    expected_feature_spec_version = _expected_version(entry, "feature_spec_version")
+    expected_id_hash_version = _expected_version(entry, "id_hash_version")
 
     if _engine_is_current(entry):
         return
@@ -645,6 +683,13 @@ def _bootstrap_one(entry: dict) -> None:
             )
             logger.info(
                 "Bootstrap: %s declares feature_spec_version %d", model_name, declared
+            )
+        if expected_id_hash_version is not None:
+            declared = _require_id_hash_version(
+                onnx_path, source_model_uri, expected_id_hash_version
+            )
+            logger.info(
+                "Bootstrap: %s declares id_hash_version %d", model_name, declared
             )
         engine_path = os.path.join(workdir, "model.plan")
         _build_engine(onnx_path, engine_path, precision, max_workspace_size, None, input_profiles=input_profiles)

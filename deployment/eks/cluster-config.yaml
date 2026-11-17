@@ -15,7 +15,12 @@ metadata:
   # __STACK_NAME__ is replaced by deploy-eks.sh at deploy time
   name: __STACK_NAME__-triton
   region: __REGION__
-  version: "1.31"
+  # A version in EKS standard support ($0.10/h control plane). A version in
+  # extended support bills $0.60/h, and EKS stops creating clusters on a version
+  # once its extended support ends. Check `aws eks describe-cluster-versions`
+  # before release and move this forward when standard support nears its end
+  # (1.35: standard support until 2027-03-26).
+  version: "1.35"
 
 # Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
 # On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
