@@ -200,6 +200,25 @@ def test_a_version_that_records_neither_reads_as_none():
     assert versions[0]["fingerprint"] is None
 
 
+def test_demo_dataset_provenance_is_read_back():
+    """FR2.3: a version trained with the demo dataset is identifiable as such."""
+    versions = read_model_versions(
+        _sagemaker({"includes_demo_dataset": "true", "demo_dataset_generated_at": "2026-11-15T10:00:00Z"}),
+        "g",
+    )
+    assert versions[0]["includes_demo_dataset"] is True
+    assert versions[0]["demo_dataset_generated_at"] == "2026-11-15T10:00:00Z"
+
+
+def test_demo_dataset_provenance_defaults_to_false_and_none():
+    versions = read_model_versions(_sagemaker({"load_test_run_id": "lt-abc123"}), "g")
+    assert versions[0]["includes_demo_dataset"] is False
+    assert versions[0]["demo_dataset_generated_at"] is None
+    failed = _sagemaker({})
+    failed.describe_model_package.side_effect = RuntimeError("AccessDenied")
+    assert read_model_versions(failed, "g")[0]["includes_demo_dataset"] is False
+
+
 # ---------------------------------------------------------------------------
 # The deployment half of the chain
 # ---------------------------------------------------------------------------

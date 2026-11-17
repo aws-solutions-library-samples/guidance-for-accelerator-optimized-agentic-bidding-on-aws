@@ -346,3 +346,140 @@ class TestTriggerTrainingXGBoostShape:
         )
         s3_uri = call_kwargs["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"]
         assert s3_uri == "s3://artf-training-data-bucket/training-data/"
+
+
+class TestIncludeDemoDataset:
+    """FR2.2, FR2.3: the opt-in demo dataset reaches the job through a
+    ManifestFile on the existing channel; with the option off the input is the
+    same S3Prefix channel as before."""
+
+    _COMMON_KWARGS = dict(
+        sagemaker_role_arn="arn:aws:iam::123456789012:role/sagemaker-training",
+        model_bucket="artf-model-bucket",
+        training_data_bucket="artf-training-data-bucket",
+        training_image_registry="123456789012.dkr.ecr.us-east-1.amazonaws.com",
+    )
+    _XGB = "123456789012.dkr.ecr.us-east-1.amazonaws.com/xgboost:1.7-1"
+
+    @staticmethod
+    def _sagemaker_ready():
+        client = MagicMock()
+        client.list_training_jobs.return_value = {"TrainingJobSummaries": []}
+        client.list_model_packages.return_value = {
+            "ModelPackageSummaryList": [{"ModelPackageArn": "arn:aws:sagemaker:us-east-1:123:model-package/g/1"}]
+        }
+        return client
+
+    @staticmethod
+    def _s3_with_demo(training_prefix: str, demo_prefix: str):
+        import io
+        import json as _json
+
+        client = MagicMock()
+        client.get_object.return_value = {
+            "Body": io.BytesIO(_json.dumps({"generated_at": "2026-11-15T10:00:00Z"}).encode())
+        }
+        listings = {
+            f"{training_prefix}/": [
+                f"{training_prefix}/window_start=a/window_end=b/part-0.parquet",
+                f"{training_prefix}/window_start=a/window_end=b/",
+            ],
+            f"{demo_prefix}/": [
+                f"{demo_prefix}/part-00000.parquet",
+                f"{demo_prefix}/_demo_metadata.json",
+            ],
+        }
+        client.list_objects_v2.side_effect = lambda **kw: {
+            "Contents": [{"Key": k} for k in listings.get(kw["Prefix"], [])],
+            "IsTruncated": False,
+        }
+        return client
+
+    @pytest.mark.parametrize("model_type,channel,prefix,image", [
+        ("dlrm_bid_shader", "training", "training-data", None),
+        ("deal_yield_manager_floor", "train", "training-data-deal-yield-floor", _XGB),
+    ])
+    def test_option_off_keeps_input_data_config_unchanged(self, model_type, channel, prefix, image):
+        from orchestrator.training_trigger import _build_training_job_params
+
+        params = _build_training_job_params(
+            model_type, "job-1", "arn:base",
+            xgboost_training_image_uri=image, **self._COMMON_KWARGS,
+        )
+        assert params["InputDataConfig"] == [{
+            "ChannelName": channel,
+            "DataSource": {"S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri": f"s3://artf-training-data-bucket/{prefix}/",
+                "S3DataDistributionType": "FullyReplicated",
+            }},
+            "ContentType": "application/x-parquet",
+        }]
+        assert not any(t["Key"] == "includes_demo_dataset" for t in params["Tags"])
+
+    def test_option_on_uses_manifest_on_the_train_channel(self):
+        import json as _json
+
+        sm = self._sagemaker_ready()
+        s3 = self._s3_with_demo("training-data-deal-yield-floor", "demo-training-data-deal-yield-floor")
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=sm), \
+                patch("orchestrator.training_trigger._s3_client", return_value=s3):
+            result = trigger_training(
+                "deal_yield_manager_floor", confirmed=True, include_demo_dataset=True,
+                xgboost_training_image_uri=self._XGB, **self._COMMON_KWARGS,
+            )
+
+        params = sm.create_training_job.call_args.kwargs
+        channel = params["InputDataConfig"][0]
+        assert channel["ChannelName"] == "train"
+        source = channel["DataSource"]["S3DataSource"]
+        assert source["S3DataType"] == "ManifestFile"
+        manifest_key = f"training-manifests/{result.job_name}.json"
+        assert source["S3Uri"] == f"s3://artf-training-data-bucket/{manifest_key}"
+
+        put = s3.put_object.call_args.kwargs
+        assert put["Key"] == manifest_key
+        manifest = _json.loads(put["Body"])
+        assert manifest[0] == {"prefix": "s3://artf-training-data-bucket/"}
+        assert manifest[1:] == [
+            "training-data-deal-yield-floor/window_start=a/window_end=b/part-0.parquet",
+            "demo-training-data-deal-yield-floor/part-00000.parquet",
+        ]
+        tags = {t["Key"]: t["Value"] for t in params["Tags"]}
+        assert tags["includes_demo_dataset"] == "true"
+        assert tags["demo_dataset_generated_at"] == "2026-11-15T10:00:00Z"
+        # Built-in XGBoost rejects unknown hyperparameters.
+        assert "includes_demo_dataset" not in params["HyperParameters"]
+
+    def test_option_on_for_dlrm_sets_hyperparameters_too(self):
+        sm = self._sagemaker_ready()
+        s3 = self._s3_with_demo("training-data", "demo-training-data")
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=sm), \
+                patch("orchestrator.training_trigger._s3_client", return_value=s3):
+            trigger_training(
+                "dlrm_bid_shader", confirmed=True, include_demo_dataset=True, **self._COMMON_KWARGS,
+            )
+        params = sm.create_training_job.call_args.kwargs
+        assert params["InputDataConfig"][0]["ChannelName"] == "training"
+        assert params["HyperParameters"]["includes_demo_dataset"] == "true"
+        assert params["HyperParameters"]["demo_dataset_generated_at"] == "2026-11-15T10:00:00Z"
+
+    def test_option_on_without_dataset_raises_before_any_job_call(self):
+        from botocore.exceptions import ClientError
+        from orchestrator.training_trigger import NoDemoDatasetError
+
+        sm = self._sagemaker_ready()
+        s3 = MagicMock()
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+        )
+        with patch("orchestrator.training_trigger._sagemaker_client", return_value=sm), \
+                patch("orchestrator.training_trigger._s3_client", return_value=s3):
+            with pytest.raises(NoDemoDatasetError):
+                trigger_training(
+                    "dlrm_bid_shader", confirmed=True, include_demo_dataset=True,
+                    **self._COMMON_KWARGS,
+                )
+        sm.list_training_jobs.assert_not_called()
+        sm.create_training_job.assert_not_called()
+        s3.put_object.assert_not_called()

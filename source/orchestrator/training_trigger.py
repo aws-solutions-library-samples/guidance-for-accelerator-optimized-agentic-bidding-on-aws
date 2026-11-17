@@ -12,6 +12,7 @@ Maps to: FR-4, FR-5 (Story 3, train-from-load-test unit).
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -346,6 +347,91 @@ def _resolve_base_model_version(model_type: str) -> str:
     return packages[0]["ModelPackageArn"]
 
 
+class NoDemoDatasetError(Exception):
+    """Raised when "Include demo dataset" is on but no demo dataset exists for
+    the model type (FR2.2). The API maps it to HTTP 422 ``no_demo_dataset``."""
+
+    def __init__(self, model_type: str):
+        super().__init__(
+            f"No demo dataset exists for '{model_type}'. Generate one in the "
+            "Train step, or turn off 'Include demo dataset'."
+        )
+        self.model_type = model_type
+
+
+# Where the per-job ManifestFile is written when a job includes the demo dataset.
+_TRAINING_MANIFEST_PREFIX = "training-manifests"
+
+
+def _s3_client():
+    region = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    return boto3.client("s3", region_name=region)
+
+
+@dataclass(frozen=True)
+class DemoTrainingInput:
+    """The uploaded ManifestFile and the demo dataset it includes."""
+
+    manifest_uri: str
+    generated_at: str
+    keys: tuple[str, ...]
+
+
+def _training_data_prefix(model_type: str) -> str:
+    if _TRAINING_SHAPE.get(model_type, "nemo-rl") == "xgboost":
+        return _XGBOOST_TRAINING_DATA_PREFIX[model_type]
+    return "training-data"
+
+
+def _prepare_demo_input(
+    model_type: str,
+    job_name: str,
+    *,
+    training_data_bucket: str,
+    s3_client,
+    generated_at: str,
+) -> DemoTrainingInput:
+    """Write the ManifestFile that reads the training prefix and the demo dataset.
+
+    Lists every object under the model's training prefix (what ``S3Prefix``
+    reads today) and the ``.parquet`` objects under its demo prefix, then
+    uploads ``[{"prefix": "s3://<bucket>/"}, "<key>", ...]`` to
+    ``training-manifests/<job_name>.json``. This is the manifest form in the
+    SageMaker S3DataSource API reference; SageMaker appends each key to the
+    prefix. Keys ending in ``/`` are folder markers and are left out. S3
+    failures raise DemoDatasetStorageError.
+    """
+    from orchestrator import demo_dataset
+
+    training_keys = demo_dataset.list_keys(
+        s3_client, training_data_bucket, f"{_training_data_prefix(model_type)}/"
+    )
+    demo_keys = demo_dataset.list_keys(
+        s3_client, training_data_bucket, f"{demo_dataset.DEMO_PREFIXES[model_type]}/"
+    )
+    keys = tuple(
+        [k for k in training_keys if not k.endswith("/")]
+        + [k for k in demo_keys if k.endswith(".parquet")]
+    )
+    if not any(k.startswith(f"{demo_dataset.DEMO_PREFIXES[model_type]}/") for k in keys):
+        raise NoDemoDatasetError(model_type)
+
+    manifest_key = f"{_TRAINING_MANIFEST_PREFIX}/{job_name}.json"
+    body = json.dumps([{"prefix": f"s3://{training_data_bucket}/"}, *keys]).encode("utf-8")
+    try:
+        s3_client.put_object(
+            Bucket=training_data_bucket, Key=manifest_key, Body=body,
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        raise demo_dataset.DemoDatasetStorageError("PutObject", manifest_key, exc) from exc
+    return DemoTrainingInput(
+        manifest_uri=f"s3://{training_data_bucket}/{manifest_key}",
+        generated_at=generated_at,
+        keys=keys,
+    )
+
+
 class XGBoostTrainingImageNotConfiguredError(Exception):
     """Raised when triggering a deal_yield_manager_floor/margin job but no
     XGBoost training image URI is configured on this deployment (mirrors
@@ -371,6 +457,8 @@ def _build_training_job_params(
     training_image_registry: str,
     xgboost_training_image_uri: str | None,
     load_test_run_id: str = "",
+    include_demo_dataset: bool = False,
+    demo_input: DemoTrainingInput | None = None,
 ) -> dict:
     """Builds the CreateTrainingJob params for model_type, branching by
     training shape (see _TRAINING_SHAPE). Raises
@@ -395,13 +483,23 @@ def _build_training_job_params(
     holds every run swept so far -- so this is "the run this job was triggered
     from", not "the only data it learned from". Anything presenting it must say
     so.
+
+    ``include_demo_dataset`` (FR2.2, FR2.3) switches the channel to the
+    ManifestFile in ``demo_input`` and adds the ``includes_demo_dataset`` and
+    ``demo_dataset_generated_at`` tags, plus the same two hyperparameters on the
+    NeMo-RL shape. With it off the channel is the ``S3Prefix`` one, unchanged.
     """
+    if include_demo_dataset and demo_input is None:
+        raise ValueError("include_demo_dataset requires demo_input (the uploaded ManifestFile)")
     shape = _TRAINING_SHAPE.get(model_type, "nemo-rl")
     output_path = f"s3://{model_bucket}/models/{model_type}/{job_name}"
 
     tags = [{"Key": "base_model_version", "Value": base_model_version}]
     if load_test_run_id:
         tags.append({"Key": "load_test_run_id", "Value": load_test_run_id})
+    if include_demo_dataset:
+        tags.append({"Key": "includes_demo_dataset", "Value": "true"})
+        tags.append({"Key": "demo_dataset_generated_at", "Value": demo_input.generated_at})
 
     if shape == "xgboost":
         if not xgboost_training_image_uri:
@@ -434,6 +532,15 @@ def _build_training_job_params(
         }
         if load_test_run_id:
             hyperparameters["load_test_run_id"] = load_test_run_id
+        if include_demo_dataset:
+            hyperparameters["includes_demo_dataset"] = "true"
+            hyperparameters["demo_dataset_generated_at"] = demo_input.generated_at
+
+    if include_demo_dataset:
+        s3_data_type, s3_uri = "ManifestFile", demo_input.manifest_uri
+    else:
+        s3_data_type = "S3Prefix"
+        s3_uri = f"s3://{training_data_bucket}/{training_data_prefix}/"
 
     return {
         "TrainingJobName": job_name,
@@ -445,8 +552,8 @@ def _build_training_job_params(
         "InputDataConfig": [{
             "ChannelName": channel_name,
             "DataSource": {"S3DataSource": {
-                "S3DataType": "S3Prefix",
-                "S3Uri": f"s3://{training_data_bucket}/{training_data_prefix}/",
+                "S3DataType": s3_data_type,
+                "S3Uri": s3_uri,
                 "S3DataDistributionType": "FullyReplicated",
             }},
             "ContentType": "application/x-parquet",
@@ -473,12 +580,18 @@ def trigger_training(
     training_image_registry: str,
     xgboost_training_image_uri: str | None = None,
     load_test_run_id: str = "",
+    include_demo_dataset: bool = False,
 ) -> TrainingTriggerResult:
     """Start a real, fire-and-forget SageMaker training job.
 
     ``xgboost_training_image_uri`` is only required when model_type is
     xgboost-shaped (deal_yield_manager_floor/margin -- see
     _TRAINING_SHAPE); ignored otherwise.
+
+    ``include_demo_dataset`` adds the model type's demo dataset to the input
+    through a ManifestFile (see _prepare_demo_input). It raises
+    NoDemoDatasetError when no demo dataset exists, and S3 failures raise
+    orchestrator.demo_dataset.DemoDatasetStorageError.
 
     Raises ModelTypeNotTrainableError, TrainingNotConfirmedError,
     TrainingAlreadyInProgressError, NoApprovedBaseVersionError, or
@@ -492,6 +605,16 @@ def trigger_training(
     if not confirmed:
         raise TrainingNotConfirmedError(model_type)
 
+    demo_metadata = None
+    s3_client = None
+    if include_demo_dataset:
+        from orchestrator.demo_dataset import read_demo_metadata
+
+        s3_client = _s3_client()
+        demo_metadata = read_demo_metadata(training_data_bucket, model_type, client=s3_client)
+        if demo_metadata is None:
+            raise NoDemoDatasetError(model_type)
+
     in_progress, existing_job = is_training_in_progress(model_type)
     if in_progress:
         raise TrainingAlreadyInProgressError(model_type, existing_job or "")
@@ -499,6 +622,19 @@ def trigger_training(
     base_model_version = _resolve_base_model_version(model_type)
 
     job_name = f"{_job_name_prefix(model_type)}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    demo_input = None
+    if include_demo_dataset:
+        # Checked here as well as in the builder so no manifest is uploaded for
+        # a job that cannot start.
+        if _TRAINING_SHAPE.get(model_type) == "xgboost" and not xgboost_training_image_uri:
+            raise XGBoostTrainingImageNotConfiguredError(model_type)
+        demo_input = _prepare_demo_input(
+            model_type,
+            job_name,
+            training_data_bucket=training_data_bucket,
+            s3_client=s3_client,
+            generated_at=str(demo_metadata.get("generated_at", "")),
+        )
     create_params = _build_training_job_params(
         model_type,
         job_name,
@@ -509,6 +645,8 @@ def trigger_training(
         training_image_registry=training_image_registry,
         xgboost_training_image_uri=xgboost_training_image_uri,
         load_test_run_id=load_test_run_id,
+        include_demo_dataset=include_demo_dataset,
+        demo_input=demo_input,
     )
 
     client = _sagemaker_client()

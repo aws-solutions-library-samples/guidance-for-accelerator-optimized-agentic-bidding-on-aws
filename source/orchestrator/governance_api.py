@@ -50,6 +50,7 @@ from orchestrator.training_trigger import (
     TRAINABLE_MODEL_TYPES,
     ModelTypeNotTrainableError,
     NoApprovedBaseVersionError,
+    NoDemoDatasetError,
     TrainingAlreadyInProgressError,
     TrainingNotConfirmedError,
     XGBoostTrainingImageNotConfiguredError,
@@ -270,13 +271,13 @@ async def trainable_runs_handler(request: Request) -> JSONResponse:
         # Almost always "recorded after the last successful sweep", which is the
         # single most common reason a user cannot find the run they just made.
         trainable_ids = {r.get("id") for r in runs}
-        pending = [
+        captured = [
             r for r in history
             if r.get("target_model_type") == model_type
             and int(r.get("outcome_sample_count") or 0) > 0
-            and r.get("id") not in trainable_ids
         ]
-        etl = _etl_health(job_name, job_runs, latest_completion)
+        pending = [r for r in captured if r.get("id") not in trainable_ids]
+        etl = _etl_health(job_name, job_runs, latest_completion, len(captured))
     except Exception as exc:
         logging.getLogger(__name__).exception("trainable_runs_handler failed unexpectedly")
         return JSONResponse({"error": str(exc), "reason": "internal_error"}, status_code=500)
@@ -304,14 +305,29 @@ async def trainable_runs_handler(request: Request) -> JSONResponse:
     })
 
 
-def _etl_health(job_name: str, job_runs: list[dict], latest_completion) -> dict:  # noqa: C901
+# Spark's error when the input path holds no Parquet files. The ETL scripts read
+# with pathGlobFilter=*.parquet, so this means Firehose has delivered nothing to
+# the raw outcomes prefix yet, not that the job itself is broken.
+_EMPTY_INPUT_ERROR = "Unable to infer schema for Parquet"
+
+
+def _etl_health(
+    job_name: str,
+    job_runs: list[dict],
+    latest_completion,
+    captured_load_tests: int = 0,
+) -> dict:  # noqa: C901
     """Health of the Glue job that labels a model type's training data.
 
     Reports the job's own state rather than only its last success, so a picker
     can distinguish "waiting for the next scheduled sweep" from "this job fails
-    every run, so waiting will never help". The yield job is currently the second
-    case: it has never succeeded, failing each run with "Unable to infer schema
-    for Parquet" because its input prefix is empty.
+    every run, so waiting will never help".
+
+    ``no_input_data`` is set when the latest failure is Spark's empty-input
+    error. On a new deployment that is the expected state until a load test
+    sends outcomes through Firehose, and ``captured_load_tests`` (load tests in
+    history that captured outcomes for this model) tells the UI which of the two
+    it is: no load test yet, or outcomes captured that never reached S3.
 
     ``last_error`` is taken from the most recent FAILED run regardless of when it
     started -- unlike sweep_status._describe_glue_runs, which only attributes a
@@ -329,6 +345,8 @@ def _etl_health(job_name: str, job_runs: list[dict], latest_completion) -> dict:
             "never_succeeded": True,
             "last_error": None,
             "consecutive_failures": 0,
+            "no_input_data": False,
+            "captured_load_tests": captured_load_tests,
         }
 
     failed = [r for r in job_runs if (r.get("JobRunState") or "").upper() in GLUE_FAILED_STATES]
@@ -365,6 +383,11 @@ def _etl_health(job_name: str, job_runs: list[dict], latest_completion) -> dict:
             if latest_failed is not None else None
         ),
         "consecutive_failures": consecutive,
+        "no_input_data": (
+            latest_failed is not None
+            and _EMPTY_INPUT_ERROR in (latest_failed.get("ErrorMessage") or "")
+        ),
+        "captured_load_tests": captured_load_tests,
     }
 
 
@@ -497,7 +520,9 @@ async def training_estimate_handler(request: Request) -> JSONResponse:
 async def train_handler(request: Request) -> JSONResponse:
     """POST /v1/governance/train
 
-    Body: {"model_type": str, "confirmed": bool, "run_id"?: str}.
+    Body: {"model_type": str, "confirmed": bool, "run_id"?: str,
+    "include_demo_dataset"?: bool}. With include_demo_dataset true and no demo
+    dataset for the model type, returns 422 ``no_demo_dataset``.
     Returns 202 with the started job's name/base_model_version on success.
     Returns 422 for a precondition failure (not trainable, not confirmed,
     already in progress, no approved base version) — reported plainly,
@@ -516,6 +541,14 @@ async def train_handler(request: Request) -> JSONResponse:
     model_type = body.get("model_type", "")
     confirmed = bool(body.get("confirmed", False))
     run_id = body.get("run_id", "") or ""
+    # FR2.2: opt-in demo dataset. A JSON boolean only, so a string "false" is
+    # refused rather than read as on.
+    include_demo_dataset = body.get("include_demo_dataset", False)
+    if not isinstance(include_demo_dataset, bool):
+        return JSONResponse(
+            {"error": "include_demo_dataset must be a boolean.", "reason": "invalid_request"},
+            status_code=422,
+        )
 
     sagemaker_role_arn = os.environ.get("SAGEMAKER_TRAINING_ROLE_ARN", "")
     model_bucket = os.environ.get("MODEL_BUCKET", "")
@@ -544,7 +577,10 @@ async def train_handler(request: Request) -> JSONResponse:
             training_image_registry=training_image_registry,
             xgboost_training_image_uri=xgboost_training_image_uri,
             load_test_run_id=run_id,
+            include_demo_dataset=include_demo_dataset,
         )
+    except NoDemoDatasetError as exc:
+        return JSONResponse({"error": str(exc), "reason": "no_demo_dataset"}, status_code=422)
     except ModelTypeNotTrainableError as exc:
         return JSONResponse({"error": str(exc), "reason": "not_trainable"}, status_code=422)
     except TrainingNotConfirmedError as exc:

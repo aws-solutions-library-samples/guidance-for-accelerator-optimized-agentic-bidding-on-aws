@@ -343,6 +343,7 @@ def _outcome_from_rtb_response(data: dict) -> ContainerCallOutcome:
         # reason attached is a different fact from an empty one without.
         abstained_reason=metadata.get("abstained_reason") or None,
         timing=metadata.get("timing") or None,
+        applied_params=metadata.get("applied_params") or None,
     )
 
 
@@ -596,6 +597,7 @@ async def _call_container_timed(
             display_name=display_name,
             abstained_reason=outcome.abstained_reason,
             timing=outcome.timing,
+            applied_params=outcome.applied_params,
         )
     except asyncio.TimeoutError:
         latency_ms = round((time.monotonic() - start) * 1000.0, 2)
@@ -1686,17 +1688,36 @@ async def gpu_status(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+#: GPU nodes the Start GPUs button brings up. Matches deploy.sh's steady state
+#: (GPU_DESIRED): one node for Triton. The README cost table assumes this count.
+_GPU_START_DESIRED = 1
+
+
+def _gpu_nodegroup_max(eks) -> int:
+    """The node group's current maxSize, so start/stop keep deploy.sh's --maxGPUs."""
+    ng = eks.describe_nodegroup(clusterName=_EKS_CLUSTER, nodegroupName=_GPU_NODEGROUP)
+    return int(ng["nodegroup"]["scalingConfig"]["maxSize"])
+
+
 async def gpu_start(request: Request) -> JSONResponse:
-    """POST /v1/gpu/start — scale GPU node group to 3 nodes for Triton + NVIDIA containers."""
+    """POST /v1/gpu/start: scale the GPU node group to one node for Triton."""
     import boto3
     try:
         eks = boto3.client("eks", region_name=_AWS_REGION)
+        max_size = max(_gpu_nodegroup_max(eks), _GPU_START_DESIRED)
         eks.update_nodegroup_config(
             clusterName=_EKS_CLUSTER,
             nodegroupName=_GPU_NODEGROUP,
-            scalingConfig={"minSize": 1, "maxSize": 5, "desiredSize": 3},
+            scalingConfig={"minSize": 1, "maxSize": max_size, "desiredSize": _GPU_START_DESIRED},
         )
-        return JSONResponse({"ok": True, "message": "GPU node group scaling to 3 nodes. Triton + NVIDIA containers will be ready in ~3-5 minutes."})
+        return JSONResponse({
+            "ok": True,
+            "desiredSize": _GPU_START_DESIRED,
+            "message": (
+                f"GPU node group scaling to {_GPU_START_DESIRED} node. "
+                "Triton will be ready in ~3-5 minutes."
+            ),
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1706,10 +1727,11 @@ async def gpu_stop(request: Request) -> JSONResponse:
     import boto3
     try:
         eks = boto3.client("eks", region_name=_AWS_REGION)
+        max_size = max(_gpu_nodegroup_max(eks), 1)
         eks.update_nodegroup_config(
             clusterName=_EKS_CLUSTER,
             nodegroupName=_GPU_NODEGROUP,
-            scalingConfig={"minSize": 0, "maxSize": 5, "desiredSize": 0},
+            scalingConfig={"minSize": 0, "maxSize": max_size, "desiredSize": 0},
         )
         return JSONResponse({"ok": True, "message": "GPU node group scaling to 0. GPU costs will stop in ~1-2 minutes."})
     except Exception as e:
@@ -1839,12 +1861,37 @@ except Exception as _gov_exc:  # pragma: no cover - depends on image contents
         "Governance training-trigger API unavailable (routes disabled): %s", _gov_exc
     )
 
+# Demo training datasets (FR1). Separate from the block above so a failure here
+# leaves the training and comparison routes registered.
+_DEMO_DATASET_API_AVAILABLE = False
+try:
+    from orchestrator.demo_dataset_api import (  # noqa: E402
+        estimate_handler as demo_dataset_estimate,
+        generate_handler as demo_dataset_generate,
+        status_handler as demo_dataset_status,
+    )
+    _DEMO_DATASET_API_AVAILABLE = True
+except Exception as _demo_exc:  # pragma: no cover - depends on image contents
+    logging.getLogger(__name__).warning(
+        "Demo dataset API unavailable (routes disabled): %s", _demo_exc
+    )
+
+
+def _demo_dataset_routes(prefix: str) -> list:
+    if not _DEMO_DATASET_API_AVAILABLE:
+        return []
+    return [
+        Route(f"{prefix}/v1/governance/demo-dataset", demo_dataset_status, methods=["GET"]),
+        Route(f"{prefix}/v1/governance/demo-dataset", demo_dataset_generate, methods=["POST"]),
+        Route(f"{prefix}/v1/governance/demo-dataset/estimate", demo_dataset_estimate, methods=["GET"]),
+    ]
+
 
 def _governance_routes(prefix: str) -> list:
     """Build the governance routes (training trigger + comparison/promotion) under a given prefix."""
     if not _GOVERNANCE_API_AVAILABLE:
         return []
-    return [
+    return _demo_dataset_routes(prefix) + [
         Route(f"{prefix}/v1/governance/training-estimate", gov_training_estimate, methods=["GET"]),
         Route(f"{prefix}/v1/governance/train", gov_train, methods=["POST"]),
         Route(f"{prefix}/v1/governance/eligible-runs", gov_eligible_runs, methods=["GET"]),

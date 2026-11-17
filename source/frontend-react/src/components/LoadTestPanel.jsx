@@ -20,6 +20,10 @@ const PRESETS = [
   { value: "1k", label: "1K", requests: 1000 },
   { value: "10k", label: "10K", requests: 10000 },
   { value: "100k", label: "100K", requests: 100000 },
+  // Paced: the orchestrator starts requests at ratePerS for durationS instead of
+  // back to back (orchestrator/loadtest.py PRESET_CONFIG["60k-paced"]), long
+  // enough for the autoscalers to act. Its duration is fixed.
+  { value: "60k-paced", label: "60K paced", requests: 60000, ratePerS: 100, durationS: 600 },
 ];
 
 const DURATIONS = [
@@ -27,6 +31,7 @@ const DURATIONS = [
   { value: 30, label: "30s" },
   { value: 60, label: "60s" },
   { value: 120, label: "2m" },
+  { value: 600, label: "10m" },
 ];
 
 // Model types selectable for outcome/version capture (target_model_type).
@@ -341,6 +346,11 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
   }, [preset, duration, scenario, targetModelType, targetVariant, stopTest, resetToIdle, startPolling]);
 
   const totalRequests = PRESETS.find((p) => p.value === preset)?.requests || 0;
+  const pacedPreset = PRESETS.find((p) => p.value === preset && p.ratePerS) || null;
+  const selectPreset = (p) => {
+    setPreset(p.value);
+    if (p.durationS) setDuration(p.durationS);
+  };
   const completedPct = progress ? ((progress.completed / progress.total) * 100).toFixed(1) : 0;
 
   return (
@@ -389,9 +399,10 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
               name="loadtest-preset"
               value={p.value}
               checked={preset === p.value}
-              onChange={() => setPreset(p.value)}
+              onChange={() => selectPreset(p)}
               disabled={running}
               aria-label={`${p.label} requests`}
+              data-testid={`loadtest-preset-${p.value}`}
             />
             <span className="loadtest-preset-label">{p.label}</span>
             <span className="loadtest-preset-detail">
@@ -415,12 +426,21 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
               value={d.value}
               checked={duration === d.value}
               onChange={() => setDuration(d.value)}
-              disabled={running}
+              disabled={running || Boolean(pacedPreset)}
+              data-testid={`loadtest-duration-${d.value}`}
             />
             {d.label}
           </label>
         ))}
       </div>
+      {pacedPreset && (
+        <p className="loadtest-paced-summary" data-testid="loadtest-paced-summary">
+          {pacedPreset.ratePerS} req/s for {pacedPreset.durationS / 60} min
+          ({pacedPreset.requests.toLocaleString("en-US")} requests). Requests start at a steady
+          rate; if the containers cannot keep up, the run stops at {pacedPreset.durationS / 60} min
+          and reports the requests actually sent.
+        </p>
+      )}
 
       {/* Outcome-capture targeting (FR-2/FR-3) — optional. Selecting a model
           type enables real BidShadingOutcomeEvent emission + model-version capture

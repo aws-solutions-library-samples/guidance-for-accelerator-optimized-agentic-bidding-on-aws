@@ -9,6 +9,7 @@ import {
   GovernanceVerdictCard, SessionAuditTrail, RecommendationBadge,
 } from "./closedLoopUi.jsx";
 import LoadTestSweepStatus from "./LoadTestSweepStatus.jsx";
+import DemoDatasetPanel from "./DemoDatasetPanel.jsx";
 import GovernanceStepper, { GOVERNANCE_STEPS } from "./GovernanceStepper.jsx";
 import LoadTestPanel, { LoadTestResults } from "./LoadTestPanel.jsx";
 import BidBubbleOverlay from "./BidBubbleOverlay.jsx";
@@ -80,6 +81,39 @@ export function mergeTrainRunOptions(runs, pending) {
   return [...ready, ...waiting].sort((a, b) => ts(b) - ts(a));
 }
 
+// Used only for baseline records written before the orchestrator stored seed
+// and duration_s. 42 is the seed every UI-started load test has sent; 30s was
+// the challenger duration this flow used before replaying the baseline's.
+const LEGACY_REPLAY_SEED = 42;
+const LEGACY_REPLAY_DURATION_S = 30;
+
+/**
+ * The load-test inputs that reproduce a baseline run's request stream:
+ * scenario, preset, seed and duration cap. `missing` lists the fields the
+ * baseline record did not store, which were filled from the legacy defaults,
+ * so the UI can say the replay may not match.
+ */
+export function replayInputs(run) {
+  const missing = [];
+  const pick = (field, fallback) => {
+    const v = run?.[field];
+    if (v === undefined || v === null || v === "") {
+      missing.push(field);
+      return fallback;
+    }
+    return v;
+  };
+  return {
+    inputs: {
+      preset: pick("preset", "1k"),
+      scenario: pick("scenario", "baseline"),
+      seed: pick("seed", LEGACY_REPLAY_SEED),
+      duration_s: pick("duration_s", LEGACY_REPLAY_DURATION_S),
+    },
+    missing,
+  };
+}
+
 /**
  * GovernancePanel — the A/B model-promotion closed loop.
  *
@@ -146,6 +180,12 @@ export default function GovernancePanel() {
   const [trainingSubmitting, setTrainingSubmitting] = useState(false);
   const [trainingResult, setTrainingResult] = useState(null);
   const [trainingError, setTrainingError] = useState(null);
+  // Demo dataset for the selected training model (FR2.1): its status comes from
+  // DemoDatasetPanel, and the include option is off by default and only
+  // enabled while a dataset exists.
+  const [demoDatasetStatus, setDemoDatasetStatus] = useState(null);
+  const [includeDemoDataset, setIncludeDemoDataset] = useState(false);
+  const demoDatasetExists = Boolean(demoDatasetStatus?.exists);
 
   // Trainable load-test runs (this fix): only runs whose outcome data has
   // actually been swept into training-data/ by a completed Glue job run —
@@ -163,17 +203,21 @@ export default function GovernancePanel() {
   const [pendingRuns, setPendingRuns] = useState([]);
 
   // Load-test-based comparison (FR-7/FR-8, Story 5) and Promote (FR-9/FR-10, Story 6).
+  // Only the baseline run is picked. The challenger run is always a fresh load
+  // test of the latest version at the baseline's scenario+preset (see
+  // compareRetrained), so the two sides share the same inputs.
   const [currentRuns, setCurrentRuns] = useState([]);
-  const [challengerRuns, setChallengerRuns] = useState([]);
   const [selectedCurrentRun, setSelectedCurrentRun] = useState("");
-  const [selectedChallengerRun, setSelectedChallengerRun] = useState("");
+  const selectedReplayMissing = useMemo(() => {
+    const run = currentRuns.find((r) => r.id === selectedCurrentRun);
+    return run ? replayInputs(run).missing : [];
+  }, [currentRuns, selectedCurrentRun]);
   const [eligibleRunsError, setEligibleRunsError] = useState(null);
   // Where the preselected control came from — "training_provenance" (the run the
   // challenger was trained from) or "most_recent" (a weaker fallback). Shown so
   // the baseline is never implied to be the training data when it is not.
   const [controlSource, setControlSource] = useState("none");
   const [controlProvenance, setControlProvenance] = useState(null);
-  const [comparing, setComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
   const [comparisonError, setComparisonError] = useState(null);
   const [promoting, setPromoting] = useState(false);
@@ -184,9 +228,8 @@ export default function GovernancePanel() {
   // registered version as the FIL canary (no compile). DLRM: the governance
   // agent already staged the retrained version as the canary when its
   // load-test-triggered training finished, so nothing is staged here. Then run
-  // a real challenger load test at the control run's scenario+preset (seed is
-  // fixed at 42 UI-wide, so control and challenger share the request stream)
-  // and compare. Every step is gated on a real poll — no fabricated progress.
+  // a challenger load test on the control run's recorded inputs (see
+  // replayInputs) and compare. Each step waits on a real poll.
   const [retraining, setRetraining] = useState(false);
   const [retrainStep, setRetrainStep] = useState("");
   const [retrainError, setRetrainError] = useState(null);
@@ -317,7 +360,14 @@ export default function GovernancePanel() {
     setConfirmingTraining(false);
     setTrainingResult(null);
     setTrainingError(null);
+    setDemoDatasetStatus(null);
+    setIncludeDemoDataset(false);
   }, [trainingModelType, fetchTrainingEstimate, fetchTrainableRuns]);
+
+  // The include option cannot stay on for a model with no demo dataset.
+  useEffect(() => {
+    if (!demoDatasetExists) setIncludeDemoDataset(false);
+  }, [demoDatasetExists]);
 
   // A run becomes trainable when a Glue ETL sweep covering it succeeds, which
   // happens minutes after the load test ends and independently of this panel.
@@ -327,9 +377,28 @@ export default function GovernancePanel() {
     return () => clearInterval(timer);
   }, [fetchTrainableRuns]);
 
+  const trainRunOptions = useMemo(
+    () => mergeTrainRunOptions(trainableRuns, pendingRuns),
+    [trainableRuns, pendingRuns]
+  );
+  // Train is enabled only for a run a Glue sweep has already moved into the
+  // training bucket; a run still in the pipeline is selectable so its stages
+  // are visible, but cannot be trained on yet.
+  const selectedRunReady = trainRunOptions.some(
+    (r) => r.id === selectedTrainingRun && r.ready
+  );
+  // FR2.2: with the demo dataset included, the job has data to train on even
+  // when no load test run is ready.
+  const trainWithDemoOnly = includeDemoDataset && demoDatasetExists && !selectedRunReady;
+  const canTrain = selectedRunReady || (includeDemoDataset && demoDatasetExists);
+
   const startTraining = useCallback(async () => {
     setTrainingSubmitting(true);
     setTrainingError(null);
+    // With the demo dataset included, Train is allowed before any load test run
+    // is ready. A run that is not in the training bucket is not this job's
+    // provenance, so run_id is sent empty then.
+    const selectedTrainingRunIfReady = selectedRunReady ? selectedTrainingRun : "";
     try {
       const resp = await authFetch("/api/v1/governance/train", {
         method: "POST",
@@ -341,7 +410,8 @@ export default function GovernancePanel() {
         body: JSON.stringify({
           model_type: trainingModelType,
           confirmed: true,
-          run_id: selectedTrainingRun,
+          run_id: selectedTrainingRunIfReady,
+          include_demo_dataset: includeDemoDataset && demoDatasetExists,
         }),
       });
       const data = await resp.json();
@@ -367,41 +437,29 @@ export default function GovernancePanel() {
     } finally {
       setTrainingSubmitting(false);
     }
-  }, [trainingModelType, selectedTrainingRun, registryModelType, refreshState]);
+  }, [
+    trainingModelType, selectedTrainingRun, selectedRunReady, includeDemoDataset,
+    demoDatasetExists, registryModelType, refreshState,
+  ]);
 
-  const trainRunOptions = useMemo(
-    () => mergeTrainRunOptions(trainableRuns, pendingRuns),
-    [trainableRuns, pendingRuns]
-  );
-  // Train is enabled only for a run a Glue sweep has already moved into the
-  // training bucket; a run still in the pipeline is selectable so its stages
-  // are visible, but cannot be trained on yet.
-  const selectedRunReady = trainRunOptions.some(
-    (r) => r.id === selectedTrainingRun && r.ready
-  );
-
-  // Fetch eligible load-test runs whenever the model type changes, auto-
-  // selecting the most recent per role (FR-7). Clears any prior
-  // comparison/promotion result — it was scoped to the previous model type.
+  // Fetch eligible baseline runs whenever the model type changes, auto-
+  // selecting one (FR-7). Clears any prior comparison/promotion result: it was
+  // scoped to the previous model type.
   const fetchEligibleRuns = useCallback(async () => {
     setEligibleRunsError(null);
     try {
-      const [curResp, chalResp] = await Promise.all([
-        authFetch(`/api/v1/governance/eligible-runs?model_type=${modelType}&role=current`),
-        authFetch(`/api/v1/governance/eligible-runs?model_type=${modelType}&role=challenger`),
-      ]);
+      const curResp = await authFetch(
+        `/api/v1/governance/eligible-runs?model_type=${modelType}&role=current`
+      );
       const curData = await curResp.json();
-      const chalData = await chalResp.json();
-      if (curResp.ok && chalResp.ok) {
+      if (curResp.ok) {
         setCurrentRuns(curData.runs || []);
-        setChallengerRuns(chalData.runs || []);
-        setSelectedChallengerRun(chalData.most_recent?.id || "");
 
         // Prefer the run the challenger was actually trained from over simply
         // the newest eligible run. That is the comparison worth making: did
         // training on this data beat what that data itself produced? The
-        // endpoint reports which source it used so the label below stays honest
-        // — it is a suggestion, and either side can still be overridden.
+        // endpoint reports which source it used so the note below can say so.
+        // It is a suggestion; the picker can still override it.
         let control = curData.most_recent?.id || "";
         let source = control ? "most_recent" : "none";
         try {
@@ -417,13 +475,13 @@ export default function GovernancePanel() {
             setControlProvenance(pair);
           }
         } catch {
-          // Suggestion is optional; the manual pickers still work without it.
+          // Suggestion is optional; the picker still works without it.
           setControlProvenance(null);
         }
         setSelectedCurrentRun(control);
         setControlSource(source);
       } else {
-        setEligibleRunsError(curData.error || chalData.error || "Could not load eligible runs.");
+        setEligibleRunsError(curData.error || "Could not load eligible runs.");
       }
     } catch (e) {
       setEligibleRunsError(String(e));
@@ -437,33 +495,6 @@ export default function GovernancePanel() {
     setPromotionResult(null);
     setPromotionError(null);
   }, [modelType, fetchEligibleRuns]);
-
-  const compareRuns = useCallback(async () => {
-    if (!selectedCurrentRun || !selectedChallengerRun) return;
-    setComparing(true);
-    setComparisonError(null);
-    setPromotionResult(null);
-    setPromotionError(null);
-    try {
-      const resp = await authFetch("/api/v1/governance/compare", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model_type: modelType,
-          current_run_id: selectedCurrentRun,
-          challenger_run_id: selectedChallengerRun,
-        }),
-      });
-      const data = await resp.json();
-      if (resp.ok) setComparisonResult(data);
-      else { setComparisonResult(null); setComparisonError(data.error || `HTTP ${resp.status}`); }
-    } catch (e) {
-      setComparisonResult(null);
-      setComparisonError(String(e));
-    } finally {
-      setComparing(false);
-    }
-  }, [modelType, selectedCurrentRun, selectedChallengerRun]);
 
   const promoteChallenger = useCallback(async () => {
     if (!comparisonResult || comparisonResult.recommendation !== "promote") return;
@@ -498,12 +529,12 @@ export default function GovernancePanel() {
     setPromotionError(null);
 
     // The current (control) run is the baseline we replay the challenger
-    // against; its scenario+preset drive the challenger run so the two are
-    // comparable on the same deterministic request stream.
+    // against; its scenario, preset, seed and duration cap drive the
+    // challenger run so both sides see the same deterministic request stream.
     const controlRunId = selectedCurrentRun;
     const controlRun = currentRuns.find((r) => r.id === controlRunId);
     if (!controlRunId || !controlRun) {
-      setRetrainError("Select a current-version run to compare the retrained model against.");
+      setRetrainError("Select a baseline load test to compare the latest version against.");
       return;
     }
 
@@ -537,17 +568,14 @@ export default function GovernancePanel() {
         }
       }
 
-      // 2. Run the challenger load test against the canary at the control run's
-      //    scenario+preset.
+      // 2. Run the challenger load test against the canary on the control
+      //    run's inputs.
       setRetrainStep("Running challenger load test…");
       const startResp = await authFetch("/api/v1/loadtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          preset: controlRun.preset || "1k",
-          seed: 42,
-          duration_s: 30,
-          scenario: controlRun.scenario || "baseline",
+          ...replayInputs(controlRun).inputs,
           target_model_type: modelType,
           target_variant: "challenger",
         }),
@@ -588,7 +616,6 @@ export default function GovernancePanel() {
 
       // 4. Compare the fresh challenger run against the control run.
       setRetrainStep("Comparing…");
-      setSelectedChallengerRun(challengerRunId);
       const cmpResp = await authFetch("/api/v1/governance/compare", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -828,14 +855,52 @@ export default function GovernancePanel() {
             every run is not a "wait a few minutes" situation, and the picker
             previously looked identical in both cases. */}
         {trainEtl && trainEtl.configured && trainEtl.never_succeeded && (
-          <div className="cl-honest cl-honest-block" data-testid="governance-train-etl-broken">
-            <strong>The ETL job for {trainingModelType} has never completed successfully.</strong>{" "}
-            No run of <code>{trainEtl.job_name}</code> has ever succeeded
-            {trainEtl.consecutive_failures > 0
-              ? ` (${trainEtl.consecutive_failures} consecutive failures)`
-              : ""}
-            , so no training data exists for this model and waiting will not
-            change that.
+          <div
+            className="cl-honest cl-honest-block"
+            data-testid={trainEtl.no_input_data ? "governance-train-etl-no-input" : "governance-train-etl-broken"}
+          >
+            {/* An empty-input failure is the normal state of a new deployment
+                before any load test has run, so it gets its likely cause and
+                next step rather than reading as a broken job. */}
+            {trainEtl.no_input_data && !(trainEtl.captured_load_tests > 0) && (
+              <>
+                <strong>No training data for {trainingModelType} yet.</strong>{" "}
+                No load test has captured outcomes for this model, so{" "}
+                <code>{trainEtl.job_name}</code> has had no input to read
+                {trainEtl.consecutive_failures > 0
+                  ? ` (${trainEtl.consecutive_failures} runs failed on empty input)`
+                  : ""}
+                . This is expected on a new deployment. Run a load test targeting
+                this model; the next Glue sweep labels its outcomes and this
+                message clears.
+              </>
+            )}
+            {trainEtl.no_input_data && trainEtl.captured_load_tests > 0 && (
+              <>
+                <strong>The ETL job for {trainingModelType} found no input data.</strong>{" "}
+                {trainEtl.captured_load_tests} load{" "}
+                {trainEtl.captured_load_tests === 1 ? "test has" : "tests have"} captured
+                outcomes for this model, but <code>{trainEtl.job_name}</code> found no
+                Parquet files in the raw outcomes prefix
+                {trainEtl.consecutive_failures > 0
+                  ? ` (${trainEtl.consecutive_failures} consecutive failures)`
+                  : ""}
+                . Firehose may not have flushed them yet, or it is rejecting the
+                records; check the delivery stream's error prefix in the raw
+                outcomes bucket.
+              </>
+            )}
+            {!trainEtl.no_input_data && (
+              <>
+                <strong>The ETL job for {trainingModelType} has never completed successfully.</strong>{" "}
+                No run of <code>{trainEtl.job_name}</code> has ever succeeded
+                {trainEtl.consecutive_failures > 0
+                  ? ` (${trainEtl.consecutive_failures} consecutive failures)`
+                  : ""}
+                , so no training data exists for this model and waiting will not
+                change that.
+              </>
+            )}
             {trainEtl.last_error?.message && (
               <div
                 className="cl-etl-error-detail"
@@ -872,6 +937,26 @@ export default function GovernancePanel() {
             <span>Max cost: ${trainingEstimate.estimated_max_cost_usd.toFixed(2)}</span>
           </div>
         )}
+        <DemoDatasetPanel modelType={trainingModelType} onStatusChange={setDemoDatasetStatus} />
+        <label className="cl-train-include-demo">
+          <input
+            type="checkbox"
+            className="sg-interactive"
+            data-testid="governance-train-include-demo"
+            checked={includeDemoDataset && demoDatasetExists}
+            onChange={(e) => setIncludeDemoDataset(e.target.checked)}
+            disabled={!demoDatasetExists || trainingSubmitting}
+          />
+          Include demo dataset
+          {!demoDatasetExists ? " (no demo dataset for this model)" : ""}
+        </label>
+        {includeDemoDataset && demoDatasetExists && (
+          <div className="cl-honest cl-honest-block" data-testid="governance-train-include-demo-notice">
+            Demonstration only: the training input will include the synthetic demo dataset
+            for {trainingModelType}, and the resulting model version is labelled as trained
+            with demo data.
+          </div>
+        )}
         {trainingResult && (
           <div className="cl-train-result" data-testid="governance-train-result">
             Training started — job {trainingResult.job_name}, base version {trainingResult.base_model_version}.
@@ -885,8 +970,8 @@ export default function GovernancePanel() {
             className="btn btn-primary sg-interactive"
             data-testid="governance-train-trigger-button"
             onClick={() => setConfirmingTraining(true)}
-            disabled={!trainingEstimate || !selectedRunReady || trainingInProgress || trainingSubmitting}
-            title={selectedTrainingRun && !selectedRunReady
+            disabled={!trainingEstimate || !canTrain || trainingInProgress || trainingSubmitting}
+            title={selectedTrainingRun && !canTrain
               ? "This run's outcomes are not in the training bucket yet. The pipeline above shows which stage it is on."
               : undefined}
           >
@@ -894,9 +979,11 @@ export default function GovernancePanel() {
           </button>
         ) : (
           <div className="cl-train-confirm">
-            <span>
-              Start a real SageMaker training job for {trainingModelType}, using run {selectedTrainingRun}?
-              Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
+            <span data-testid="governance-train-confirm-text">
+              {trainWithDemoOnly
+                ? `Start a real SageMaker training job for ${trainingModelType} on the synthetic demo dataset (and any data already in its training prefix)?`
+                : `Start a real SageMaker training job for ${trainingModelType}, using run ${selectedTrainingRun}${includeDemoDataset && demoDatasetExists ? " plus the synthetic demo dataset" : ""}?`}
+              {" "}Estimated max cost ${trainingEstimate?.estimated_max_cost_usd.toFixed(2)}.
             </span>
             <button
               className="btn btn-primary sg-interactive"
@@ -934,7 +1021,7 @@ export default function GovernancePanel() {
         )}
         <div className="cl-controls-bar">
           <div className="cl-control-group">
-            <label htmlFor="cl-gov-current-run">Current version run:</label>
+            <label htmlFor="cl-gov-current-run">Baseline load test (current version):</label>
             <select
               id="cl-gov-current-run"
               className="cl-select sg-interactive"
@@ -957,6 +1044,14 @@ export default function GovernancePanel() {
                 Preselected the run this challenger was trained from.
               </div>
             )}
+            {selectedReplayMissing.length > 0 && (
+              <div className="cl-control-note" data-testid="governance-replay-legacy">
+                This run predates stored replay inputs ({selectedReplayMissing.join(", ")}).
+                The challenger run uses seed {LEGACY_REPLAY_SEED} and a{" "}
+                {LEGACY_REPLAY_DURATION_S}s cap, which may not match this run's
+                request stream. Run a new baseline load test for an exact replay.
+              </div>
+            )}
             {controlSource === "most_recent" && (
               <div className="cl-control-note" data-testid="governance-control-fallback">
                 Most recent eligible run — not necessarily the data the challenger
@@ -968,42 +1063,17 @@ export default function GovernancePanel() {
               </div>
             )}
           </div>
-          <div className="cl-control-group">
-            <label htmlFor="cl-gov-challenger-run">Challenger version run:</label>
-            <select
-              id="cl-gov-challenger-run"
-              className="cl-select sg-interactive"
-              data-testid="governance-challenger-run-select"
-              value={selectedChallengerRun}
-              onChange={(e) => setSelectedChallengerRun(e.target.value)}
-            >
-              <option value="">— select a run —</option>
-              {challengerRuns.map((r) => (
-                <option key={r.id} value={r.id}>
-                  {r.id} ({r.timestamp ? new Date(r.timestamp).toLocaleString() : "unknown time"})
-                </option>
-              ))}
-            </select>
-          </div>
+          {/* Stages the latest version as the challenger canary (yield) or uses
+              the agent-staged DLRM canary, runs a challenger load test on the
+              baseline's inputs, then compares. */}
           <button
             className="btn btn-primary sg-interactive"
-            data-testid="governance-compare-button"
-            onClick={compareRuns}
-            disabled={!selectedCurrentRun || !selectedChallengerRun || comparing || retraining}
-          >
-            {comparing ? <><span className="spinner" /> Comparing…</> : "Compare & Assess"}
-          </button>
-          {/* One-click: stage the retrained model as the challenger canary
-              (yield) or use the agent-staged DLRM canary, run a challenger load
-              test at the current run's scenario+preset, then compare. */}
-          <button
-            className="btn btn-secondary sg-interactive"
             data-testid="governance-compare-retrained-button"
             onClick={compareRetrained}
-            disabled={!selectedCurrentRun || comparing || retraining}
-            title="Run the retrained model against the selected current run and compare"
+            disabled={!selectedCurrentRun || retraining}
+            title="Load test the latest version on the baseline's inputs and compare"
           >
-            {retraining ? <><span className="spinner" /> {retrainStep || "Working…"}</> : "Compare current vs. retrained"}
+            {retraining ? <><span className="spinner" /> {retrainStep || "Working…"}</> : "Compare & Assess"}
           </button>
         </div>
 

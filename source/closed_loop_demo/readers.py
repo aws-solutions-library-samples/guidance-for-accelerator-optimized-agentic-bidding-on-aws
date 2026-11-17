@@ -139,10 +139,19 @@ def _version_detail(sagemaker_client, model_package_arn: Optional[str]) -> dict:
             "training_run_id": None,
             "training_data": None,
             "fingerprint": None,
+            "includes_demo_dataset": False,
+            "demo_dataset_generated_at": None,
         }
     detail = _describe(sagemaker_client, model_package_arn)
     metadata = detail.get("CustomerMetadataProperties") or {}
     return {
+        # Whether the training job's input included the Governance page's
+        # synthetic demo dataset, and when that dataset was generated. Set on
+        # the training job by orchestrator/training_trigger.py and copied here
+        # by the registration Lambda. The UI labels such versions as trained
+        # with demo data.
+        "includes_demo_dataset": str(metadata.get("includes_demo_dataset", "")).lower() == "true",
+        "demo_dataset_generated_at": metadata.get("demo_dataset_generated_at") or None,
         # What the version was trained on, as registered: "sample" for the Deal
         # Scorer trained at deploy time on interactions generated from the deal
         # book (deployment/scripts/register_genesis_models.py). None when the

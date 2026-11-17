@@ -224,6 +224,45 @@ class TestRunLoadTestDealYieldWiring:
         assert status.outcome_sample_count == 0
         assert status.outcome_samples == []
 
+    def test_seed_and_duration_are_recorded_in_status_and_history(self, monkeypatch):
+        """The Governance compare flow replays a baseline run's seed and duration
+        cap for the challenger run, so both must reach the persisted record."""
+        fake_containers = [{"name": "yield-optimizer-floor", "intents": {"ADJUST_DEAL_FLOOR"}}]
+
+        async def fake_call_container_timed(client, container, payload, payload_bytes, timeout_s, headers=None):
+            return _make_invocation("yield-optimizer-floor", mutations=[], model_version="deal-yield-floor-xgboost-v1")
+
+        monkeypatch.setattr(
+            loadtest, "_get_app_deps",
+            lambda: (fake_containers, fake_call_container_timed, lambda intents: fake_containers),
+        )
+        monkeypatch.setattr(loadtest, "emit_load_test_deal_yield_outcome", MagicMock(return_value=[]))
+        monkeypatch.setattr(loadtest, "_LOADTEST_TABLE", "")
+
+        asyncio.run(
+            loadtest._run_load_test(
+                "test-dy-seed", "100", seed=7, duration_s=5,
+                target_model_type="deal_yield_manager_floor", target_variant="current",
+            )
+        )
+
+        status = loadtest._active_tests["test-dy-seed"]
+        assert status.seed == 7
+        assert status.duration_s == 5
+        saved = next(r for r in loadtest._history_cache if r["id"] == "test-dy-seed")
+        assert saved["seed"] == 7
+        assert saved["duration_s"] == 5
+
+    def test_records_without_seed_or_duration_still_load(self):
+        """History written before these fields existed has neither key."""
+        status = loadtest.LoadTestStatus(
+            id="lt-old", state="complete", preset="1k", total_requests=1, completed=1,
+            errors=0, elapsed_ms=1.0, rps=1.0, latency_p50=0, latency_p95=0, latency_p99=0,
+            latency_min=0, latency_avg=0, latency_max=0, histogram={}, per_container=[],
+        )
+        assert status.seed is None
+        assert status.duration_s is None
+
     def test_multiple_mutations_per_request_are_all_counted(self, monkeypatch):
         """One request can still carry several mutations from a single yield
         container -- one per PMP deal it adjusts -- and every one must be
@@ -361,3 +400,109 @@ class TestGetLoadtestLiveProgress:
     def test_unknown_test_is_404(self):
         response = asyncio.run(loadtest.get_loadtest(self._request("lt-missing")))
         assert response.status_code == 404
+
+
+class TestPacedPreset:
+    """FR3.1 to FR3.5, NFR4: the 60k-paced preset starts requests at a fixed
+    rate for a fixed window; the back-to-back presets are unchanged."""
+
+    _CONTAINER = {"name": "dlrm-bid-shader", "intents": {"BID_SHADE"}}
+
+    def _stub(self, monkeypatch, latency_s: float, starts: list, payloads: list | None = None):
+        import time as _time
+
+        async def fake_call(client, container, payload, payload_bytes, timeout_s, headers=None):
+            starts.append(_time.monotonic())
+            if payloads is not None:
+                payloads.append(payload)
+            await asyncio.sleep(latency_s)
+            return _make_invocation(self._CONTAINER["name"])
+
+        monkeypatch.setattr(
+            loadtest, "_get_app_deps",
+            lambda: ([self._CONTAINER], fake_call, lambda intents: [self._CONTAINER]),
+        )
+        monkeypatch.setattr(loadtest, "_LOADTEST_TABLE", "")
+
+    def test_existing_presets_are_unchanged(self):
+        assert loadtest.PRESET_CONFIG["100"] == {"total": 100, "concurrency": 10}
+        assert loadtest.PRESET_CONFIG["1k"] == {"total": 1_000, "concurrency": 25}
+        assert loadtest.PRESET_CONFIG["10k"] == {"total": 10_000, "concurrency": 50}
+        assert loadtest.PRESET_CONFIG["100k"] == {"total": 100_000, "concurrency": 100}
+        assert loadtest.PRESET_CONFIG["60k-paced"] == {
+            "total": 60_000, "concurrency": 100, "rate_per_s": 100, "duration_s": 600,
+        }
+
+    def test_paced_preset_is_accepted_and_duration_forced_to_600(self, monkeypatch):
+        monkeypatch.setattr(loadtest, "any_peer_running", AsyncMock(return_value=None))
+        monkeypatch.setattr(loadtest, "_run_load_test", AsyncMock(return_value=None))
+        monkeypatch.setattr(loadtest, "_active_task", None)
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"preset": "60k-paced", "seed": 3, "duration_s": 30})
+
+        response = asyncio.run(loadtest.start_loadtest(request))
+
+        assert response.status_code == 202
+        test_id = __import__("json").loads(response.body)["id"]
+        status = loadtest._active_tests[test_id]
+        assert status.duration_s == 600
+        assert status.total_requests == 60_000
+        assert status.target_rps == 100.0
+        assert loadtest._run_load_test.call_args.args[3] == 600
+        monkeypatch.setattr(loadtest, "_active_task", None)
+
+    def test_paced_run_spreads_requests_across_the_window(self, monkeypatch):
+        monkeypatch.setitem(
+            loadtest.PRESET_CONFIG, "60k-paced",
+            {"total": 50, "concurrency": 100, "rate_per_s": 50, "duration_s": 1},
+        )
+        starts: list = []
+        payloads: list = []
+        self._stub(monkeypatch, latency_s=0.01, starts=starts, payloads=payloads)
+
+        asyncio.run(loadtest._run_load_test("lt-paced-ok", "60k-paced", seed=5, duration_s=1))
+
+        status = loadtest._active_tests["lt-paced-ok"]
+        assert status.completed == 50 == len(starts)
+        assert status.errors == 0
+        assert status.target_rps == 50.0
+        # 50 starts at 50/s span about 0.98 s rather than arriving in one batch.
+        assert 0.85 <= max(starts) - min(starts) <= 1.1
+        assert 45 <= status.rps <= 55  # NFR4: within 10% of the target rate
+
+        # Lazy generation gives the same request stream as pre-generating.
+        import random as _random
+
+        rng = _random.Random(5)
+        profile = loadtest.get_traffic_profile(loadtest.DEFAULT_SCENARIO)
+        expected = [loadtest.generate_payload(rng, i, profile) for i in range(50)]
+        assert payloads == expected
+
+    def test_slow_containers_stop_at_the_deadline_without_counting_unsent(self, monkeypatch):
+        monkeypatch.setitem(
+            loadtest.PRESET_CONFIG, "60k-paced",
+            {"total": 50, "concurrency": 2, "rate_per_s": 50, "duration_s": 1},
+        )
+        starts: list = []
+        self._stub(monkeypatch, latency_s=0.3, starts=starts)
+
+        asyncio.run(loadtest._run_load_test("lt-paced-slow", "60k-paced", seed=5, duration_s=1))
+
+        status = loadtest._active_tests["lt-paced-slow"]
+        assert status.total_requests == 50
+        assert 2 <= status.completed < 50
+        assert status.completed == len(starts)
+        assert status.rps < 50
+
+    def test_batch_presets_report_no_target_rate(self, monkeypatch):
+        starts: list = []
+        self._stub(monkeypatch, latency_s=0.0, starts=starts)
+        asyncio.run(loadtest._run_load_test("lt-batch", "100", seed=1, duration_s=5))
+        status = loadtest._active_tests["lt-batch"]
+        assert status.completed == 100
+        assert status.target_rps is None
+
+    def test_request_model_accepts_paced_preset(self):
+        assert LoadTestRequest(preset="60k-paced").preset == "60k-paced"
+        with pytest.raises(Exception):
+            LoadTestRequest(preset="60k")

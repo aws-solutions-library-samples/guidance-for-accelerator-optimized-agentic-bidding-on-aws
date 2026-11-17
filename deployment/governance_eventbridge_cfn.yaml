@@ -802,6 +802,12 @@ Resources:
                   # originating run. NOT a claim that the job trained only on
                   # that run: the input is the whole training-data prefix.
                   'load_test_run_id': _provenance('load_test_run_id'),
+                  # "true" when the job's input included the Governance page's
+                  # synthetic demo dataset, with that dataset's generation time
+                  # (orchestrator/training_trigger.py). Empty otherwise. The
+                  # registry view labels such versions as trained with demo data.
+                  'includes_demo_dataset': _provenance('includes_demo_dataset'),
+                  'demo_dataset_generated_at': _provenance('demo_dataset_generated_at'),
               }
               for metric_name, value in metrics.items():
                   customer_metadata[f'metric_{metric_name}'] = str(value)

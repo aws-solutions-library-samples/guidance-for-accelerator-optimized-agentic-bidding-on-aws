@@ -179,6 +179,71 @@ display_name() {
   esac
 }
 
+# is_arm64_image KEY: exit 0 for the image keys built for linux/arm64 (they back
+# AgentCore runtimes, which are arm64-only), 1 for every other key. Keep in step
+# with the arm64 blocks in codebuild/buildspec.yml and remote_build.sh's
+# arm64-only check. Step 4 uses it to send arm64 images to the Graviton CodeBuild
+# project and the rest to the x86 one, so neither build needs QEMU emulation.
+is_arm64_image() {
+  case "$1" in
+    agentcore|adaptive-bidding-agent|model-promotion-governance-agent) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# remote_build_group ARCH KEY...: one remote_build.sh run (CodeBuild) for KEYs.
+# Reads HASH_KEYS/HASH_VALS (src-<hash> tag per key), NGC_FLAG, STACK_NAME,
+# IMAGE_TAG, AWS_REGION, AWS_PROFILE and SCRIPT_DIR from build_images' scope.
+# Only this group's src- tag pairs are sent: the buildspec tags what this run
+# built, and a pair for an image it did not build is only a warning there.
+# Returns remote_build.sh's exit status.
+remote_build_group() {
+  local arch="$1"; shift
+  local pairs="" i k
+  for i in "${!HASH_KEYS[@]}"; do
+    for k in "$@"; do
+      if [[ "${HASH_KEYS[$i]}" == "${k}" ]]; then
+        pairs+="${STACK_NAME}-$(display_name "${k}")=${HASH_VALS[$i]} "
+      fi
+    done
+  done
+  local src_tags_flag=()
+  if [[ -n "${pairs}" ]]; then src_tags_flag=(--src-tags "${pairs% }"); fi
+  # remote_build.sh narrates on stderr and polls CodeBuild every 15 s; all of
+  # that is in the detail log. The terminal shows one label per group.
+  run_step "CodeBuild (${arch}): $# image(s), tag ${IMAGE_TAG}" \
+    bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
+      --stack-name "${STACK_NAME}" \
+      --only "$*" \
+      --tag "${IMAGE_TAG}" \
+      --region "${AWS_REGION}" \
+      --profile "${AWS_PROFILE}" \
+      ${src_tags_flag[@]+"${src_tags_flag[@]}"} \
+      ${NGC_FLAG[@]+"${NGC_FLAG[@]}"}
+      # ^ bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`, so a
+      #   plain "${NGC_FLAG[@]}" aborts the run when no NGC flag was given.
+}
+
+# remote_build_by_arch KEY...: build KEYs in CodeBuild, one run per architecture.
+# A single mixed build goes to the x86 project, which cross-compiles the arm64
+# image with QEMU and pulls multiarch/qemu-user-static from Docker Hub
+# anonymously; CodeBuild's shared egress regularly hits Docker Hub's rate limit
+# there and the whole build fails in PRE_BUILD. remote_build.sh sends an
+# arm64-only --only list to the Graviton project, which builds natively, and the
+# buildspec skips QEMU for an amd64-only list. The amd64 group runs first. A
+# failed group returns its status at once, so the other group does not start and
+# build_images' caller stops under set -e; images from a group that finished keep
+# their src- tags, so the next run rebuilds only what is still missing.
+remote_build_by_arch() {
+  local x86=() arm=() key
+  for key in "$@"; do
+    if is_arm64_image "${key}"; then arm+=("${key}"); else x86+=("${key}"); fi
+  done
+  if [[ ${#x86[@]} -gt 0 ]]; then remote_build_group amd64 "${x86[@]}" || return $?; fi
+  if [[ ${#arm[@]} -gt 0 ]]; then remote_build_group arm64 "${arm[@]}" || return $?; fi
+  return 0
+}
+
 # =========================================================================
 # "Was this explicitly given?" markers, for remembered inputs
 # =========================================================================
@@ -431,7 +496,7 @@ fi
 # which routes to all commercial regions and works from any source region.
 # Overridable via BEDROCK_MODEL_ID / --model-id.
 if [[ -z "${BEDROCK_MODEL_ID}" ]]; then
-  BEDROCK_MODEL_ID="global.anthropic.claude-opus-4-8"
+  BEDROCK_MODEL_ID="global.anthropic.claude-opus-5-5"
 fi
 # Per-agent overrides fall back to the shared model id (mirrors deploy_closed_loop.sh).
 ADAPTIVE_BIDDING_MODEL_ID="${ADAPTIVE_BIDDING_MODEL_ID:-${BEDROCK_MODEL_ID}}"
@@ -1474,13 +1539,25 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   # for completion so the ENIs are gone before eksctl runs.
   # The UI API proxy Lambda (Part 1) has the same VPC-attached ENIs, so it goes
   # at the same point for the same reason.
+  # Both functions use the same security group and subnets, so Lambda shares one
+  # set of Hyperplane ENIs between them. Issue both deletes before waiting on
+  # either: a sequential delete-then-wait blocks on ENIs the other function still
+  # holds, until the 60-minute waiter times out.
+  _vpc_lambda_deleting=()
   for _vpc_lambda_stack in "${UI_API_PROXY_STACK}" "${VPC_PROXY_STACK}"; do
     if aws cloudformation describe-stacks --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" >/dev/null 2>&1; then
       say "Deleting VPC-attached Lambda stack (${_vpc_lambda_stack}) before the EKS cluster..."
       aws cloudformation delete-stack --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" 2>/dev/null || true
-      aws cloudformation wait stack-delete-complete --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" 2>/dev/null || true
+      _vpc_lambda_deleting+=("${_vpc_lambda_stack}")
     fi
   done
+  if (( ${#_vpc_lambda_deleting[@]} > 0 )); then
+    say "  Waiting for Lambda to release the shared VPC ENIs (can take up to ~20 minutes)..."
+    for _vpc_lambda_stack in "${_vpc_lambda_deleting[@]}"; do
+      aws cloudformation wait stack-delete-complete --stack-name "${_vpc_lambda_stack}" --region "${AWS_REGION}" 2>/dev/null \
+        || warn "  ${_vpc_lambda_stack} did not finish deleting; check: aws cloudformation describe-stack-events --stack-name ${_vpc_lambda_stack}"
+    done
+  fi
 
   say "Deleting EKS cluster ${CLUSTER_NAME}..."
   # Disable termination protection on eksctl-managed stacks first, in case
@@ -1503,6 +1580,7 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   eksctl delete iamserviceaccount --name triton-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
   eksctl delete iamserviceaccount --name model-optimizer-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
   eksctl delete iamserviceaccount --name deal-scorer-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
+  eksctl delete iamserviceaccount --name bid-pricer-sa --namespace default --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" 2>/dev/null || true
   eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --wait 2>/dev/null || true
 
   say "Deleting Triton model bucket..."
@@ -1552,10 +1630,12 @@ if [[ "${DESTROY}" -eq 1 ]]; then
   CLOSED_LOOP_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${CLOSED_LOOP_POLICY_NAME}"
   DEAL_SCORER_POLICY_NAME="${STACK_NAME}-deal-scorer-deals-read-${STACK_UID}"
   DEAL_SCORER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${DEAL_SCORER_POLICY_NAME}"
+  BID_PRICER_POLICY_NAME="${STACK_NAME}-bid-pricer-params-read-${STACK_UID}"
+  BID_PRICER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${BID_PRICER_POLICY_NAME}"
 
   # model-optimizer-s3 (Step 7.1's IRSA policy) was missing from this cleanup —
   # every other IRSA/orchestrator policy Step 7/7.5/7.6/9 creates was already here.
-  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${OPTIMIZER_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}" "${CLOSED_LOOP_POLICY_ARN}" "${DEAL_SCORER_POLICY_ARN}"; do
+  for POLICY_ARN in "${TRITON_POLICY_ARN}" "${OPTIMIZER_POLICY_ARN}" "${DYNAMO_POLICY_ARN}" "${EKS_SCALE_POLICY_ARN}" "${CLOSED_LOOP_POLICY_ARN}" "${DEAL_SCORER_POLICY_ARN}" "${BID_PRICER_POLICY_ARN}"; do
     # Detach from all entities before deletion
     for ENTITY in $(aws iam list-entities-for-policy --policy-arn "${POLICY_ARN}" --query 'PolicyRoles[].RoleName' --output text 2>/dev/null); do
       aws iam detach-role-policy --role-name "${ENTITY}" --policy-arn "${POLICY_ARN}" 2>/dev/null || true
@@ -2695,12 +2775,21 @@ from shared import dlrm_features
 print(dlrm_features.FEATURE_SPEC_VERSION)
 ")" || fail "Could not read FEATURE_SPEC_VERSION from source/shared/dlrm_features.py"
 log "  DLRM feature spec version: ${FEATURE_SPEC_VERSION}"
+# Same idea for the Deal Scorer: the version of the id hash in shared/ncf_ids.py.
+NCF_ID_HASH_VERSION="$("${PYTHON}" -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}/../source')
+from shared import ncf_ids
+print(ncf_ids.ID_HASH_VERSION)
+")" || fail "Could not read ID_HASH_VERSION from source/shared/ncf_ids.py"
+log "  Deal Scorer id hash version: ${NCF_ID_HASH_VERSION}"
 BOOTSTRAP_TMP="$(mktemp)"
 sed -e "s|__MODEL_BUCKET__|${MODEL_BUCKET}|g" \
     -e "s|__FEATURE_SPEC_VERSION__|${FEATURE_SPEC_VERSION}|g" \
+    -e "s|__NCF_ID_HASH_VERSION__|${NCF_ID_HASH_VERSION}|g" \
   "${SCRIPT_DIR}/optimizer-bootstrap.json" > "${BOOTSTRAP_TMP}"
-grep -q '__FEATURE_SPEC_VERSION__' "${BOOTSTRAP_TMP}" \
-  && fail "optimizer-bootstrap.json still has an unsubstituted __FEATURE_SPEC_VERSION__"
+grep -q -E '__(FEATURE_SPEC|NCF_ID_HASH)_VERSION__' "${BOOTSTRAP_TMP}" \
+  && fail "optimizer-bootstrap.json still has an unsubstituted version placeholder"
 quiet "s3 cp optimizer bootstrap spec" \
   aws s3 cp "${BOOTSTRAP_TMP}" \
     "s3://${MODEL_BUCKET}/optimizer-bootstrap/spec.json" --region "${AWS_REGION}"
@@ -3010,29 +3099,10 @@ build_images() {
     NGC_FLAG=()
     if [[ -n "${NGC_KEY}" ]]; then NGC_FLAG=(--ngc-key "${NGC_KEY}")
     elif [[ -n "${NGC_SECRET}" ]]; then NGC_FLAG=(--ngc-secret "${NGC_SECRET}"); fi
-    # CodeBuild adds the src-<hash> tags itself once every image is pushed, so a
-    # deploy.sh killed while waiting below still leaves the cache populated and
-    # the next run reuses those images. The client-side tagging loop after the
-    # build stays as the fallback and is a no-op when the tags already exist.
-    _SRC_TAG_PAIRS=""
-    for i in "${!HASH_KEYS[@]}"; do
-      _SRC_TAG_PAIRS+="${STACK_NAME}-$(display_name "${HASH_KEYS[$i]}")=${HASH_VALS[$i]} "
-    done
-    SRC_TAGS_FLAG=()
-    if [[ -n "${_SRC_TAG_PAIRS}" ]]; then SRC_TAGS_FLAG=(--src-tags "${_SRC_TAG_PAIRS% }"); fi
-    # remote_build.sh narrates on stderr and polls CodeBuild every 15 s; all of that is
-    # in the detail log. The terminal shows this one label until the build finishes.
-    run_step "CodeBuild: ${#MISSING_KEYS[@]} image(s), tag ${IMAGE_TAG}" \
-      bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
-        --stack-name "${STACK_NAME}" \
-        --only "${MISSING_KEYS[*]}" \
-        --tag "${IMAGE_TAG}" \
-        --region "${AWS_REGION}" \
-        --profile "${AWS_PROFILE}" \
-        ${SRC_TAGS_FLAG[@]+"${SRC_TAGS_FLAG[@]}"} \
-        ${NGC_FLAG[@]+"${NGC_FLAG[@]}"}
-        # ^ bash 3.2 (macOS) treats an EMPTY array as unbound under `set -u`, so a
-        #   plain "${NGC_FLAG[@]}" aborts the run when no NGC flag was given.
+    # One CodeBuild run per architecture; see remote_build_by_arch. CodeBuild adds
+    # the src-<hash> tags itself once a run's images are pushed; the client-side
+    # tagging loop after the builds stays as the fallback.
+    remote_build_by_arch "${MISSING_KEYS[@]}"
   else
     step "Step 4: Building changed images locally (tag=${IMAGE_TAG}): ${MISSING_KEYS[*]}"
     quiet "ECR login (${REGISTRY})" _ecr_docker_login
@@ -3486,6 +3556,10 @@ fi
 #   - emits synthetic input metrics and reads market metrics (CloudWatch)
 #   - reads/writes the DynamoDB Parameter Store + Audit Trail (KMS-encrypted)
 #   - lists/describes SageMaker model package versions
+#   - writes and replaces the Governance page's demo training datasets and the
+#     per-job ManifestFile that includes one in training (the three demo-*
+#     prefixes and training-manifests/ in the SSE-KMS training-data bucket),
+#     and lists the training prefixes to build that manifest
 # These stores are created by deploy_closed_loop.sh; the policy is scoped by
 # name/ARN patterns so it is valid whether or not a stack prefix is used.
 step "Step 7.7: Ensuring closed-loop (Part 2) access for orchestrator"
@@ -3513,6 +3587,9 @@ CLOSED_LOOP_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[\
 {\"Sid\":\"PassSageMakerTrainingRole\",\"Effect\":\"Allow\",\"Action\":[\"iam:PassRole\"],\"Resource\":\"arn:aws:iam::${ACCOUNT_ID}:role/${SAGEMAKER_TRAINING_ROLE_NAME}\",\"Condition\":{\"StringEquals\":{\"iam:PassedToService\":\"sagemaker.amazonaws.com\"}}},\
 {\"Sid\":\"PromoteFromGovernanceUI\",\"Effect\":\"Allow\",\"Action\":[\"sagemaker:UpdateModelPackage\"],\"Resource\":[\"arn:aws:sagemaker:${AWS_REGION}:${ACCOUNT_ID}:model-package/*artf-*/*\"]},\
 {\"Sid\":\"TritonModelRepoReadWrite\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::${MODEL_BUCKET}\",\"arn:aws:s3:::${MODEL_BUCKET}/triton-models/*\"]},\
+{\"Sid\":\"DemoTrainingDataReadWrite\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":[\"arn:aws:s3:::${TRAINING_DATA_BUCKET}/demo-training-data/*\",\"arn:aws:s3:::${TRAINING_DATA_BUCKET}/demo-training-data-deal-yield-floor/*\",\"arn:aws:s3:::${TRAINING_DATA_BUCKET}/demo-training-data-deal-yield-margin/*\",\"arn:aws:s3:::${TRAINING_DATA_BUCKET}/training-manifests/*\"]},\
+{\"Sid\":\"TrainingDataListForDemoManifest\",\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":\"arn:aws:s3:::${TRAINING_DATA_BUCKET}\",\"Condition\":{\"StringLike\":{\"s3:prefix\":[\"demo-training-data/*\",\"demo-training-data-deal-yield-floor/*\",\"demo-training-data-deal-yield-margin/*\",\"training-data/*\",\"training-data-deal-yield-floor/*\",\"training-data-deal-yield-margin/*\"]}}},\
+{\"Sid\":\"KmsForTrainingDataBucket\",\"Effect\":\"Allow\",\"Action\":[\"kms:Decrypt\",\"kms:GenerateDataKey\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":[\"s3.${AWS_REGION}.amazonaws.com\"]}}},\
 {\"Sid\":\"KmsForDynamoDb\",\"Effect\":\"Allow\",\"Action\":[\"kms:Decrypt\",\"kms:GenerateDataKey\",\"kms:DescribeKey\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":[\"dynamodb.${AWS_REGION}.amazonaws.com\"]}}}\
 ]}"
 
@@ -3708,6 +3785,56 @@ log "  Check status any time: kubectl get job model-optimizer-bootstrap  |  cat 
 # GPU node for a bit longer than before, in exchange for not blocking the rest
 # of the deploy on the bootstrap Job.
 
+# =========================================================================
+# Step 8a.1: IRSA for the Bid Pricer (parameter-store read)
+# In Phase 3, next to the manifest apply that names bid-pricer-sa, so an upgrade
+# that skips Phase 2 still creates the service account before the pod needs it.
+# The Bid Pricer reads shade_factor and conversion_value from the Part 2
+# parameter store (through a 60-second cache), which is how the Adaptive Bidding
+# Agent's updates reach the bid path. Read-only on that one table, plus the
+# cache's sustained-read-error metric in its own namespace.
+# =========================================================================
+step "Step 8a.1: Ensuring IRSA for the Bid Pricer parameter-store read"
+BID_PRICER_PARAM_TABLE="${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store"
+BID_PRICER_POLICY_NAME="${STACK_NAME}-bid-pricer-params-read-${STACK_UID}"
+BID_PRICER_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${BID_PRICER_POLICY_NAME}"
+BID_PRICER_POLICY_DOC="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"ParameterStoreRead\",\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\"],\"Resource\":\"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${BID_PRICER_PARAM_TABLE}\"},{\"Sid\":\"ParameterCacheMetric\",\"Effect\":\"Allow\",\"Action\":[\"cloudwatch:PutMetricData\"],\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"cloudwatch:namespace\":\"ARTF/ParameterCache\"}}}]}"
+if aws iam get-policy --policy-arn "${BID_PRICER_POLICY_ARN}" >/dev/null 2>&1; then
+  update_managed_policy "${BID_PRICER_POLICY_ARN}" "${BID_PRICER_POLICY_NAME}" "${BID_PRICER_POLICY_DOC}"
+else
+  aws iam create-policy \
+    --policy-name "${BID_PRICER_POLICY_NAME}" \
+    --policy-document "${BID_PRICER_POLICY_DOC}" >/dev/null
+fi
+quiet "eksctl create iamserviceaccount bid-pricer-sa" \
+  eksctl create iamserviceaccount \
+    --name bid-pricer-sa \
+    --namespace default \
+    --cluster "${CLUSTER_NAME}" \
+    --region "${AWS_REGION}" \
+    --attach-policy-arn "${BID_PRICER_POLICY_ARN}" \
+    --approve \
+    --override-existing-serviceaccounts || true
+BID_PRICER_ROLE_ARN=""
+for attempt in $(seq 1 10); do
+  BID_PRICER_ROLE_ARN="$(kubectl get sa bid-pricer-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo '')"
+  [[ -n "${BID_PRICER_ROLE_ARN}" ]] && break
+  sleep 3
+done
+if [[ -z "${BID_PRICER_ROLE_ARN}" ]]; then
+  # Fatal: the Bid Pricer pod names this service account, so without it the pod
+  # is never created.
+  fail "Bid Pricer IRSA role annotation did not populate after 30s. If bid-pricer-sa's ServiceAccount is missing from the cluster but its CFN stack (eksctl-${CLUSTER_NAME}-addon-iamserviceaccount-default-bid-pricer-sa) still exists, eksctl will not recreate it automatically. Fix by deleting that CFN stack first, or manually: kubectl annotate sa bid-pricer-sa eks.amazonaws.com/role-arn=<role-arn> --overwrite"
+fi
+log "  Bid Pricer IRSA role: ${BID_PRICER_ROLE_ARN}"
+# The table exists only when Part 2 is deployed. Without it the pod is given no
+# table name and prices with its built-in defaults.
+if [[ "${WITH_RETRAINING}" == "1" ]]; then
+  BID_PRICER_PARAMETER_STORE_TABLE="${BID_PRICER_PARAM_TABLE}"
+else
+  BID_PRICER_PARAMETER_STORE_TABLE=""
+fi
+
 # Step 8b: apply Triton + ARTF containers + orchestrator. The Model Optimizer is
 # NOT here anymore (on-demand Jobs only). ARTF model containers default to the CPU
 # node group (role=services) since they call Triton over the network and hold no
@@ -3726,6 +3853,7 @@ for manifest in "${_APPLIED_MANIFESTS[@]}"; do
       -e "s|__COGNITO_USER_POOL_ID__|${COGNITO_USER_POOL_ID:-}|g" \
       -e "s|__ARTF_MUTATIONS_REQUIRED_SCOPE__|${ARTF_MUTATIONS_REQUIRED_SCOPE}|g" \
       -e "s|__PARAMETER_STORE_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}parameter-store|g" \
+      -e "s|__BID_PRICER_PARAMETER_STORE_TABLE__|${BID_PRICER_PARAMETER_STORE_TABLE}|g" \
       -e "s|__AUDIT_TRAIL_TABLE__|${STACK_PREFIX:+${STACK_PREFIX}-}audit-trail|g" \
       -e "s|__CONTAINER_REGISTRY_TABLE__|${CONTAINER_REGISTRY_TABLE}|g" \
       -e "s|__DLRM_MODEL_GROUP__|${STACK_PREFIX:+${STACK_PREFIX}-}artf-dlrm-bid-shader|g" \
@@ -3747,9 +3875,14 @@ for manifest in "${_APPLIED_MANIFESTS[@]}"; do
       -e "s|__GLUE_JOB_NAME__|${GLUE_JOB_NAME}|g" \
       -e "s|__DEAL_YIELD_GLUE_JOB_NAME__|${DEAL_YIELD_GLUE_JOB_NAME}|g" \
       -e "s|__NCF_MODEL_LABEL__|${NCF_MODEL_LABEL}|g" \
+      -e "s|__MAX_GPUS__|${MAX_GPUS}|g" \
       "${SCRIPT_DIR}/eks/${manifest}" > "${PROCESSED}"
   grep -q '__NCF_MODEL_LABEL__' "${PROCESSED}" \
     && fail 3 "${manifest} still has an unsubstituted __NCF_MODEL_LABEL__"
+  # triton-hpa.yaml's maxReplicas: an unsubstituted value is not an integer and
+  # the HPA would be rejected, so stop here with the cause instead.
+  grep -q '__MAX_GPUS__' "${PROCESSED}" \
+    && fail 3 "${manifest} still has an unsubstituted __MAX_GPUS__"
   quiet "kubectl apply ${manifest}" kubectl apply -f "${PROCESSED}"
 done
 log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"

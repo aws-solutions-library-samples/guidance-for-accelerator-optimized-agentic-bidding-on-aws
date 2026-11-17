@@ -120,7 +120,7 @@ _MODEL_TYPE_TO_CONTAINER_NAME = {
 
 
 class LoadTestRequest(BaseModel):
-    preset: Literal["100", "1k", "10k", "100k"]
+    preset: Literal["100", "1k", "10k", "100k", "60k-paced"]
     seed: int = 42
     duration_s: int = 30  # max duration in seconds; test stops after this even if not all requests sent
     # target_model_type/target_variant: optional (default preserves the
@@ -180,6 +180,14 @@ class LoadTestStatus(BaseModel):
     # Traffic scenario this run used (see TrafficProfile). Recorded so history
     # and comparisons can show which demand shape a run exercised.
     scenario: str = "baseline"
+    # The request's seed and duration cap. With scenario and preset they fully
+    # determine the request stream, so a challenger run can replay a baseline's
+    # inputs exactly. None on records written before these were stored.
+    seed: int | None = None
+    duration_s: int | None = None
+    # The request rate a paced preset aims for (FR3.3); None for the
+    # back-to-back presets. rps above is what the run achieved.
+    target_rps: float | None = None
     canary_supported: bool = False
     canary_staged: bool = False
     # outcome_sample_count: how many BidShadingOutcomeEvents were actually emitted
@@ -206,7 +214,15 @@ PRESET_CONFIG = {
     "1k": {"total": 1_000, "concurrency": 25},
     "10k": {"total": 10_000, "concurrency": 50},
     "100k": {"total": 100_000, "concurrency": 100},
+    # Paced (FR3): starts requests at rate_per_s for duration_s instead of
+    # sending batches back to back, so the autoscalers have time to act.
+    # concurrency bounds the requests in flight at once.
+    "60k-paced": {"total": 60_000, "concurrency": 100, "rate_per_s": 100, "duration_s": 600},
 }
+
+
+def _is_paced(config: dict) -> bool:
+    return "rate_per_s" in config
 
 # Intents that trigger a full fan-out across all containers. Includes
 # ADJUST_DEAL_FLOOR/ADJUST_DEAL_MARGIN so both yield containers are actually
@@ -800,6 +816,63 @@ async def _scale_down_after_delay(delay_s: int = 120) -> None:
 
 # ---------------------------------------------------------------------------
 
+async def _dispatch_paced(
+    execute,
+    next_payload,
+    *,
+    total: int,
+    rate_per_s: float,
+    concurrency: int,
+    start_time: float,
+    deadline: float,
+    is_cancelled,
+) -> int:
+    """Start up to ``total`` requests at ``rate_per_s`` (FR3.3). Returns how many started.
+
+    Request ``i`` is due at ``start_time + i / rate_per_s``. A request that is
+    late (every slot in flight, or the loop fell behind) starts as soon as a
+    slot frees, so the run catches up instead of dropping it. No request starts
+    at or after ``deadline`` or once the run is cancelled; requests already in
+    flight finish. ``concurrency`` bounds requests in flight.
+
+    ``execute(index, payload)`` returns an awaitable that records its own
+    outcome; ``next_payload(index)`` is called once per started request, in
+    index order.
+    """
+    slots = asyncio.Semaphore(concurrency)
+    in_flight: set[asyncio.Task] = set()
+
+    async def _run(index: int, payload: dict) -> None:
+        try:
+            await execute(index, payload)
+        finally:
+            slots.release()
+
+    started = 0
+    try:
+        for index in range(total):
+            delay = start_time + index / rate_per_s - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await slots.acquire()
+            if time.monotonic() >= deadline or is_cancelled():
+                slots.release()
+                break
+            task = asyncio.create_task(_run(index, next_payload(index)))
+            in_flight.add(task)
+            task.add_done_callback(in_flight.discard)
+            started += 1
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
+    except asyncio.CancelledError:
+        # The run was cancelled from outside (cancel_loadtest): stop the
+        # requests this loop started rather than leaving them running.
+        for task in in_flight:
+            task.cancel()
+        raise
+    return started
+
+
 async def _run_load_test(
     test_id: str,
     preset: str,
@@ -861,8 +934,11 @@ async def _run_load_test(
     start_time = _progress_start_time[test_id]
     deadline = start_time + duration_s  # absolute monotonic deadline
 
+    paced = _is_paced(config)
     # Pre-generate all payloads for reproducibility, shaped by the scenario.
-    payloads = [generate_payload(rng, i, profile) for i in range(total)]
+    # The paced preset draws them lazily from the same RNG in the same order,
+    # which gives the same stream without holding 60,000 payloads in memory.
+    payloads = [] if paced else [generate_payload(rng, i, profile) for i in range(total)]
 
     # Get all containers (full fan-out since applicable_intents includes all)
     active_containers = _filter_containers(ALL_INTENTS)
@@ -1006,18 +1082,30 @@ async def _run_load_test(
             timeout=httpx.Timeout(10.0, connect=5.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
         ) as client:
-            batch_size = concurrency
-            for i in range(0, total, batch_size):
-                # Check deadline and cancel flag before each batch
-                if time.monotonic() > deadline:
-                    break
-                if _cancel_flags.get(test_id, False):
-                    break
+            if paced:
+                await _dispatch_paced(
+                    lambda index, payload: _execute_single(index, payload, client),
+                    lambda index: generate_payload(rng, index, profile),
+                    total=total,
+                    rate_per_s=float(config["rate_per_s"]),
+                    concurrency=concurrency,
+                    start_time=start_time,
+                    deadline=deadline,
+                    is_cancelled=lambda: _cancel_flags.get(test_id, False),
+                )
+            else:
+                batch_size = concurrency
+                for i in range(0, total, batch_size):
+                    # Check deadline and cancel flag before each batch
+                    if time.monotonic() > deadline:
+                        break
+                    if _cancel_flags.get(test_id, False):
+                        break
 
-                batch = payloads[i:i + batch_size]
-                await asyncio.gather(*[
-                    _execute_single(i + offset, p, client) for offset, p in enumerate(batch)
-                ])
+                    batch = payloads[i:i + batch_size]
+                    await asyncio.gather(*[
+                        _execute_single(i + offset, p, client) for offset, p in enumerate(batch)
+                    ])
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -1101,6 +1189,9 @@ async def _run_load_test(
         target_model_type=target_model_type or "",
         target_variant=target_variant,
         scenario=profile.key,
+        seed=seed,
+        duration_s=duration_s,
+        target_rps=float(config["rate_per_s"]) if paced else None,
         canary_supported=canary_supported(target_model_type) if target_model_type else False,
         canary_staged=(
             await is_canary_staged(target_model_type)
@@ -1285,6 +1376,10 @@ async def start_loadtest(request: Request) -> JSONResponse:
 
     test_id = f"lt-{uuid.uuid4().hex[:12]}"
     config = PRESET_CONFIG[req.preset]
+    # A paced preset's window is part of its definition (FR3.2): 60,000
+    # requests at 100/s need the full 600 s, whatever duration was sent.
+    if _is_paced(config):
+        req = req.model_copy(update={"duration_s": config["duration_s"]})
 
     # Initialize status as running
     _active_tests[test_id] = LoadTestStatus(
@@ -1307,6 +1402,9 @@ async def start_loadtest(request: Request) -> JSONResponse:
         target_model_type=req.target_model_type or "",
         target_variant=req.target_variant,
         scenario=req.scenario,
+        seed=req.seed,
+        duration_s=req.duration_s,
+        target_rps=config.get("rate_per_s"),
     )
     _cancel_flags[test_id] = False
 
@@ -1412,6 +1510,9 @@ async def cancel_loadtest(request: Request) -> JSONResponse:
         latency_max=0.0,
         histogram={"lt_10ms": 0, "10_30ms": 0, "30_50ms": 0, "gt_50ms": 0},
         per_container=[],
+        seed=status.seed,
+        duration_s=status.duration_s,
+        target_rps=status.target_rps,
     )
     _expiry_times[test_id] = time.monotonic() + _EXPIRY_SECONDS
 

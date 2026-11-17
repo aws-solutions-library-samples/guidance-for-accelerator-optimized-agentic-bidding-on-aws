@@ -292,6 +292,14 @@ Resources:
                   # their input channel.
                   - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-floor/*'
                   - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-data-deal-yield-margin/*'
+                  # Demo datasets written by the orchestrator's Governance
+                  # page, and the per-job ManifestFile that adds one to the
+                  # input when "Include demo dataset" is on
+                  # (orchestrator/training_trigger.py).
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/demo-training-data/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/demo-training-data-deal-yield-floor/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/demo-training-data-deal-yield-margin/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${TrainingDataBucketName}/training-manifests/*'
         # The training-data bucket is SSE-KMS encrypted with KMSKeyArn (see
         # glue_etl_cfn.yaml). Without Decrypt on that key, CreateTrainingJob's
         # input-channel download fails with a KMS AccessDenied ClientError

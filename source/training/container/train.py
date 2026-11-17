@@ -820,6 +820,7 @@ def search_policy_parameters(
     not invent a tuned parameter set from an unusable dataset.
     """
     from shared.shading_policy import (
+        DEFAULT_CONVERSION_VALUE,
         GENESIS_POLICY,
         ShadingPolicy,
         policy_search_space,
@@ -889,9 +890,20 @@ def search_policy_parameters(
     floor = scorable["bid_floor"].fillna(0.0).to_numpy(dtype=float)
     original = scorable["original_price"].fillna(0.0).to_numpy(dtype=float)
     p = np.clip(scorable["_p"].fillna(0.0).to_numpy(dtype=float), 0.0, 1.0)
-    # The conversion-value estimate the policy prices against, same knob the serving
-    # path reads from the Parameter Store.
-    ev = p * float(hp.get("conversion_value_estimate", 5.0))
+    # The conversion value each bid was priced against, as recorded on its outcome
+    # event; the hyperparameter (default: the shader's own default) fills rows that
+    # predate the column.
+    fallback_value = float(hp.get("conversion_value_estimate", DEFAULT_CONVERSION_VALUE))
+    if "conversion_value_estimate_used" in scorable.columns:
+        priced_value = (
+            scorable["conversion_value_estimate_used"]
+            .astype(float)
+            .fillna(fallback_value)
+            .to_numpy(dtype=float)
+        )
+    else:
+        priced_value = np.full(len(scorable), fallback_value)
+    ev = p * priced_value
 
     space = policy_search_space()
     # Fixed seed: a search whose result cannot be reproduced cannot be reviewed.
@@ -1068,6 +1080,7 @@ def ncf_manifest(hp: dict, dataset_report: dict, supervised_metrics: dict, calib
         "base_model_version": hp.get("base_model_version", ""),
         "nb_users": ncf_ids.NB_USERS,
         "nb_items": ncf_ids.NB_ITEMS,
+        "id_hash_version": ncf_ids.ID_HASH_VERSION,
         "triton_input_names": list(ncf_model.INPUT_NAMES),
         "triton_output_names": [ncf_model.OUTPUT_NAME],
         "thresholds": {"activate": ncf_ids.ACTIVATE_THRESHOLD, "suppress": ncf_ids.SUPPRESS_THRESHOLD},
@@ -1224,6 +1237,10 @@ def main():
                     # promotion gate can tell at a glance whether these weights
                     # learned from observed outcomes or from the outcome simulator.
                     outcome_provenance=dataset_report.get("outcome_provenance", {}),
+                    # Set by orchestrator/training_trigger.py when the job's input
+                    # included the Governance page's demo dataset (FR2.3).
+                    includes_demo_dataset=bool(hp.get("includes_demo_dataset", False)),
+                    demo_dataset_generated_at=hp.get("demo_dataset_generated_at") or None,
                     # The shading policy these weights were tuned alongside, and how
                     # it was arrived at. `policy_search_method` is what stops the
                     # coefficients being read as a measured improvement: the search

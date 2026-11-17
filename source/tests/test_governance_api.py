@@ -176,6 +176,62 @@ class TestTrainableRunsHandler:
         assert resp.json()["reason"] == "internal_error"
 
 
+class TestEtlHealthEmptyInput:
+    """A new deployment's Glue job fails every run with Spark's empty-input error
+    until a load test sends outcomes. The etl block flags that error and counts
+    the load tests that captured outcomes, so the UI can name the likely cause."""
+
+    EMPTY_INPUT = (
+        "AnalysisException: Unable to infer schema for Parquet. "
+        "It must be specified manually."
+    )
+
+    def _get(self, monkeypatch, history, error_message):
+        monkeypatch.setenv("GLUE_JOB_NAME", "riv-feature-engineering-etl")
+        mock_glue = MagicMock()
+        mock_glue.get_job_runs.return_value = {
+            "JobRuns": [
+                {
+                    "JobRunState": "FAILED",
+                    "StartedOn": datetime(2026, 11, 14, 18, 0, tzinfo=timezone.utc),
+                    "ErrorMessage": error_message,
+                },
+                {
+                    "JobRunState": "FAILED",
+                    "StartedOn": datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc),
+                    "ErrorMessage": error_message,
+                },
+            ]
+        }
+        with patch("boto3.client", return_value=mock_glue), \
+             patch("orchestrator.governance_api._get_loadtest_history_fn", return_value=lambda limit: history):
+            resp = client.get("/v1/governance/trainable-runs?model_type=dlrm_bid_shader")
+        assert resp.status_code == 200
+        return resp.json()["etl"]
+
+    def test_empty_input_with_no_load_tests(self, monkeypatch):
+        etl = self._get(monkeypatch, [], self.EMPTY_INPUT)
+        assert etl["never_succeeded"] is True
+        assert etl["no_input_data"] is True
+        assert etl["captured_load_tests"] == 0
+        assert etl["consecutive_failures"] == 2
+
+    def test_empty_input_counts_only_this_models_captured_load_tests(self, monkeypatch):
+        history = [
+            {"id": "lt-1", "target_model_type": "dlrm_bid_shader", "outcome_sample_count": 40},
+            {"id": "lt-2", "target_model_type": "dlrm_bid_shader", "outcome_sample_count": 0},
+            {"id": "lt-3", "target_model_type": "ncf_deal_manager", "outcome_sample_count": 25},
+        ]
+        etl = self._get(monkeypatch, history, self.EMPTY_INPUT)
+        assert etl["no_input_data"] is True
+        assert etl["captured_load_tests"] == 1
+
+    def test_other_failure_is_not_flagged_as_empty_input(self, monkeypatch):
+        etl = self._get(monkeypatch, [], "AccessDeniedException: not authorized to perform glue:GetTable")
+        assert etl["never_succeeded"] is True
+        assert etl["no_input_data"] is False
+
+
 class TestSweepStatusHandler:
     """The sweep-status poller that shows where a load test's outcomes are
     between the run finishing and appearing in the "Train from load test"
@@ -390,4 +446,58 @@ class TestTrainHandlerXGBoostImageWiring:
             )
 
         assert resp.status_code == 503
+        mock_trigger.assert_not_called()
+
+
+class TestTrainHandlerDemoDataset:
+    """FR2.2: include_demo_dataset is passed through, and a missing demo
+    dataset is a 422 no_demo_dataset."""
+
+    _ENV = TestTrainHandlerXGBoostImageWiring._ENV
+
+    def test_include_demo_dataset_without_dataset_returns_422(self, monkeypatch):
+        for k, v in self._ENV.items():
+            monkeypatch.setenv(k, v)
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject"
+        )
+        sm = MagicMock()
+        with patch("orchestrator.training_trigger._s3_client", return_value=s3), \
+                patch("orchestrator.training_trigger._sagemaker_client", return_value=sm):
+            resp = client.post(
+                "/v1/governance/train",
+                json={"model_type": "dlrm_bid_shader", "confirmed": True, "include_demo_dataset": True},
+            )
+
+        assert resp.status_code == 422
+        assert resp.json()["reason"] == "no_demo_dataset"
+        sm.create_training_job.assert_not_called()
+
+    def test_include_demo_dataset_is_passed_through(self, monkeypatch):
+        for k, v in self._ENV.items():
+            monkeypatch.setenv(k, v)
+        with patch("orchestrator.governance_api.trigger_training") as mock_trigger:
+            mock_trigger.return_value = MagicMock(
+                job_name="dlrm-bid-shader-1-a", model_type="dlrm_bid_shader",
+                base_model_version="arn:...:1", instance_type="ml.g5.2xlarge",
+            )
+            resp = client.post(
+                "/v1/governance/train",
+                json={"model_type": "dlrm_bid_shader", "confirmed": True, "include_demo_dataset": True},
+            )
+        assert resp.status_code == 202
+        assert mock_trigger.call_args.kwargs["include_demo_dataset"] is True
+
+    def test_non_boolean_include_demo_dataset_is_refused(self, monkeypatch):
+        for k, v in self._ENV.items():
+            monkeypatch.setenv(k, v)
+        with patch("orchestrator.governance_api.trigger_training") as mock_trigger:
+            resp = client.post(
+                "/v1/governance/train",
+                json={"model_type": "dlrm_bid_shader", "confirmed": True, "include_demo_dataset": "false"},
+            )
+        assert resp.status_code == 422
         mock_trigger.assert_not_called()

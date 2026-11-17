@@ -1858,6 +1858,85 @@ test_k8s_rollout() {
 }
 
 # =========================================================================
+# Test: Step 4 sends each architecture to its own CodeBuild run
+# =========================================================================
+# A mixed --only list went to the x86 project, which cross-compiles arm64 with
+# QEMU and pulled multiarch/qemu-user-static from Docker Hub anonymously. A fresh
+# r2v deploy failed in PRE_BUILD on "toomanyrequests: You have reached your
+# unauthenticated pull rate limit". Splitting by architecture means each run is
+# single-arch: remote_build.sh routes the arm64-only list to the Graviton project
+# and the buildspec skips QEMU for the amd64-only list.
+test_remote_build_split_by_arch() {
+  local fn_src calls
+  for fn in display_name is_arm64_image remote_build_group remote_build_by_arch; do
+    fn_src="$(sed -n "/^${fn}() {/,/^}/p" "${DEPLOY_SH}")"
+    if [[ -z "${fn_src}" ]]; then
+      FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: %s() not found in deploy.sh\n' "${fn}" >&2; return
+    fi
+    eval "${fn_src}"
+  done
+
+  is_arm64_image agentcore && PASS_COUNT=$((PASS_COUNT + 1)) \
+    || { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: agentcore is arm64\n' >&2; }
+  is_arm64_image adaptive-bidding-agent && PASS_COUNT=$((PASS_COUNT + 1)) \
+    || { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: adaptive-bidding-agent is arm64\n' >&2; }
+  is_arm64_image model-promotion-governance-agent && PASS_COUNT=$((PASS_COUNT + 1)) \
+    || { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: model-promotion-governance-agent is arm64\n' >&2; }
+  is_arm64_image orchestrator && { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL: orchestrator is not arm64\n' >&2; } \
+    || PASS_COUNT=$((PASS_COUNT + 1))
+
+  # Every remote_build.sh invocation is recorded instead of run.
+  # Locals, so the globals later tests read (SCRIPT_DIR above all) are untouched;
+  # bash's dynamic scoping lets the functions under test see them.
+  local rec; rec="$(mktemp)"
+  local STACK_NAME="t-stack" IMAGE_TAG="abc1234" AWS_REGION="us-east-1" AWS_PROFILE="p" SCRIPT_DIR="/x"
+  local -a NGC_FLAG=(--ngc-secret t-ngc)
+  local -a HASH_KEYS=(dlrm-bid-shader agentcore orchestrator)
+  local -a HASH_VALS=(src-aaa src-bbb src-ccc)
+  run_step() { shift; printf '%s\n' "$*" >> "${rec}"; }
+
+  remote_build_by_arch dlrm-bid-shader agentcore orchestrator
+  calls="$(cat "${rec}")"
+  assert_eq "$(wc -l < "${rec}" | tr -d ' ')" "2" "a mixed list starts two CodeBuild runs"
+  assert_contains "$(sed -n 1p "${rec}")" "--only dlrm-bid-shader orchestrator" "the first run is the amd64 group"
+  assert_contains "$(sed -n 1p "${rec}")" "--src-tags t-stack-bid-pricer=src-aaa t-stack-orchestrator=src-ccc" "the amd64 run carries only its own src- tags"
+  assert_not_contains "$(sed -n 1p "${rec}")" "agentcore" "the amd64 run does not include the arm64 image"
+  assert_contains "$(sed -n 2p "${rec}")" "--only agentcore" "the second run is the arm64 group"
+  assert_contains "$(sed -n 2p "${rec}")" "--src-tags t-stack-agentcore=src-bbb" "the arm64 run carries only its own src- tag"
+  assert_contains "${calls}" "--ngc-secret t-ngc" "the NGC flag is passed through"
+
+  : > "${rec}"
+  remote_build_by_arch dlrm-bid-shader orchestrator
+  assert_eq "$(wc -l < "${rec}" | tr -d ' ')" "1" "an amd64-only list starts one run"
+
+  : > "${rec}"
+  NGC_FLAG=()
+  remote_build_by_arch agentcore
+  assert_eq "$(wc -l < "${rec}" | tr -d ' ')" "1" "an arm64-only list starts one run"
+  assert_not_contains "$(cat "${rec}")" "--ngc" "no NGC flag is passed when none was given (bash 3.2 empty array)"
+
+  # A failed amd64 run returns its status and the arm64 run never starts.
+  : > "${rec}"
+  run_step() { shift; printf '%s\n' "$*" >> "${rec}"; case "$*" in *agentcore*) return 0 ;; *) return 7 ;; esac; }
+  local rc=0
+  remote_build_by_arch dlrm-bid-shader agentcore || rc=$?
+  assert_eq "${rc}" "7" "a failed amd64 run's exit status is returned"
+  assert_eq "$(wc -l < "${rec}" | tr -d ' ')" "1" "only the amd64 run was started"
+  assert_not_contains "$(cat "${rec}")" "--only agentcore" "the arm64 run does not start after the amd64 run failed"
+
+  # Under set -e (as deploy.sh runs), the failure stops the caller.
+  local out
+  out="$(set -e; remote_build_by_arch dlrm-bid-shader agentcore; echo "AFTER")"
+  assert_not_contains "${out}" "AFTER" "under set -e nothing after a failed build runs"
+
+  # Step 4 uses the split for CodeBuild builds.
+  assert_contains "$(sed -n '/^build_images() {/,/^}/p' "${DEPLOY_SH}")" 'remote_build_by_arch "${MISSING_KEYS[@]}"' "build_images routes CodeBuild builds through remote_build_by_arch"
+
+  rm -f "${rec}"
+  unset -f run_step
+}
+
+# =========================================================================
 # Run all tests
 # =========================================================================
 test_k8s_rollout
@@ -1880,6 +1959,7 @@ test_demo_credentials_block
 test_ncf_build_wiring
 test_phase_staleness
 test_update_managed_policy
+test_remote_build_split_by_arch
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

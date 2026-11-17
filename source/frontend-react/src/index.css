@@ -2515,6 +2515,88 @@ body {
   color: var(--text-muted);
 }
 
+/* Rate, total and duration of the paced preset, shown before the run starts.
+   --text on --surface-low keeps well above 4.5:1. */
+.loadtest-paced-summary {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface-low);
+  font-size: clamp(10px, 0.9vw, 12px);
+  line-height: 1.45;
+  color: var(--text);
+}
+
+/* ── Demo training dataset (Governance Train step, FR1) ── */
+.cl-demo-dataset {
+  margin: 4px 0 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--surface-low);
+}
+.cl-demo-dataset-title {
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.cl-demo-dataset-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.cl-demo-dataset-param {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text);
+}
+.cl-demo-dataset-param input {
+  width: 110px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 12px;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.cl-demo-dataset-param input:focus-visible {
+  outline: none;
+  border-color: rgba(99, 102, 241, 0.4);
+  box-shadow: 0 0 0 2px #ffffff, 0 0 0 5px var(--glow-brand-primary);
+}
+.cl-demo-dataset-bounds { font-size: 10.5px; color: var(--text); opacity: 0.8; }
+.cl-demo-dataset-estimate,
+.cl-demo-dataset-status {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.cl-demo-dataset-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text);
+}
+/* The amber wash over --surface-low leaves #b45309 at 4.27:1; #92400e gives 6.04:1 (NFR1). */
+.cl-demo-dataset .cl-honest { color: #92400e; }
+.cl-train-include-demo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
 .loadtest-target-variant {
   display: flex;
   gap: 6px;

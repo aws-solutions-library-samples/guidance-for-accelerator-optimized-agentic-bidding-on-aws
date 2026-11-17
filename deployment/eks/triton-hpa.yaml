@@ -14,7 +14,9 @@ spec:
     kind: Deployment
     name: triton-inference-server
   minReplicas: 1
-  maxReplicas: 4
+  # One Triton pod per GPU node, so the cap is the GPU node group's maximum:
+  # deploy.sh substitutes --maxGPUs here (Step 8b) and fails if it is left unset.
+  maxReplicas: __MAX_GPUS__
   metrics:
     # Scale on GPU utilization
     - type: Resource

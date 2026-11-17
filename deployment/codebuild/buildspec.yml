@@ -151,10 +151,33 @@ phases:
             exit 1
           fi
         fi
-      # buildx is configured regardless: the amd64 builds below invoke
-      # `docker buildx build`, so the builder has to exist even with no ARM work.
-      - docker buildx create --name multiarch --driver docker-container --use 2>/dev/null || docker buildx use multiarch
-      - docker buildx inspect --bootstrap
+      # buildx builder. The builds below all run `docker buildx build`.
+      #
+      # A native-architecture build (everything deploy.sh starts: it sends amd64
+      # images to the x86 project and arm64 images to the Graviton project) uses
+      # the `docker` driver, i.e. the BuildKit bundled in the Docker daemon. That
+      # driver needs no image. The `docker-container` driver runs BuildKit in a
+      # container and pulls moby/buildkit from Docker Hub anonymously when the
+      # builder boots, which is exposed to the same shared-egress rate limit as
+      # the QEMU pull above.
+      #
+      # Only a cross-compile (NEEDS_ARM=1: arm64 images on the x86 project, as
+      # `remote_build.sh --target all|part1` does) needs `docker-container`,
+      # because the `docker` driver cannot build for a non-native platform.
+      #
+      # BUILDER is exported so the NeMo step below can switch back to it.
+      - |
+        if [ "${NEEDS_ARM}" = "1" ]; then
+          BUILDER=multiarch
+          docker buildx create --name multiarch --driver docker-container --use 2>/dev/null || docker buildx use multiarch
+          echo "Cross-compiling arm64: using the docker-container builder (pulls moby/buildkit)."
+        else
+          BUILDER=default
+          docker buildx use default
+          echo "Native-architecture build: using the Docker daemon's built-in BuildKit (no builder image pulled)."
+        fi
+        export BUILDER
+        docker buildx inspect --bootstrap
 
   build:
     commands:
@@ -313,10 +336,11 @@ phases:
           sh "${SOURCE_DIR}/training/stage_shared.sh"
 
           # Use the default builder (not multiarch) for this native amd64 build
-          # to avoid QEMU/platform confusion with the large NeMo base image
+          # to avoid QEMU/platform confusion with the large NeMo base image, then
+          # switch back to the builder pre_build selected.
           docker buildx use default 2>/dev/null || true
           docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SOURCE_DIR}/training/container/"
-          docker buildx use multiarch 2>/dev/null || true
+          docker buildx use "${BUILDER:-default}" 2>/dev/null || true
 
           # widedeep is intentionally absent — segment activation is rule-based,
           # not a trainable model (see

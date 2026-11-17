@@ -12,7 +12,9 @@
 #
 # Exposes the REST API on :8000 (health at /health/live, /health/ready).
 
-FROM python:3.12-slim AS base
+# The Docker Official python image, pulled from its Amazon ECR Public mirror so
+# CodeBuild does not hit Docker Hub's anonymous pull rate limit.
+FROM public.ecr.aws/docker/library/python:3.12-slim AS base
 
 ARG AGENT_NAME=artf-orchestrator
 ARG VERSION=0.1.0
@@ -28,11 +30,13 @@ LABEL agent-manifest="{ \
 # - Starlette/uvicorn/httpx/grpc/pydantic: orchestrator serving + fan-out
 # - boto3: CloudWatch / DynamoDB / SageMaker / EKS calls (Part 1 + Part 2)
 # - python-jose: Cognito JWT verification
+# - pyarrow: Parquet writer for the demo training datasets (orchestrator/demo_dataset.py)
 # The Part 2 A/B evaluator implements its own statistics (no scipy/numpy needed).
 RUN pip install --no-cache-dir \
     fastapi "uvicorn[standard]" starlette httpx pydantic \
     grpcio protobuf boto3 \
-    "python-jose[cryptography]==3.3.0"
+    "python-jose[cryptography]==3.3.0" \
+    pyarrow
 
 WORKDIR /app
 

@@ -862,6 +862,17 @@ export function ModelsView({ versions, error, modelLabel, trainingJobs, training
                       sample
                     </span>
                   ) : null}
+                  {/* The training job's input included the Governance page's
+                      synthetic demo dataset (FR2.3). */}
+                  {v.includes_demo_dataset ? (
+                    <span
+                      className="cl-sample-badge"
+                      title={`Demonstration only: trained with the synthetic demo dataset${v.demo_dataset_generated_at ? ` generated ${v.demo_dataset_generated_at}` : ""}.`}
+                      data-testid="model-version-demo-badge"
+                    >
+                      Trained with demo data
+                    </span>
+                  ) : null}
                 </td>
                 <td><ApprovalBadge status={v.approval_status} /></td>
                 <td><ApprovalReason status={v.approval_status} reason={v.approval_description} /></td>

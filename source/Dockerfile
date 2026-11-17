@@ -10,7 +10,9 @@
 #   - Health :8080   /health/live, /health/ready
 
 # nosemgrep: dockerfile-source-not-pinned deploy by tag; CodeBuild rebuilds the image on every deploy
-FROM python:3.12-slim AS base
+# The Docker Official python image, pulled from its Amazon ECR Public mirror so
+# CodeBuild does not hit Docker Hub's anonymous pull rate limit.
+FROM public.ecr.aws/docker/library/python:3.12-slim AS base
 
 ARG CONTAINER
 ARG AGENT_NAME=artf-nvidia-agent
