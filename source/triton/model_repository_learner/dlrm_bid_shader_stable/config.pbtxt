@@ -1,0 +1,139 @@
+# DLRM Bid Shader STABLE model, LEARNER-MODE CPU config.
+# Served only by deploy.sh --learner-mode, which overlays this file on
+# model_repository/dlrm_bid_shader_stable/config.pbtxt and stages the Step 2 ONNX
+# export as 1/model.onnx. Identical to that config except the platform (ONNX
+# Runtime instead of a TensorRT plan) and instance_group (KIND_CPU). The ONNX graph
+# takes the same [batch] / [batch, 4] inputs as the engine, so the reshape and
+# warm-up entries carry over unchanged. Learner mode is for learning;
+# ARTF-compliant production workloads must not use it.
+# tests/test_triton_learner_configs.py keeps the two configs in step.
+
+name: "dlrm_bid_shader_stable"
+platform: "onnxruntime_onnx"
+max_batch_size: 64
+
+input [
+  {
+    name: "dense_features"
+    data_type: TYPE_FP32
+    dims: [ 4 ]
+  },
+  {
+    name: "sparse_site_domain"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_device_type"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  },
+  {
+    name: "sparse_geo_country"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+output [
+  {
+    name: "ctr_prediction"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    reshape: { shape: [] }
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 500
+}
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]
+# Warm-up: Triton runs these requests on each instance at load and reports the
+# model not ready until they complete (Triton r24.08 model_configuration.md,
+# "Model Warmup"; ModelWarmup in common/protobuf/model_config.proto). dims are
+# the declared input dims (before reshape), without the batch dimension. Batch 1
+# and 8, the opt batch of the GPU engine's profile in deployment/optimizer-bootstrap.json.
+model_warmup [
+  {
+    name: "zero_batch1"
+    batch_size: 1
+    inputs {
+      key: "dense_features"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 4 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_site_domain"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_device_type"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_geo_country"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  },
+  {
+    name: "zero_batch8"
+    batch_size: 8
+    inputs {
+      key: "dense_features"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 4 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_site_domain"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_device_type"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+    inputs {
+      key: "sparse_geo_country"
+      value: {
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+        zero_data: true
+      }
+    }
+  }
+]

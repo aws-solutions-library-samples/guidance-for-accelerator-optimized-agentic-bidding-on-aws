@@ -67,7 +67,7 @@ def test_the_label_is_implicit_engagement():
 def test_the_dataset_gate_reports_sample_interactions(frame):
     report = train_module.validate_dataset(frame, "label", "implicit_engagement", model_type=NCF)
     assert report["training_data"] == "sample"
-    assert report["id_cardinality"]["deal_id"] == 24
+    assert report["id_cardinality"]["deal_id"] == 25
     assert 0 < report["positive_rate"] < 1
 
 

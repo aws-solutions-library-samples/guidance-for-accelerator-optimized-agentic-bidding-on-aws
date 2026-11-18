@@ -159,6 +159,21 @@ describe("narration and captions", () => {
     expect(validateCaption(text, recap, CONTEXT).ok).toBe(true);
   });
 
+  it("the recap says when the auction shown is a rerun, and the caption still validates", () => {
+    const recap = beatsFor(extensionPoint({ winnerDisposition: "applied" })).find((b) => b.kind === BEAT_RECAP);
+    const rerun = { ...recap, artfReport: { ...recap.artfReport, retriedAfter: [{ outcome: "timeout", correlationId: "c1" }] } };
+    const text = factualCaption(rerun, CONTEXT);
+    expect(text).toMatch(/mutated this request\. The ARTF hook did not answer in time on the first auction, so the Theater ran the request again\.$/);
+    expect(validateCaption(text, rerun, CONTEXT).ok).toBe(true);
+    expect(JSON.parse(buildCaptionPrompt(rerun, CONTEXT).message).step.artf_hook_retry).toMatch(/ran the request again/);
+  });
+  it("a recap still empty after reruns states the timeout and the reruns, and validates", () => {
+    const recap = beatsFor({ available: true, outcome: "timeout", response: null }).find((b) => b.kind === BEAT_RECAP);
+    const rerun = { ...recap, artfReport: { ...recap.artfReport, retriedAfter: [{ outcome: "timeout" }, { outcome: "timeout" }] } };
+    const text = factualCaption(rerun, CONTEXT);
+    expect(text).toBe("The ARTF hook timed out, so this auction ran unmutated. The ARTF hook did not answer in time on earlier auctions, so the Theater ran the request again.");
+    expect(validateCaption(text, rerun, CONTEXT).ok).toBe(true);
+  });
   it("an answered hook with nothing applied keeps the pinned wording", () => {
     const recap = beatsFor({ available: true, outcome: "no_mutations",
       response: { id: "t", mutations: [], metadata: { containers: [] } } })

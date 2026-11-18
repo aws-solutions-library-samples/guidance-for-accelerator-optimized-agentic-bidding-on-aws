@@ -47,6 +47,32 @@ export const RUN_FAILED = "failed";
 export const AUCTION_NOT_DEPLOYED = "not_deployed";
 export const AUCTION_FAILED = "failed";
 
+/**
+ * Hook outcomes after which the with-ARTF auction is run again.
+ *
+ * The first auctions after Prebid, the orchestrator or a container starts spend
+ * longer than the hook's 150 ms group timeout setting up connections and
+ * credentials, so the hook reports `timeout` (or `transport_failure` while its
+ * token is still being fetched) and the auction runs unmutated. Running the same
+ * request again reaches the warmed path. `skipped_insufficient_budget` is not
+ * here: it is decided from the auction's own budget and a rerun gets the same one.
+ */
+export const RETRYABLE_HOOK_OUTCOMES = Object.freeze(new Set(["timeout", "transport_failure"]));
+
+/**
+ * Further with-ARTF auctions after the first. Two, not one: the orchestrator and
+ * each container run two replicas, so a second auction can land on a replica
+ * that has not been called yet.
+ */
+export const MAX_HOOK_RETRIES = 2;
+
+function retryableHookOutcome(outcome) {
+  if (outcome?.kind !== "live") return null;
+  const ep = outcome.auction?.artf_meta?.extension_point;
+  if (ep?.available !== true) return null;
+  return RETRYABLE_HOOK_OUTCOMES.has(ep.outcome) ? ep.outcome : null;
+}
+
 export function useTheaterRun({ baseUrl = "/api" } = {}) {
   const { submit } = useOrchestratorClientWithBase({ baseUrl });
   const [status, setStatus] = useState(RUN_IDLE);
@@ -227,8 +253,22 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
       setPayload(submitted);
 
       void runAuction(submitted, token, { artf: "off" });
-      const withArtf = await runAuction(submitted, token, { artf: "on" });
+      let withArtf = await runAuction(submitted, token, { artf: "on" });
       if (token !== runTokenRef.current || withArtf == null) return null;
+      // Each earlier with-ARTF auction whose hook did not answer in time. The run
+      // is built from the last auction, and these are carried on its artfReport so
+      // the recap can say the auction was run again and why.
+      const retriedAfter = [];
+      for (let attempt = 0; attempt < MAX_HOOK_RETRIES; attempt += 1) {
+        const outcome = retryableHookOutcome(withArtf);
+        if (!outcome) break;
+        retriedAfter.push({
+          outcome,
+          correlationId: withArtf.auction.artf_meta.extension_point.correlation_id ?? null,
+        });
+        withArtf = await runAuction(submitted, token, { artf: "on" });
+        if (token !== runTokenRef.current || withArtf == null) return null;
+      }
 
       let answered;
       if (withArtf.kind === "live") {
@@ -240,6 +280,7 @@ export function useTheaterRun({ baseUrl = "/api" } = {}) {
           reason: "the orchestrator did not report the ARTF hook's mutations",
         };
         answered = normalizeExtensionPoint(ep, submitted);
+        answered.artfReport.retriedAfter = retriedAfter;
       } else if (withArtf.kind === AUCTION_NOT_DEPLOYED) {
         // No exchange to read. The containers are asked directly, as before
         // Prebid existed, and the offers column shows the fixture with its notice.

@@ -63,7 +63,7 @@ The yield optimizer's floor and margin models use a separate path, because a dea
 No live win/loss signal for deal-level decisions is wired in yet, so this path learns from two labelled sources:
 
 - **Load-test traffic.** Load tests against a yield container emit outcome events tagged `source=load_test`, with an outcome computed by the load test's own buyer model.
-- **Bounded exploration.** With probability `YIELD_EXPLORATION_EPSILON` (0.1 in the shipped manifests), the container perturbs its prediction by a small bounded amount, which lets a model that has converged to "no change" still produce mutations to learn from. Exploration applies only to load-test requests and to requests that set `ext.model_params.explore`; other traffic always gets the unperturbed prediction. Each explored response carries a `:explore` suffix on its `model_version`, so training data can separate probes from the model's own recommendations.
+- **Bounded exploration.** With probability `YIELD_EXPLORATION_EPSILON` (0.1 in the shipped manifests), the container perturbs its prediction by a small bounded amount, which lets a model that has converged to "no change" still produce mutations to learn from. That epsilon applies to load-test requests. Requests that set `ext.model_params.explore`, which every demo scenario with a yield model does, probe every deal the model would leave unchanged and pass a prediction that already moves the value through unchanged. Other traffic always gets the unperturbed prediction. Each explored response carries a `:explore` suffix on its `model_version`, so training data can separate probes from the model's own recommendations.
 
 **2. Governance loop.** A `ModelPackageGroupChanged` event invokes the Model Promotion Governance Agent (an AgentCore runtime) through a shim Lambda. For a scheduled retraining version, the agent: (a) compiles the ONNX artifact to a TensorRT engine with the on-demand Model Optimizer, (b) stages the engine as a canary at 5% of traffic through the Triton router, (c) runs an A/B test on per-variant CloudWatch metrics (primary metric `revenue_per_bid`, at least 100 samples, significance 0.05, up to 4 hours), and (d) promotes, rejects, or declares the test inconclusive. Promotion publishes the canary as a new stable version; rejection, an inconclusive result, or a guardrail breach rolls back to the incumbent. The agent updates the registry status and writes the decision and metrics to the DynamoDB audit trail.
 
@@ -114,7 +114,7 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 | AWS Service | Role in This Guidance |
 |-------------|------------------------|
 | Amazon Bedrock AgentCore | Hosts the Adaptive Bidding Strategy Agent and the Model Promotion Governance Agent |
-| Amazon Bedrock | Foundation model for both agents (default: the `global.anthropic.claude-opus-4-8` cross-region inference profile) |
+| Amazon Bedrock | Foundation model for both agents (default: the `global.anthropic.claude-opus-5-5` cross-region inference profile) |
 | Amazon SageMaker | Training jobs for the bid pricer (NeMo Framework-based training image) and the yield optimizer (built-in XGBoost); Model Registry with one Model Package Group per model |
 | Amazon Kinesis Data Streams and Amazon Data Firehose | Capture bid outcomes and deal-yield outcomes and deliver them to S3 as Parquet |
 | AWS Glue | Data Catalog tables for raw outcomes; two ETL jobs every 6 hours that de-duplicate and label outcomes |
@@ -187,12 +187,12 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 
 - The Part 1 prerequisites (see [GUIDANCE.md](GUIDANCE.md)); Part 2 runs on the same EKS cluster
 - Permissions to create Amazon Bedrock AgentCore runtimes, SageMaker training jobs and Model Package Groups, Kinesis streams, Firehose delivery streams, Glue jobs, EventBridge schedules and rules, DynamoDB tables, Lambda functions, KMS keys, SNS topics, and IAM roles
-- Access to an Amazon Bedrock model or inference profile in the target account and Region (default: `global.anthropic.claude-opus-4-8`)
+- Access to an Amazon Bedrock model or inference profile in the target account and Region (default: `global.anthropic.claude-opus-5-5`)
 - An NVIDIA NGC API key to pull the gated `nvcr.io/nvidia/nemo` base image for the training container
 
 ### Supported Regions
 
-Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G `g5` instances). Confirm AgentCore availability first; it has a smaller regional footprint than the other services. `deploy.sh` defaults the agents' model to the `global.anthropic.claude-opus-4-8` cross-region inference profile; `--model-id` (or `BEDROCK_MODEL_ID`, and per agent `ADAPTIVE_BIDDING_MODEL_ID` or `GOVERNANCE_MODEL_ID`) overrides it. Run standalone, `deploy_closed_loop.sh` has no default and requires one of these variables.
+Part 2 can be deployed in any AWS Region that supports Amazon Bedrock AgentCore, Amazon SageMaker, AWS Glue, and the Part 1 prerequisites (Amazon EKS and NVIDIA A10G `g5` instances). Confirm AgentCore availability first; it has a smaller regional footprint than the other services. `deploy.sh` defaults the agents' model to the `global.anthropic.claude-opus-5-5` cross-region inference profile; `--model-id` (or `BEDROCK_MODEL_ID`, and per agent `ADAPTIVE_BIDDING_MODEL_ID` or `GOVERNANCE_MODEL_ID`) overrides it. Run standalone, `deploy_closed_loop.sh` has no default and requires one of these variables.
 
 ### Deployment Steps
 
@@ -270,6 +270,7 @@ With Part 1, the default deploy is about **$1,495/month** on the nightly GPU shu
 (about $1,970/month with the GPU node on 24/7). The line items, and the assumptions that move them,
 are in the single cost table in [README.md](README.md#cost).
 
+<<<<<<< HEAD
 The largest variables are the agent cadence (`AdaptiveBiddingScheduleRate`; about $0.075 per
 Adaptive Bidding Agent invocation, so $657/month at `rate(5 minutes)`) and SageMaker training
 (about $15/month while jobs stop at the gate, about $104/month once all four pass, capped at about
@@ -277,6 +278,32 @@ $737/month by the 4-hour job limit). Pausing the schedules takes the Bedrock and
 zero; the Kinesis shards ($44), the KMS key, DynamoDB storage and the Glue runs (unless their
 triggers are stopped) remain. No DAX cluster is deployed; the parameter cache reads DynamoDB
 directly unless you provision one and set `DAX_ENDPOINT`.
+=======
+| AWS Service | Dimensions (defaults) | Cost [USD/month] |
+|-------------|-----------------------|--------------------|
+| Amazon Kinesis Data Streams | 2 provisioned streams × 2 shards, $0.015 per shard-hour | $44 |
+| Amazon Data Firehose, Amazon S3, AWS KMS | 2 delivery streams ($0.029/GB), raw-outcomes, training-data, and scripts buckets, 1 customer-managed key ($1) | ~$3 |
+| AWS Glue | 2 jobs × 10 G.1X workers, 4 runs/day each, ~5 minutes per run at $0.44 per DPU-hour | ~$88 |
+| Amazon DynamoDB | 3 tables (parameter store, audit trail, user features), on-demand | ~$5 |
+| Amazon SageMaker Training | Up to 4 jobs per daily trigger on `ml.g5.2xlarge` ($1.515/h); ~30 minutes each when the data passes the gate (shown), about $5/month when every job stops at the gate | up to ~$91 |
+| Amazon Bedrock (Adaptive Bidding Agent) | `global.anthropic.claude-opus-5-5`, 30 invocations/month, ~10K input and ~1K output tokens each ($4 / $20 per million) | ~$2 |
+| Amazon Bedrock (Governance Agent) | Same model; invoked on model registration only | ~$10 |
+| Amazon Bedrock AgentCore | Runtime consumption for both agents, $0.0895 per vCPU-hour and $0.00945 per GB-hour, ~30 s per invocation | ~$1 |
+| AWS Secrets Manager, Amazon EventBridge Scheduler, AWS Lambda, Amazon SNS | NGC key secret ($0.40), 2 schedules, invocation and proxy functions, alerts topic | ~$2 |
+| **Estimated Total** | | **~$245/month** |
+
+What moves the total:
+
+- **Agent cadence.** The Bedrock line is about $0.075 per invocation and scales linearly with `AdaptiveBiddingScheduleRate`: about $9 at `rate(6 hours)`, $54 at `rate(1 hour)`, and $648 at `rate(5 minutes)`. Change the template default and re-run `deploy.sh --prefix <p> --start-at 5`, or pass the parameter in the governance-eventbridge `deploy_cfn_stack` call in `deployment/deploy_closed_loop.sh`.
+- **Model choice.** `--model-id` selects the model for both agents; a smaller model lowers the per-token rate.
+- **Training data.** The trigger starts jobs every day from the first day, because the genesis versions are Approved. Jobs with no or unfit data end at the dataset gate after a minute or two of billing, so the SageMaker line sits near $5 until datasets pass the gate.
+- **Pausing.** With both schedules disabled, the Bedrock and SageMaker lines drop to zero. The Kinesis shards ($44), the KMS key, DynamoDB storage, and the Glue runs (unless their triggers are stopped) remain.
+- **No DAX cluster is deployed.** The parameter client reads DynamoDB through an in-process cache; a DAX cluster is used only if you provision one and set `DAX_ENDPOINT`.
+
+### Combined Total (Part 1 + Part 2)
+
+The default `deploy.sh` run deploys both parts. Combined with Part 1's ~$1,225/month on the nightly GPU schedule (~$1,700 with the GPU on 24/7; see [GUIDANCE.md](GUIDANCE.md#cost-estimation)), expect roughly **$1,470/month** (**$1,945** with the GPU on 24/7). See [README.md](README.md#cost) for the combined line-item table.
+>>>>>>> origin/beta
 
 ## Related Content
 

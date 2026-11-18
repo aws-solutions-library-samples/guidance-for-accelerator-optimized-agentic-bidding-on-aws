@@ -133,7 +133,7 @@ describe("configuration", () => {
         trace: captureTrace,
       },
     });
-    expect(command.input.modelId).not.toBe("anthropic.claude-haiku-4-5-20251001-v1:0");
+    expect(command.input.modelId).not.toBe("anthropic.claude-haiku-5-5");
   });
 });
 

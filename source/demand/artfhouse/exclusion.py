@@ -1,6 +1,6 @@
 """Why a campaign made no offer.
 
-A CLOSED set of exactly five members. Closed rather than a free string so the
+A CLOSED set of exactly seven members. Closed rather than a free string so the
 distinction between a suppressed deal and a below-floor rejection cannot be lost
 to a typo, and so the frontend can render every case exhaustively instead of
 falling back to an "other" bucket.
@@ -45,6 +45,20 @@ class ExclusionReason(str, Enum):
 
     NO_DEAL_ON_IMPRESSION = "no_deal_on_impression"
     """No deal this campaign holds was present, and it may not offer without one."""
+
+    CAMPAIGN_PAUSED = "campaign_paused"
+    """The campaign is paused in the deals table (its ``status`` is ``paused``).
+
+    A fresh deploy that includes the campaign/deals control plane seeds every
+    campaign paused, so until an agent activates it the campaign is considered and
+    declines for this reason. It is still listed, because an absent row would read
+    as "not involved" rather than "waiting to be activated".
+    """
+
+    DEAL_INACTIVE = "deal_inactive"
+    """Every deal this campaign holds on the impression has a non-active Deals API
+    ``sellerstatus`` (paused, pending, complete or archived), so the seller is not
+    transacting on it."""
 
 
 #: Every member, for exhaustiveness checks in tests and consumers.

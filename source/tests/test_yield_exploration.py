@@ -18,6 +18,7 @@ import os
 import random
 import sys
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -163,27 +164,66 @@ class TestIndependentPerModelCoinFlip:
                 assert value != 1.0
 
 
+class TestMinStep:
+    @given(
+        value=st.sampled_from([1.0, 0.0]),
+        seed=st.integers(min_value=0, max_value=2**31 - 1),
+    )
+    @settings(max_examples=200)
+    def test_explored_step_is_at_least_min_step_and_at_most_bound(self, value, seed):
+        result, explored = apply_exploration(
+            value, rng=random.Random(seed), epsilon=1.0,
+            bound=0.05, clamp_min=-1.5, clamp_max=1.5, min_step=0.01,
+        )
+        assert explored is True
+        assert 0.01 <= abs(result - value) <= 0.05
+
+    def test_both_directions_occur(self):
+        rng = random.Random(5)
+        steps = [
+            apply_exploration(1.0, rng=rng, epsilon=1.0, min_step=0.01, **FLOOR_KW)[0] - 1.0
+            for _ in range(200)
+        ]
+        assert any(s > 0 for s in steps)
+        assert any(s < 0 for s in steps)
+
+    def test_min_step_larger_than_bound_is_capped(self):
+        result, _ = apply_exploration(
+            1.0, rng=random.Random(1), epsilon=1.0, min_step=1.0, **FLOOR_KW,
+        )
+        assert abs(result - 1.0) == pytest.approx(0.05)
+
+
 class TestResolveEffectiveEpsilon:
     """The load-test/demo-only gate. Exploration must never arm itself on
     traffic the container cannot identify as load-test or demo-originated,
     regardless of how the epsilon env var is set."""
 
+    NO_OP = dict(prediction=1.0, no_op_value=1.0)
+    MOVED = dict(prediction=1.2, no_op_value=1.0)
+
     def test_plain_production_traffic_never_explores(self):
-        assert resolve_effective_epsilon(False, None, 0.1) == 0.0
+        assert resolve_effective_epsilon(False, None, 0.1, **self.NO_OP) == 0.0
+        assert resolve_effective_epsilon(False, None, 1.0, **self.NO_OP) == 0.0
 
-    def test_load_test_traffic_arms_epsilon(self):
-        assert resolve_effective_epsilon(True, None, 0.1) == 0.1
+    def test_load_test_traffic_uses_the_configured_epsilon(self):
+        assert resolve_effective_epsilon(True, None, 0.1, **self.NO_OP) == 0.1
+        assert resolve_effective_epsilon(True, None, 0.1, **self.MOVED) == 0.1
 
-    def test_explicit_opt_in_arms_epsilon_without_a_load_test(self):
-        assert resolve_effective_epsilon(False, True, 0.1) == 0.1
+    def test_load_test_with_configured_zero_stays_zero(self):
+        assert resolve_effective_epsilon(True, None, 0.0, **self.NO_OP) == 0.0
+
+    def test_opt_in_always_probes_a_no_op_prediction(self):
+        """A demo scenario run must never come back empty because of a 0.1 coin flip."""
+        assert resolve_effective_epsilon(False, True, 0.1, **self.NO_OP) == 1.0
+        assert resolve_effective_epsilon(False, True, 0.0, **self.NO_OP) == 1.0
+
+    def test_opt_in_leaves_a_real_recommendation_alone(self):
+        """A trained model that already moves the value is shown unperturbed."""
+        assert resolve_effective_epsilon(False, True, 0.1, **self.MOVED) == 0.0
 
     def test_explicit_opt_out_beats_the_load_test_signal(self):
-        """Lets a user who has since trained a real model turn exploration off
-        and observe that model's unperturbed prediction."""
-        assert resolve_effective_epsilon(True, False, 0.1) == 0.0
-
-    def test_configured_epsilon_of_zero_stays_zero_even_when_armed(self):
-        assert resolve_effective_epsilon(True, True, 0.0) == 0.0
+        assert resolve_effective_epsilon(True, False, 0.1, **self.NO_OP) == 0.0
 
 
 class TestParseExploreOverride:

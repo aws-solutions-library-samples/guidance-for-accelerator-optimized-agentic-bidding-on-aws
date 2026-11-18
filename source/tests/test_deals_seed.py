@@ -118,6 +118,21 @@ def test_a_deal_held_by_two_campaigns_is_rejected(seeder, seed):
         seeder.validate(seed)
 
 
+def test_a_campaign_may_target_content_ids(seeder, seed):
+    campaign = next(c for c in seed["campaigns"] if c["campaign_id"] == "camp-ctv-drama-auto")
+    assert campaign["target_content_ids"] == ["cid:premium-drama-finale"]
+    seed["campaigns"][0]["target_content_ids"] = ["cid:a", "cid:b"]
+    seeder.validate(seed)
+
+
+@pytest.mark.parametrize("value", ["cid:premium-drama-finale", ["premium-drama-finale"], ["cid:"], [7]])
+def test_a_malformed_content_id_list_is_rejected(seeder, seed, value):
+    bad = copy.deepcopy(seed)
+    bad["campaigns"][0]["target_content_ids"] = value
+    with pytest.raises(seeder.SeedError, match="target_content_ids"):
+        seeder.validate(bad)
+
+
 def test_every_deal_is_held_by_a_campaign(seed):
     held = {d for c in seed["campaigns"] for d in c["deal_ids"]}
     assert held == {d["id"] for d in seed["deals"]}
@@ -151,6 +166,10 @@ def test_an_invalid_prefix_raises(seeder, prefix):
 # ------------------------------------------------- one publisher per deal
 
 
+#: The publisher behind each app bundle in the seed.
+APP_SELLERS = {"com.ridesharer.app": "ridesharer.example", "com.streamco.ctv": "streamco.example"}
+
+
 def test_every_deal_belongs_to_one_publisher(seed):
     for deal in seed["deals"]:
         inventory = deal["inventory"]
@@ -161,7 +180,7 @@ def test_every_deal_belongs_to_one_publisher(seed):
             assert deal["seller"] == inventory["sitedomains"][0]
             assert inventory["inclinventory"] == [1]
         else:
-            assert deal["seller"] == "ridesharer.example"
+            assert deal["seller"] == APP_SELLERS[inventory["appbundles"][0]]
             assert inventory["inclinventory"] == [2]
 
 

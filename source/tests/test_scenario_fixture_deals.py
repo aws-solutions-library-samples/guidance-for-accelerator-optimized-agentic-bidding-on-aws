@@ -33,6 +33,7 @@ _CARD = os.path.join(_ROOT, "frontend-react", "src", "components", "ScenarioCard
 
 REQUEST_FIXTURES = (
     "banner-basic.json",
+    "ctv-drama-finale.json",
     "finance-news.json",
     "home-lifestyle.json",
     "isv-ecosystem.json",

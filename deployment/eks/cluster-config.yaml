@@ -21,6 +21,8 @@ metadata:
   # before release and move this forward when standard support nears its end
   # (1.35: standard support until 2027-03-26).
   version: "1.35"
+  annotations:
+    description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
 
 # Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
 # On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
@@ -124,6 +126,11 @@ addons:
   - name: vpc-cni
     attachPolicyARNs:
       - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+    # Enforce Kubernetes NetworkPolicy (standard mode). Without it the demand
+    # service's Prebid-only policy is applied but inert. deploy_prebid.sh turns
+    # this on for clusters created before this line existed.
+    configurationValues: |-
+      enableNetworkPolicy: "true"
   - name: coredns
   - name: kube-proxy
 

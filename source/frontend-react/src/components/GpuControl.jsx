@@ -11,6 +11,9 @@ export default function GpuControl() {
   const [tritonReady, setTritonReady] = useState(false);
   const [detail, setDetail] = useState(null);
   const [busy, setBusy] = useState(false);
+  // Set from this component's own poll, so the variant follows what the
+  // orchestrator reports rather than a value passed down from elsewhere.
+  const [learner, setLearner] = useState(false);
 
   const checkStatus = useCallback(async () => {
     try {
@@ -24,6 +27,16 @@ export default function GpuControl() {
         setStatus("error");
         return;
       }
+      if (data.deploymentMode === "learner") {
+        // No GPU node group: Triton runs on the CPU nodes, so the only state
+        // worth showing is whether Triton answers.
+        setLearner(true);
+        setTritonReady(data.tritonReady === true);
+        setDetail(data.tritonDetail || null);
+        setStatus(data.tritonReady === true ? "running" : "triton-not-ready");
+        return;
+      }
+      setLearner(false);
       setDesiredSize(data.desiredSize || 0);
       setTritonReady(data.tritonReady || false);
       setDetail(data.tritonDetail || null);
@@ -103,6 +116,32 @@ export default function GpuControl() {
       setBusy(false);
     }
   }, []);
+
+  if (learner) {
+    const ready = status === "running";
+    return (
+      <div className="gpu-control" data-testid="gpu-control-learner">
+        <div className="gpu-control-header">
+          <h3>Inference (CPU, learner mode)</h3>
+          <span
+            className={`gpu-status-badge ${ready ? "gpu-status-running" : "gpu-status-blocked"}`}
+            data-testid="gpu-control-learner-status-badge"
+          >
+            {ready ? "Triton ready" : "Triton not ready"}
+          </span>
+        </div>
+        <p className="gpu-control-desc">
+          This stack was deployed in learner mode, so there is no GPU node group to
+          start or stop. NVIDIA Triton serves the models on the CPU nodes.
+        </p>
+        {!ready && detail && (
+          <p className="gpu-control-detail" data-testid="gpu-control-learner-detail" role="status">
+            {detail}
+          </p>
+        )}
+      </div>
+    );
+  }
 
   const badgeClass =
     status === "running" ? "gpu-status-running" :

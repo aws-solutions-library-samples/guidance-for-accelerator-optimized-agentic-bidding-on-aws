@@ -15,8 +15,6 @@
 #
 # Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
 
-# The Docker Official python image, pulled from its Amazon ECR Public mirror so
-# CodeBuild does not hit Docker Hub's anonymous pull rate limit.
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
@@ -30,12 +28,6 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY agents/__init__.py /app/agents/__init__.py
 COPY agents/governance/ /app/agents/governance/
 COPY deployment/ /app/deployment/
-# Two stdlib-only shared modules: deployment/model_deployer.py reads
-# FEATURE_SPEC_VERSION and ID_HASH_VERSION from them so the optimizer can refuse
-# a model built against a different feature spec or id hash.
-COPY shared/__init__.py /app/shared/__init__.py
-COPY shared/dlrm_features.py /app/shared/dlrm_features.py
-COPY shared/ncf_ids.py /app/shared/ncf_ids.py
 
 # The build context keeps the host's file modes, so a source file that is not
 # world-readable there would be unreadable to appuser. Normalize before USER.

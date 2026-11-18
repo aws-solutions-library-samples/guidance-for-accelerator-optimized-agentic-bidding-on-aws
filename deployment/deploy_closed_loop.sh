@@ -30,8 +30,15 @@ fi
 #   ./deploy_closed_loop.sh --prefix prod
 #   ./deploy_closed_loop.sh --skip-agentcore        # skip AgentCore deploy step
 #   ./deploy_closed_loop.sh --stack-only            # deploy CFN stacks only, no agents
+#   ./deploy_closed_loop.sh --adaptive-only         # Adaptive Bidding agent only (learner mode)
 #   ./deploy_closed_loop.sh --profile myprof        # AWS CLI profile (default: $AWS_PROFILE, else "default")
 #   AWS_REGION=us-west-2 ./deploy_closed_loop.sh
+#
+# --adaptive-only deploys what the Adaptive Bidding agent needs and nothing that
+# trains or promotes: Step 1 (KMS key), Step 3 without genesis registration (the
+# parameter-store and audit tables), Step 4 (roles, parameter seed), Step 5a and
+# Step 7. Glue ETL, the NeMo-RL image, the Governance agent and the invocation
+# stack (Step 6) are skipped. deploy.sh passes it in learner mode.
 #
 # --profile is exported as AWS_PROFILE and passed on explicitly to remote_build.sh,
 # the scripts/*.py helpers and `aws eks update-kubeconfig`. deploy.sh supplies it;
@@ -51,6 +58,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-}"
 SKIP_AGENTCORE=0
 STACK_ONLY=0
+ADAPTIVE_ONLY=0
 LOCAL_BUILD=0
 NGC_SECRET="${NGC_SECRET:-}"
 NGC_KEY="${NGC_KEY:-}"
@@ -79,6 +87,7 @@ for arg in "$@"; do
     --skip-agentcore)  SKIP_AGENTCORE=1 ;;
     --verbose)         VERBOSE=1 ;;
     --stack-only)      STACK_ONLY=1; SKIP_AGENTCORE=1 ;;
+    --adaptive-only)   ADAPTIVE_ONLY=1 ;;
     --local-build)     LOCAL_BUILD=1 ;;
     --remote-build)    LOCAL_BUILD=0 ;;
     --ngc-secret=*)    NGC_SECRET="${arg#--ngc-secret=}" ;;
@@ -91,7 +100,7 @@ for arg in "$@"; do
     --prefix)          ;;
     --profile=*)       DEPLOY_PROFILE="${arg#--profile=}" ;;
     --profile)         ;;
-    -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)         sed -n '8,41p' "$0"; exit 0 ;;
     *)
       if [[ "${_PREV_ARG:-}" == "--prefix" ]]; then
         STACK_PREFIX="${arg}"
@@ -458,7 +467,15 @@ fi
 # =========================================================================
 fi # step 1
 
-if [[ "${START_AT}" -le 2 ]]; then
+if [[ "${START_AT}" -le 2 && "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+  log "  Step 2 (Glue ETL) skipped: --adaptive-only deploys no training data path."
+  # A prefix switched from a standard deploy keeps its glue-etl stack. Reusing its
+  # bucket keeps Step 3's update from removing the SageMaker training role that
+  # the left-in-place retraining resources still use.
+  TRAINING_DATA_BUCKET="$(get_stack_output "${GLUE_STACK}" "TrainingDataBucketName" 2>/dev/null || true)"
+  if [[ "${TRAINING_DATA_BUCKET}" == "None" ]]; then TRAINING_DATA_BUCKET=""; fi
+fi
+if [[ "${START_AT}" -le 2 && "${ADAPTIVE_ONLY}" -eq 0 ]]; then
 step "Step 2: Deploying Glue ETL"
 
 # Glue script bucket. GLUE_SCRIPT_S3_PATH can still be overridden to point at
@@ -578,7 +595,9 @@ log "  SageMaker Training Execution Role: ${SAGEMAKER_TRAINING_ROLE_ARN:-<not cr
 # the registry starts empty and the first retraining job has nothing real to
 # fine-tune from. Skips honestly (non-fatal) if MODEL_BUCKET is not set - that
 # only happens when deploy_closed_loop.sh is run standalone without deploy.sh.
-if [[ -n "${MODEL_BUCKET:-}" ]]; then
+if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+  log "  Genesis model registration skipped: --adaptive-only deploys no retraining."
+elif [[ -n "${MODEL_BUCKET:-}" ]]; then
   run_step "Registering genesis models in the Model Registry" \
     python3 "${SCRIPT_DIR}/scripts/register_genesis_models.py" \
     --model-bucket "${MODEL_BUCKET}" \
@@ -656,6 +675,14 @@ log "  Governance execution role: ${GOVERNANCE_ROLE_ARN}"
 TRAINING_REPO="artf-nemo-rl-training"
 fi # step 4
 
+# Read by the final NeMo build check at the end of this script, so they are set
+# even when Step 4b is skipped.
+NEMO_OUTPUTS="${SCRIPT_DIR}/.nemo-outputs.json"
+NEMO_BUILD_ID=""
+
+if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+  log "  Step 4b (NeMo-RL training container) skipped: --adaptive-only builds nothing NGC-based."
+else
 step "Step 4b: Building NeMo-RL training container"
 
 # Create ECR repo if needed
@@ -663,8 +690,6 @@ aws ecr describe-repositories --repository-names "${TRAINING_REPO}" --region "${
   aws ecr create-repository --repository-name "${TRAINING_REPO}" --region "${AWS_REGION}" --image-scanning-configuration scanOnPush=true >/dev/null
 
 # Check if NeMo images were already built
-NEMO_OUTPUTS="${SCRIPT_DIR}/.nemo-outputs.json"
-NEMO_BUILD_ID=""
 
 # --- Content hash over exactly what this image's Dockerfile COPYs.
 # Mirrors deploy.sh's _source_hash() for the ARTF images. This gate used to be
@@ -816,6 +841,7 @@ EOF
     log "  Continuing with remaining deployment steps..."
   fi
 fi
+fi # step 4b (skipped with --adaptive-only)
 
 # =========================================================================
 # Step 5: Deploy AgentCore Runtimes (Adaptive Bidding + Model Promotion Governance)
@@ -834,7 +860,9 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   ADAPTIVE_BIDDING_ROLE_ARN="${ADAPTIVE_BIDDING_ROLE_ARN:-$(get_stack_output "${AGENTCORE_SECURITY_STACK}" "AdaptiveBiddingAgentRoleArn")}"
   GOVERNANCE_ROLE_ARN="${GOVERNANCE_ROLE_ARN:-$(get_stack_output "${AGENTCORE_SECURITY_STACK}" "ModelPromotionGovernanceAgentRoleArn")}"
   [[ -n "${ADAPTIVE_BIDDING_ROLE_ARN}" && "${ADAPTIVE_BIDDING_ROLE_ARN}" != "None" ]] || fail "Adaptive Bidding execution role not found — deploy Step 4 (${AGENTCORE_SECURITY_STACK}) first."
-  [[ -n "${GOVERNANCE_ROLE_ARN}" && "${GOVERNANCE_ROLE_ARN}" != "None" ]] || fail "Governance execution role not found — deploy Step 4 (${AGENTCORE_SECURITY_STACK}) first."
+  if [[ "${ADAPTIVE_ONLY}" -eq 0 ]]; then
+    [[ -n "${GOVERNANCE_ROLE_ARN}" && "${GOVERNANCE_ROLE_ARN}" != "None" ]] || fail "Governance execution role not found — deploy Step 4 (${AGENTCORE_SECURITY_STACK}) first."
+  fi
 
   # Resolve the DynamoDB table names the agents need (from the closed-loop core stack).
   # Fetch here (not only in Step 3) so --start-at=5 still works.
@@ -846,7 +874,9 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # Both agents are Bedrock reasoning agents — a model id is required. Fail fast rather
   # than shipping a possibly-unavailable default (no faking).
   [[ -n "${ADAPTIVE_BIDDING_MODEL_ID}" ]] || fail "BEDROCK_MODEL_ID (or ADAPTIVE_BIDDING_MODEL_ID) is required — set it to a Bedrock model/inference-profile id enabled in this account/region."
-  [[ -n "${GOVERNANCE_MODEL_ID}" ]] || fail "BEDROCK_MODEL_ID (or GOVERNANCE_MODEL_ID) is required — set it to a Bedrock model/inference-profile id enabled in this account/region."
+  if [[ "${ADAPTIVE_ONLY}" -eq 0 ]]; then
+    [[ -n "${GOVERNANCE_MODEL_ID}" ]] || fail "BEDROCK_MODEL_ID (or GOVERNANCE_MODEL_ID) is required — set it to a Bedrock model/inference-profile id enabled in this account/region."
+  fi
 
   STACK_NAME="${STACK_PREFIX:+${STACK_PREFIX}-}nvidia-artf-recommenders"
   REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -885,10 +915,18 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
     # One CodeBuild run builds AND pushes both agent images (buildspec --target
     # agents), so the per-image build/push steps below are skipped. Done before the
     # repositories are touched, so a failure here leaves nothing half-made.
-    run_logged "${CL_DETAIL_LOG}" "Building both agent images in CodeBuild (arm64)" \
+    # --adaptive-only builds the Adaptive Bidding image alone (--only), since the
+    # Governance agent is not deployed.
+    _AGENT_BUILD_SELECT=(--target agents)
+    _AGENT_BUILD_LABEL="Building both agent images in CodeBuild (arm64)"
+    if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+      _AGENT_BUILD_SELECT=(--only adaptive-bidding-agent)
+      _AGENT_BUILD_LABEL="Building the Adaptive Bidding agent image in CodeBuild (arm64)"
+    fi
+    run_logged "${CL_DETAIL_LOG}" "${_AGENT_BUILD_LABEL}" \
       bash "${SCRIPT_DIR}/codebuild/remote_build.sh" \
         --stack-name "${STACK_NAME}" \
-        --target agents \
+        "${_AGENT_BUILD_SELECT[@]}" \
         --tag "${IMAGE_TAG}" \
         --region "${AWS_REGION}" \
         --profile "${AWS_PROFILE}" \
@@ -952,7 +990,15 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
 
   # -----------------------------------------------------------------------
   # 5b. Model Promotion Governance Agent (HTTP, reasoning + deterministic gate)
+  #
+  # Skipped with --adaptive-only: promotion runs TensorRT optimize Jobs on GPU
+  # nodes, and its VPC proxy needs the model-optimizer image, which learner mode
+  # does not build. The block below is left at its original indentation.
   # -----------------------------------------------------------------------
+  GOVERNANCE_RUNTIME_ARN=""
+  if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+    log "  Step 5b (Model Promotion Governance agent) skipped: --adaptive-only."
+  else
   GOVERNANCE_REPO="${STACK_NAME}-model-promotion-governance-agent"
   GOVERNANCE_IMAGE="${REGISTRY}/${GOVERNANCE_REPO}:${IMAGE_TAG}"
 
@@ -1109,6 +1155,7 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   [[ -n "${GOVERNANCE_RUNTIME_ARN}" ]] || fail "${GOVERNANCE_RUNTIME_NAME} deploy did not return a runtime ARN"
   export GOVERNANCE_RUNTIME_ARN
   log "  GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}"
+  fi # 5b (skipped with --adaptive-only)
 
   log "  AgentCore runtime deploys complete."
 
@@ -1122,7 +1169,15 @@ if [[ "${SKIP_AGENTCORE}" -eq 0 ]]; then
   # non-empty: the training role + both buckets (from Step 3) and both Model
   # Package Group names (also from Step 3). Falls back to stack-output lookups so
   # --start-at=5/6 works standalone.
+  #
+  # Skipped with --adaptive-only. The stack's Governance invoker and rule take the
+  # Governance runtime ARN unconditionally, and the rest is scheduled retraining.
+  # The Adaptive Bidding agent is then invoked from the UI only, with no daily
+  # schedule.
   # -----------------------------------------------------------------------
+  if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
+    log "  Step 6 (invocation stack ${GOVERNANCE_EVENTBRIDGE_STACK}) skipped: --adaptive-only."
+  else
   step "Step 6: Deploying invocation stack (${GOVERNANCE_EVENTBRIDGE_STACK})"
   SAGEMAKER_TRAINING_ROLE_ARN="${SAGEMAKER_TRAINING_ROLE_ARN:-$(get_stack_output "${CLOSED_LOOP_STACK}" "SageMakerTrainingExecutionRoleArn")}"
   DLRM_PACKAGE_GROUP="${DLRM_PACKAGE_GROUP:-$(get_stack_output "${CLOSED_LOOP_STACK}" "DLRMModelPackageGroupName")}"
@@ -1197,6 +1252,7 @@ except Exception:
   else
     warn "  Scheduled retraining NOT enabled (missing training role/buckets/package groups)."
   fi
+  fi # Step 6 (skipped with --adaptive-only)
 
   # -----------------------------------------------------------------------
   # Step 7: Rewire the UI with the now-known agent runtime ARNs.
@@ -1243,11 +1299,21 @@ except Exception:
       [[ -n "${COGNITO_USER_POOL_ID}" ]] || warn "  Cognito outputs not found (${COGNITO_OUTPUTS}) — UI auth vars will be empty."
 
       REACT_ENV="${SCRIPT_DIR}/../source/frontend-react/.env.production"
+      # The caption profile deploy.sh passes in. A standalone run keeps the value
+      # the last deploy.sh build wrote, then falls back to deploy.sh's default.
+      # This heredoc replaces the whole file, so a variable left out here is lost
+      # from the rebuilt bundle.
+      if [[ -z "${CAPTION_INFERENCE_PROFILE_ID:-}" ]]; then
+        CAPTION_INFERENCE_PROFILE_ID="$(sed -n 's/^VITE_CAPTION_INFERENCE_PROFILE_ID=//p' "${REACT_ENV}" 2>/dev/null | tail -n 1 || true)"
+      fi
+      CAPTION_INFERENCE_PROFILE_ID="${CAPTION_INFERENCE_PROFILE_ID:-global.anthropic.claude-haiku-5-5}"
       cat > "${REACT_ENV}" <<EOF
 VITE_COGNITO_USER_POOL_ID=${COGNITO_USER_POOL_ID}
 VITE_COGNITO_CLIENT_ID=${COGNITO_CLIENT_ID}
 VITE_COGNITO_REGION=${AWS_REGION}
 VITE_IDENTITY_POOL_ID=${IDENTITY_POOL_ID}
+VITE_BEDROCK_REGION=${AWS_REGION}
+VITE_CAPTION_INFERENCE_PROFILE_ID=${CAPTION_INFERENCE_PROFILE_ID}
 VITE_ADAPTIVE_BIDDING_RUNTIME_ARN=${ADAPTIVE_BIDDING_RUNTIME_ARN}
 VITE_GOVERNANCE_RUNTIME_ARN=${GOVERNANCE_RUNTIME_ARN}
 VITE_UI_API_PROXY_ARN=${UI_API_PROXY_ARN}

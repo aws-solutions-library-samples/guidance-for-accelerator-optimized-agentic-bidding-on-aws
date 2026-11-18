@@ -24,7 +24,7 @@
 // not from an expectation of it.
 
 import { BEAT_ORIGIN, BEAT_RECAP } from "./theaterBeats.js";
-import { hookReportSentence } from "./theaterCaptions.js";
+import { hookReportSentence, hookRetrySentence } from "./theaterCaptions.js";
 
 export const MAX_TOKENS = 120;      // NFR3-10: roughly double the measured 46-61
 export const TEMPERATURE = 0.3;     // NFR3-9: measured to be largely stable
@@ -174,6 +174,8 @@ export function buildCaptionPrompt(beat, context, deps = {}) {
       artf_hook_report: (beat.contributors ?? []).length === 0
         ? hookReportSentence(beat.artfReport)
         : null,
+      // The auction shown is a rerun after the hook did not answer in time.
+      artf_hook_retry: hookRetrySentence(beat.artfReport),
     });
   } else {
     step = omitEmpty({

@@ -42,9 +42,12 @@ real, disclosed feedback its Glue ETL job needs to build labeled training data:
   the shipped manifests) the container perturbs its own prediction by a small,
   bounded amount. This breaks a model that has converged to "no change" out of a
   cold-start deadlock, since a constant recommendation never produces the
-  mutation an outcome event needs. Exploration applies only to load-test
-  requests and to requests that set `ext.model_params.explore`; other traffic
-  gets the unperturbed prediction. Every exploratory response carries a
+  mutation an outcome event needs. That epsilon applies to load-test requests.
+  Requests that set `ext.model_params.explore` (every demo scenario that runs a
+  yield model) probe every deal the model would leave unchanged, by at least 1%
+  of the floor or 0.005 of margin, and pass a prediction that already moves the
+  value through unchanged. Other traffic gets the unperturbed prediction. Every
+  exploratory response carries a
   `:explore` suffix on its `model_version`, so training data can separate probes
   from the model's own recommendations.
 
@@ -139,7 +142,7 @@ DynamoDB parameter/audit/feature tables, the SageMaker Model Registry groups
 with a **genesis (v1)** starter version per model type, the two Glue ETL jobs
 (every 6 hours), the training image (built asynchronously into the shared
 `artf-nemo-rl-training` ECR repository), both AgentCore agent runtimes
-backed by `global.anthropic.claude-opus-4-8` (change with `--model-id`), and the
+backed by `global.anthropic.claude-opus-5-5` (change with `--model-id`), and the
 EventBridge schedules: the Adaptive Bidding Agent every 24 hours (the
 `AdaptiveBiddingScheduleRate` parameter of `deployment/governance_eventbridge_cfn.yaml`)
 and retraining every 24 hours. [GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps) lists
@@ -195,6 +198,7 @@ With Part 1, the default deploy is about **$1,495/month** on the nightly GPU shu
 (about $1,970/month with the GPU node on 24/7). The line items, and the assumptions that move them,
 are in the single cost table in [README.md](README.md#cost).
 
+<<<<<<< HEAD
 The largest variables are the agent cadence (`AdaptiveBiddingScheduleRate`; about $0.075 per
 Adaptive Bidding Agent invocation, so $657/month at `rate(5 minutes)`) and SageMaker training
 (about $15/month while jobs stop at the gate, about $104/month once all four pass, capped at about
@@ -202,6 +206,32 @@ $737/month by the 4-hour job limit). Pausing the schedules takes the Bedrock and
 zero; the Kinesis shards ($44), the KMS key, DynamoDB storage and the Glue runs (unless their
 triggers are stopped) remain. No DAX cluster is deployed; the parameter cache reads DynamoDB
 directly unless you provision one and set `DAX_ENDPOINT`.
+=======
+| AWS service | Dimensions (defaults) | Cost [USD/month] |
+| --- | --- | --- |
+| Amazon Kinesis Data Streams | 2 provisioned streams × 2 shards | $44 |
+| Firehose, S3, KMS | 2 delivery streams, 3 buckets, 1 customer-managed key | ~$3 |
+| AWS Glue | 2 jobs × 10 G.1X workers, every 6 hours, ~5 min per run | ~$88 |
+| Amazon DynamoDB | 3 tables, on-demand | ~$5 |
+| Amazon SageMaker Training | up to 4 jobs/day on ml.g5.2xlarge ($1.515/h), ~30 min each when the data passes the gate; about $5/month when every job stops at the gate | up to ~$91 |
+| Amazon Bedrock (Adaptive Bidding Agent) | Claude Opus (`global.anthropic.claude-opus-5-5`), every 24 hours, ~10K in / 1K out tokens per call ($4 / $20 per million) | ~$2 |
+| Amazon Bedrock (Governance Agent) | Same model, invoked on model registration only | ~$10 |
+| Amazon Bedrock AgentCore | Runtime consumption for both agents | ~$1 |
+| Secrets Manager, EventBridge Scheduler, Lambda, SNS | NGC secret, 2 schedules, VPC proxy function, alerts topic | ~$2 |
+| **Part 2 total (estimate)** | | **~$245** |
+
+With both parts running on the included nightly GPU shutdown schedule, expect
+roughly **$1,470/month** total (**$1,945** with the GPU on 24/7). The Bedrock
+line scales linearly with the agent cadence (`AdaptiveBiddingScheduleRate`
+in `deployment/governance_eventbridge_cfn.yaml`, default `rate(24 hours)`;
+about $648 at `rate(5 minutes)`).
+Pausing the scheduled components above takes the Bedrock and SageMaker lines
+to zero while the infrastructure stays up; the Kinesis shards, KMS key and
+DynamoDB storage remain. No DAX cluster is deployed; the parameter cache reads
+DynamoDB directly unless you provision one and set `DAX_ENDPOINT`. See
+[README.md](README.md#cost) for the full combined line-item table and
+[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for the assumptions.
+>>>>>>> origin/beta
 
 ## Learn more
 

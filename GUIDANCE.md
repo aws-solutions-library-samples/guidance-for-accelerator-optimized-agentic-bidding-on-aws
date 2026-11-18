@@ -302,8 +302,8 @@ versions against.
 | AWS Lambda (UI API proxy) | VPC-attached function the browser invokes with SigV4; forwards UI API calls to the orchestrator's internal NLB so nothing in the VPC is internet-facing |
 | Amazon Cognito (User Pool + Identity Pool) | Signs users in; exchanges the ID token for temporary credentials scoped to invoking the UI API proxy and the closed-loop agents |
 | AWS IAM (IRSA) | IAM Roles for Service Accounts grants Triton S3 read access without long-lived credentials |
-| Amazon Bedrock AgentCore | Hosts the MCP runtime for AI agent integration via the extend_rtb tool (deployed by default; `--skip-agentcore` omits it) |
-| Amazon DynamoDB | `loadtest-history` and `container-registry` tables (on-demand) |
+| Amazon Bedrock AgentCore | Hosts the MCP runtime for AI agent integration via the extend_rtb tool (deployed by default; `--skip-agentcore` omits it). With `--with-prebid`, also hosts the campaign/deals MCP control plane: ten tools that create, change, activate and pause campaigns and Deals API deals in the deals table, behind an inbound Cognito JWT authorizer (`--no-control-plane` omits it) |
+| Amazon DynamoDB | `loadtest-history` and `container-registry` tables, and the `<stack>-deals` table of IAB Deals API v1.0 deals and demand-side campaigns (on-demand, encrypted, point-in-time recovery) |
 | AWS Secrets Manager | Stores the NVIDIA NGC API key used by the Part 2 training-image build |
 
 
@@ -345,6 +345,7 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 - **Non-root execution:** All ARTF containers run as appuser (non-root) per the ARTF specification
 - **Security hardening:** no-new-privileges security option and read-only filesystem in container runtime
 - **Network isolation:** ARTF containers and the orchestrator communicate only within the cluster; the orchestrator has no public address (a ClusterIP Service in-cluster, an internal NLB for the UI API proxy). The only path in from the testing frontend is browser, then `lambda:InvokeFunction` (SigV4, Cognito Identity Pool), then the UI API proxy Lambda inside the VPC, then the orchestrator's internal NLB, with the user's Cognito bearer token forwarded for the orchestrator's own JWT check. This works unchanged in accounts running VPC Block Public Access in block-ingress mode
+- **Machine-to-machine OAuth for the control plane (`--with-prebid`):** an external agent reaches the campaign/deals control plane with a Cognito `client_credentials` token for a dedicated app client and resource server (`artf-control`, four scopes), never with AWS credentials. AgentCore's inbound JWT authorizer accepts only that client and those scopes, and the container verifies the token a second time (RS256 only) and requires each tool's scope. Entitlement is by advertiser domain (campaigns) and seller domain (deals), deny by default. The runtime's role can read and write the one deals table and cannot delete; the Prebid host's own client holds no control scope
 - **Image provenance:** Base images sourced from NVIDIA NGC (authenticated registry) and Python official images; application containers stored in private ECR
 
 ### Reliability
@@ -430,7 +431,7 @@ Deploy options (each flag's default is in parentheses):
 ./deploy.sh --prefix dv1 --skip-cluster     # reuse the existing EKS cluster
 ./deploy.sh --prefix dv1 --maxGPUs 5        # GPU node group maximum (default 3)
 ./deploy.sh --prefix dv1 --artf-on-gpu      # run the ARTF containers on the GPU node (default: CPU node group)
-./deploy.sh --prefix dv1 --model-id ID      # Bedrock model for both agents (default: global.anthropic.claude-opus-4-8)
+./deploy.sh --prefix dv1 --model-id ID      # Bedrock model for both agents (default: global.anthropic.claude-opus-5-5)
 ./deploy.sh --prefix dv1 --start-at 3       # force a starting phase, 1-5 (default: probe AWS, run what is missing)
 ./deploy.sh --prefix dv1 --export-only      # only export and upload the models
 ./deploy.sh --prefix dv1 --ui-only          # only redeploy the frontend
@@ -501,11 +502,53 @@ table for both parts. In summary, at `us-east-1` on-demand rates current when it
 - **Default deploy** (Part 1 and Part 2): about **$1,495/month**, about $1,970/month with the GPU
   node on 24/7.
 
+<<<<<<< HEAD
 The CPU node group, not the GPU, is the largest fixed line: the three `c5.2xlarge` nodes run around
 the clock. Scale `cpu-services` to its minimum of 2 to save about $248/month. For demos: deploy,
 test, then `./deploy.sh --prefix <p> --destroy` immediately. A two-hour session with the default
 node groups costs about $5 of running infrastructure, plus about $20 to $25 of CodeBuild time on a
 first deploy.
+=======
+| Resource | Configuration | Part | Est. monthly cost |
+|----------|---------------|------|-------------------|
+| EKS cluster | 1 control plane | Part 1 | $73 |
+| GPU node (g5.xlarge, $1.006/h) | 1 instance, ~260 h on the nightly shutdown schedule | Part 1 | $262 (24/7: $734) |
+| CPU nodes (c5.2xlarge, $0.34/h) | 3 instances, 24/7 (`cpu-services` desired 3, min 2, max 8) | Part 1 | $745 |
+| NAT gateways | 3 (one per AZ) at $0.045/h, plus $0.045 per GB processed | Part 1 | $99 + data |
+| Network Load Balancer (internal, Triton) | 1 at $0.0225/h, plus LCU usage | Part 1 | $16 + LCU |
+| EBS (gp3, $0.08/GB-mo) | 100 GB GPU node volume + 3 × 50 GB CPU node volumes | Part 1 | $20 |
+| S3 (models + frontend), CloudFront, Cognito | Low-traffic demo | Part 1 | <$2 |
+| DynamoDB (`loadtest-history`, `container-registry`) | On-demand | Part 1 | <$2 |
+| Lambda (UI API proxy), CloudWatch Logs, ECR storage | Per-invocation and per-GB; idle when the UI is closed | Part 1 | <$5 |
+| Bedrock AgentCore MCP runtime | Consumption-billed; idle unless an agent calls `extend_rtb` | Part 1 | <$2 |
+| **Part 1 total (estimate)** | | | **~$1,225/month (24/7 GPU: ~$1,700)** |
+
+With `--with-prebid` (off by default) the variant adds, on the same cluster:
+
+| Resource | Configuration | Part | Est. monthly cost |
+|----------|---------------|------|-------------------|
+| Secrets Manager secret | The Prebid host's Cognito client credential | Prebid | $0.40 |
+| Prebid Server, artfhouse demand service, simulator seat | Pods on the existing `cpu-services` nodes; no new nodes or load balancers | Prebid | $0 standing |
+| Bedrock AgentCore runtime (campaign/deals control plane) | Billed per second while a tool call's session runs, $0.1276/vCPU-h and $0.0169/GB-h; CPU not billed during I/O wait. 1,000 calls of about 1 s CPU and 30 s at 0.25 GB is about $0.07. `--no-control-plane` omits it | Prebid | <$1 |
+| Cognito domain, 3 resource servers, 2 app clients, IAM roles | No standing charge | Prebid | $0 |
+| ECR (Prebid, demand, control-plane images) | Per GB-month of image storage | Prebid | <$1 |
+
+AgentCore rates are from the Runtime example on the [AgentCore pricing page](https://aws.amazon.com/bedrock/agentcore/pricing/), read 2026-10-23.
+
+The CPU node group, not the GPU, is the largest fixed line: the three
+`c5.2xlarge` nodes run around the clock. Scale `cpu-services` to its minimum
+of 2 to save about $248/month. For demos: deploy, test, then
+`./deploy.sh --prefix <p> --destroy` immediately. A 2-hour demo session with
+the default node groups costs approximately $5 of compute.
+
+Part 2 (closed-loop learning, deployed by default alongside Part 1) adds
+roughly $245/month at its default schedules (the Adaptive Bidding Agent runs
+once every 24 hours by default; shortening that cadence is what moves the
+Bedrock line); see
+[GUIDANCE-part2.md](GUIDANCE-part2.md#cost-estimation) for its line items and
+the knobs that reduce it, or [README.md](README.md#cost) for both parts
+combined in one table.
+>>>>>>> origin/beta
 
 ## Amazon Bedrock AgentCore Integration
 

@@ -16,7 +16,7 @@
  *
  * Refs:
  * - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
- * - https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html
+ * - https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -30,12 +30,12 @@ import { resolveSegmentLabel } from "./utils/segmentLabels.js";
 const REGION = import.meta.env.VITE_BEDROCK_REGION || COGNITO_REGION;
 
 /**
- * The global inference profile, in every region. Haiku 4.5 reports
- * INFERENCE_PROFILE as its only supported inference type, so the bare model id
- * is not an option; and `global.` is available everywhere, so nothing has to
- * derive a geography from the deployment region.
+ * The global inference profile, in every region. Haiku 5.5 has no general
+ * in-Region endpoint, so the bare model id is not an option; and `global.` is
+ * available everywhere, so nothing has to derive a geography from the
+ * deployment region.
  */
-const DEFAULT_PROFILE_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
+const DEFAULT_PROFILE_ID = "global.anthropic.claude-haiku-5-5";
 const PROFILE_ID = import.meta.env.VITE_CAPTION_INFERENCE_PROFILE_ID || DEFAULT_PROFILE_ID;
 
 /** @type {{token: string, client: BedrockRuntimeClient} | null} */

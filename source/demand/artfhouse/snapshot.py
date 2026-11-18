@@ -14,9 +14,11 @@ deals_source.py) into an immutable snapshot:
     swapped in with one assignment, so a bid in flight sees either the old one or
     the new one, never a mix.
 
-Deal records are not consulted by the decision (a request carries its own deal
-floors); they are loaded so the snapshot can report campaigns that name a deal the
-book does not hold, which is a seed fault worth a log line.
+Deal records are loaded for two things: to report campaigns that name a deal the
+book does not hold (a seed fault worth a log line), and to tell the catalog which
+deals the seller has taken off the market (Deals API ``sellerstatus`` not 0), so a
+campaign holding only such deals declines with ``deal_inactive``. A request still
+carries its own deal floors; the decision never reads the table.
 """
 from __future__ import annotations
 
@@ -43,11 +45,26 @@ class Snapshot:
     campaigns: int
     deals: int
     loaded_at: datetime
+    paused_campaigns: int = 0
+    inactive_deals: int = 0
 
 
 _snapshot: Optional[Snapshot] = None
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
+
+
+#: Deals API ``sellerstatus`` meaning the deal may transact; also the spec's default.
+_SELLERSTATUS_ACTIVE = 0
+
+
+def _deal_is_active(record: dict) -> bool:
+    """Same rule as shared/deal_library.deal_is_active; restated because the demand
+    image carries only the demand package."""
+    try:
+        return int(record.get("sellerstatus", _SELLERSTATUS_ACTIVE)) == _SELLERSTATUS_ACTIVE
+    except (TypeError, ValueError):
+        return False
 
 
 def _build() -> Snapshot:
@@ -57,7 +74,8 @@ def _build() -> Snapshot:
     # records means the wrong table or a failed seed.
     if not campaign_records:
         raise ValueError("the source returned no campaign records")
-    catalog = CampaignCatalog(campaigns_from_records(campaign_records))
+    inactive = {str(d.get("id")) for d in deal_records if not _deal_is_active(d)}
+    catalog = CampaignCatalog(campaigns_from_records(campaign_records), inactive_deal_ids=inactive)
     known = {str(d.get("id")) for d in deal_records}
     unknown = sorted({deal for c in catalog.all() for deal in c.deal_ids} - known)
     if unknown:
@@ -69,6 +87,8 @@ def _build() -> Snapshot:
         campaigns=len(catalog.all()),  # nosemgrep: len-all-count CampaignCatalog.all() returns a tuple, not a Django queryset
         deals=len(deal_records),
         loaded_at=datetime.now(timezone.utc),
+        paused_campaigns=sum(1 for c in catalog.all() if c.paused),
+        inactive_deals=len(inactive),
     )
 
 
@@ -79,6 +99,7 @@ def load() -> Snapshot:
     _snapshot = snap
     logger.info(json.dumps({
         "event": "catalog_loaded", "campaigns": snap.campaigns, "deals": snap.deals,
+        "paused_campaigns": snap.paused_campaigns, "inactive_deals": snap.inactive_deals,
         "source": deals_source.describe_source(),
     }))
     return snap

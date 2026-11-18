@@ -102,6 +102,10 @@ function presentStatus(c) {
   if (c.status === "degraded" && c.inferenceStatus === "gpu_offline") {
     return { cls: "degraded", label: "gpu offline" };
   }
+  // Learner mode: Triton runs on CPU nodes, so the cause is Triton itself.
+  if (c.status === "degraded" && c.inferenceStatus === "triton_offline") {
+    return { cls: "degraded", label: "triton offline" };
+  }
   const known = STATUS_PRESENTATION[c.status];
   if (known) return known;
   // An unrecognised status is shown verbatim rather than mapped onto a guess.

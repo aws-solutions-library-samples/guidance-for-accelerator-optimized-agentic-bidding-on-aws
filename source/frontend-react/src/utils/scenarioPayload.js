@@ -15,12 +15,26 @@ const AGE_YOB_MAP = [
   { yobMin: 1940, yobMax: 1961 },
 ];
 
+const YIELD_MODEL_KEYS = new Set(["deal_yield_manager_floor", "deal_yield_manager_margin"]);
+
+export const YIELD_EXPLORATION_DISCLOSURE =
+  "The Yield Optimizer models start untrained and predict no change. When one does, " +
+  "this run moves that deal's floor or margin by a small random step instead, and " +
+  "labels the result as an exploration arm.";
+
+/** True when the scenario runs either Yield Optimizer container. */
+export function scenarioUsesYieldOptimizer(scenario) {
+  return (scenario?.models || []).some((m) => YIELD_MODEL_KEYS.has(m.key));
+}
+
 /**
  * Apply a scenario card's tuner values to its payload.
  *
  * Every model parameter is gated on `scenario.controls` containing the control:
  * a value the card never showed must not travel, or a scenario would be running
- * with a parameter the reader had no way to see.
+ * with a parameter the reader had no way to see. `explore` is the one parameter
+ * with no control; it travels on every yield scenario, and the card states it in
+ * YIELD_EXPLORATION_DISCLOSURE.
  */
 export function applyTunerToPayload(payload, scenario, params = {}) {
   const patched = JSON.parse(JSON.stringify(payload));
@@ -53,12 +67,12 @@ export function applyTunerToPayload(payload, scenario, params = {}) {
   if (params.segThreshold != null && scenario.controls?.includes("segThreshold")) {
     modelParams.segment_threshold = params.segThreshold;
   }
-  if (params.explore != null && scenario.controls?.includes("explore")) {
-    // Yield Optimizer's bounded exploration toggle (see
-    // shared/yield_exploration.py's resolve_effective_epsilon) — explicit
-    // True/False, read the same way every other demo-tunable parameter here is
-    // (ext.model_params).
-    modelParams.explore = params.explore;
+  if (scenarioUsesYieldOptimizer(scenario)) {
+    // Every yield scenario opts in. The containers then probe each deal the
+    // model would leave unchanged and pass a real recommendation through as is
+    // (shared/yield_exploration.py's resolve_effective_epsilon). The card shows
+    // YIELD_EXPLORATION_DISCLOSURE, so this parameter is visible to the reader.
+    modelParams.explore = true;
   }
   if (Object.keys(modelParams).length > 0) {
     // Nonstandard signaling travels through the ARTF `ext` object, not as a

@@ -53,16 +53,31 @@ def test_triton_hpa_max_replicas_is_the_max_gpus_placeholder():
     assert rendered["spec"]["minReplicas"] == 1
 
 
-def test_deploy_substitutes_and_guards_max_gpus_in_the_step_8b_loop():
+def test_deploy_substitutes_and_guards_max_gpus_when_rendering_manifests():
     deploy = _deploy()
     loop = deploy[deploy.index("_APPLIED_MANIFESTS=("):]
     loop = loop[: loop.index('log "  Applied ${#_APPLIED_MANIFESTS[@]} manifests"')]
     assert "triton-hpa.yaml" in loop.split("\n", 1)[0]
-    assert '-e "s|__MAX_GPUS__|${MAX_GPUS}|g"' in loop
-    assert "grep -q '__MAX_GPUS__' \"${PROCESSED}\"" in loop
-    assert 'fail 3 "${manifest} still has an unsubstituted __MAX_GPUS__"' in loop
+    assert 'render_manifest "${manifest}" "${PROCESSED}"' in loop
+
+    render = deploy[deploy.index("render_manifest() {"):]
+    render = render[: render.index("\n}\n")]
+    assert 'local hpa_max="${MAX_GPUS}"' in render
+    assert '-e "s|__MAX_GPUS__|${hpa_max}|g"' in render
+    # The guard runs after the learner transform, which fills the placeholder there.
+    assert render.index("_learner_transform") < render.index("grep -q '__MAX_GPUS__' \"${out}\"")
+    assert 'fail 3 "${manifest} still has an unsubstituted __MAX_GPUS__"' in render
     # A re-run restores --maxGPUs from .deploy-state.json before Step 8b.
     assert deploy.index("_reuse MAX_GPUS") < deploy.index("_APPLIED_MANIFESTS=(")
+
+
+def test_learner_mode_caps_triton_hpa_at_two():
+    import sys
+    sys.path.insert(0, str(REPO / "deployment" / "scripts"))
+    from learner_render import transform
+
+    rendered = _hpa(transform("triton-hpa", TRITON_HPA.read_text(encoding="utf-8")), "triton-hpa")
+    assert rendered["spec"]["maxReplicas"] == 2
 
 
 def test_orchestrator_hpa_is_unchanged():

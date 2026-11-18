@@ -23,8 +23,11 @@ from typing import Any, Iterable, Optional
 ENV_TABLE = "DEALS_TABLE"
 ENV_SEED_FILE = "DEALS_SEED_FILE"
 
-#: Storage attributes the seeder adds to every item; not part of the record.
-STORAGE_KEYS = ("record_type", "seq")
+#: Attributes the writers add to every item that are not part of the record: the
+#: table keys and seed order from the seeder, the provenance marks from the
+#: control plane. ``status`` on a campaign and ``sellerstatus`` on a deal ARE part
+#: of the record and are kept.
+STORAGE_KEYS = ("record_type", "seq", "managed_by", "updated_at")
 
 #: Integer-valued campaign fields. DynamoDB returns every number as Decimal.
 _INT_FIELDS = frozenset({"width", "height", "duration", "seq"})

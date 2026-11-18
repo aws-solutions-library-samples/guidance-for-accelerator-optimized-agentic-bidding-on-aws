@@ -53,6 +53,11 @@ PREMIUM_VIDEO_FLOOR = _seed_deal_floor("deal-premium-video")
 # floor coming down. Its campaigns clear only once the deal floor is lowered.
 PRICED_FOR_A_LOWERED_FLOOR = frozenset({"ridesharer-suburban-midday.json"})
 
+# This scenario's deal campaign targets a content id that only an ADD_CIDS
+# container supplies (imp.metric[].type with the cid: prefix). It bids only once
+# that metric is on the impression.
+UNLOCKED_BY_CONTENT_IDS = {"ctv-drama-finale.json": "cid:premium-drama-finale"}
+
 
 def scenario_files():
     return sorted(SAMPLES.glob("*.json"))
@@ -181,6 +186,17 @@ def test_each_scenario_with_deals_produces_at_least_one_deal_bid(scenario):
             for deal in (imp.get("pmp") or {}).get("deals") or []:
                 deal["bidfloor"] = imp["bidfloor"]
         bid_request = lowered
+
+    if scenario in UNLOCKED_BY_CONTENT_IDS:
+        assert not _deal_bids(SERVICE.decide(bid_request)), (
+            f"{scenario} should go unsold without its content identifiers"
+        )
+        tagged = json.loads(json.dumps(bid_request))
+        for imp in tagged["imp"]:
+            imp.setdefault("metric", []).append(
+                {"type": UNLOCKED_BY_CONTENT_IDS[scenario], "value": 1.0}
+            )
+        bid_request = tagged
 
     response = SERVICE.decide(bid_request)
     deal_bids = _deal_bids(response)

@@ -49,15 +49,18 @@ USE_TRITON = os.environ.get("USE_TRITON", "").lower() in ("1", "true", "yes")
 # emits a mutation, so it can never generate the outcome data needed to learn
 # anything else.
 #
-# epsilon defaults to 0.1 but only takes effect on requests that are
-# load-test-originated or that explicitly opt in via ext.model_params.explore
-# (see resolve_effective_epsilon). A prior version read this epsilon
+# epsilon (default 0.1) applies to load-test requests. A request that opts in
+# via ext.model_params.explore (every demo scenario that runs a yield model)
+# probes each deal the model would leave unchanged instead; see
+# resolve_effective_epsilon. Other traffic never explores. A prior version read this epsilon
 # unconditionally with a disabled (0.0) default, which meant a freshly deployed
 # stack could NEVER produce a yield mutation for the genesis model -- confirmed
 # live: every load test produced exactly 0 mutations, so no outcome event was
 # ever emitted and the training pipeline had nothing to bootstrap from.
 _EXPLORATION_EPSILON = float(os.environ.get("YIELD_EXPLORATION_EPSILON", "0.1"))
 _EXPLORATION_MARGIN_BOUND = float(os.environ.get("YIELD_EXPLORATION_MARGIN_BOUND", "0.02"))
+# A probe moves the margin by at least 0.005, so the 4-place rounded value is never 0.
+_EXPLORATION_MARGIN_MIN_STEP = 0.005
 # Module-level so tests can substitute a seeded random.Random() for
 # deterministic assertions, without monkeypatching the `random` module itself.
 _exploration_rng = random.Random()
@@ -110,11 +113,8 @@ def mutate(req: RTBRequest) -> RTBResponse:
     request_time = datetime.now(timezone.utc)
     bid_request = req.bid_request or {}
 
-    effective_epsilon = resolve_effective_epsilon(
-        get_is_load_test(),
-        parse_explore_override(req.model_params),
-        _EXPLORATION_EPSILON,
-    )
+    is_load_test = get_is_load_test()
+    explore_override = parse_explore_override(req.model_params)
 
     mutations: list[Mutation] = []
     served_model_version = ""
@@ -138,12 +138,15 @@ def mutate(req: RTBRequest) -> RTBResponse:
             margin_value, explored = apply_exploration(
                 margin_value,
                 rng=_exploration_rng,
-                epsilon=effective_epsilon,
+                epsilon=resolve_effective_epsilon(
+                    is_load_test, explore_override, _EXPLORATION_EPSILON,
+                    prediction=margin_value, no_op_value=0.0,
+                ),
                 bound=_EXPLORATION_MARGIN_BOUND,
                 clamp_min=MARGIN_VALUE_MIN,
                 clamp_max=MARGIN_VALUE_MAX,
+                min_step=_EXPLORATION_MARGIN_MIN_STEP,
             )
-            any_explored = any_explored or explored
 
             # BR-3/BR-4: a margin of exactly 0.0 is "no change" and must never
             # become a mutation -- emitting a no-op REPLACE would put a
@@ -151,6 +154,7 @@ def mutate(req: RTBRequest) -> RTBResponse:
             # event in the training data.
             if margin_value == 0.0:
                 continue
+            any_explored = any_explored or explored
 
             mutations.append(Mutation(
                 intent=Intent.ADJUST_DEAL_MARGIN, op=Operation.REPLACE,

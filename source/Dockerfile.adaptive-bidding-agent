@@ -11,8 +11,6 @@
 #
 # Must be built for ARM64 (AgentCore uses Graviton-based microVMs).
 
-# The Docker Official python image, pulled from its Amazon ECR Public mirror so
-# CodeBuild does not hit Docker Hub's anonymous pull rate limit.
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app

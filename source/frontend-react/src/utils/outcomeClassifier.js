@@ -76,6 +76,8 @@ export const EXCLUSION = Object.freeze({
   NOT_TARGETED: "not_targeted",
   NO_DEAL_ON_IMPRESSION: "no_deal_on_impression",
   MEDIA_TYPE_UNSUPPORTED: "media_type_unsupported",
+  CAMPAIGN_PAUSED: "campaign_paused",
+  DEAL_INACTIVE: "deal_inactive",
 });
 
 /** Hook outcomes that mean enrichment never happened (U3). */
@@ -106,6 +108,8 @@ const HUMAN_REASON = new Map([
     EXCLUSION.MEDIA_TYPE_UNSUPPORTED,
     "The impression offers no slot this campaign's creative could fill",
   ],
+  [EXCLUSION.CAMPAIGN_PAUSED, "Campaign is paused; activate it through the control plane"],
+  [EXCLUSION.DEAL_INACTIVE, "The seller has taken this campaign's deal off the market"],
   [HOOK_OUTCOME.TIMEOUT, "Enrichment timed out"],
   [HOOK_OUTCOME.TRANSPORT_FAILURE, "Enrichment could not be reached"],
   [
