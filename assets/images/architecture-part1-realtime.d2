@@ -1,7 +1,11 @@
-# Part 1 — Real-Time Agentic Bidding (live integration path)
+# Part 1: Real-Time Agentic Bidding (live integration path)
 # Shows how the solution is invoked in a live environment: an ad exchange / DSP
-# calls the ARTF extension point directly over the bidstream. The React test
-# console and its Cognito/CloudFront auth path are intentionally omitted.
+# calls the ARTF extension point directly over the bidstream. The optional Prebid
+# host (--with-prebid) runs in the same EKS cluster and reaches the same extension
+# point through its ARTF hook. With Prebid, the campaign/deals MCP control plane
+# (an AgentCore runtime) lets an external agent manage the deals table over OAuth
+# client_credentials. The React test console and its Cognito/CloudFront auth path
+# are intentionally omitted.
 
 direction: right
 
@@ -24,12 +28,20 @@ exchange: "Ad Exchange / DSP\nOpenRTB bidstream" {
   style.font-size: 24
 }
 
+agent: "External agent (--with-prebid)\nOAuth 2.0 client_credentials\nmanages campaigns and deals" {
+  shape: cloud
+  style.fill: "#EFE9FB"
+  style.stroke: "#8C4FFF"
+  style.stroke-dash: 4
+  style.font-size: 22
+}
+
 aws: "AWS Cloud" {
   style.stroke: "#232F3E"
   style.font-size: 26
   style.bold: true
 
-  orch: "Orchestrator\nAmazon EKS · Starlette\ngRPC fan-out (+ MCP/REST)" {
+  orch: "Orchestrator\nAmazon EKS · Starlette\nstaged ARTF pipeline over gRPC (+ MCP/REST)\n1 enrich, 2 deals, 3 yield, 4 price" {
     shape: hexagon
     style.fill: "#FDEBD0"
     style.stroke: "#ED7100"
@@ -39,45 +51,83 @@ aws: "AWS Cloud" {
   containers: "ARTF Containers (Amazon EKS)" {
     style.stroke: "#ED7100"
     style.font-size: 24
-    grid-columns: 2
-    dlrm: "DLRM Bid Shader\nBID_SHADE"
-    wd: "Wide & Deep Segment Activator\nACTIVATE_SEGMENTS"
-    ncf: "NCF Deal Manager\nACTIVATE_DEALS / SUPPRESS_DEALS"
-    metrics: "Metrics Enricher\nADD_METRICS (rule-based, CPU)"
+    # Listed in pipeline stage order so the orchestrator edges do not cross.
+    grid-columns: 1
+    metrics: "1 Signals Enricher\nADD_METRICS (rule-based, CPU)"
+    wd: "1 Audience Activator\nACTIVATE_SEGMENTS (rule-based, CPU)"
+    ncf: "2 Deal Scorer (NCF, TensorRT)\nACTIVATE_DEALS / SUPPRESS_DEALS"
+    yield_floor: "3 Yield Optimizer: Deal Floor (XGBoost, FIL)\nADJUST_DEAL_FLOOR"
+    yield_margin: "3 Yield Optimizer: Deal Margin (XGBoost, FIL)\nADJUST_DEAL_MARGIN"
+    dlrm: "4 Bid Pricer (DLRM, TensorRT)\nBID_SHADE"
   }
 
-  triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nONNX Runtime + CUDA EP · 3 models" {
+  triton: "NVIDIA Triton Inference Server\nGPU node · g5.xlarge (A10G)\nor Amazon EC2 G7e (Blackwell, more powerful)\nTensorRT plan (stable/canary router) + FIL · 4 models" {
     style.fill: "#76b900"
     style.stroke: "#5a8c00"
     style.font-color: "#000000"
     style.font-size: 22
   }
 
-  models: "Amazon S3\nModel Repository (ONNX)" {
+  models: "Amazon S3\nModel Repository (TensorRT .plan + xgboost.json)" {
     shape: cylinder
     style.fill: "#E4F2DD"
     style.stroke: "#3F8624"
     style.font-size: 22
   }
 
-  agentcore: "Amazon Bedrock AgentCore\nMCP Runtime — extend_rtb (optional)" {
+  agentcore: "Amazon Bedrock AgentCore\nMCP Runtime: extend_rtb (optional)" {
     style.fill: "#FDEBD0"
     style.stroke: "#ED7100"
     style.font-size: 22
   }
+
+  prebid_host: "Prebid host (--with-prebid, same EKS cluster, optional)" {
+    style.stroke: "#ED7100"
+    style.stroke-dash: 4
+    style.font-size: 24
+
+    pbs: "Prebid Server\nARTF hook (gRPC to orchestrator)" {
+      style.fill: "#FDEBD0"
+      style.stroke: "#ED7100"
+    }
+    demand: "artfhouse demand service\nDeployment + ClusterIP Service\nin-memory deal catalog (30 s refresh)" {
+      style.fill: "#FDEBD0"
+      style.stroke: "#ED7100"
+    }
+    sim: "Simulator seat (amt)\nstatic OpenRTB bids" {
+      style.fill: "#F2F3F3"
+      style.stroke: "#7D8998"
+    }
+  }
+
+  deals: "Amazon DynamoDB\nDeals and campaigns table" {
+    shape: cylinder
+    style.fill: "#E6EBF8"
+    style.stroke: "#C925D1"
+    style.font-size: 22
+  }
+
+  control: "Campaign/deals control plane (--with-prebid)\nAmazon Bedrock AgentCore MCP runtime\n10 tools · Cognito JWT authorizer\nthe only writer of the deals table" {
+    style.fill: "#FDEBD0"
+    style.stroke: "#ED7100"
+    style.stroke-dash: 4
+    style.font-size: 22
+  }
 }
 
-exchange -> aws.orch: "OpenRTB BidRequest"
-aws.orch -> exchange: "RTBResponse (mutations)"
+exchange <-> aws.orch: "OpenRTB BidRequest / RTBResponse (mutations)"
 
-aws.orch -> aws.containers.dlrm: "parallel fan-out"
+aws.orch -> aws.containers.metrics: "staged pipeline (gRPC)"
 aws.orch -> aws.containers.wd
 aws.orch -> aws.containers.ncf
-aws.orch -> aws.containers.metrics
+aws.orch -> aws.containers.yield_floor
+aws.orch -> aws.containers.yield_margin
+aws.orch -> aws.containers.dlrm
 
 aws.containers.dlrm -> aws.triton: "tritonclient"
-aws.containers.wd -> aws.triton
 aws.containers.ncf -> aws.triton
+aws.containers.yield_floor -> aws.triton
+aws.containers.yield_margin -> aws.triton
 
 aws.triton -> aws.models: "load models at startup" {
   style.stroke-dash: 4
@@ -86,3 +136,15 @@ aws.triton -> aws.models: "load models at startup" {
 aws.agentcore -> aws.orch: "extend_rtb (MCP)" {
   style.stroke-dash: 4
 }
+
+aws.prebid_host.pbs -> aws.orch: "ARTF hook (gRPC)"
+aws.prebid_host.pbs -> aws.prebid_host.demand: "OpenRTB (in-cluster)"
+aws.prebid_host.pbs -> aws.prebid_host.sim: "OpenRTB"
+aws.prebid_host.demand -> aws.deals: "catalog refresh (off the bid path)" {
+  style.stroke-dash: 4
+}
+
+agent -> aws.control: "MCP over HTTPS, Bearer token\n(Cognito client_credentials)" {
+  style.stroke-dash: 4
+}
+aws.control -> aws.deals: "create / update / activate / pause\n(read and write; no delete)"

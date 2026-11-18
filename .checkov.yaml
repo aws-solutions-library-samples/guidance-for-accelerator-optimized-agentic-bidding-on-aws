@@ -1,0 +1,33 @@
+# Checkov suppressions for this guidance. Each id carries the reason it is skipped.
+# Pod security context checks CKV_K8S_23, CKV_K8S_20, CKV_K8S_28, CKV_K8S_37, CKV_K8S_31
+# and the Dockerfile USER check CKV_DOCKER_3 are not skipped here: they are fixed in the
+# manifests and Dockerfiles, or handled per resource with checkov.io/skip annotations.
+skip-check:
+  # Kubernetes manifests: single-tenant demo cluster deploys by tag into the default namespace
+  - CKV_K8S_21   # default namespace: single-tenant demo cluster deploys into default
+  - CKV_K8S_43   # image digest: single-tenant demo cluster deploys by tag
+  - CKV_K8S_14   # image pull policy: single-tenant demo cluster deploys by tag
+  - CKV_K8S_15   # image tag: single-tenant demo cluster deploys by tag
+  # Kubernetes manifests: documented demo scope
+  - CKV2_K8S_6   # NetworkPolicy: documented demo scope
+  - CKV_K8S_38   # service account token automount: documented demo scope
+  - CKV_K8S_40   # high UID: documented demo scope
+  - CKV_K8S_8    # liveness probe on containers that have readiness only: documented demo scope
+  # Kubernetes manifests: writable root filesystem is required
+  - CKV_K8S_22   # read only root filesystem: Python containers write model caches and temp files; Triton and the optimizer job write to the model repository
+  # Kubernetes manifests: security context on third party images
+  - CKV_K8S_29   # pod security context: resolved in the ARTF manifests; remaining hits (Triton, Prebid) are images that manage their own UID
+  - CKV_K8S_30   # container security context: resolved in the ARTF manifests; remaining hits (Triton, Prebid) are images that manage their own UID
+  - CKV_K8S_35   # secrets as env vars (Prebid): the Prebid host contract injects config as env
+  # CloudFormation: AWS managed encryption and default service behaviour are the documented choice for this guidance
+  - CKV_AWS_117  # Lambda in VPC: default service behaviour is the documented choice for this guidance
+  - CKV_AWS_116  # Lambda DLQ: default service behaviour is the documented choice for this guidance
+  - CKV_AWS_115  # Lambda reserved concurrency: default service behaviour is the documented choice for this guidance
+  - CKV_AWS_173  # Lambda env var KMS: AWS managed encryption is the documented choice for this guidance
+  - CKV_AWS_158  # log group KMS: AWS managed encryption is the documented choice for this guidance
+  - CKV_AWS_119  # DynamoDB CMK: AWS managed encryption is the documented choice for this guidance
+  - CKV_AWS_149  # Secrets Manager CMK: AWS managed encryption is the documented choice for this guidance
+  - CKV_AWS_18   # S3 access logging: default service behaviour is the documented choice for this guidance
+  - CKV_AWS_195  # Glue security configuration: AWS managed encryption is the documented choice for this guidance
+  # Dockerfiles
+  - CKV_DOCKER_2 # HEALTHCHECK: liveness and readiness are Kubernetes probes, not Docker health checks

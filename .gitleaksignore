@@ -1,0 +1,3 @@
+# source/frontend-react/.env.example line 3 is the placeholder VITE_COGNITO_CLIENT_ID=<COGNITO_CLIENT_ID>, not a credential
+6aad419b31119e46b3a7016b4ce71263923ff125:source/frontend-react/.env.example:generic-api-key:3
+ddc5cc4fe44aa5b25890e3ab5f3b39bf5280c4ae:source/frontend-react/.env.example:generic-api-key:3

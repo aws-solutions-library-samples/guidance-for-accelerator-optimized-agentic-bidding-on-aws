@@ -1,0 +1,55 @@
+{
+  "id": "sample-response-floor-001",
+  "tmax": 120,
+  "lifecycle": "LIFECYCLE_DSP_BID_RESPONSE",
+  "originator": {"type": "TYPE_DSP", "id": "dsp-keystone-001"},
+  "applicable_intents": [
+    "BID_SHADE",
+    "ADD_METRICS"
+  ],
+  "bid_request": {
+    "id": "auction-response-floor-001",
+    "imp": [
+      {
+        "id": "imp-1",
+        "banner": {"w": 300, "h": 250, "pos": 1},
+        "bidfloor": 3.00,
+        "bidfloorcur": "USD"
+      }
+    ],
+    "site": {
+      "id": "site-ledger-01",
+      "domain": "market-ledger.example",
+      "cat": ["IAB13"],
+      "page": "https://market-ledger.example/analysis/rate-decision-what-it-means-for-savers"
+    },
+    "user": {
+      "id": "user-floor-01",
+      "yob": 1969,
+      "gender": "M"
+    },
+    "device": {
+      "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "ip": "203.0.113.91",
+      "geo": {"country": "USA", "region": "IL"}
+    }
+  },
+  "bid_response": {
+    "id": "auction-response-floor-001",
+    "seatbid": [
+      {
+        "seat": "dsp-keystone-001",
+        "bid": [
+          {
+            "id": "bid-keystone-floor",
+            "impid": "imp-1",
+            "price": 12.00,
+            "adomain": ["keystone-wealth.example"],
+            "crid": "cr-keystone-300x250",
+            "cid": "camp-keystone-retirement"
+          }
+        ]
+      }
+    ]
+  }
+}

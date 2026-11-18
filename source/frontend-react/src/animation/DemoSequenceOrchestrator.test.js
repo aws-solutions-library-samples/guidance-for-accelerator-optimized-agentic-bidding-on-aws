@@ -69,7 +69,7 @@ describe('DemoSequenceOrchestrator', () => {
   describe('buildSequenceForResult()', () => {
     it('produces timeline step first with correct annotation', () => {
       const result = createMockResult({ totalLatencyMs: 200 });
-      const scenario = SCENARIOS[0]; // banner-basic
+      const scenario = SCENARIOS[0]; // whichever scenario is first; this test is not specific to one
       const steps = orchestrator.buildSequenceForResult(result, scenario);
 
       expect(steps[0]).toEqual({
@@ -253,12 +253,12 @@ describe('DemoSequenceOrchestrator', () => {
       submitFn.mockImplementation(async () => {
         callCount++;
         if (callCount <= SCENARIOS.length) return createMockResult();
-        // On the 9th call (first scenario again), hang
+        // On the call after the last scenario (first scenario again), hang
         return new Promise((r) => { resolveHang = r; });
       });
 
       const startPromise = orchestrator.start();
-      // Advance enough time for all 8 scenarios + delays
+      // Advance enough time for all scenarios + delays
       await vi.advanceTimersByTimeAsync(5000);
 
       // Should have been called SCENARIOS.length + 1 times (looped back)

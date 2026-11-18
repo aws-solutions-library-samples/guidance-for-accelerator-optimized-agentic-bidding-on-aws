@@ -1,0 +1,878 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Feedback Pipeline Infrastructure - Kinesis Data Stream + Firehose → S3 (Parquet, hourly partitions).
+  Encrypts data in transit (TLS) and at rest (KMS). Scopes consumer access to specific IAM roles.
+  Requirements: 2.1, 12.2
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for all resource names (e.g., 'prod', 'staging')
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of shards for the Kinesis Data Stream
+
+  FirehoseBufferIntervalSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Firehose buffer interval in seconds before flushing to S3
+
+  FirehoseBufferSizeMB:
+    Type: Number
+    Default: 128
+    MinValue: 1
+    MaxValue: 128
+    Description: Firehose buffer size in MB before flushing to S3
+
+  S3TransitionToIADays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days before transitioning S3 objects to Infrequent Access
+
+  EKSNodeRoleArn:
+    Type: String
+    Description: ARN of the EKS node IAM role (or IRSA role) used by FeedbackCollector pods
+
+  GlueJobRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the Glue ETL job role that needs read access to the raw outcomes bucket.
+      If empty, the GlueConsumerPolicy is not created (useful for initial deploy before Glue is set up).
+
+Conditions:
+  HasStackPrefix: !Not [!Equals [!Ref StackPrefix, '']]
+  HasGlueRole: !Not [!Equals [!Ref GlueJobRoleArn, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # KMS Key - shared by Kinesis stream, Firehose, and S3 bucket.
+  # The key policy grants access to the account root and to the
+  # FeedbackCollector (EKS) role. Firehose and Glue access the key via
+  # IAM policies on their own roles (which is sufficient when the key policy
+  # grants root access).
+  # ---------------------------------------------------------------------------
+  FeedbackPipelineKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the feedback pipeline (Kinesis stream, Firehose, and S3 raw outcomes bucket)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowFeedbackCollectorRoleToEncrypt
+            Effect: Allow
+            Principal:
+              AWS: !Ref EKSNodeRoleArn
+            Action:
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+  FeedbackPipelineKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !If
+        - HasStackPrefix
+        - !Sub 'alias/${StackPrefix}-feedback-pipeline-key'
+        - 'alias/feedback-pipeline-key'
+      TargetKeyId: !Ref FeedbackPipelineKMSKey
+
+  # ---------------------------------------------------------------------------
+  # Kinesis Data Stream - receives BidOutcomeEvents from the FeedbackCollector
+  # ---------------------------------------------------------------------------
+  BidOutcomeStream:
+    Type: AWS::Kinesis::Stream
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-bid-outcome-stream'
+        - 'bid-outcome-stream'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref FeedbackPipelineKMSKey
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket - raw outcomes (Parquet, hourly partitions)
+  # ---------------------------------------------------------------------------
+  RawOutcomesBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 access logging is not enabled for this demo data bucket which is the documented choice for this guidance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-raw-outcomes-${AWS::AccountId}-${AWS::Region}'
+        - !Sub 'raw-outcomes-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Ref FeedbackPipelineKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Prefix: 'raw-outcomes/'
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: !Ref S3TransitionToIADays
+      VersioningConfiguration:
+        Status: Enabled
+
+  RawOutcomesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawOutcomesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLSOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RawOutcomesBucket.Arn
+              - !Sub '${RawOutcomesBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ---------------------------------------------------------------------------
+  # Glue Database & Table - schema for the Parquet data (used by Firehose
+  # format conversion and downstream Glue ETL)
+  # ---------------------------------------------------------------------------
+  FeedbackGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !If
+          - HasStackPrefix
+          - !Sub '${StackPrefix}_feedback_pipeline'
+          - 'feedback_pipeline'
+        Description: Glue database for feedback pipeline raw outcomes
+
+  BidOutcomeGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: !Ref FeedbackGlueDatabase
+      TableInput:
+        Name: raw_bid_outcomes
+        Description: Raw bid outcome events written by Firehose in Parquet format
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+        StorageDescriptor:
+          # Columns match shared/feedback_models.py's BidShadingOutcomeEvent field
+          # names/types exactly -- Firehose's JSON->Parquet conversion maps
+          # by field name, so any mismatch here silently produces a null
+          # column (confirmed live: a prior mismatched schema left
+          # event_timestamp, model_type, and other columns permanently null,
+          # even though the pipeline appeared to be delivering data
+          # successfully). If BidShadingOutcomeEvent's fields change, this schema
+          # must be updated in the same change.
+          Columns:
+            - Name: request_id
+              Type: string
+            - Name: timestamp
+              Type: double
+            - Name: model_version
+              Type: string
+            - Name: source
+              Type: string
+            - Name: model_type
+              Type: string
+            - Name: original_price
+              Type: double
+            - Name: shaded_price
+              Type: double
+            - Name: bid_floor
+              Type: double
+            - Name: won
+              Type: boolean
+            - Name: price_paid
+              Type: double
+            - Name: impression
+              Type: boolean
+            - Name: click
+              Type: boolean
+            - Name: conversion
+              Type: boolean
+            - Name: conversion_value
+              Type: double
+            - Name: user_id_hash
+              Type: string
+            - Name: site_domain
+              Type: string
+            - Name: device_type
+              Type: string
+            - Name: hour_of_day
+              Type: int
+            # day_of_week / geo_country / has_video are read by the DLRM feature
+            # spec (source/shared/dlrm_features.py). They were added to
+            # BidShadingOutcomeEvent without being added here, so Firehose dropped
+            # all three during JSON->Parquet conversion and they never reached a
+            # training dataset -- exactly the failure the comment above warns about.
+            - Name: day_of_week
+              Type: int
+            - Name: geo_country
+              Type: string
+            - Name: has_video
+              Type: boolean
+            - Name: shade_factor_used
+              Type: double
+            - Name: conversion_value_estimate_used
+              Type: double
+            # Where this row's outcome came from: unresolved / simulated / observed.
+            # Carried into the trainer's dataset report and the model manifest, so a
+            # model trained on simulated outcomes stays identifiable as one.
+            - Name: outcome_provenance
+              Type: string
+          Location: !Sub 's3://${RawOutcomesBucket}/raw-outcomes/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: '1'
+        PartitionKeys:
+          - Name: partition_date
+            Type: string
+          - Name: partition_hour
+            Type: string
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Firehose Delivery (read from Kinesis, write to S3, use KMS,
+  # access Glue catalog for format conversion)
+  # ---------------------------------------------------------------------------
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-firehose-delivery-role'
+        - 'firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: KinesisReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !GetAtt BidOutcomeStream.Arn
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawOutcomesBucket.Arn
+                  - !Sub '${RawOutcomesBucket.Arn}/*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt FeedbackPipelineKMSKey.Arn
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${FeedbackGlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${FeedbackGlueDatabase}/raw_bid_outcomes'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource:
+                  - !GetAtt FirehoseLogGroup.Arn
+                  - !Sub '${FirehoseLogGroup.Arn}:*'
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for Firehose errors
+  # ---------------------------------------------------------------------------
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log group uses the default CloudWatch Logs encryption which is the documented choice for this guidance
+    Properties:
+      LogGroupName: !If
+        - HasStackPrefix
+        - !Sub '/aws/kinesisfirehose/${StackPrefix}-bid-outcome-delivery'
+        - '/aws/kinesisfirehose/bid-outcome-delivery'
+      RetentionInDays: 14
+
+  FirehoseS3LogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  # ---------------------------------------------------------------------------
+  # Kinesis Data Firehose - buffers from Kinesis stream, converts to Parquet,
+  # writes to S3 with hourly partitions
+  # ---------------------------------------------------------------------------
+  BidOutcomeDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-bid-outcome-delivery'
+        - 'bid-outcome-delivery'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt BidOutcomeStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BucketARN: !GetAtt RawOutcomesBucket.Arn
+        Prefix: 'raw-outcomes/partition_date=!{timestamp:yyyy-MM-dd}/partition_hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'raw-outcomes-errors/!{firehose:error-output-type}/!{timestamp:yyyy-MM-dd}/'
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+          SizeInMBs: !Ref FirehoseBufferSizeMB
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt FeedbackPipelineKMSKey.Arn
+        DataFormatConversionConfiguration:
+          Enabled: true
+          SchemaConfiguration:
+            CatalogId: !Ref 'AWS::AccountId'
+            DatabaseName: !Ref FeedbackGlueDatabase
+            TableName: raw_bid_outcomes
+            Region: !Ref 'AWS::Region'
+            RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+            VersionId: LATEST
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseS3LogStream
+
+  # ---------------------------------------------------------------------------
+  # IAM Policy - FeedbackCollector (EKS pods): write to Kinesis only
+  # ---------------------------------------------------------------------------
+  FeedbackCollectorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts attach this policy by its predictable prefixed name
+    Properties:
+      ManagedPolicyName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-feedback-collector-kinesis-write'
+        - 'feedback-collector-kinesis-write'
+      Description: Allows the FeedbackCollector (EKS pods) to write records to the bid outcome Kinesis stream
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+            Resource: !GetAtt BidOutcomeStream.Arn
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt FeedbackPipelineKMSKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # IAM Policy - Glue ETL: read from S3 raw outcomes bucket only
+  # ---------------------------------------------------------------------------
+  GlueConsumerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts attach this policy by its predictable prefixed name
+    Condition: HasGlueRole
+    Properties:
+      ManagedPolicyName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-glue-raw-outcomes-read'
+        - 'glue-raw-outcomes-read'
+      Description: Allows the Glue ETL job to read raw outcomes from S3 and decrypt via KMS
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !GetAtt RawOutcomesBucket.Arn
+              - !Sub '${RawOutcomesBucket.Arn}/raw-outcomes/*'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: !GetAtt FeedbackPipelineKMSKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # Deal Yield feedback pipeline -- parallel to the BidOutcome* resources
+  # above, for DealYieldOutcomeEvents (deal floor/margin adjustment outcomes).
+  # A SEPARATE stream/table (not a shared one) because Firehose's Glue-schema
+  # -based Parquet conversion maps by field name -- sharing BidOutcomeStream
+  # would silently drop this event's distinguishing fields (deal_id, intent,
+  # adjusted_bidfloor, etc.). Reuses the existing KMS key and S3 bucket (new
+  # prefix only).
+  # ---------------------------------------------------------------------------
+
+  DealYieldOutcomeStream:
+    Type: AWS::Kinesis::Stream
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    Properties:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-outcome-stream'
+        - 'deal-yield-outcome-stream'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref FeedbackPipelineKMSKey
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+
+  DealYieldOutcomeGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: !Ref FeedbackGlueDatabase
+      TableInput:
+        Name: raw_deal_yield_outcomes
+        Description: Raw deal floor/margin outcome events written by Firehose in Parquet format
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+        StorageDescriptor:
+          # Columns match shared/feedback_models.py's DealYieldOutcomeEvent
+          # field names/types exactly -- see the BidOutcomeGlueTable comment
+          # above for why this must stay in sync.
+          Columns:
+            - Name: request_id
+              Type: string
+            - Name: timestamp
+              Type: double
+            - Name: model_version
+              Type: string
+            - Name: source
+              Type: string
+            - Name: imp_id
+              Type: string
+            - Name: deal_id
+              Type: string
+            - Name: intent
+              Type: string
+            - Name: original_bidfloor
+              Type: double
+            - Name: adjusted_bidfloor
+              Type: double
+            - Name: margin_value
+              Type: double
+            - Name: margin_calculation_type
+              Type: int
+            - Name: won
+              Type: boolean
+            - Name: price_paid
+              Type: double
+            - Name: auction_type
+              Type: int
+            - Name: category_tier
+              Type: double
+            - Name: hour_of_day
+              Type: int
+            - Name: day_of_week
+              Type: int
+          Location: !Sub 's3://${RawOutcomesBucket}/raw-deal-yield-outcomes/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters:
+              serialization.format: '1'
+        PartitionKeys:
+          - Name: partition_date
+            Type: string
+          - Name: partition_hour
+            Type: string
+
+  DealYieldFirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts look up this resource by its predictable prefixed name
+    Properties:
+      RoleName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-firehose-delivery-role'
+        - 'deal-yield-firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: KinesisReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !GetAtt DealYieldOutcomeStream.Arn
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawOutcomesBucket.Arn
+                  - !Sub '${RawOutcomesBucket.Arn}/*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt FeedbackPipelineKMSKey.Arn
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${FeedbackGlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${FeedbackGlueDatabase}/raw_deal_yield_outcomes'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource:
+                  - !GetAtt DealYieldFirehoseLogGroup.Arn
+                  - !Sub '${DealYieldFirehoseLogGroup.Arn}:*'
+
+  DealYieldFirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log group uses the default CloudWatch Logs encryption which is the documented choice for this guidance
+    Properties:
+      LogGroupName: !If
+        - HasStackPrefix
+        - !Sub '/aws/kinesisfirehose/${StackPrefix}-deal-yield-outcome-delivery'
+        - '/aws/kinesisfirehose/deal-yield-outcome-delivery'
+      RetentionInDays: 14
+
+  DealYieldFirehoseS3LogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref DealYieldFirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  DealYieldOutcomeDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-outcome-delivery'
+        - 'deal-yield-outcome-delivery'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt DealYieldOutcomeStream.Arn
+        RoleARN: !GetAtt DealYieldFirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt DealYieldFirehoseDeliveryRole.Arn
+        BucketARN: !GetAtt RawOutcomesBucket.Arn
+        Prefix: 'raw-deal-yield-outcomes/partition_date=!{timestamp:yyyy-MM-dd}/partition_hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'raw-deal-yield-outcomes-errors/!{firehose:error-output-type}/!{timestamp:yyyy-MM-dd}/'
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+          SizeInMBs: !Ref FirehoseBufferSizeMB
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt FeedbackPipelineKMSKey.Arn
+        DataFormatConversionConfiguration:
+          Enabled: true
+          SchemaConfiguration:
+            CatalogId: !Ref 'AWS::AccountId'
+            DatabaseName: !Ref FeedbackGlueDatabase
+            TableName: raw_deal_yield_outcomes
+            Region: !Ref 'AWS::Region'
+            RoleARN: !GetAtt DealYieldFirehoseDeliveryRole.Arn
+            VersionId: LATEST
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref DealYieldFirehoseLogGroup
+          LogStreamName: !Ref DealYieldFirehoseS3LogStream
+
+  DealYieldFeedbackCollectorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Deploy scripts attach this policy by its predictable prefixed name
+    Properties:
+      ManagedPolicyName: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-deal-yield-feedback-collector-kinesis-write'
+        - 'deal-yield-feedback-collector-kinesis-write'
+      Description: Allows the orchestrator to write deal yield outcome records to Kinesis
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+            Resource: !GetAtt DealYieldOutcomeStream.Arn
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt FeedbackPipelineKMSKey.Arn
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  KinesisStreamArn:
+    Description: ARN of the Kinesis Data Stream for bid outcomes
+    Value: !GetAtt BidOutcomeStream.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-BidOutcomeStreamArn'
+        - 'BidOutcomeStreamArn'
+
+  KinesisStreamName:
+    Description: Name of the Kinesis Data Stream
+    Value: !Ref BidOutcomeStream
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-BidOutcomeStreamName'
+        - 'BidOutcomeStreamName'
+
+  FirehoseDeliveryStreamArn:
+    Description: ARN of the Firehose delivery stream
+    Value: !GetAtt BidOutcomeDeliveryStream.Arn
+
+  RawOutcomesBucketName:
+    Description: Name of the S3 bucket storing raw outcomes
+    Value: !Ref RawOutcomesBucket
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-RawOutcomesBucketName'
+        - 'RawOutcomesBucketName'
+
+  RawOutcomesBucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt RawOutcomesBucket.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-RawOutcomesBucketArn'
+        - 'RawOutcomesBucketArn'
+
+  KMSKeyArn:
+    Description: ARN of the KMS key encrypting the feedback pipeline
+    Value: !GetAtt FeedbackPipelineKMSKey.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-FeedbackPipelineKMSKeyArn'
+        - 'FeedbackPipelineKMSKeyArn'
+
+  GlueDatabaseName:
+    Description: Name of the Glue database for the feedback pipeline
+    Value: !Ref FeedbackGlueDatabase
+
+  GlueTableName:
+    Description: Name of the Glue table for raw bid outcomes
+    Value: raw_bid_outcomes
+
+  FeedbackCollectorPolicyArn:
+    Description: ARN of the managed policy for the FeedbackCollector role
+    Value: !Ref FeedbackCollectorPolicy
+
+  GlueConsumerPolicyArn:
+    Description: ARN of the managed policy for the Glue ETL consumer role
+    Value: !If
+      - HasGlueRole
+      - !Ref GlueConsumerPolicy
+      - ''
+
+  DealYieldKinesisStreamArn:
+    Description: ARN of the Kinesis Data Stream for deal yield (floor/margin) outcomes
+    Value: !GetAtt DealYieldOutcomeStream.Arn
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldKinesisStreamArn'
+        - 'DealYieldKinesisStreamArn'
+
+  DealYieldKinesisStreamName:
+    Description: Name of the Kinesis Data Stream for deal yield outcomes
+    Value: !Ref DealYieldOutcomeStream
+    Export:
+      Name: !If
+        - HasStackPrefix
+        - !Sub '${StackPrefix}-DealYieldKinesisStreamName'
+        - 'DealYieldKinesisStreamName'
+
+  DealYieldFeedbackCollectorPolicyArn:
+    Description: ARN of the managed policy for the deal yield FeedbackCollector role
+    Value: !Ref DealYieldFeedbackCollectorPolicy
