@@ -432,7 +432,7 @@ class TrainingPipeline:
                 "SupportedContentTypes": ["application/octet-stream"],
                 "SupportedResponseMIMETypes": ["application/octet-stream"],
                 "SupportedRealtimeInferenceInstanceTypes": [
-                    "ml.g5.xlarge",
+                    "ml.g6.xlarge",
                     "ml.p4d.24xlarge",
                 ],
             },

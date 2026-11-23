@@ -74,3 +74,16 @@ def test_a_change_within_one_cent_emits_no_mutation(ctr):
         _request(price=3.905, floor=0.10, model_params={"shade_factor": 0.65, "conversion_value": 12.0})
     )
     assert resp.mutations == []
+
+
+def test_the_bid_pricer_image_installs_the_sdk_its_parameter_cache_imports():
+    """The image is built from triton/Dockerfile.triton-artf, which installs only the
+    container's own requirements.txt. Without boto3 there, every ParameterCache
+    refresh failed with "No module named 'boto3'" and the Adaptive Bidding agent's
+    parameter updates never reached the bid path."""
+    root = os.path.join(os.path.dirname(__file__), "..")
+    req = os.path.join(root, "containers", "dlrm_bid_shader", "requirements.txt")
+    assert os.path.exists(req)
+    assert any(line.split("==")[0].strip() == "boto3" for line in open(req))
+    dockerfile = open(os.path.join(root, "triton", "Dockerfile.triton-artf")).read()
+    assert "pip install --no-cache-dir -r /app/container/requirements.txt" in dockerfile

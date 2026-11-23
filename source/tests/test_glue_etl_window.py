@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 try:
     import pyspark  # noqa: F401
 
-    from etl.glue_feature_engineering import _resolve_window
+    from etl.glue_feature_engineering import _resolve_region, _resolve_window
 except ImportError:
     import types as _types
 
@@ -47,7 +47,7 @@ except ImportError:
     sys.modules["pyspark.sql"] = _fake_sql
     sys.modules["pyspark.sql.types"] = _fake_types
 
-    from etl.glue_feature_engineering import _resolve_window
+    from etl.glue_feature_engineering import _resolve_region, _resolve_window
 
     # Remove the stubs so other test modules' own real-pyspark detection
     # (e.g. test_glue_etl.py's pytest.importorskip("pyspark")) isn't fooled
@@ -83,3 +83,33 @@ class TestResolveWindow:
     def test_end_before_start_raises(self):
         with pytest.raises(ValueError, match="must be after"):
             _resolve_window("2026-08-20T15:00:00+00:00", "2026-08-20T14:00:00+00:00", None)
+
+
+class TestResolveRegion:
+    """The catalog client's Region. The Glue runtime does not set AWS_REGION, so a
+    us-east-1 fallback broke every deployment in another Region (EntityNotFound
+    on GetTable in us-west-2)."""
+
+    def test_the_job_argument_wins(self):
+        assert _resolve_region("us-west-2", {"AWS_REGION": "eu-central-1"}) == "us-west-2"
+
+    def test_environment_is_used_without_the_argument(self):
+        assert _resolve_region(None, {"AWS_REGION": "us-west-2"}) == "us-west-2"
+        assert _resolve_region(None, {"AWS_DEFAULT_REGION": "ap-southeast-2"}) == "ap-southeast-2"
+
+    def test_no_region_is_an_error_not_us_east_1(self):
+        with pytest.raises(ValueError, match="pass --region"):
+            _resolve_region(None, {})
+
+
+def test_both_glue_jobs_pass_the_stack_region():
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "deployment", "glue_etl_cfn.yaml")
+    text = open(path).read()
+    assert text.count("'--region': !Ref 'AWS::Region'") == 2
+
+
+def test_no_etl_script_falls_back_to_us_east_1():
+    etl = os.path.join(os.path.dirname(__file__), "..", "etl")
+    for name in ("glue_feature_engineering.py", "glue_deal_yield_feature_engineering.py"):
+        code = open(os.path.join(etl, name)).read()
+        assert 'os.environ.get("AWS_REGION", "us-east-1")' not in code, name

@@ -892,8 +892,8 @@ export default function GovernancePanel() {
             )}
             {!trainEtl.no_input_data && (
               <>
-                <strong>The ETL job for {trainingModelType} has never completed successfully.</strong>{" "}
-                No run of <code>{trainEtl.job_name}</code> has ever succeeded
+                <strong>The ETL job for {trainingModelType} has never been run before.</strong>{" "}
+                No run of <code>{trainEtl.job_name}</code> has completed 
                 {trainEtl.consecutive_failures > 0
                   ? ` (${trainEtl.consecutive_failures} consecutive failures)`
                   : ""}

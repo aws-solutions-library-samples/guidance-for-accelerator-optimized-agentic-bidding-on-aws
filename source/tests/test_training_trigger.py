@@ -66,8 +66,8 @@ class TestTrainableModelTypes:
 class TestEstimateCost:
     def test_returns_real_instance_type_and_rate(self):
         estimate = estimate_cost("dlrm_bid_shader")
-        assert estimate.instance_type == "ml.g5.2xlarge"
-        assert estimate.hourly_rate_usd == 1.515
+        assert estimate.instance_type == "ml.g6.2xlarge"
+        assert estimate.hourly_rate_usd == 1.222
 
     def test_max_runtime_matches_automated_pipeline(self):
         """MaxRuntimeInSeconds must match governance_eventbridge_cfn.yaml's
@@ -79,7 +79,7 @@ class TestEstimateCost:
     def test_cost_computed_from_rate_and_runtime(self):
         """The cost estimate is a real computation, not a hardcoded value."""
         estimate = estimate_cost("dlrm_bid_shader")
-        expected = round((14400 / 3600.0) * 1.515, 2)
+        expected = round((14400 / 3600.0) * 1.222, 2)
         assert estimate.estimated_max_cost_usd == expected
 
     @given(st.sampled_from(sorted(TRAINABLE_MODEL_TYPES)))
@@ -89,7 +89,7 @@ class TestEstimateCost:
         trainable model type, and stays correct if a second one is
         re-enabled later)."""
         estimate = estimate_cost(model_type)
-        assert estimate.instance_type == "ml.g5.2xlarge"
+        assert estimate.instance_type == "ml.g6.2xlarge"
         assert estimate.max_runtime_seconds == 14400
 
     def test_returns_frozen_dataclass(self):
@@ -210,10 +210,10 @@ class TestTriggerTraining:
         assert result.base_model_version == (
             "arn:aws:sagemaker:us-east-1:123:model-package/artf-dlrm-bid-shader/3"
         )
-        assert result.instance_type == "ml.g5.2xlarge"
+        assert result.instance_type == "ml.g6.2xlarge"
         mock_client.create_training_job.assert_called_once()
         call_kwargs = mock_client.create_training_job.call_args[1]
-        assert call_kwargs["ResourceConfig"]["InstanceType"] == "ml.g5.2xlarge"
+        assert call_kwargs["ResourceConfig"]["InstanceType"] == "ml.g6.2xlarge"
         assert call_kwargs["StoppingCondition"]["MaxRuntimeInSeconds"] == 14400
         assert call_kwargs["HyperParameters"]["base_model_version"] == result.base_model_version
         assert call_kwargs["HyperParameters"]["triggered_by"] == "governance_ui_on_demand"

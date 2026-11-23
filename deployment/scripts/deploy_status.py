@@ -183,6 +183,8 @@ NCF_ENGINE_KEY = "triton-models/ncf_deal_manager_stable/1/model.plan"
 NCF_SERVED_ONNX_KEY = "triton-models/ncf_deal_manager_stable/1/model.onnx"
 # The GPU node group. Learner mode creates none, and scales an existing one to 0.
 GPU_NODEGROUP = "gpu-inference"
+# Deployments that only schedule on the gpu-inference group (standard mode).
+GPU_DEPLOYMENTS = ("triton-inference-server",)
 # The Model Optimizer image, which learner mode does not build.
 OPTIMIZER_IMAGE = "model-optimizer"
 # Engine metadata written by source/optimizer/app.py (S3 returns user metadata keys
@@ -199,6 +201,24 @@ def _client_error_code(exc: Exception) -> str:
 
 def _short(value: str) -> str:
     return value[:12] if value else "<none>"
+
+
+def _nodegroup_issue_text(nodegroup: Dict[str, Any]) -> str:
+    """The first health issue as "<code>: <message>", or "".
+
+    The message is where EKS names the cause (for example EC2's
+    InsufficientInstanceCapacity with the instance type and AZ); the code alone
+    (AsgInstanceLaunchFailures) does not say what to do. EC2's trailing advice
+    ("Our system will be working on provisioning...") is cut.
+    """
+    issues = (nodegroup.get("health") or {}).get("issues") or []
+    if not issues:
+        return ""
+    code = issues[0].get("code", "") or ""
+    msg = (issues[0].get("message", "") or "").split(" Our system will be working")[0].strip()
+    if len(msg) > 220:
+        msg = msg[:217] + "..."
+    return f"{code}: {msg}" if code and msg else (code or msg)
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +584,13 @@ class Probe:
             return [self._check("node groups", UNKNOWN, str(exc))]
         if not names:
             return [self._check("node groups", MISSING, "cluster has no node groups")]
+        if GPU_NODEGROUP not in names and not getattr(self, "learner", False):
+            # The cluster is created without it and deploy.sh adds it once a GPU size
+            # launches, so a cluster can exist with no GPU group at all.
+            out.append(self._check(
+                f"node group {GPU_NODEGROUP}", MISSING,
+                "not created (no GPU size had capacity, or the deploy stopped before "
+                "the GPU search); re-running deploy.sh searches again"))
         ec2 = self._client("ec2")
         registered = self._registered_nodes()      # None when kubectl cannot answer
         for ng in names:
@@ -576,14 +603,19 @@ class Probe:
             desired = (d.get("scalingConfig") or {}).get("desiredSize", 0)
             running = self._running_instances(ec2, cluster, ng)
             issues = [i.get("code", "") for i in (d.get("health") or {}).get("issues", [])]
+            issue_text = _nodegroup_issue_text(d)
             joined = None if registered is None else registered.get(ng, 0)
+            # Read by _rollout_status: a GPU pod Pending against a group that cannot
+            # launch is stuck, not starting.
+            if ng == GPU_NODEGROUP and issue_text and not joined:
+                self.gpu_launch_blocked = issue_text
 
             if status in ("CREATING", "UPDATING"):
                 out.append(self._check(f"node group {ng}", IN_PROGRESS, status))
                 continue
             if status != "ACTIVE":
                 out.append(self._check(f"node group {ng}", FAILED,
-                                       f"{status}{' — ' + ','.join(issues) if issues else ''}"))
+                                       f"{status}{' — ' + issue_text if issue_text else ''}"))
                 continue
             if running is None:
                 out.append(self._check(f"node group {ng}", UNKNOWN,
@@ -593,7 +625,7 @@ class Probe:
                 out.append(self._check(
                     f"node group {ng}", FAILED,
                     f"ACTIVE but only {running}/{desired} instances running"
-                    + (f" — {','.join(issues)}" if issues else
+                    + (f" — {issue_text}" if issue_text else
                        " — no health issue reported; suspect instance-type capacity in"
                        " this AZ or an EC2 service quota")))
                 continue
@@ -903,6 +935,13 @@ class Probe:
         reason = self._pod_reason(deployment)
         if any(hard in reason for hard in self._HARD_POD_FAILURES):
             return FAILED, reason
+        # A GPU pod Pending while gpu-inference reports launch failures will not
+        # schedule until EC2 has capacity. Reporting it IN_PROGRESS made a re-run
+        # wait up to an hour (gate_wait) before the phase that could fix it ran.
+        blocked = getattr(self, "gpu_launch_blocked", "")
+        if (blocked and deployment in GPU_DEPLOYMENTS and reason.startswith("pod Pending")
+                and not getattr(self, "learner", False)):
+            return FAILED, f"pod Pending: no GPU node, node group {GPU_NODEGROUP} cannot launch one ({blocked})"
         return IN_PROGRESS, reason or "starting"
 
     def _expected_manifest_files(self) -> Optional[List[str]]:

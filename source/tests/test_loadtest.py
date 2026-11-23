@@ -506,3 +506,54 @@ class TestPacedPreset:
         assert LoadTestRequest(preset="60k-paced").preset == "60k-paced"
         with pytest.raises(Exception):
             LoadTestRequest(preset="60k")
+
+
+class TestErrorCounting:
+    """errors counts REQUESTS with a failed container call; per_container[].errors
+    counts each container's failed calls. Adding every failed call to the request
+    count let errors exceed completed (UI: 1,890 errors for 1,818 sent, received
+    -72, error rate 103.96%)."""
+
+    def _run(self, monkeypatch, test_id, statuses):
+        containers = [{"name": n, "intents": {"BID_SHADE"}} for n in statuses]
+
+        async def fake_call(client, container, payload, payload_bytes, timeout_s, headers=None):
+            inv = _make_invocation(container["name"], mutations=[], model_version="v1")
+            return inv.model_copy(update={"status": statuses[container["name"]]})
+
+        monkeypatch.setattr(loadtest, "_get_app_deps", lambda: (containers, fake_call, lambda intents: containers))
+        monkeypatch.setattr(loadtest, "emit_load_test_outcome", MagicMock(return_value=None))
+        monkeypatch.setattr(loadtest, "_LOADTEST_TABLE", "")
+        asyncio.run(loadtest._run_load_test(test_id, "100", seed=1, duration_s=5))
+        return loadtest._active_tests[test_id]
+
+    def test_two_failing_containers_count_each_request_once(self, monkeypatch):
+        status = self._run(monkeypatch, "lt-err-2of3", {"a": "unreachable", "b": "timeout", "c": "ok"})
+        assert status.completed == 100
+        assert status.errors == 100
+        assert status.errors <= status.completed
+        by_name = {c["name"]: c for c in status.per_container}
+        assert by_name["a"]["errors"] == 100
+        assert by_name["b"]["errors"] == 100
+        assert by_name["c"]["errors"] == 0
+
+    def test_no_failures_counts_no_errors(self, monkeypatch):
+        status = self._run(monkeypatch, "lt-err-none", {"a": "ok", "b": "no_mutations"})
+        assert status.errors == 0
+        assert all(c["errors"] == 0 for c in status.per_container)
+
+    def test_live_progress_carries_the_per_container_breakdown(self):
+        tid = "lt-live-pc"
+        loadtest._progress_latencies[tid] = [5.0]
+        loadtest._progress_completed[tid] = 1
+        loadtest._progress_errors[tid] = 1
+        loadtest._progress_start_time[tid] = __import__("time").monotonic() - 1.0
+        loadtest._progress_per_container_latencies[tid] = {"a": [3.0], "b": [5.0]}
+        loadtest._progress_per_container_mutations[tid] = {"a": 1, "b": 0}
+        loadtest._progress_per_container_errors[tid] = {"a": 0, "b": 1}
+        loadtest._progress_per_container_timing[tid] = {"a": {}, "b": {}}
+        live = loadtest._live_progress(tid)
+        by_name = {c["name"]: c for c in live["per_container"]}
+        assert by_name["a"]["total_mutations"] == 1
+        assert by_name["b"]["errors"] == 1
+        assert by_name["b"]["avg_latency_ms"] == 5.0

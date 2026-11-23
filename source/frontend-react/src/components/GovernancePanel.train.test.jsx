@@ -60,8 +60,8 @@ function handler(url, opts = {}) {
   if (url.includes('/governance/comparison-pair')) return Promise.resolve(jsonResp({}));
   if (url.includes('/governance/training-estimate')) {
     return Promise.resolve(jsonResp({
-      instance_type: 'ml.g5.2xlarge', hourly_rate_usd: 1.515,
-      max_runtime_seconds: 14400, estimated_max_cost_usd: 6.06,
+      instance_type: 'ml.g6.2xlarge', hourly_rate_usd: 1.222,
+      max_runtime_seconds: 14400, estimated_max_cost_usd: 4.89,
     }));
   }
   if (url.includes('/governance/trainable-runs')) {

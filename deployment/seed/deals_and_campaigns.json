@@ -719,34 +719,6 @@
           "com.ridesharer.app"
         ]
       }
-    },
-    {
-      "id": "deal-ctv-drama-open-auto",
-      "name": "Northgate Motors Finale PMP on StreamCo TV",
-      "desc": "Northgate Motors buys video on the StreamCo TV app at a 10.00 USD deal floor, first price, on premium drama content.",
-      "origin": "{stackprefix}-prebid.example",
-      "seller": "streamco.example",
-      "sellerstatus": 0,
-      "adtypes": [
-        2
-      ],
-      "pubcount": 1,
-      "dinventory": 1,
-      "auxdata": 3,
-      "terms": {
-        "dealfloor": 10.0,
-        "cur": "USD",
-        "guar": 0,
-        "pricetype": 1
-      },
-      "inventory": {
-        "inclinventory": [
-          2
-        ],
-        "appbundles": [
-          "com.streamco.ctv"
-        ]
-      }
     }
   ],
   "campaigns": [
@@ -1197,10 +1169,8 @@
       "width": 1280,
       "height": 720,
       "declared_cpm": 18.5,
-      "deal_ids": [
-        "deal-ctv-drama-open-auto"
-      ],
-      "open_market": false,
+      "deal_ids": [],
+      "open_market": true,
       "target_categories": [],
       "target_content_ids": [
         "cid:premium-drama-finale"
@@ -1208,7 +1178,7 @@
       "media_type": "video",
       "duration": 30,
       "audience_uplift": null,
-      "note": "ctv-drama-finale: video 1280x720, 15 to 30s, imp floor 8.00. Deal floor 10.00 binds. Bids only when ADD_CIDS adds cid:premium-drama-finale."
+      "note": "ctv-drama-finale: video 1280x720, 15 to 30s, open market at the 8.00 imp floor. Holds no deal, so the Deal Scorer cannot take it out of the auction. Bids only when ADD_CIDS adds cid:premium-drama-finale."
     }
   ]
 }

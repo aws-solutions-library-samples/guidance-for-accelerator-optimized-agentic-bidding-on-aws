@@ -312,13 +312,15 @@ def test_courtside_is_eligible_only_on_banner_basic():
 
 
 # ------------------------------------------------- the CTV content-id scenario
-def test_ctv_drama_finale_prices_survive_the_yield_worst_case_and_beat_amt():
+def test_ctv_drama_finale_is_open_market_and_beats_amt():
+    # Open market on purpose: a deal on this campaign would hand the outcome to the
+    # Deal Scorer, which suppresses or activates per viewer. The yield worst case
+    # does not apply, because ADJUST_DEAL_FLOOR only moves deal floors.
     campaign = CAMPAIGNS["camp-ctv-drama-auto"]
-    deal = LIBRARY["deal-ctv-drama-open-auto"]
     request = _sample("ctv-drama-finale.json")["bid_request"]
     imp_floor = float(request["imp"][0]["bidfloor"])
-    assert deal.at == 1
-    assert campaign.declared_cpm >= 1.5 * deal.bidfloor
-    assert campaign.declared_cpm >= worst_case_floor(deal.bidfloor, deal.at)
+    assert campaign.open_market and campaign.deal_ids == ()
+    assert "pmp" not in request["imp"][0]
+    assert "deal-ctv-drama-open-auto" not in LIBRARY
     assert campaign.declared_cpm > AMT_PRICE["video"] > imp_floor
     assert campaign.declared_cpm < TOP_PRICE_BUCKET

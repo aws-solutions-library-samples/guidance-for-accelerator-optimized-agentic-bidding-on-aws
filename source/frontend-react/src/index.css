@@ -2008,6 +2008,10 @@ body {
 .loadtest-breakdown-table tr:last-child td {
   border-bottom: none;
 }
+.loadtest-breakdown-errors {
+  color: var(--red);
+  font-weight: 600;
+}
 
 .loadtest-breakdown-name {
   font-weight: 600;

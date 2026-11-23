@@ -402,7 +402,7 @@ phases:
         fi
 
       # -----------------------------------------------------------------------
-      # Model Optimizer service (amd64 — GPU x86, matches Triton A10G)
+      # Model Optimizer service (amd64 — GPU x86, matches Triton L4)
       # The design's model-optimization role: ONNX -> TensorRT engine plan.
       # TensorRT-based (NOT stock NIM). Built on nvcr.io/nvidia/tensorrt (NGC login
       # above) to match Triton 24.08.

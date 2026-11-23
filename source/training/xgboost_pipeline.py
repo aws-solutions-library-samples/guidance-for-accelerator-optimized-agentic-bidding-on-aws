@@ -337,7 +337,7 @@ class XGBoostTrainingPipeline:
                 ],
                 "SupportedContentTypes": ["application/octet-stream"],
                 "SupportedResponseMIMETypes": ["application/octet-stream"],
-                "SupportedRealtimeInferenceInstanceTypes": ["ml.g5.xlarge"],
+                "SupportedRealtimeInferenceInstanceTypes": ["ml.g6.xlarge"],
             },
             "ModelApprovalStatus": "PendingManualApproval",
             "CustomerMetadataProperties": customer_metadata,

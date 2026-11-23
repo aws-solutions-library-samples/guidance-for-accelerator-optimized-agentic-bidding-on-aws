@@ -17,6 +17,10 @@
 #   * renders THEIR Kubernetes example against this repo's conventions;
 #   * probes POST /mutate — never /health/ready, which answers ok unconditionally.
 #
+# The container is treated as an ARTF endpoint and nothing more. Whether it runs a
+# model, and whether it needs a GPU, is decided by the producer's manifest
+# (resources, nodeSelector, tolerations), which is rendered as they wrote it.
+#
 # A sibling script, deliberately not part of deploy.sh: attaching a container is
 # not a deploy, and should not require one.
 #
@@ -26,7 +30,7 @@
 # Usage:
 #   ./attach_artf_container.sh --record /path/to/artf-registry-record.json \
 #       --stack my-stack [--region us-east-1] [--namespace default] \
-#       [--variant cpu|gpu] [--priority 0] [--no-copy] [--apply] [--yes]
+#       [--priority 0] [--no-copy] [--apply] [--yes]
 #
 #   ./attach_artf_container.sh --detach contextual-yield-agent --stack my-stack
 #
@@ -39,7 +43,6 @@ RECORD=""
 STACK_NAME="${STACK_NAME:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 NAMESPACE=""
-VARIANT="cpu"
 PRIORITY="0"
 DO_COPY=1
 DO_APPLY=0
@@ -65,7 +68,7 @@ while [[ $# -gt 0 ]]; do
     --stack)       STACK_NAME="$2"; shift 2 ;;
     --region)      AWS_REGION="$2"; shift 2 ;;
     --namespace)   NAMESPACE="$2"; shift 2 ;;
-    --variant)     VARIANT="$2"; shift 2 ;;
+    --variant)     fail "--variant was removed. Placement and resources (including any GPU) come from the manifest passed with --template." ;;
     --priority)    PRIORITY="$2"; shift 2 ;;
     --dest-repo)   DEST_REPO="$2"; shift 2 ;;
     --template)    TEMPLATE="$2"; shift 2 ;;
@@ -155,7 +158,6 @@ fi
 # ---------------------------------------------------------------------------
 [[ -n "${RECORD}" ]]   || fail "--record is required. It is the artf-registry-record.json the container's own deploy step produced."
 [[ -f "${RECORD}" ]]   || fail "No record file at ${RECORD}"
-[[ "${VARIANT}" == "cpu" || "${VARIANT}" == "gpu" ]] || fail "--variant must be cpu or gpu."
 
 head1 "1. Reading the record"
 
@@ -340,7 +342,7 @@ phases:
         echo "Digest verified against the record."
 SPEC
 )
-  log "Starting the copy in CodeBuild (in-region; a 10.7 GB GPU image over a laptop connection is the wrong shape)..."
+  log "Starting the copy in CodeBuild (in-region; a multi-GB image over a laptop connection is the wrong shape)..."
   BUILD_ID="$(aws codebuild start-build \
     --project-name "${STACK_NAME}-image-builder" \
     --region "${AWS_REGION}" \
@@ -367,21 +369,6 @@ if [[ -z "${TEMPLATE}" ]]; then
 else
   [[ -f "${TEMPLATE}" ]] || fail "No template at ${TEMPLATE}"
   [[ -n "${OUT}" ]] || OUT="${SCRIPT_DIR}/eks/external-${NAME}.yaml"
-
-  if [[ "${VARIANT}" == "gpu" ]]; then
-    GPU_INSTANCES="$(helper '
-import re, sys
-text = open(sys.argv[1]).read()
-print(",".join(re.findall(r"g\d+\.\w+|p\d+d?\.\w+", text)) or "unknown")
-' "${SCRIPT_DIR}/eks/cluster-config.yaml" 2>/dev/null || echo unknown)"
-    helper '
-import sys, artf_attach as A
-c = A.parse_record(open(sys.argv[1]).read())
-ok, reason = A.gpu_guard(c, instance_types=sys.argv[2].split(","), image_exists=False)
-sys.exit("REFUSED: " + reason)
-' "${RECORD}" "${GPU_INSTANCES}" || true
-    fail "The GPU variant is refused. See the reason above. Only the CPU image is published today; the GPU path is untested and cannot be verified from here."
-  fi
 
   helper '
 import sys, artf_attach as A

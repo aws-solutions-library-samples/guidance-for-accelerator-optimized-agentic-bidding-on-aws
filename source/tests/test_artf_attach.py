@@ -30,7 +30,6 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from artf_attach import (  # noqa: E402
-    GPU_SUPPORTED_ARCHES,
     MUTATE_PORT,
     REQUEST_SIDE_INTENTS,
     AttachError,
@@ -40,7 +39,6 @@ from artf_attach import (  # noqa: E402
     check_endpoint,
     check_prebid_ceiling,
     describe_contention,
-    gpu_guard,
     item_to_record,
     parse_record,
     probe_payload,
@@ -109,8 +107,6 @@ class TestParseRecord:
         assert check_endpoint(container.endpoint).ok
         assert container.image
         assert container.image_digest.startswith("sha256:")
-        # The published build is CPU-only; the GPU guard depends on this.
-        assert container.supports_gpu is False
 
     def test_parses_minimal_record(self):
         c = parse_record(MINIMAL)
@@ -474,39 +470,35 @@ class TestRenderManifest:
 
 
 # ---------------------------------------------------------------------------
-# GPU guard
+# Hardware and model agnostic
 # ---------------------------------------------------------------------------
 
-class TestGpuGuard:
-    def test_refuses_when_the_image_is_absent(self):
-        ok, reason = gpu_guard(_container(), instance_types=["g5.xlarge"], image_exists=False)
-        assert not ok
-        assert "not found" in reason
+class TestHardwareAgnostic:
+    """Attaching depends on the ARTF contract only, not on a model or a GPU."""
 
-    def test_refuses_when_the_label_does_not_advertise_gpu(self):
-        """The image's own label is the authority, not the manifest shape."""
-        ok, reason = gpu_guard(_container(), instance_types=["g5.xlarge"], image_exists=True)
-        assert not ok
-        assert "does not include 'gpu'" in reason
+    def test_a_record_with_no_serving_fields_parses(self):
+        data = json.loads(json.dumps(MINIMAL))
+        data.pop("serving_modes")
+        data.pop("gpu_architectures")
+        assert parse_record(data).name == "contextual-yield-agent"
 
-    def test_allows_on_g5_which_is_sm86(self):
-        c = _container(serving_modes=["cpu", "gpu"], gpu_architectures=["sm_86"])
-        ok, reason = gpu_guard(c, instance_types=["g5.xlarge", "g5.2xlarge"], image_exists=True)
-        assert ok, reason
-        assert "sm_86" in reason
+    def test_gpu_fields_in_a_record_do_not_change_the_registry_item(self):
+        gpu = _container(serving_modes=["gpu"], gpu_architectures=["sm_86"])
+        cpu = _container()
+        args = dict(endpoint=cpu.endpoint, priority=0, updated_at="t", updated_by="u")
+        assert build_item(gpu, **args) == build_item(cpu, **args)
 
-    def test_refuses_on_g6_which_is_sm89(self):
-        """L4 is sm_89 and HierarchicalKV does not build for it."""
-        c = _container(serving_modes=["gpu"], gpu_architectures=sorted(GPU_SUPPORTED_ARCHES))
-        ok, reason = gpu_guard(c, instance_types=["g6.xlarge"], image_exists=True)
-        assert not ok
-        assert "do not overlap" in reason
-
-    def test_refuses_an_unrecognised_instance_family(self):
-        c = _container(serving_modes=["gpu"], gpu_architectures=["sm_86"])
-        ok, reason = gpu_guard(c, instance_types=["m5.large"], image_exists=True)
-        assert not ok
-        assert "Refusing rather than" in reason
+    def test_a_gpu_manifest_renders_as_the_producer_wrote_it(self):
+        template = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\nspec:\n"
+            "  template:\n    spec:\n      nodeSelector:\n        nvidia.com/gpu: present\n"
+            "      containers:\n      - image: __REGISTRY__:__TAG__\n"
+            "        resources:\n          limits:\n            nvidia.com/gpu: 1\n"
+        )
+        out = render_manifest(template, image="r/i:t", namespace="")
+        assert "nvidia.com/gpu: 1" in out
+        assert "nvidia.com/gpu: present" in out
+        assert "image: r/i:t" in out
 
 
 # ---------------------------------------------------------------------------

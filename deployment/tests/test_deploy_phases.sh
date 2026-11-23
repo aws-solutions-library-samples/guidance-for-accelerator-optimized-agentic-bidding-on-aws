@@ -2183,7 +2183,7 @@ test_learner_mode_flags() {
     warn_part2_left_on_switch '$1' '$2' '$3'" 2>&1; }
   out="$(_lm_switch 0 1 1)"
   assert_contains "${out}" "Prefix 'dv1' had Part 2 deployed" "standard (Part 2 on) to learner warns"
-  assert_contains "${out}" "ml.g5.2xlarge retraining (dv1-governance-eventbridge)" "the warning names the scheduled GPU retraining stack"
+  assert_contains "${out}" "ml.g6.2xlarge retraining (dv1-governance-eventbridge)" "the warning names the scheduled GPU retraining stack"
   assert_contains "${out}" "governance AgentCore runtime" "the warning names the governance runtime"
   assert_contains "${out}" "./deploy.sh --prefix dv1 --destroy" "the warning says how to remove them"
   assert_contains "$(_lm_switch 0 1 '')" "had Part 2 deployed" "a record without withRetraining (the default, on) warns"
@@ -2248,7 +2248,11 @@ _learner_render_src() {
     /^render_bootstrap_job() {/,/^}/p
     /^render_manifest() {/,/^}/p
     /^stage_served_repo() {/,/^}/p
-    /^reconcile_nodegroups_for_mode() {/,/^}/p' "${DEPLOY_SH}"
+    /^reconcile_nodegroups_for_mode() {/,/^}/p
+    /^reconcile_gpu_instance_types() {/,/^}/p
+    /^gpu_candidate_types() {/,/^}/p
+    /^render_cluster_config_without_gpu() {/,/^}/p
+    /^render_gpu_nodegroup_config() {/,/^}/p' "${DEPLOY_SH}"
 }
 _LEARNER_RENDER_HARNESS='
   set -euo pipefail
@@ -2325,6 +2329,17 @@ test_learner_render_no_gpu() {
   assert_contains "$(cat "${tmp}/m1/orchestrator-deployment.yaml")" "name: DEPLOYMENT_MODE" "the learner orchestrator carries DEPLOYMENT_MODE"
   assert_contains "$(cat "${tmp}/m0/triton-deployment.yaml")" 'nvidia.com/gpu: "1"' "the default Triton still requests a GPU"
   assert_contains "$(cat "${tmp}/m0/cluster-config.yaml")" "name: gpu-inference" "the default cluster config still has the GPU group"
+  out="$("${sh}" -c "${_LEARNER_RENDER_HARNESS}${fn_src}
+    LEARNER_MODE=0
+    render_cluster_config_without_gpu \"\$2/no-gpu.yaml\"
+    render_gpu_nodegroup_config \"\$2/one.yaml\" g6.4xlarge" _ "${D}" "${tmp}/m0" 2>&1)"; rc=$?
+  assert_eq "${rc}" "0" "the GPU-less and single-size renders succeed (output: ${out})"
+  assert_eq "$(grep -c 'name: gpu-inference' "${tmp}/m0/no-gpu.yaml")" "0" "the cluster is created without the GPU group"
+  assert_contains "$(cat "${tmp}/m0/no-gpu.yaml")" "name: cpu-services" "but with cpu-services"
+  assert_eq "$(awk '/name: gpu-inference/{g=1} g&&/instanceTypes:/{print;exit}' "${tmp}/m0/one.yaml")" '    instanceTypes: ["g6.4xlarge"]' "the search creates the group with one size"
+  assert_eq "$(awk '/name: gpu-inference/{g=1} g&&/desiredCapacity:/{print;exit}' "${tmp}/m0/one.yaml")" "    desiredCapacity: 0" "with 0 nodes"
+  assert_eq "$(awk '/name: gpu-inference/{g=1} g&&/minSize:/{print;exit}' "${tmp}/m0/one.yaml")" "    minSize: 0" "and minimum 0"
+  assert_eq "$(awk '/name: cpu-services/{g=1} g&&/desiredCapacity:/{print;exit}' "${tmp}/m0/one.yaml")" "    desiredCapacity: 3" "cpu-services keeps its size"
   assert_not_contains "$(cat "${tmp}/m0/orchestrator-deployment.yaml")" "DEPLOYMENT_MODE" "the default orchestrator has no DEPLOYMENT_MODE"
   # The two triton-*-nlb / orchestrator-internal-nlb manifests are identical in both modes.
   # The ARTF containers' EKS deployment is byte-identical between the two renders.
@@ -2347,10 +2362,16 @@ test_learner_phase_structure() {
       printf "aws %s\n" "$*" >> "$CALLS"
       if [[ "$1 $2" == "eks describe-nodegroup" ]]; then
         case "$*" in
-          *"--nodegroup-name gpu-inference"*) [[ "${GPU_EXISTS}" == 1 ]] || return 1 ;;
+          *"--nodegroup-name gpu-inference"*)
+            [[ "${GPU_EXISTS}" == 1 ]] || return 1
+            case "$*" in
+              *nodegroup.instanceTypes*) printf "%s\n" "${GPU_TYPES:-g6.2xlarge	g6.4xlarge	g6.xlarge}" ;;
+              *autoScalingGroups*) echo "eks-gpu-asg" ;;
+            esac ;;
           *"--nodegroup-name cpu-services"*) [[ "$*" == *desiredSize* ]] && echo "${CPU_DESIRED}" ;;
         esac
       fi
+      if [[ "$1 $2" == "autoscaling describe-auto-scaling-groups" ]]; then echo "${GPU_COUNT:-0}"; fi
       return 0
     }
     eksctl() { printf "eksctl %s\n" "$*" >> "$CALLS"; return 0; }
@@ -2360,6 +2381,8 @@ test_learner_phase_structure() {
     : > "${tmp}/calls"
     CALLS="${tmp}/calls" GPU_EXISTS="$3" CPU_DESIRED="$4" "${sh}" -c "${_LEARNER_RENDER_HARNESS}${mocks}${fn_src}
       LEARNER_MODE=$1; _PREV_LEARNER_MODE='$2'
+      ensure_gpu_nodegroup() { printf 'ensure_gpu_nodegroup\n' >> \"\$CALLS\"; return 0; }
+      gpu_search_failure() { echo searched; }
       reconcile_nodegroups_for_mode" _ "${D}" 2>&1
   }
   out="$(_lm_reconcile 1 0 1 3)"; rc=$?; calls="$(cat "${tmp}/calls")"
@@ -2372,14 +2395,30 @@ test_learner_phase_structure() {
   assert_not_contains "${calls}" "update-nodegroup-config" "learner on a learner cluster at 4 nodes changes nothing"
   out="$(_lm_reconcile 0 1 0 4)"; rc=$?; calls="$(cat "${tmp}/calls")"
   assert_eq "${rc}" "0" "standard after learner succeeds (output: ${out})"
-  assert_contains "${calls}" "eksctl create nodegroup --config-file" "standard after learner recreates the missing GPU group"
-  assert_contains "${calls}" "--include=gpu-inference" "only the gpu-inference group is created"
+  assert_contains "${calls}" "ensure_gpu_nodegroup" "standard after learner hands the missing GPU group to the size search"
   out="$(_lm_reconcile 0 1 1 4)"; calls="$(cat "${tmp}/calls")"
-  assert_not_contains "${calls}" "eksctl create" "standard after learner with the GPU group present creates nothing"
-  out="$(_lm_reconcile 0 '' 0 3)"; calls="$(cat "${tmp}/calls")"
-  assert_eq "${calls}" "" "the default path (never in learner mode) makes no call at all"
-  out="$(_lm_reconcile 0 0 0 3)"; calls="$(cat "${tmp}/calls")"
-  assert_eq "${calls}" "" "a standard prefix re-deployed in standard mode makes no call at all"
+  assert_not_contains "${calls}" "ensure_gpu_nodegroup" "standard after learner with the GPU group present searches nothing"
+  assert_not_contains "${calls}" "eksctl create" "and creates nothing"
+  # Standard mode only reads.
+  _lm_mutating() { grep -vE '^aws (eks describe-nodegroup|autoscaling describe-auto-scaling-groups) ' "${tmp}/calls" || true; }
+  out="$(_lm_reconcile 0 '' 0 3)"
+  assert_eq "$(_lm_mutating)" "" "the default path (never in learner mode) makes no mutating call"
+  out="$(_lm_reconcile 0 0 0 3)"
+  assert_eq "$(_lm_mutating)" "" "a standard prefix re-deployed in standard mode makes no mutating call"
+  out="$(_lm_reconcile 0 0 1 3)"
+  assert_eq "$(_lm_mutating)" "" "a GPU group already in the config's instance-type order is left alone"
+  # The group holds the one size the search found, so another g6 size is expected.
+  out="$(GPU_TYPES='g6.4xlarge' _lm_reconcile 0 0 1 3)"; rc=$?
+  assert_eq "${rc}" "0" "a group holding one g6 size from the list succeeds"
+  assert_eq "$(_lm_mutating)" "" "and is left alone"
+  assert_not_contains "${out}" "different GPU" "with no warning"
+
+  # A family change is a different GPU: the old engines would stay in S3.
+  out="$(GPU_TYPES=$'g5.2xlarge\tg5.xlarge\tg5.4xlarge' GPU_COUNT=0 _lm_reconcile 0 0 1 3)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "a GPU family change does not fail the deploy"
+  assert_not_contains "${calls}" "eksctl" "an empty GPU group of another family is never deleted or recreated"
+  assert_contains "${out}" "runs g5 instances but cluster-config.yaml now lists g6" "and the deploy names both families"
+  assert_contains "${out}" "Deploy a new prefix" "and says how to move"
 
   # --- GPU-only steps sit inside a LEARNER_MODE -eq 0 guard -------------------
   _lm_guarded() {  # _lm_guarded <fixed-string>: is its first line inside an `if LEARNER_MODE -eq 0` block?
@@ -2393,6 +2432,8 @@ test_learner_phase_structure() {
   assert_eq "$(_lm_guarded 'quiet "kubectl apply model-optimizer-bootstrap Job"')" "guarded" "the optimizer bootstrap Job is applied only in standard mode"
   assert_eq "$(_lm_guarded 'quiet "kubectl apply nvidia-device-plugin"')" "guarded" "the NVIDIA device plugin is applied only in standard mode"
   assert_eq "$(_lm_guarded '--scheduled-action-name "${STACK_NAME}-gpu-nightly-shutdown"')" "guarded" "the nightly GPU shutdown is scheduled only in standard mode"
+  assert_contains "$(cat "${DEPLOY_SH}")" '--recurrence "0 0 * * *"' "the nightly GPU shutdown runs at midnight"
+  assert_not_contains "$(cat "${DEPLOY_SH}")" '--recurrence "0 20 * * *"' "not at 8 PM"
   assert_eq "$(_lm_guarded 'GPU_NODES="$(kubectl get nodes -l nvidia.com/gpu=present')" "guarded" "the GPU node wait runs only in standard mode"
   local src; src="$(cat "${DEPLOY_SH}")"
   assert_contains "${src}" '_k}" != "model-optimizer"' "learner mode drops the Model Optimizer image from Step 4"
@@ -2568,6 +2609,310 @@ test_remote_build_split_by_arch() {
 }
 
 # =========================================================================
+# GPU node group that cannot launch: the deploy names the EC2 cause
+# =========================================================================
+test_gpu_launch_problem_messaging() {
+  echo "test_gpu_launch_problem_messaging"
+  local D="${SCRIPT_DIR}/.." out fn_src
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  fn_src="$(sed -n '/^gpu_launch_problem() {/,/^}/p; /^gpu_launch_warning() {/,/^}/p' "${DEPLOY_SH}")"
+  local harness='
+    set -euo pipefail
+    SCRIPT_DIR="$1"; CLUSTER_NAME=t-stack-triton; AWS_REGION=us-east-1; STACK_PREFIX=t1
+    warn() { printf "[warn] %s\n" "$*"; }
+  '
+  local ice=$'AsgInstanceLaunchFailures\tCould not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do not have sufficient g6.2xlarge capacity in the Availability Zone you requested (us-east-1c). Our system will be working on provisioning additional capacity.'
+  out="$(ISSUE="${ice}" "${sh}" -c "${harness}"'aws() { printf "%s\n" "${ISSUE}"; }
+'"${fn_src}"'
+    gpu_launch_problem' _ "${D}" 2>&1)"
+  assert_eq "${out}" "AsgInstanceLaunchFailures: Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do not have sufficient g6.2xlarge capacity in the Availability Zone you requested (us-east-1c)." "gpu_launch_problem returns code and EC2 cause without the trailing advice"
+  out="$("${sh}" -c "${harness}"'aws() { echo None; }
+'"${fn_src}"'
+    gpu_launch_problem' _ "${D}" 2>&1)"
+  assert_eq "${out}" "" "no health issue prints nothing"
+  out="$("${sh}" -c "${harness}"'aws() { return 255; }
+'"${fn_src}"'
+    gpu_launch_problem' _ "${D}" 2>&1)"
+  assert_eq "${out}" "" "an unreadable node group prints nothing"
+  out="$("${sh}" -c "${harness}${fn_src}"'
+    gpu_launch_warning "AsgInstanceLaunchFailures: no capacity" 0' _ "${D}" 2>&1)"
+  assert_contains "${out}" "EKS reports: AsgInstanceLaunchFailures: no capacity" "the warning carries the EKS reason"
+  assert_contains "${out}" "Triton stays Pending" "with no GPU node the warning says Triton cannot start"
+  assert_contains "${out}" "This deploy will finish as incomplete" "and that the deploy will not report success"
+  assert_contains "${out}" "each size in deployment/eks/cluster-config.yaml (g6.2xlarge first) is tried in turn" "it says a re-run searches the sizes"
+  out="$("${sh}" -c "${harness}${fn_src}"'
+    gpu_launch_warning "x" 1' _ "${D}" 2>&1)"
+  assert_contains "${out}" "so the Job waits for it" "with Triton's node running only the bootstrap Job is affected"
+  # The GPU wait and the Triton rollout wait both consult it.
+  local src; src="$(cat "${DEPLOY_SH}")"
+  assert_contains "${src}" 'GPU_PROBLEM="$(gpu_launch_problem)"' "the GPU node wait checks for a launch failure"
+  assert_contains "${src}" 'Pending, no GPU node (gpu-inference: ${problem})' "the Triton rollout wait records the cause in the incomplete-deploy summary"
+}
+
+# =========================================================================
+# --region: a flag, remembered per prefix, honoured by --status and --destroy
+# =========================================================================
+test_region_flag() {
+  echo "test_region_flag"
+  local D="${SCRIPT_DIR}/.." out rc block
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  _rg_run() { AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y env -u AWS_PROFILE -u AWS_REGION bash "$@" 2>&1; }
+  out="$(_rg_run "${D}/deploy.sh" --prefix dv1 --region us-west-2 --bogus)"; rc=$?
+  assert_contains "${out}" "unknown argument '--bogus'" "--region and its value are parsed"
+  out="$(_rg_run "${D}/deploy.sh" --prefix dv1 --region=us-west-2 --bogus)"; rc=$?
+  assert_contains "${out}" "unknown argument '--bogus'" "--region=VALUE is parsed"
+  out="$(_rg_run "${D}/deploy.sh" --prefix dv1 --region)"; rc=$?
+  assert_eq "${rc}" "1" "--region as the last argument stops the run"
+  assert_contains "${out}" "--region needs a value" "and says it needs a value"
+  out="$(_rg_run "${D}/deploy.sh" --prefix dv1 --region us-west)"; rc=$?
+  assert_eq "${rc}" "1" "a malformed Region stops the run"
+  assert_contains "${out}" "'us-west' (from --region) is not an AWS Region name" "and names the value and its source"
+  out="$(AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y AWS_REGION=uswest2 env -u AWS_PROFILE bash "${D}/deploy.sh" --prefix dv1 2>&1)"; rc=$?
+  assert_eq "${rc}" "1" "a malformed AWS_REGION stops the run"
+  assert_contains "${out}" "(from AWS_REGION environment variable)" "a malformed AWS_REGION names the variable"
+  out="$(bash "${DEPLOY_SH}" --help 2>&1)"
+  assert_contains "${out}" "--region us-west-2" "--help documents --region"
+
+  # The resolution block, run with a stubbed state record.
+  block="$(awk '/^# AWS Region -- resolved here too/{f=1} f; f && /^say "  AWS region:/{exit}' "${DEPLOY_SH}")"
+  _rg_resolve() {  # _rg_resolve <AWS_REGION> <_GIVEN_REGION> <source> <remembered>
+    "${sh}" -c "set -euo pipefail
+      STACK_PREFIX=dv1; DEPLOY_STATE_FILE=/tmp/state.json
+      AWS_REGION='$1'; _GIVEN_REGION='$2'; DEPLOY_REGION_SOURCE='$3'
+      state_read() { printf '%s' '$4'; }
+      say() { printf '%s\n' \"\$*\"; }
+      fail() { printf '[fail] %s\n' \"\$*\"; exit 1; }
+      ${block}
+      bash -c 'echo child=\${AWS_REGION:-unset}'" 2>&1
+  }
+  out="$(_rg_resolve us-east-1 0 env us-west-2)"; rc=$?
+  assert_eq "${rc}" "0" "an omitted Region with a remembered one succeeds"
+  assert_contains "${out}" "AWS region:  us-west-2 (remembered for prefix 'dv1')" "the remembered Region is used and named"
+  assert_contains "${out}" "child=us-west-2" "and exported to child scripts"
+  out="$(_rg_resolve us-east-1 0 env '')"
+  assert_contains "${out}" "AWS region:  us-east-1 (default)" "nothing given or remembered falls back to us-east-1"
+  out="$(_rg_resolve us-west-2 1 --region us-west-2)"; rc=$?
+  assert_eq "${rc}" "0" "a given Region that matches the record succeeds"
+  assert_contains "${out}" "(--region)" "and names the flag as its source"
+  out="$(_rg_resolve us-west-2 1 --region us-east-1)"; rc=$?
+  assert_eq "${rc}" "1" "a given Region that differs from the prefix's record stops the run"
+  assert_contains "${out}" "Region mismatch for prefix 'dv1'" "and says why"
+  assert_contains "${out}" "Use a new prefix for us-west-2" "and how to proceed"
+  # Resolved for every mode: before --status, before the destroy block.
+  local region_line status_line destroy_line
+  region_line="$(grep -n '^# AWS Region -- resolved here too' "${DEPLOY_SH}" | cut -d: -f1)"
+  status_line="$(grep -n '^if \[\[ "${STATUS_ONLY}" -eq 1 \]\]; then$' "${DEPLOY_SH}" | head -1 | cut -d: -f1)"
+  destroy_line="$(grep -n '^if \[\[ "${DESTROY}" -eq 1 \]\]; then$' "${DEPLOY_SH}" | head -1 | cut -d: -f1)"
+  assert_eq "$(( region_line < status_line && region_line < destroy_line ))" "1" "the Region is resolved before --status and --destroy run"
+}
+
+# =========================================================================
+# GPU node group: the size search (ensure_gpu_nodegroup)
+# =========================================================================
+# A stateful mock of aws/eksctl: the node group lives in files under $ST.
+# CAPACITY lists the sizes EC2 can launch; every other size fails with
+# InsufficientInstanceCapacity in each cluster AZ. ERROR_TYPE fails with a quota error.
+_GPU_SEARCH_MOCKS='
+  sleep() { :; }
+  _st() { cat "$ST/$1" 2>/dev/null || true; }
+  aws() {
+    printf "aws %s\n" "$*" >> "$CALLS"
+    case "$1 $2" in
+      "eks describe-nodegroup")
+        [[ -n "$(_st status)" ]] || return 254
+        case "$*" in
+          *nodegroup.status*) _st status ;;
+          *desiredSize*) _st desired ;;
+          *autoScalingGroups*) echo "asg-$(_st type)" ;;
+          *health.issues*) if [[ -n "$(_st issue)" ]]; then printf "AsgInstanceLaunchFailures\t%s\n" "$(_st issue)"; else echo None; fi ;;
+          *instanceTypes*) _st type ;;
+        esac ;;
+      "eks update-nodegroup-config")
+        [[ "$*" == *desiredSize=1* ]] && echo 1 > "$ST/desired" ;;
+      "eks wait") rm -f "$ST/status" ;;
+      "autoscaling describe-auto-scaling-groups")
+        if [[ -n "$(_st count)" ]]; then _st count
+        elif [[ "$(_st desired)" == 1 && " ${CAPACITY:-} " == *" $(_st type) "* ]]; then echo 1
+        else echo 0; fi ;;
+      "autoscaling describe-scaling-activities")
+        local t; t="$(_st type)"
+        if [[ "$(_st desired)" != 1 || " ${CAPACITY:-} " == *" ${t} "* ]]; then echo "{\"Activities\": []}"
+        elif [[ "${t}" == "${ERROR_TYPE:-none}" ]]; then
+          echo "{\"Activities\": [{\"StartTime\": \"2999-01-01T00:00:00+00:00\", \"StatusCode\": \"Failed\", \"StatusMessage\": \"Could not launch On-Demand Instances. VcpuLimitExceeded - You have requested more vCPU capacity than your current vCPU limit allows.\"}]}"
+        else
+          printf "{\"Activities\": ["
+          local az sep=""
+          for az in us-east-1a us-east-1b us-east-1c; do
+            printf "%s{\"StartTime\": \"2999-01-01T00:00:00+00:00\", \"StatusCode\": \"Failed\", \"StatusMessage\": \"Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do not have sufficient %s capacity in the Availability Zone you requested (%s). Our system will be working on provisioning additional capacity.\"}" "${sep}" "${t}" "${az}"
+            sep=", "
+          done
+          echo "]}"
+        fi ;;
+      "cloudformation describe-stacks") [[ -n "$(_st stack)" ]] || return 254; _st stack ;;
+      "cloudformation delete-stack") rm -f "$ST/stack" ;;
+    esac
+    return 0
+  }
+  eksctl() {
+    printf "eksctl %s\n" "$*" >> "$CALLS"
+    # As the real eksctl: --approve is rejected unless a config file is given.
+    if [[ " $* " == *" --approve "* && " $* " != *" --config-file"* ]]; then
+      echo "Error: cannot use --approve unless a config file is specified via --config-file/-f" >&2; return 1
+    fi
+    case "$1 $2" in
+      "create nodegroup")
+        local cfg; cfg="$(printf "%s\n" "$@" | sed -n "s/^--config-file=//p")"
+        [[ -n "${cfg}" ]] || cfg="$4"
+        awk "/name: gpu-inference/{g=1} g&&/instanceTypes:/{print;exit}" "${cfg}" | tr -d "[]\" " | sed "s/instanceTypes://" > "$ST/type"
+        echo ACTIVE > "$ST/status"; echo 0 > "$ST/desired"; rm -f "$ST/issue" "$ST/count" ;;
+      "delete nodegroup") rm -f "$ST/status" "$ST/type" "$ST/desired" "$ST/issue" "$ST/count" ;;
+    esac
+    return 0
+  }
+'
+
+test_gpu_size_search() {
+  echo "test_gpu_size_search"
+  local tmp D="${SCRIPT_DIR}/.." out rc calls fn_src
+  local sh=/bin/bash; [[ -x "${sh}" ]] || sh=bash
+  tmp="$(mktemp -d)"
+  fn_src="$(_learner_render_src)
+$(sed -n '/^gpu_launch_problem() {/,/^}/p
+  /^cluster_azs() {/,/^}/p
+  /^_gpu_ng() {/,/^}/p
+  /^_gpu_stack() {.*}$/p
+  /^_gpu_unprotect_stack() {/,/^}/p
+  /^_gpu_delete_nodegroup() {/,/^}/p
+  /^_gpu_clear_failed_stack() {/,/^}/p
+  /^_gpu_create_empty() {/,/^}/p
+  /^gpu_probe_verdict() {/,/^}/p
+  /^probe_gpu_type() {/,/^}/p
+  /^_gpu_report() {/,/^}/p
+  /^ensure_gpu_nodegroup() {/,/^}/p' "${DEPLOY_SH}")"
+  _gs() {  # _gs [LEARNER_MODE]: run ensure_gpu_nodegroup against the state in $tmp/st
+    : > "${tmp}/calls"; : > "${tmp}/report"
+    CALLS="${tmp}/calls" ST="${tmp}/st" "${sh}" -c "${_LEARNER_RENDER_HARNESS}${_GPU_SEARCH_MOCKS}${fn_src}
+      LEARNER_MODE=${1:-0}; GPU_PROBE_TIMEOUT=60; GPU_PROBE_INTERVAL=20
+      GPU_SEARCH_REPORT_FILE='${tmp}/report'
+      ensure_gpu_nodegroup" _ "${D}" 2>&1
+  }
+  _gs_reset() { rm -rf "${tmp}/st"; mkdir -p "${tmp}/st"; }
+  _creates() { grep -c '^eksctl create nodegroup' "${tmp}/calls" || true; }
+
+  # 1. No group: the first size has no capacity anywhere, the second launches.
+  _gs_reset
+  out="$(CAPACITY="g6.4xlarge" _gs)"; rc=$?; calls="$(cat "${tmp}/calls")"
+  assert_eq "${rc}" "0" "the search succeeds when a later size has capacity (output: ${out})"
+  assert_contains "${out}" "g6.2xlarge: InsufficientInstanceCapacity in us-east-1a, us-east-1b, us-east-1c" "the first size is given up only after every AZ refused it"
+  assert_contains "${out}" "GPU node group: g6.4xlarge launched" "the second size is the one kept"
+  assert_eq "$(_creates)" "2" "two sizes were tried"
+  assert_eq "$(grep -c '^eksctl delete nodegroup' "${tmp}/calls")" "1" "the group was deleted once, between them"
+  assert_eq "$(cat "${tmp}/st/type")" "g6.4xlarge" "the group is left holding the size that launched"
+  assert_eq "$(grep -E '^(aws cloudformation update-termination-protection|eksctl (create|delete) nodegroup)' "${tmp}/calls" | awk '{print $2}' | tr '\n' ' ')" "create cloudformation cloudformation delete create cloudformation " "protection is turned off after each create and again before the delete"
+  assert_eq "$(grep -c -- '--stack-name eksctl-t-stack-triton-nodegroup-gpu-inference --no-enable-termination-protection --region us-east-1$' "${tmp}/calls")" "3" "on the node group's own stack"
+  assert_contains "${calls}" "--scaling-config minSize=1,maxSize=3,desiredSize=1" "each size is asked for one node, within --maxGPUs"
+  assert_not_contains "${calls}" "g6.xlarge" "the third size is never tried"
+
+  # 2. No size has capacity: the deploy stops and names every size it tried.
+  _gs_reset
+  out="$(CAPACITY="" _gs)"; rc=$?
+  assert_eq "${rc}" "1" "the search fails when no size has capacity"
+  assert_eq "$(_creates)" "3" "all three sizes were tried"
+  assert_contains "$(cat "${tmp}/report")" "No On-Demand GPU capacity in us-east-1 (us-east-1a, us-east-1b, us-east-1c)" "the report names the Region and AZs"
+  assert_contains "$(cat "${tmp}/report")" "g6.xlarge: InsufficientInstanceCapacity" "and each size's result"
+  assert_contains "$(cat "${tmp}/report")" "re-run the same command to search again" "and what to do"
+  assert_eq "$(ls "${tmp}/st")" "" "no empty GPU group is left behind"
+
+  # 3. A non-capacity launch failure stops the search at once.
+  _gs_reset
+  out="$(CAPACITY="g6.4xlarge" ERROR_TYPE="g6.2xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "1" "a quota failure stops the search"
+  assert_eq "$(_creates)" "1" "no other size is tried after it"
+  assert_contains "$(cat "${tmp}/report")" "EC2 would not launch g6.2xlarge for gpu-inference: Could not launch On-Demand Instances. VcpuLimitExceeded" "the report quotes EC2"
+
+  # 4. A running group, or one deliberately at 0, is left alone.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.2xlarge > "${tmp}/st/type"; echo 1 > "${tmp}/st/desired"; echo 1 > "${tmp}/st/count"
+  out="$(_gs)"; rc=$?
+  assert_eq "${rc}" "0" "a running GPU group passes"
+  assert_not_contains "$(cat "${tmp}/calls")" "eksctl" "and is not touched"
+  # 4b. A group at 0 (nightly shutdown, Stop GPUs) restarts with its own size first.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.xlarge > "${tmp}/st/type"; echo 0 > "${tmp}/st/desired"
+  out="$(CAPACITY="g6.xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a group at 0 whose size has capacity restarts (output: ${out})"
+  assert_contains "$(cat "${tmp}/calls")" "--scaling-config minSize=1,maxSize=3,desiredSize=1" "it is asked for one node"
+  assert_not_contains "$(cat "${tmp}/calls")" "eksctl" "without being recreated"
+  assert_contains "${out}" "GPU node group: g6.xlarge launched" "and the deploy says which size came back"
+  # 4c. Its own size has no capacity: deleted, and the other sizes are searched.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.xlarge > "${tmp}/st/type"; echo 0 > "${tmp}/st/desired"
+  out="$(CAPACITY="g6.4xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a group at 0 whose size has no capacity moves to another size (output: ${out})"
+  assert_contains "${out}" "g6.xlarge: InsufficientInstanceCapacity in us-east-1a, us-east-1b, us-east-1c; deleting the group to try the other sizes" "its own size is tried first"
+  assert_contains "${out}" "tries g6.2xlarge, g6.4xlarge in order" "and not tried twice"
+  assert_eq "$(cat "${tmp}/st/type")" "g6.4xlarge" "the group comes back with a size that launched"
+  # 4d. No size has capacity: the report includes the restart attempt.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.xlarge > "${tmp}/st/type"; echo 0 > "${tmp}/st/desired"
+  out="$(CAPACITY="" _gs)"; rc=$?
+  assert_eq "${rc}" "1" "a restart with no capacity anywhere stops the step"
+  assert_eq "$(_creates)" "2" "only the two other sizes are created"
+  assert_contains "$(cat "${tmp}/report")" "g6.xlarge: InsufficientInstanceCapacity" "the report names the restart attempt"
+  # 4e. A group at 0 with a size of another family is left for the family check.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g5.2xlarge > "${tmp}/st/type"; echo 0 > "${tmp}/st/desired"
+  out="$(CAPACITY="g5.2xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a scaled-down group of another GPU family passes"
+  assert_eq "$(grep -c -- 'desiredSize=1' "${tmp}/calls")" "0" "and is not restarted here"
+
+  # 5. A stuck group (wants a node, has none, reports launch failures) is replaced.
+  _gs_reset; echo DEGRADED > "${tmp}/st/status"; echo g6.2xlarge > "${tmp}/st/type"; echo 1 > "${tmp}/st/desired"; echo 0 > "${tmp}/st/count"
+  echo "Could not launch On-Demand Instances. InsufficientInstanceCapacity" > "${tmp}/st/issue"
+  out="$(CAPACITY="g6.2xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a stuck group is replaced (output: ${out})"
+  assert_eq "$(grep -n '^eksctl' "${tmp}/calls" | head -1 | grep -c 'delete nodegroup')" "1" "it is deleted before the search creates a new one"
+  assert_contains "${out}" "GPU node group: g6.2xlarge launched" "and the search runs from the first size"
+
+  # 5b. EKS has not reported a health issue yet, but the ASG has failed launches.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.2xlarge > "${tmp}/st/type"; echo 1 > "${tmp}/st/desired"; echo 0 > "${tmp}/st/count"
+  out="$(CAPACITY="g6.4xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a group whose ASG keeps failing is replaced before EKS reports it (output: ${out})"
+  assert_contains "${out}" "cannot launch (InsufficientInstanceCapacity in us-east-1a, us-east-1b, us-east-1c)" "the ASG's failures are the reason given"
+  assert_eq "$(cat "${tmp}/st/type")" "g6.4xlarge" "and the search moves to a size with capacity"
+  # 5c. A group that wants a node, has none and shows no failure yet is left to launch.
+  _gs_reset; echo ACTIVE > "${tmp}/st/status"; echo g6.4xlarge > "${tmp}/st/type"; echo 1 > "${tmp}/st/desired"; echo 0 > "${tmp}/st/count"
+  out="$(CAPACITY="g6.4xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a group still launching passes"
+  assert_not_contains "$(cat "${tmp}/calls")" "eksctl" "and is not touched"
+
+  # 6. A failed earlier create's leftover stack is removed first.
+  _gs_reset; echo ROLLBACK_COMPLETE > "${tmp}/st/stack"
+  out="$(CAPACITY="g6.2xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "0" "a leftover ROLLBACK_COMPLETE stack does not block the search"
+  assert_eq "$(grep -nE '^aws cloudformation delete-stack|^eksctl create' "${tmp}/calls" | head -1 | grep -c 'delete-stack')" "1" "the stack is deleted before the create"
+  _gs_reset; echo CREATE_IN_PROGRESS > "${tmp}/st/stack"
+  out="$(CAPACITY="g6.2xlarge" _gs)"; rc=$?
+  assert_eq "${rc}" "1" "a stack still in progress stops the search"
+  assert_eq "$(_creates)" "0" "without creating anything"
+
+  # 7. A group still being created by an earlier run is not raced.
+  _gs_reset; echo CREATING > "${tmp}/st/status"; echo g6.2xlarge > "${tmp}/st/type"
+  out="$(_gs)"; rc=$?
+  assert_eq "${rc}" "1" "a CREATING group stops the step"
+  assert_contains "$(cat "${tmp}/report")" "is CREATING from an earlier run" "and the report says why"
+
+  # 8. Learner mode has no GPU group.
+  _gs_reset
+  out="$(_gs 1)"; rc=$?
+  assert_eq "${rc}" "0" "learner mode passes"
+  assert_eq "$(cat "${tmp}/calls")" "" "without any call"
+
+  # Wiring: the cluster is created without the group, and Step 5 runs the search
+  # for both a new and an existing cluster.
+  local ensure_src; ensure_src="$(sed -n '/^ensure_eks_cluster() {/,/^}/p' "${DEPLOY_SH}")"
+  assert_eq "$(grep -c 'ensure_gpu_nodegroup || return 1' <<<"${ensure_src}")" "2" "Step 5 searches after creating a cluster and on an existing one"
+  assert_contains "$(sed -n '/^create_eks_cluster() {/,/^}/p' "${DEPLOY_SH}")" 'render_cluster_config_without_gpu "${CLUSTER_CONFIG}"' "eksctl create cluster gets the config without the GPU group"
+  assert_contains "$(cat "${DEPLOY_SH}")" 'PHASE_HINT_OVERRIDE="The cluster and cpu-services are kept' "a failed search replaces the generic Phase 2 hint"
+  rm -rf "${tmp}"
+}
+
+# =========================================================================
 # Run all tests
 # =========================================================================
 test_network_policy_enforcement
@@ -2596,6 +2941,9 @@ test_learner_served_repo
 test_learner_render_no_gpu
 test_learner_phase_structure
 test_remote_build_split_by_arch
+test_gpu_launch_problem_messaging
+test_region_flag
+test_gpu_size_search
 
 printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

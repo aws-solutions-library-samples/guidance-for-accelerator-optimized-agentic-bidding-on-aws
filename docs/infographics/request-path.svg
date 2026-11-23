@@ -158,7 +158,7 @@
 <g filter="url(#amb)"><rect x="422" y="1004" width="1038" height="84" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/></g>
 <rect x="422" y="1004" width="6" height="84" rx="3" fill="#76B900"/>
 <use href="#ic-gpu" x="440" y="1019" width="22" height="22" color="#76B900"/>
-<text x="470" y="1036" font-size="15" font-weight="700" fill="#0F172A">NVIDIA Triton Inference Server (GPU node group, g5 / A10G)</text>
+<text x="470" y="1036" font-size="15" font-weight="700" fill="#0F172A">NVIDIA Triton Inference Server (GPU node group, g6 / L4)</text>
 <text x="440" y="1060" font-size="12.5" fill="#334155">Behind an internal-only load balancer. Serves two TensorRT engines (DLRM, NCF) and two XGBoost models (floor, margin) from one GPU.</text>
 <text x="440" y="1078" font-size="12.5" fill="#334155">The node group scales to zero on a nightly schedule. Stage 1 never touches the GPU; stages 2 to 4 make four GPU calls per request.</text>
 </svg>

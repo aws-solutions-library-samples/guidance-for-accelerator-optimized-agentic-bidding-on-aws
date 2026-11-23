@@ -301,3 +301,92 @@ def test_stack_check_maps_cloudformation_status(cfn_status, expected):
     check = _stack_probe(_FakeCfn(status=cfn_status))._stack_check("dv1-ui-api-proxy", label="UI API proxy")
     assert check["status"] == expected
     assert check["name"] == "UI API proxy (stack dv1-ui-api-proxy)"
+
+
+# --- GPU node group that cannot launch ----------------------------------------
+
+from deploy_status import _nodegroup_issue_text  # noqa: E402
+
+_ICE = ("Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently "
+        "do not have sufficient g5.xlarge capacity in the Availability Zone you requested "
+        "(us-east-1c). Our system will be working on provisioning additional capacity. You "
+        "can currently get g5.xlarge capacity by not specifying an Availability Zone.")
+_PENDING = ("pod Pending: 0/3 nodes are available: 3 node(s) didn't match Pod's node "
+            "affinity/selector.")
+
+
+def test_issue_text_keeps_the_ec2_cause_and_drops_the_advice():
+    text = _nodegroup_issue_text({"health": {"issues": [
+        {"code": "AsgInstanceLaunchFailures", "message": _ICE}]}})
+    assert text.startswith("AsgInstanceLaunchFailures: Could not launch")
+    assert "g5.xlarge capacity in the Availability Zone you requested (us-east-1c)" in text
+    assert "Our system" not in text
+
+
+def test_issue_text_is_empty_without_issues():
+    assert _nodegroup_issue_text({"health": {"issues": []}}) == ""
+    assert _nodegroup_issue_text({}) == ""
+
+
+class _DegradedEks:
+    def list_nodegroups(self, clusterName):
+        return {"nodegroups": ["gpu-inference", "cpu-services"]}
+
+    def describe_nodegroup(self, clusterName, nodegroupName):
+        if nodegroupName == "gpu-inference":
+            return {"nodegroup": {"status": "DEGRADED", "scalingConfig": {"desiredSize": 1},
+                                  "health": {"issues": [
+                                      {"code": "AsgInstanceLaunchFailures", "message": _ICE}]}}}
+        return {"nodegroup": {"status": "ACTIVE", "scalingConfig": {"desiredSize": 3},
+                              "instanceTypes": ["c5.2xlarge"], "health": {"issues": []}}}
+
+
+def _degraded_probe(gpu_joined=0):
+    p = _probe(_PENDING)
+    p.learner = False
+    p._client = lambda service: None
+    p._registered_nodes = lambda: {"gpu-inference": gpu_joined, "cpu-services": 3}
+    p._running_instances = lambda ec2, cluster, ng: 0 if ng == "gpu-inference" else 3
+    checks = {c["name"]: c for c in p._nodegroups(_DegradedEks(), "t-cluster")}
+    return p, checks
+
+
+def test_degraded_gpu_group_names_the_ec2_cause():
+    _, checks = _degraded_probe()
+    check = checks["node group gpu-inference"]
+    assert check["status"] == FAILED
+    assert "InsufficientInstanceCapacity" in check["detail"]
+    assert "us-east-1c" in check["detail"]
+
+
+def test_triton_pending_on_a_group_that_cannot_launch_is_failed():
+    """Not IN_PROGRESS: that made a re-run wait an hour before Phase 3 could fix it."""
+    p, _ = _degraded_probe()
+    status, why = p._rollout_status("triton-inference-server", PROGRESSING)
+    assert status == FAILED
+    assert "no GPU node" in why
+    assert "InsufficientInstanceCapacity" in why
+
+
+def test_triton_pending_while_a_gpu_node_has_joined_stays_in_progress():
+    p, _ = _degraded_probe(gpu_joined=1)
+    status, _ = p._rollout_status("triton-inference-server", PROGRESSING)
+    assert status == IN_PROGRESS
+
+
+def test_triton_pending_without_a_launch_failure_stays_in_progress():
+    status, _ = _probe(_PENDING)._rollout_status("triton-inference-server", PROGRESSING)
+    assert status == IN_PROGRESS
+
+
+def test_a_cpu_deployment_is_not_failed_by_the_gpu_group():
+    p, _ = _degraded_probe()
+    status, _ = p._rollout_status("orchestrator", PROGRESSING)
+    assert status == IN_PROGRESS
+
+
+def test_learner_mode_ignores_the_gpu_group_for_triton():
+    p, _ = _degraded_probe()
+    p.learner = True
+    status, _ = p._rollout_status("triton-inference-server", PROGRESSING)
+    assert status == IN_PROGRESS

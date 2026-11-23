@@ -41,7 +41,7 @@ The solution provides six production-ready ARTF-compliant containers, each doing
 | Benefit | Description |
 |---------|-------------|
 | Sub-millisecond inference | Dynamic batching on Triton with CUDA EP delivers GPU-accelerated inference well within OpenRTB timeout budgets |
-| GPU acceleration | NVIDIA A10G GPUs via Triton deliver significant throughput improvement over equivalent CPU-based inference for recommender models |
+| GPU acceleration | NVIDIA L4 GPUs via Triton deliver significant throughput improvement over equivalent CPU-based inference for recommender models |
 | Deep learning CTR | The bid pricer and deal scorer's deep learning models (DLRM and NCF) outperform linear models and heuristic rules for the advertising decisions they cover |
 | Tree-model yield optimization | The yield optimizer's floor and margin XGBoost models, served by Triton's FIL backend, follow the published approach for reserve-price optimization, a tree/regression problem rather than a deep-embedding one |
 | Dynamic batching | Triton's preferred batch sizes (8, 16, 32) and max queue delay (500μs) maximize GPU utilization under concurrent load |
@@ -57,7 +57,7 @@ The solution provides six production-ready ARTF-compliant containers, each doing
 
 2. **Orchestration:** The orchestrator (Starlette/Python) receives the request and runs it through the registered ARTF containers in four stages (enrich, deals, yield, price), calling a stage's containers in parallel and applying their mutations to a working copy of the request before the next stage runs.
 
-   **GPU-accelerated inference:** The four GPU-backed containers (the bid pricer, the deal scorer, and the yield optimizer's floor and margin containers) extract features from the bid request, invoke their assigned model (DLRM, NCF, and one XGBoost model each via FIL, respectively) on NVIDIA Triton Inference Server via tritonclient.http, and receive predictions from the GPU (A10G). The audience activator and signals enricher apply rule-based logic on CPU.
+   **GPU-accelerated inference:** The four GPU-backed containers (the bid pricer, the deal scorer, and the yield optimizer's floor and margin containers) extract features from the bid request, invoke their assigned model (DLRM, NCF, and one XGBoost model each via FIL, respectively) on NVIDIA Triton Inference Server via tritonclient.http, and receive predictions from the GPU (L4). The audience activator and signals enricher apply rule-based logic on CPU.
 
 3. **Mutation generation:** Each container translates model predictions into typed ARTF mutations (bid price adjustments, segment activations, deal decisions, quality metrics).
 
@@ -291,7 +291,7 @@ versions against.
 | AWS Service | Role in This Guidance |
 |-------------|----------------------|
 | Amazon Elastic Kubernetes Service (EKS) | Orchestrates GPU and CPU node groups; manages container lifecycle, scaling, and health |
-| Amazon EC2 (g5.xlarge; g5.2xlarge and g5.4xlarge as capacity fallbacks) | Provides NVIDIA A10G GPU instances for Triton Inference Server (`gpu-inference` node group, 1 node by default) |
+| Amazon EC2 (g6.2xlarge) | Provides NVIDIA L4 GPU instances for Triton Inference Server (`gpu-inference` node group, 1 node by default) |
 | Amazon EC2 (c5.2xlarge) | Runs the ARTF containers, the orchestrator and the signals enricher on CPU (`cpu-services` node group, 3 nodes by default) |
 | Amazon VPC (NAT gateways) | One NAT gateway per Availability Zone (three); all nodes run in private subnets |
 | AWS CodeBuild | Builds the x86 and arm64 container images by default, so no local Docker is needed |
@@ -357,15 +357,15 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 
 ### Performance Efficiency
 
-- **GPU-accelerated inference:** NVIDIA A10G GPUs with CUDA Execution Provider for deep learning recommender models
+- **GPU-accelerated inference:** NVIDIA L4 GPUs with CUDA Execution Provider for deep learning recommender models
 - **Dynamic batching:** Triton batches concurrent requests (preferred sizes 8/16/32, max 500μs queue delay) to maximize GPU throughput
 - **Multi-model serving:** A single Triton instance serves both ONNX models (DLRM, NCF) with 2 GPU instances each
 - **Staged pipeline, parallel within a stage:** The orchestrator runs the ARTF containers in four stages (enrich, deals, yield, price) and invokes a stage's containers simultaneously; total latency is the sum of each stage's slowest container, not the sum of all six
 
 ### Cost Optimization
 
-- **Right-sized instances:** GPU nodes (g5.xlarge) run only Triton; the ARTF containers run on CPU nodes (c5.2xlarge) by default (`--artf-node-role services`)
-- **Scheduled GPU shutdown:** the deploy installs a scheduled action that scales the GPU node group to zero at 8:00 PM America/New_York every day; the UI's Start GPUs button brings it back on demand
+- **Right-sized instances:** GPU nodes (g6.2xlarge) run only Triton; the ARTF containers run on CPU nodes (c5.2xlarge) by default (`--artf-node-role services`)
+- **Scheduled GPU shutdown:** the deploy installs a scheduled action that scales the GPU node group to zero at midnight (12:00 AM) America/New_York every day; the UI's Start GPUs button brings it back on demand
 - **Horizontal Pod Autoscaler:** Kubernetes HPA scales pods based on actual request load, avoiding over-provisioning
 - **Deterministic naming:** Resource names include sha256(stack:account:region)[:8] suffix enabling multiple isolated stacks in one account without collision
 
@@ -379,21 +379,20 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 
 ### Prerequisites
 
-- An AWS account with permissions to create EKS clusters, EC2 instances (including g5 GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, CodeBuild projects, CloudFront distributions, Cognito pools, DynamoDB tables, Lambda functions, Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles (Part 2, on by default, adds Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager, SNS and Amazon Bedrock model access; see [GUIDANCE-part2.md](GUIDANCE-part2.md#prerequisites))
+- An AWS account with permissions to create EKS clusters, EC2 instances (including g6 GPU instances), VPCs with NAT gateways, S3 buckets, ECR repositories, CodeBuild projects, CloudFront distributions, Cognito pools, DynamoDB tables, Lambda functions, Bedrock AgentCore runtimes, CloudFormation stacks and IAM roles (Part 2, on by default, adds Kinesis, Firehose, KMS, Glue, SageMaker, EventBridge Scheduler, Secrets Manager, SNS and Amazon Bedrock model access; see [GUIDANCE-part2.md](GUIDANCE-part2.md#prerequisites))
 - AWS CLI v2 with valid credentials
 - Python 3.11+ with boto3, torch, onnx, onnxscript (and sagemaker, which `deploy.sh` installs itself when Part 2 is enabled)
 - jq, eksctl, kubectl
 - Docker with buildx only if you pass `--local-build`; images build on AWS CodeBuild by default
 - An NVIDIA NGC API key (`--ngc-key`) for the gated NeMo-RL training base image, unless you pass `--no-retraining`. The Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is public and needs no key
-- Service quota for at least one g5.xlarge instance in the target region (the node group also accepts g5.2xlarge and g5.4xlarge)
+- Service quota for at least one g6.2xlarge instance (8 vCPU of 'Running On-Demand G and VT instances') in the target region
 
 ### Supported Regions
 
-This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVIDIA A10G instances (g5 family), including:
+This Guidance can be deployed in any AWS Region that supports Amazon EKS and NVIDIA L4 instances (g6 family), including:
 
 - US East (N. Virginia): `us-east-1`
 - US West (Oregon): `us-west-2`
-- Europe (Ireland): `eu-west-1`
 - Europe (Frankfurt): `eu-central-1`
 - Asia Pacific (Tokyo): `ap-northeast-1`
 - Asia Pacific (Sydney): `ap-southeast-2`
@@ -414,8 +413,8 @@ This single command runs five phases:
 | Phase | What | AWS resources created (defaults) |
 |-------|------|----------------------------------|
 | 1 | Prepare models | 9 ECR repositories (`<stack>-*`), DynamoDB tables `<stack>-loadtest-history` and `<stack>-container-registry` (on-demand), ONNX export of DLRM/NCF and the genesis XGBoost models, S3 model bucket `<stack>-triton-models-<id>` |
-| 2 | Build images and provision the cluster, in parallel | CodeBuild stack `<stack>-codebuild` (x86 and arm64 projects) and source bucket; EKS cluster `<stack>-triton` (Kubernetes 1.35, 3 AZs, private nodes, 3 NAT gateways) with node groups `gpu-inference` (1 × g5.xlarge, min 1, max `--maxGPUs`, default 3) and `cpu-services` (3 × c5.2xlarge, min 2, max 8); NVIDIA device plugin; IRSA roles for Triton and the Model Optimizer |
-| 3 | Deploy workloads | Cognito user pool, app client and identity pool; Triton with an internal NLB; the six ARTF containers, the orchestrator (ClusterIP plus the `orchestrator-internal` internal NLB) and HPAs; a one-shot TensorRT bootstrap Job; the `<prefix>-ui-api-proxy` Lambda stack pointed at that NLB and verified with one request; the GPU node group's nightly scheduled shutdown (desired and minimum 0 at 8:00 PM America/New_York) |
+| 2 | Build images and provision the cluster, in parallel | CodeBuild stack `<stack>-codebuild` (x86 and arm64 projects) and source bucket; EKS cluster `<stack>-triton` (Kubernetes 1.35, 3 AZs, private nodes, 3 NAT gateways) with node groups `gpu-inference` (1 × g6.2xlarge, min 1, max `--maxGPUs`, default 3) and `cpu-services` (3 × c5.2xlarge, min 2, max 8); NVIDIA device plugin; IRSA roles for Triton and the Model Optimizer |
+| 3 | Deploy workloads | Cognito user pool, app client and identity pool; Triton with an internal NLB; the six ARTF containers, the orchestrator (ClusterIP plus the `orchestrator-internal` internal NLB) and HPAs; a one-shot TensorRT bootstrap Job; the `<prefix>-ui-api-proxy` Lambda stack pointed at that NLB and verified with one request; the GPU node group's nightly scheduled shutdown (desired and minimum 0 at midnight America/New_York) |
 | 4 | Set up access | Frontend bucket `<stack>-frontend-<id>`, CloudFront distribution (S3 origin only), demo Cognito user `admin@example.com` |
 | 5 | Register agents | Bedrock AgentCore MCP runtime `<stack>_mcp` (unless `--skip-agentcore`); then, unless `--no-retraining`, `deploy_closed_loop.sh` provisions Part 2 ([GUIDANCE-part2.md](GUIDANCE-part2.md#deployment-steps)); then, only with `--with-prebid`, `deploy_prebid.sh` adds Prebid Server as a second ARTF host |
 
@@ -437,7 +436,7 @@ Deploy options (each flag's default is in parentheses):
 ./deploy.sh --prefix dv1 --ui-only          # only redeploy the frontend
 ./deploy.sh --prefix dv1 --status           # read-only live status table
 ./deploy.sh --prefix dv1 --destroy          # tear the prefix down
-AWS_REGION=us-west-2 ./deploy.sh --prefix dv1   # different region (default: us-east-1)
+./deploy.sh --prefix dv1 --region us-west-2   # different region (default: us-east-1)
 ```
 
 Re-running the same command is the way to resume: every phase is idempotent and the script probes AWS first and runs only what is missing. The full flag reference, including environment variables, is in [README.md](README.md#customizing-your-deployment).
@@ -465,41 +464,41 @@ The default deployment (1 GPU node, 3 CPU nodes) is designed for demos and devel
 ### Scaling Architecture
 
 - **Pod autoscaling (automatic, Horizontal Pod Autoscalers).** The orchestrator runs 2 to 10 pods on CPU utilization above 70%. Each of the six ARTF containers runs 2 to 5 pods on CPU above 70% (the `artf-template` placeholder runs 1 to 5). Triton runs 1 to 4 pods on GPU utilization above 75% or CPU above 80%. HPAs place new pods only where node capacity already exists.
-- **Node scaling (manual).** No Cluster Autoscaler or Karpenter is installed. The `gpu-inference` node group is created with 1 node (minimum 1, maximum `--maxGPUs`, default 3) and the `cpu-services` node group with 3 `c5.2xlarge` nodes (minimum 2, maximum 8). To add capacity, scale the node group (`eksctl scale nodegroup` or the Auto Scaling console) or edit `deployment/eks/cluster-config.yaml` before deploying; a Triton pod that needs a GPU no node offers stays Pending until you do. Outside a deploy, the only automatic node-count change is the nightly scheduled action that sets the GPU group to 0 at 8:00 PM America/New_York. During a deploy, `deploy.sh` scales the GPU group to 2 for the bootstrap compile Job and back to 1 when the Job completes. The UI's **Start GPUs** button sets it to 1.
+- **Node scaling (manual).** No Cluster Autoscaler or Karpenter is installed. The `gpu-inference` node group is created with 1 node (minimum 1, maximum `--maxGPUs`, default 3) and the `cpu-services` node group with 3 `c5.2xlarge` nodes (minimum 2, maximum 8). To add capacity, scale the node group (`eksctl scale nodegroup` or the Auto Scaling console) or edit `deployment/eks/cluster-config.yaml` before deploying; a Triton pod that needs a GPU no node offers stays Pending until you do. Outside a deploy, the only automatic node-count change is the nightly scheduled action that sets the GPU group to 0 at midnight (12:00 AM) America/New_York. During a deploy, `deploy.sh` scales the GPU group to 2 for the bootstrap compile Job and back to 1 when the Job completes. The UI's **Start GPUs** button sets it to 1.
 - **Triton dynamic batching (automatic).** Preferred batch sizes 8, 16 and 32, maximum batch 64, maximum queue delay 500 microseconds, 2 GPU instances per model.
 
 ### Production Scaling Scenarios
 
-Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g5.xlarge $1.006/h, g5.2xlarge $1.212/h, g5.4xlarge $1.624/h, c5.2xlarge $0.34/h, c5.4xlarge $0.68/h, 730 h), with every node running 24/7 and three NAT gateways ($99). They exclude Part 2, the two internal Network Load Balancers ($33), the three NAT gateway public IPv4 addresses ($11), data processing, logs and storage. The control-plane figure assumes a Kubernetes version in standard support; extended support adds $365/month.
+Monthly figures are `us-east-1` on-demand compute only (EKS control plane $73, g6.xlarge $0.805/h, g6.2xlarge $0.978/h, g6.4xlarge $1.323/h, c5.2xlarge $0.34/h, c5.4xlarge $0.68/h, 730 h), with every node running 24/7 and three NAT gateways ($99). They exclude Part 2, the two internal Network Load Balancers ($33), the three NAT gateway public IPv4 addresses ($11), data processing, logs and storage. The control-plane figure assumes a Kubernetes version in standard support; extended support adds $365/month.
 
 | Scenario | QPS | GPU nodes | CPU nodes | Triton pods | Orchestrator pods | Est. monthly compute |
 |----------|-----|-----------|-----------|-------------|-------------------|----------------------|
-| Demo / Dev (shipped default) | <100 | 1 × g5.xlarge | 3 × c5.2xlarge | 1 | 2 | ~$1,650 |
-| Small DSP | 1K to 10K | 2 × g5.xlarge | 4 × c5.2xlarge | 2 | 4 | ~$2,633 |
-| Mid-market DSP | 10K to 100K | 3 × g5.xlarge | 6 × c5.2xlarge | 3 to 4 | 6 to 8 | ~$3,864 |
-| Large DSP | 100K to 500K | 6 × g5.2xlarge | 8 × c5.2xlarge | 6 | 10+ | ~$7,466 |
-| Enterprise DSP | 500K to 1M+ | 12 × g5.4xlarge | 16 × c5.4xlarge | 12 | 20+ | ~$22,340 |
+| Demo / Dev (shipped default) | <100 | 1 × g6.2xlarge | 3 × c5.2xlarge | 1 | 2 | ~$1,630 |
+| Small DSP | 1K to 10K | 2 × g6.xlarge | 4 × c5.2xlarge | 2 | 4 | ~$2,340 |
+| Mid-market DSP | 10K to 100K | 3 × g6.xlarge | 6 × c5.2xlarge | 3 to 4 | 6 to 8 | ~$3,424 |
+| Large DSP | 100K to 500K | 6 × g6.2xlarge | 8 × c5.2xlarge | 6 | 10+ | ~$6,440 |
+| Enterprise DSP | 500K to 1M+ | 12 × g6.4xlarge | 16 × c5.4xlarge | 12 | 20+ | ~$19,706 |
 
 ### Instance Type Selection Guide
 
 | Instance | GPU | GPU Memory | vCPU | RAM | Use Case |
 |----------|-----|------------|------|-----|----------|
-| g5.xlarge | 1× A10G | 24 GB | 4 | 16 GB | Demo, dev, small DSP |
-| g5.2xlarge | 1× A10G | 24 GB | 8 | 32 GB | Mid-market DSP (more CPU headroom for Triton) |
-| g5.4xlarge | 1× A10G | 24 GB | 16 | 64 GB | Large DSP (high-concurrency Triton serving) |
-| g5.12xlarge | 4× A10G | 96 GB | 48 | 192 GB | Enterprise (multi-GPU Triton, many models) |
+| g6.xlarge | 1× L4 | 24 GB | 4 | 16 GB | Small DSP |
+| g6.2xlarge | 1× L4 | 24 GB | 8 | 32 GB | Demo, dev (shipped default; more CPU headroom for Triton) |
+| g6.4xlarge | 1× L4 | 24 GB | 16 | 64 GB | Enterprise DSP (high-concurrency Triton serving) |
+| g6.12xlarge | 4× L4 | 96 GB | 48 | 192 GB | Multi-GPU Triton, many models |
 | p4d.24xlarge | 8× A100 | 320 GB | 96 | 1152 GB | Extreme scale (large models, TensorRT-LLM) |
 
-> **Future GPU path:** This Guidance currently deploys on NVIDIA A10G GPUs (g5 instance family). As NVIDIA Blackwell-architecture GPUs become available on AWS (g7e instance family), they will offer significantly higher inference throughput and improved power efficiency. The Triton-based serving architecture is GPU-generation agnostic, requiring only updated instance types in the cluster configuration.
+> **Future GPU path:** This Guidance currently deploys on NVIDIA L4 GPUs (g6 instance family). As NVIDIA Blackwell-architecture GPUs become available on AWS (g7e instance family), they will offer significantly higher inference throughput and improved power efficiency. The Triton-based serving architecture is GPU-generation agnostic, requiring only updated instance types in the cluster configuration.
 
 ## Cost Estimation
 
 The line-item estimate for a default deploy is in [README.md](README.md#cost), the single cost
 table for both parts. In summary, at `us-east-1` on-demand rates current when it was written:
 
-- **Part 1 only** (`--no-retraining`): about **$1,290/month** on the included nightly GPU shutdown
-  schedule, about $1,765/month with the GPU node on 24/7.
-- **Default deploy** (Part 1 and Part 2): about **$1,490/month**, about $1,970/month with the GPU
+- **Part 1 only** (`--no-retraining`): about **$1,365/month** on the included nightly GPU shutdown
+  schedule, about $1,745/month with the GPU node on 24/7.
+- **Default deploy** (Part 1 and Part 2): about **$1,550/month**, about $1,930/month with the GPU
   node on 24/7.
 
 The CPU node group, not the GPU, is the largest fixed line: the three `c5.2xlarge` nodes run around

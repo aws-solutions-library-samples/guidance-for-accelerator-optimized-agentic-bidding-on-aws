@@ -325,6 +325,9 @@ Resources:
         '--enable-glue-datacatalog': ''
         '--database_name': !Ref RawOutcomesGlueDatabaseName
         '--table_name': raw_bid_outcomes
+        # The Glue runtime does not set AWS_REGION; the script's catalog client
+        # needs the stack's Region explicitly.
+        '--region': !Ref 'AWS::Region'
         '--output_bucket': !Ref TrainingDataBucket
         '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp/'
       GlueVersion: '4.0'
@@ -408,6 +411,7 @@ Resources:
         '--enable-glue-datacatalog': ''
         '--database_name': !Ref RawOutcomesGlueDatabaseName
         '--table_name': raw_deal_yield_outcomes
+        '--region': !Ref 'AWS::Region'
         '--output_bucket': !Ref TrainingDataBucket
         '--TempDir': !Sub 's3://${TrainingDataBucket}/glue-temp-deal-yield/'
         # glue_deal_yield_feature_engineering.py imports _resolve_window()

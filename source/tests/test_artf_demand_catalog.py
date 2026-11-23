@@ -53,9 +53,10 @@ PREMIUM_VIDEO_FLOOR = _seed_deal_floor("deal-premium-video")
 # floor coming down. Its campaigns clear only once the deal floor is lowered.
 PRICED_FOR_A_LOWERED_FLOOR = frozenset({"ridesharer-suburban-midday.json"})
 
-# This scenario's deal campaign targets a content id that only an ADD_CIDS
+# This scenario's open-market campaign targets a content id that only an ADD_CIDS
 # container supplies (imp.metric[].type with the cid: prefix). It bids only once
-# that metric is on the impression.
+# that metric is on the impression. The request carries no deals, so the content
+# id is the only thing between "unsold by this seat" and a bid.
 UNLOCKED_BY_CONTENT_IDS = {"ctv-drama-finale.json": "cid:premium-drama-finale"}
 
 
@@ -187,17 +188,6 @@ def test_each_scenario_with_deals_produces_at_least_one_deal_bid(scenario):
                 deal["bidfloor"] = imp["bidfloor"]
         bid_request = lowered
 
-    if scenario in UNLOCKED_BY_CONTENT_IDS:
-        assert not _deal_bids(SERVICE.decide(bid_request)), (
-            f"{scenario} should go unsold without its content identifiers"
-        )
-        tagged = json.loads(json.dumps(bid_request))
-        for imp in tagged["imp"]:
-            imp.setdefault("metric", []).append(
-                {"type": UNLOCKED_BY_CONTENT_IDS[scenario], "value": 1.0}
-            )
-        bid_request = tagged
-
     response = SERVICE.decide(bid_request)
     deal_bids = _deal_bids(response)
     assert deal_bids, (
@@ -208,6 +198,32 @@ def test_each_scenario_with_deals_produces_at_least_one_deal_bid(scenario):
             for e in (response.get("ext", {}).get("artf", {}).get("excluded") or [])
         )
     )
+
+
+def _all_bids(response):
+    return [bid for seat in response.get("seatbid") or [] for bid in seat.get("bid") or []]
+
+
+@pytest.mark.parametrize("scenario,content_id", sorted(UNLOCKED_BY_CONTENT_IDS.items()))
+def test_a_content_id_scenario_bids_only_once_the_content_id_is_on_the_impression(scenario, content_id):
+    """End to end over the demand service for the open-market content-id case.
+
+    Without the content id the seat makes no offer at all. With it, the campaign
+    bids on the open market: a bid with no dealid, above the impression floor.
+    """
+    payload = json.loads((SAMPLES / scenario).read_text())
+    bid_request = payload["bid_request"]
+    assert not _all_bids(SERVICE.decide(bid_request)), (
+        f"{scenario} should go unsold by this seat without its content identifier"
+    )
+    tagged = json.loads(json.dumps(bid_request))
+    for imp in tagged["imp"]:
+        imp.setdefault("metric", []).append({"type": content_id, "value": 1.0})
+    bids = _all_bids(SERVICE.decide(tagged))
+    assert bids, f"{scenario} carries {content_id} but this seat produced no bid"
+    assert all(not bid.get("dealid") for bid in bids), bids
+    floors_by_imp = {imp["id"]: float(imp["bidfloor"]) for imp in tagged["imp"]}
+    assert all(float(bid["price"]) > floors_by_imp[bid["impid"]] for bid in bids), bids
 
 
 def test_video_slots_are_not_offered_a_banner_creative():

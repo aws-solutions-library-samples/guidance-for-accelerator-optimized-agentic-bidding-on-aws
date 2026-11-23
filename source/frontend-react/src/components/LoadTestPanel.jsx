@@ -220,6 +220,7 @@ export default function LoadTestPanel({ onRunningChange, onResultChange }) {
             latency_p95: data.latency_p95,
             latency_p99: data.latency_p99,
             errors: data.errors ?? 0,
+            per_container: data.per_container,
           });
         }
       } catch (_) {
@@ -779,7 +780,7 @@ function ContainerBreakdown({ containers }) {
 
   const rows = containers && containers.length > 0
     ? containers
-    : CONTAINER_NAMES.map((name) => ({ name, avg_latency_ms: null, total_mutations: null }));
+    : CONTAINER_NAMES.map((name) => ({ name, avg_latency_ms: null, total_mutations: null, errors: null }));
 
   return (
     <div className="loadtest-breakdown">
@@ -791,6 +792,7 @@ function ContainerBreakdown({ containers }) {
             <th>Container</th>
             <th>Avg Latency</th>
             <th>Mutations</th>
+            <th>Failed calls</th>
           </tr>
         </thead>
         <tbody>
@@ -811,6 +813,9 @@ function ContainerBreakdown({ containers }) {
               </td>
               <td>{c.avg_latency_ms != null ? `${c.avg_latency_ms.toFixed(1)}ms` : "—"}</td>
               <td>{c.total_mutations != null ? c.total_mutations.toLocaleString() : "—"}</td>
+              <td className={c.errors > 0 ? "loadtest-breakdown-errors" : undefined}>
+                {c.errors != null ? c.errors.toLocaleString() : "—"}
+              </td>
             </tr>
           ))}
         </tbody>

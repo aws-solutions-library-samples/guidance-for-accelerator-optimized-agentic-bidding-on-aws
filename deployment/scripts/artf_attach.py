@@ -71,13 +71,7 @@ class ExternalContainer:
     image: str
     image_digest: str
     namespace: str
-    serving_modes: tuple[str, ...] = ()
-    gpu_architectures: tuple[str, ...] = ()
     carries: dict = field(default_factory=dict)
-
-    @property
-    def supports_gpu(self) -> bool:
-        return "gpu" in {m.lower() for m in self.serving_modes}
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +135,6 @@ def parse_record(raw: str | dict) -> ExternalContainer:
         image=image,
         image_digest=str(data.get("image_digest") or "").strip(),
         namespace=str(data.get("namespace") or "default").strip() or "default",
-        serving_modes=tuple(str(m) for m in (data.get("serving_modes") or [])),
-        gpu_architectures=tuple(str(a) for a in (data.get("gpu_architectures") or [])),
         carries=data.get("carries") or {},
     )
 
@@ -550,9 +542,9 @@ def render_manifest(
 def _ensure_namespace(manifest: str, namespace: str) -> str:
     """Set ``metadata.namespace`` on every document that lacks one.
 
-    Only touches uncommented lines: the producer's GPU shape is a commented block
-    in the same file, and rewriting it would produce a manifest that silently
-    disagrees with the variant actually selected.
+    Only touches uncommented lines: a producer's file can carry alternative shapes
+    as commented blocks, and rewriting those would make them disagree with the
+    document that is actually applied.
     """
     out: list[str] = []
     for line in manifest.splitlines():
@@ -562,74 +554,6 @@ def _ensure_namespace(manifest: str, namespace: str) -> str:
             indent = len(line) - len(line.lstrip())
             out.append(" " * (indent + 2) + f"namespace: {namespace}")
     return "\n".join(out) + ("\n" if manifest.endswith("\n") else "")
-
-
-# ---------------------------------------------------------------------------
-# GPU guard
-# ---------------------------------------------------------------------------
-
-#: Compute capabilities the producer's GPU image is built for.
-GPU_SUPPORTED_ARCHES = frozenset({"sm_80", "sm_86", "sm_87", "sm_90"})
-
-#: What this cluster's GPU nodegroup actually is, by instance family.
-INSTANCE_FAMILY_ARCH = {
-    "g5": "sm_86",   # A10G — supported
-    "g6": "sm_89",   # L4 — NOT supported by HierarchicalKV
-    "p4d": "sm_80",  # A100
-    "p5": "sm_90",   # H100
-}
-
-
-def gpu_guard(
-    container: ExternalContainer,
-    *,
-    instance_types: list[str] | tuple[str, ...],
-    image_exists: bool,
-) -> tuple[bool, str]:
-    """Whether the GPU variant may be rendered, and why not if it may not.
-
-    Three conditions, all required. The label check is the one that matters most:
-    a manifest can be rendered for a GPU shape that the published image does not
-    actually support, and the failure would then appear at runtime as a startup
-    refusal rather than here as a refusal to attach.
-    """
-    if not image_exists:
-        return False, (
-            f"The GPU image for '{container.name}' was not found. Only the CPU image "
-            f"appears to be published — check the producer's build before requesting "
-            f"--variant gpu."
-        )
-    if not container.supports_gpu:
-        return False, (
-            f"The record for '{container.name}' advertises serving modes "
-            f"{list(container.serving_modes) or '[]'}, which does not include 'gpu'. "
-            f"The image's own agent-manifest label is the authority on this, and it "
-            f"says this build cannot serve on a GPU."
-        )
-
-    arches = {a.lower() for a in container.gpu_architectures} or set(GPU_SUPPORTED_ARCHES)
-    cluster_arches = set()
-    for instance in instance_types:
-        family = str(instance).split(".")[0].lower()
-        arch = INSTANCE_FAMILY_ARCH.get(family)
-        if arch:
-            cluster_arches.add(arch)
-
-    if not cluster_arches:
-        return False, (
-            f"Could not determine the GPU architecture of {list(instance_types)}, so "
-            f"whether this image can run here is unknown. Refusing rather than "
-            f"guessing."
-        )
-
-    usable = arches & cluster_arches
-    if not usable:
-        return False, (
-            f"This cluster's GPU nodes are {sorted(cluster_arches)} and the image "
-            f"builds for {sorted(arches)}. They do not overlap, so the container "
-            f"would refuse to start."
-        )
-    return True, f"GPU variant supported: cluster {sorted(cluster_arches)} matches {sorted(usable)}."
 
 
 # ---------------------------------------------------------------------------

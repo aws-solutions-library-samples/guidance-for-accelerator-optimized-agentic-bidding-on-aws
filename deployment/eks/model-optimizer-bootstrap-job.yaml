@@ -7,7 +7,7 @@
 # service.
 #
 # This Job requires a GPU on the SAME architecture as the Triton serving GPU
-# (A10G / g5) because TensorRT engine plans are GPU-architecture-specific. It runs
+# (L4 / g6) because TensorRT engine plans are GPU-architecture-specific. It runs
 # on the gpu-inference node group. deploy.sh runs it (and waits for completion)
 # BEFORE Triton so, on a single GPU node, the engines are built and the Job frees
 # the GPU before Triton claims it.

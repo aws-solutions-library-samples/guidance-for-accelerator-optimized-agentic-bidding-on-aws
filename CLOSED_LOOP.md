@@ -192,16 +192,16 @@ turns them back on.
 
 ## Cost
 
-Part 2 adds about **$202/month** to Part 1 at its default schedules once training data passes
-the trainer's dataset gate, and about $105/month while every training job stops at the gate.
-With Part 1, the default deploy is about **$1,490/month** on the nightly GPU shutdown schedule
-(about $1,970/month with the GPU node on 24/7). The line items, and the assumptions that move them,
+Part 2 adds about **$182/month** to Part 1 at its default schedules once training data passes
+the trainer's dataset gate, and about $102/month while every training job stops at the gate.
+With Part 1, the default deploy is about **$1,550/month** on the nightly GPU shutdown schedule
+(about $1,930/month with the GPU node on 24/7). The line items, and the assumptions that move them,
 are in the single cost table in [README.md](README.md#cost).
 
 The largest variables are the agent cadence (`AdaptiveBiddingScheduleRate`; about $0.06 per
 Adaptive Bidding Agent invocation, so $526/month at `rate(5 minutes)`) and SageMaker training
-(about $15/month while jobs stop at the gate, about $104/month once all four pass, capped at about
-$737/month by the 4-hour job limit). Pausing the schedules takes the Bedrock and SageMaker lines to
+(about $12/month while jobs stop at the gate, about $84/month once all four pass, capped at about
+$595/month by the 4-hour job limit). Pausing the schedules takes the Bedrock and SageMaker lines to
 zero; the Kinesis shards ($44), the KMS key, DynamoDB storage and the Glue runs (unless their
 triggers are stopped) remain. No DAX cluster is deployed; the parameter cache reads DynamoDB
 directly unless you provision one and set `DAX_ENDPOINT`.

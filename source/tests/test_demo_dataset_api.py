@@ -178,3 +178,20 @@ class TestStatusAndEstimate:
         )
         assert resp.status_code == 422
         assert resp.json()["field"] == "clear_share"
+
+
+# ---------------------------------------------------------------------------
+# Image dependencies
+
+
+def test_orchestrator_image_installs_pyarrow():
+    """demo_dataset.to_parquet_bytes imports pyarrow at call time, so a missing
+    package is invisible to every unit test and surfaces only as a 500 from the
+    deployed POST /v1/governance/demo-dataset. Pin the dependency to the image."""
+    dockerfile = os.path.join(os.path.dirname(__file__), "..", "Dockerfile.orchestrator")
+    with open(dockerfile, encoding="utf-8") as fh:
+        text = fh.read()
+    install_lines = [line for line in text.splitlines() if "pip install" in line or line.startswith("    ")]
+    assert any("pyarrow" in line for line in install_lines), (
+        "Dockerfile.orchestrator must pip install pyarrow for the demo dataset Parquet writer"
+    )

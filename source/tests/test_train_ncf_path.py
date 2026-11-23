@@ -67,7 +67,9 @@ def test_the_label_is_implicit_engagement():
 def test_the_dataset_gate_reports_sample_interactions(frame):
     report = train_module.validate_dataset(frame, "label", "implicit_engagement", model_type=NCF)
     assert report["training_data"] == "sample"
-    assert report["id_cardinality"]["deal_id"] == 25
+    # Every seed deal appears in the sample interactions, so the cardinality is the
+    # seed's deal count rather than a number that drifts when a deal is added or removed.
+    assert report["id_cardinality"]["deal_id"] == len(gen.seed_deal_ids(gen.load_json(gen.DEFAULT_SEED)))
     assert 0 < report["positive_rate"] < 1
 
 

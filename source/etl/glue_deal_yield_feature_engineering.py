@@ -69,7 +69,7 @@ from pyspark.sql.types import DoubleType
 try:
     # Local/test execution: etl/ is a real package on the path (source/ is
     # the pytest rootdir -- see test_glue_deal_yield_etl.py).
-    from etl.glue_feature_engineering import _resolve_window
+    from etl.glue_feature_engineering import _resolve_region, _resolve_window
 except ImportError:
     # Glue runtime: --extra-py-files delivers glue_feature_engineering.py as
     # a flat top-level module (Glue does not preserve package structure for
@@ -78,7 +78,7 @@ except ImportError:
     # --extra-py-files docs). See glue_etl_cfn.yaml's
     # DealYieldFeatureEngineeringJob for the matching --extra-py-files
     # argument that makes this import resolve at run time.
-    from glue_feature_engineering import _resolve_window  # type: ignore
+    from glue_feature_engineering import _resolve_region, _resolve_window  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -242,6 +242,7 @@ def main():
     output_bucket = args["output_bucket"]
     database_name = _optional_arg("database_name") or "feedback_pipeline"
     table_name = _optional_arg("table_name") or "raw_deal_yield_outcomes"
+    region = _resolve_region(_optional_arg("region"))
 
     start_dt, end_dt = _resolve_window(
         _optional_arg("window_start"), _optional_arg("window_end"), _optional_arg("window_hours")
@@ -272,7 +273,7 @@ def main():
         # metadata -- see glue_feature_engineering.py's identical comment
         # for why (nothing in this pipeline registers partition_date/
         # partition_hour, so spark.read.table() would always return 0 rows).
-        boto3_glue = boto3.client("glue", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        boto3_glue = boto3.client("glue", region_name=region)
         table_location = boto3_glue.get_table(
             DatabaseName=database_name, Name=table_name
         )["Table"]["StorageDescriptor"]["Location"]

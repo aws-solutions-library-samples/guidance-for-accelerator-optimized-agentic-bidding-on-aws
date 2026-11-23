@@ -51,3 +51,41 @@ def test_start_reports_an_eks_error(eks):
     assert status == 500
     assert "AccessDenied" in body["error"]
     eks.update_nodegroup_config.assert_not_called()
+
+
+_ICE = ("Could not launch On-Demand Instances. InsufficientInstanceCapacity - We currently do "
+        "not have sufficient g6.xlarge capacity in the Availability Zone you requested "
+        "(us-west-2a). Our system will be working on provisioning additional capacity.")
+
+
+def _status_with(eks, monkeypatch, *, desired, issues):
+    eks.describe_nodegroup.return_value = {"nodegroup": {
+        "status": "DEGRADED" if issues else "ACTIVE",
+        "scalingConfig": {"minSize": 1, "maxSize": 3, "desiredSize": desired},
+        "health": {"issues": issues},
+        "modifiedAt": 0,
+    }}
+    monkeypatch.setenv("TRITON_URL", "127.0.0.1:9")  # nothing listens: Triton not ready
+    return _call(oapp.gpu_status)
+
+
+def test_status_reports_no_capacity_with_the_ec2_reason(eks, monkeypatch):
+    status, body = _status_with(eks, monkeypatch, desired=1, issues=[
+        {"code": "AsgInstanceLaunchFailures", "message": _ICE}])
+    assert status == 200
+    assert body["tritonState"] == "no_capacity"
+    assert "sufficient g6.xlarge capacity" in body["tritonDetail"]
+    assert "(us-west-2a)" in body["tritonDetail"]
+    assert "Our system will be working" not in body["tritonDetail"]
+    assert "Re-running deploy.sh" in body["tritonDetail"]
+
+
+def test_status_without_a_capacity_issue_is_not_no_capacity(eks, monkeypatch):
+    _, body = _status_with(eks, monkeypatch, desired=1, issues=[])
+    assert body["tritonState"] in ("starting", "blocked")
+
+
+def test_a_stopped_group_with_an_old_issue_is_stopped(eks, monkeypatch):
+    _, body = _status_with(eks, monkeypatch, desired=0, issues=[
+        {"code": "AsgInstanceLaunchFailures", "message": _ICE}])
+    assert body["tritonState"] == "stopped"

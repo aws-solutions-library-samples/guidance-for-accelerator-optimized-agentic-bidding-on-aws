@@ -16,7 +16,7 @@
 # (handled by the CodeBuild buildspec using the NGC API key secret).
 #
 # amd64 only: engines are GPU-architecture-specific and must be built on the
-# same NVIDIA A10G (g5.xlarge, x86_64) the ARTF Triton server runs on.
+# same NVIDIA L4 (g6, x86_64) the ARTF Triton server runs on.
 
 FROM nvcr.io/nvidia/tensorrt:24.08-py3
 

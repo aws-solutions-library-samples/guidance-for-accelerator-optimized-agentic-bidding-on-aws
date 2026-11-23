@@ -28,10 +28,12 @@ LABEL agent-manifest="{ \
 # - Starlette/uvicorn/httpx/grpc/pydantic: orchestrator serving + fan-out
 # - boto3: CloudWatch / DynamoDB / SageMaker / EKS calls (Part 1 + Part 2)
 # - python-jose: Cognito JWT verification
+# - pyarrow: orchestrator/demo_dataset.py writes the demo training datasets as
+#   Parquet (POST /v1/governance/demo-dataset); the training container reads them.
 # The Part 2 A/B evaluator implements its own statistics (no scipy/numpy needed).
 RUN pip install --no-cache-dir \
     fastapi "uvicorn[standard]" starlette httpx pydantic \
-    grpcio protobuf boto3 \
+    grpcio protobuf boto3 pyarrow \
     "python-jose[cryptography]==3.3.0"
 
 WORKDIR /app

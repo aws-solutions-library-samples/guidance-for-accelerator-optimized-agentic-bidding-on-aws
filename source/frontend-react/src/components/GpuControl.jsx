@@ -52,6 +52,7 @@ export default function GpuControl() {
         scaling_down: "scaling-down",
         starting: "starting",
         blocked: "blocked",
+        no_capacity: "no-capacity",
       };
       if (data.tritonState && BY_STATE[data.tritonState]) {
         setStatus(BY_STATE[data.tritonState]);
@@ -76,7 +77,7 @@ export default function GpuControl() {
 
   // Re-poll faster when in a transitional state
   useEffect(() => {
-    if (status === "scaling-up" || status === "scaling-down" || status === "starting" || status === "blocked") {
+    if (status === "scaling-up" || status === "scaling-down" || status === "starting" || status === "blocked" || status === "no-capacity") {
       const fast = setInterval(checkStatus, 10000);
       return () => clearInterval(fast);
     }
@@ -146,7 +147,7 @@ export default function GpuControl() {
   const badgeClass =
     status === "running" ? "gpu-status-running" :
     status === "stopped" ? "gpu-status-stopped" :
-    status === "blocked" ? "gpu-status-blocked" :
+    status === "blocked" || status === "no-capacity" ? "gpu-status-blocked" :
     status === "scaling-up" || status === "scaling-down" || status === "starting" ? "gpu-status-scaling" :
     "gpu-status-error";
 
@@ -157,6 +158,7 @@ export default function GpuControl() {
     status === "scaling-down" ? "scaling down..." :
     status === "starting" ? "starting (Triton loading...)" :
     status === "blocked" ? "Triton not ready — needs attention" :
+    status === "no-capacity" ? "no GPU capacity" :
     status === "checking" ? "checking..." :
     "error";
 
@@ -168,7 +170,7 @@ export default function GpuControl() {
   return (
     <div className="gpu-control">
       <div className="gpu-control-header">
-        <h3>GPU Inference (g5 family · A10G)</h3>
+        <h3>GPU Inference (g6 family · L4)</h3>
         <span className={`gpu-status-badge ${badgeClass}`}>{badgeText}</span>
       </div>
       <p className="gpu-control-desc">
@@ -177,7 +179,7 @@ export default function GpuControl() {
         Optimizer runs on-demand, so a single GPU is enough. Scale it to control
         costs; starting takes ~3-5 min.
       </p>
-      {status === "blocked" && detail && (
+      {(status === "blocked" || status === "no-capacity") && detail && (
         <p className="gpu-control-detail" data-testid="gpu-control-blocked-detail" role="status">
           {detail}
         </p>

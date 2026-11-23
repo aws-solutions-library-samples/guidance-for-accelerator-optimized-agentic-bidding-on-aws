@@ -2,8 +2,12 @@
 
 The sample request alone leaves Northgate Motors NOT_TARGETED: nothing in the seed
 can bid on it. An ADD_CIDS mutation on /imp/imp-1/metric, applied by the real ARTF
-applier, adds cid:premium-drama-finale, and the deal campaign becomes the only
-eligible candidate at the 10.00 deal floor.
+applier, adds cid:premium-drama-finale, and the open-market campaign becomes the
+only eligible candidate at the 8.00 impression floor.
+
+The request carries no private marketplace and the campaign holds no deal, so the
+outcome does not depend on the Deal Scorer: a suppressed deal cannot take the
+campaign out of the auction, and an activated one cannot let it in.
 """
 import json
 from pathlib import Path
@@ -20,7 +24,6 @@ SAMPLE = (
     / "frontend-react" / "public" / "samples" / "ctv-drama-finale.json"
 )
 CAMPAIGN_ID = "camp-ctv-drama-auto"
-DEAL_ID = "deal-ctv-drama-open-auto"
 
 ADD_CIDS = Mutation(
     intent=Intent.ADD_CIDS,
@@ -47,7 +50,14 @@ def test_without_content_ids_nothing_in_the_seed_is_eligible():
     assert [cid for cid, c in candidates.items() if c.eligible] == []
 
 
-def test_add_cids_unlocks_the_deal_campaign_at_the_deal_floor():
+def test_the_request_offers_no_deal_and_the_campaign_holds_none():
+    imp = _request()["imp"][0]
+    assert "pmp" not in imp
+    campaign = _by_campaign(imp)[CAMPAIGN_ID].campaign
+    assert campaign.open_market and campaign.deal_ids == ()
+
+
+def test_add_cids_unlocks_the_open_market_campaign_at_the_impression_floor():
     result = artf_applier.apply(_request(), [ADD_CIDS])
     assert [d.applied for d in result.dispositions] == [True], result.dispositions
 
@@ -57,9 +67,9 @@ def test_add_cids_unlocks_the_deal_campaign_at_the_deal_floor():
     assert eligible == [CAMPAIGN_ID]
 
     winner = candidates[CAMPAIGN_ID]
-    assert winner.deal_id == DEAL_ID
+    assert winner.deal_id is None
     floor = floors.resolve(imp, winner.deal)
-    assert floor.value == 10.0
+    assert floor.value == 8.0
     assert floor.clears(winner.campaign.declared_cpm)
 
 

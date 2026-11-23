@@ -575,7 +575,7 @@ Resources:
                       }],
                       OutputDataConfig={'S3OutputPath': output_path},
                       ResourceConfig={
-                          'InstanceType': 'ml.g5.2xlarge',
+                          'InstanceType': 'ml.g6.2xlarge',
                           'InstanceCount': 1,
                           'VolumeSizeInGB': 100,
                       },
@@ -841,7 +841,7 @@ Resources:
                       }],
                       'SupportedContentTypes': ['application/octet-stream'],
                       'SupportedResponseMIMETypes': ['application/octet-stream'],
-                      'SupportedRealtimeInferenceInstanceTypes': ['ml.g5.xlarge', 'ml.p4d.24xlarge'],
+                      'SupportedRealtimeInferenceInstanceTypes': ['ml.g6.xlarge', 'ml.p4d.24xlarge'],
                   },
                   ModelApprovalStatus='PendingManualApproval',
                   CustomerMetadataProperties=customer_metadata,

@@ -368,6 +368,25 @@ def validate_no_raw_pii(df: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 
 
+
+def _resolve_region(arg_region, environ=None):
+    """The Region of the Glue Data Catalog this job reads.
+
+    Comes from the job's --region argument, which glue_etl_cfn.yaml sets to the
+    stack's Region. The Glue runtime does not set AWS_REGION, so the previous
+    "us-east-1" fallback sent GetTable to us-east-1 from every other Region and
+    failed with EntityNotFoundException. No Region at all is an error rather
+    than a guess.
+    """
+    environ = os.environ if environ is None else environ
+    region = arg_region or environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        raise ValueError(
+            "No AWS Region for the Glue Data Catalog: pass --region to the job "
+            "(glue_etl_cfn.yaml sets it to the stack's Region)."
+        )
+    return region
+
 def _resolve_window(
     window_start: str | None,
     window_end: str | None,
@@ -470,6 +489,7 @@ def main():
     output_bucket = args["output_bucket"]
     database_name = _optional_arg("database_name") or "feedback_pipeline"
     table_name = _optional_arg("table_name") or "raw_bid_outcomes"
+    region = _resolve_region(_optional_arg("region"))
 
     start_dt, end_dt = _resolve_window(
         _optional_arg("window_start"),
@@ -481,12 +501,13 @@ def main():
     window_end = end_dt.isoformat()
 
     logger.info(
-        "Starting ETL job %s: window=[%s, %s), database=%s, table=%s",
+        "Starting ETL job %s: window=[%s, %s), database=%s, table=%s, region=%s",
         job_name,
         window_start,
         window_end,
         database_name,
         table_name,
+        region,
     )
 
     # Initialize Glue context
@@ -520,7 +541,7 @@ def main():
         # required for correctness -- only for read efficiency, which an
         # unpartitioned read still gets from Parquet's own predicate pushdown
         # on the timestamp column.
-        boto3_glue = boto3.client("glue", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        boto3_glue = boto3.client("glue", region_name=region)
         table_location = boto3_glue.get_table(
             DatabaseName=database_name, Name=table_name
         )["Table"]["StorageDescriptor"]["Location"]

@@ -29,11 +29,11 @@ ModelTypeStr = Literal[
 # Real, current on-demand SageMaker Training pricing for the instance type
 # the automated retraining pipeline already uses (verified via
 # `aws pricing get-products --service-code AmazonSageMaker --filters
-# usagetype=USE1-Train:ml.g5.2xlarge`, us-east-1, 2026-08-20). Not a
+# usagetype=USE1-Train:ml.g6.2xlarge`, us-east-1, 2026-11-19). Not a
 # fabricated number — refresh this if the automated pipeline's instance
 # type or region changes.
-_INSTANCE_TYPE = "ml.g5.2xlarge"
-_HOURLY_RATE_USD = 1.515
+_INSTANCE_TYPE = "ml.g6.2xlarge"
+_HOURLY_RATE_USD = 1.222
 
 # Matches deployment/governance_eventbridge_cfn.yaml's
 # RetrainingTriggerFunction StoppingCondition.MaxRuntimeInSeconds — the same

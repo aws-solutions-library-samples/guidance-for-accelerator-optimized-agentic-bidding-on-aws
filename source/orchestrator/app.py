@@ -1603,6 +1603,19 @@ _AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", os.environ.get("AWS_REGION", 
 _TRITON_START_GRACE_S = 720
 
 
+def _gpu_capacity_issue(nodegroup: dict) -> str | None:
+    """EKS's health issue for a launch that failed for lack of EC2 capacity, or None.
+
+    The message names the instance type and AZ. EC2's trailing advice ("Our system
+    will be working on provisioning...") is dropped.
+    """
+    for issue in (nodegroup.get("health") or {}).get("issues") or []:
+        message = issue.get("message") or ""
+        if "InsufficientInstanceCapacity" in message:
+            return message.split(" Our system will be working")[0].strip()
+    return None
+
+
 def _humanize_duration(seconds: float) -> str:
     """Coarse duration for operator-facing status text ("4d 17h", not "6666 min")."""
     total = int(seconds)
@@ -1670,6 +1683,15 @@ async def gpu_status(request: Request) -> JSONResponse:
             triton_state = "scaling_up" if desired > 0 else "scaling_down"
         elif triton_ready:
             triton_state = "ready"
+        elif _gpu_capacity_issue(ng["nodegroup"]):
+            # Start GPUs can only ask for the size the node group was created with
+            # (instance types are immutable); deploy.sh's GPU search tries the rest.
+            triton_state = "no_capacity"
+            triton_detail = (
+                f"The GPU node group's last launch failed: {_gpu_capacity_issue(ng['nodegroup'])}. "
+                f"Start GPUs retries the same instance size. Re-running deploy.sh for this "
+                f"prefix tries the other sizes in deployment/eks/cluster-config.yaml."
+            )
         elif settled_for is None or settled_for < _TRITON_START_GRACE_S:
             triton_state = "starting"
         else:

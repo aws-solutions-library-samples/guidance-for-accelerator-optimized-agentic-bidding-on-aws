@@ -25,10 +25,10 @@ Triton serves **two deep-learning models** (DLRM for the bid pricer, NCF for the
 deal scorer) plus **two independent XGBoost tree models** for the yield optimizer
 (one for floor, one for margin, each served by its own container; Triton's Forest
 Inference Library backend doesn't support multi-output regression, so these were
-always two models) on a single NVIDIA **A10G GPU** (`g5.xlarge` by default;
-the node group also accepts `g5.2xlarge` and `g5.4xlarge`) with the CUDA
-Execution Provider. The TensorRT engines Part 2 compiles are specific to the
-A10G, so the node group is pinned to the `g5` family. The audience activator and signals enricher
+always two models) on a single NVIDIA **L4 GPU** (`g6.2xlarge`, the first
+and only launched type in the node group's list) with the CUDA
+Execution Provider. The TensorRT engines are compiled on the L4 and load only
+on it, so the node group is pinned to the `g6` family. The audience activator and signals enricher
 are rule-based and need no GPU model. The audience activator previously scored
 segments with a Wide & Deep neural network on Triton. That model's ONNX graph
 could not be compiled to a TensorRT engine (a `BatchNorm1d` fusion limitation), so
@@ -111,7 +111,7 @@ graph TB
     subgraph EKS["Compute (Amazon EKS)"]
         ORCH["Orchestrator (Starlette)<br/>ClusterIP in-cluster + internal NLB for the UI proxy<br/>no public address<br/>JWT verify + staged pipeline<br/>gRPC / REST / MCP"]
 
-        subgraph GPU["GPU node: g5.xlarge, NVIDIA A10G"]
+        subgraph GPU["GPU node: g6.2xlarge, NVIDIA L4"]
             TRITON["NVIDIA Triton Inference Server<br/>TensorRT plans (stable/canary router) + FIL<br/>4 models on GPU"]
             DLRM_C["Bid Pricer<br/>BID_SHADE"]
             NCF_C["Deal Scorer<br/>ACTIVATE_DEALS / SUPPRESS_DEALS"]
@@ -215,7 +215,7 @@ graph TB
    return rule-based mutations.
 6. **Triton** loads the DLRM/NCF ONNX models and the two yield optimizer XGBoost
    models from the **S3 model repository** at startup and runs inference on the
-   A10G GPU.
+   L4 GPU.
 7. The orchestrator **merges** all mutations into a single `RTBResponse` and returns
    it through the proxy Lambda to the browser.
 
@@ -231,14 +231,14 @@ which `deploy.sh` registers by default (`--skip-agentcore` omits it).
   ONNX and XGBoost models to S3, builds and pushes the images on AWS CodeBuild
   (default) or with local Docker (`--local-build`) while it creates or reuses the
   EKS cluster (Kubernetes 1.35, three AZs, private nodes behind one NAT gateway per
-  AZ; `gpu-inference` node group of 1 `g5.xlarge`, min 1, max `--maxGPUs` default 3;
+  AZ; `gpu-inference` node group of 1 `g6.2xlarge`, min 1, max `--maxGPUs` default 3;
   `cpu-services` node group of 3 `c5.2xlarge`, min 2, max 8), installs the NVIDIA
   device plugin and IRSA roles, creates the Cognito pools, applies the manifests
   under `deployment/eks/` (Triton behind an internal NLB, six ARTF containers, the
   orchestrator with its own internal NLB for the UI API proxy, HPAs, the TensorRT
   bootstrap Job), deploys the UI API proxy Lambda
   stack (`deployment/ui_api_proxy_cfn.yaml`) and grants the Identity Pool role
-  invoke on it, installs the nightly GPU scheduled shutdown (8:00 PM
+  invoke on it, installs the nightly GPU scheduled shutdown (midnight
   America/New_York), deploys the frontend (S3 + CloudFront), registers the AgentCore
   MCP runtime (default; `--skip-agentcore` omits it) and, unless `--no-retraining`,
   runs `deploy_closed_loop.sh` for Part 2. `--with-prebid` (off by default) adds

@@ -232,3 +232,16 @@ def test_learner_expects_the_adaptive_bidding_runtime_and_not_governance():
 def test_no_retraining_outside_learner_mode_expects_only_the_mcp_runtime():
     checks = _runtime_checks(learner=False, retraining=False, names=["t_mcp"])
     assert checks == {"agent runtime t_mcp": OK}
+
+
+def test_missing_gpu_group_is_missing_by_default():
+    # The cluster is created without gpu-inference; deploy.sh adds it once a size launches.
+    checks = _nodegroup_checks({"cpu-services": 3}, learner=False)
+    assert checks["node group gpu-inference"]["status"] == MISSING
+    assert "re-running deploy.sh searches again" in checks["node group gpu-inference"]["detail"]
+    assert checks["node group cpu-services"]["status"] == OK
+
+
+def test_missing_gpu_group_is_not_reported_in_learner_mode():
+    checks = _nodegroup_checks({"cpu-services": 4}, learner=True)
+    assert "node group gpu-inference" not in checks

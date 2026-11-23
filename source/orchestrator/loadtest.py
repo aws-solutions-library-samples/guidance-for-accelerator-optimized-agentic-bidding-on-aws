@@ -148,6 +148,9 @@ class LoadTestStatus(BaseModel):
     preset: str
     total_requests: int
     completed: int
+    # Requests with at least one failed container call (unreachable, error or
+    # timeout), so it is never larger than completed. Failures per container are
+    # in per_container[].errors.
     errors: int
     elapsed_ms: float
     rps: float
@@ -158,8 +161,9 @@ class LoadTestStatus(BaseModel):
     latency_avg: float
     latency_max: float
     histogram: dict  # {"lt_10ms": int, "10_30ms": int, "30_50ms": int, "gt_50ms": int}
-    # [{name, avg_latency_ms, total_mutations, p50_latency_ms, p95_latency_ms,
-    #   timing_p50: {segment: ms}, transport_p50_ms}] -- the last three come from
+    # [{name, avg_latency_ms, total_mutations, errors, p50_latency_ms, p95_latency_ms,
+    #   timing_p50: {segment: ms}, transport_p50_ms}] -- errors is that container's
+    # failed calls; the last three come from
     # the container's own metadata.timing (shared/hop_timing.py) and are 0/{} when
     # a container reported none. transport_p50_ms is the p50 of
     # (orchestrator-measured latency_ms - container-reported total), i.e. the
@@ -256,7 +260,8 @@ _EXPIRY_SECONDS = 300  # 5 minutes
 # The load test runner appends latencies here so the SSE handler can compute
 # real-time stats without blocking the runner.
 _progress_latencies: dict[str, list[float]] = {}  # test_id -> list of latencies (ms)
-_progress_errors: dict[str, int] = {}  # test_id -> error count
+_progress_errors: dict[str, int] = {}  # test_id -> requests with >=1 failed container call
+_progress_per_container_errors: dict[str, dict[str, int]] = {}  # test_id -> {container: failed calls}
 _progress_completed: dict[str, int] = {}  # test_id -> completed count
 _progress_start_time: dict[str, float] = {}  # test_id -> monotonic start time
 _progress_per_container_latencies: dict[str, dict[str, list[float]]] = {}  # test_id -> {name: [latencies]}
@@ -280,6 +285,7 @@ def _cleanup_expired() -> None:
         _progress_start_time.pop(tid, None)
         _progress_per_container_latencies.pop(tid, None)
         _progress_per_container_mutations.pop(tid, None)
+        _progress_per_container_errors.pop(tid, None)
         _progress_per_container_timing.pop(tid, None)
 
 
@@ -816,6 +822,38 @@ async def _scale_down_after_delay(delay_s: int = 120) -> None:
 
 # ---------------------------------------------------------------------------
 
+
+def _per_container_breakdown(test_id: str, containers: list[dict] | None = None) -> list[dict]:
+    """Per-container latency, mutations and failed calls for a run.
+
+    Read from the _progress_* dicts, so it serves the live view (poll and SSE)
+    and the final status alike. Without containers, the run's own keys are used.
+    """
+    lat_store = _progress_per_container_latencies.get(test_id, {})
+    if containers is None:
+        names = list(lat_store)
+    else:
+        names = [c["name"] for c in containers]
+    out = []
+    for name in names:
+        c_lats = lat_store.get(name, [])
+        avg_lat = round(sum(c_lats) / len(c_lats), 3) if c_lats else 0.0
+        c_stats = compute_latency_stats(c_lats)
+        entry = {
+            "name": name,
+            "avg_latency_ms": avg_lat,
+            "total_mutations": _progress_per_container_mutations.get(test_id, {}).get(name, 0),
+            "errors": _progress_per_container_errors.get(test_id, {}).get(name, 0),
+            "p50_latency_ms": c_stats["latency_p50"],
+            "p95_latency_ms": c_stats["latency_p95"],
+        }
+        entry.update(summarize_container_timing(
+            _progress_per_container_timing.get(test_id, {}).get(name, {})
+        ))
+        out.append(entry)
+    return out
+
+
 async def _dispatch_paced(
     execute,
     next_payload,
@@ -929,6 +967,7 @@ async def _run_load_test(
     _progress_start_time[test_id] = time.monotonic()
     _progress_per_container_latencies[test_id] = {c["name"]: [] for c in CONTAINERS}
     _progress_per_container_mutations[test_id] = {c["name"]: 0 for c in CONTAINERS}
+    _progress_per_container_errors[test_id] = {c["name"]: 0 for c in CONTAINERS}
     _progress_per_container_timing[test_id] = {c["name"]: {} for c in CONTAINERS}
 
     start_time = _progress_start_time[test_id]
@@ -1000,6 +1039,7 @@ async def _run_load_test(
             req_latency = (time.monotonic() - req_start) * 1000.0
             _progress_latencies[test_id].append(req_latency)
 
+            request_failed = False
             for inv in invocations:
                 _progress_per_container_latencies[test_id][inv.name].append(inv.latency_ms)
                 _progress_per_container_mutations[test_id][inv.name] += len(inv.mutations)
@@ -1011,7 +1051,12 @@ async def _run_load_test(
                 # blind to a container that was scaled to zero or had no Service
                 # endpoints -- precisely the failure a load test should catch.
                 if inv.status in ERROR_STATUSES:
-                    _progress_errors[test_id] += 1
+                    # Counted per container here and once per request below: a
+                    # request fans out to every container, so adding each failed
+                    # call to the request count let errors exceed completed.
+                    per_container_errors = _progress_per_container_errors[test_id]
+                    per_container_errors[inv.name] = per_container_errors.get(inv.name, 0) + 1
+                    request_failed = True
                 if (
                     target_container_name
                     and inv.name == target_container_name
@@ -1069,6 +1114,8 @@ async def _run_load_test(
                             if len(outcome_samples) < _MAX_STORED_SAMPLES:
                                 outcome_samples.append(sample_value)
 
+            if request_failed:
+                _progress_errors[test_id] += 1
             _progress_completed[test_id] += 1
         except Exception:
             req_latency = (time.monotonic() - req_start) * 1000.0
@@ -1122,23 +1169,7 @@ async def _run_load_test(
     histogram = compute_histogram(latencies)
 
     # Per-container breakdown
-    per_container = []
-    for c in CONTAINERS:
-        name = c["name"]
-        c_lats = _progress_per_container_latencies.get(test_id, {}).get(name, [])
-        avg_lat = round(sum(c_lats) / len(c_lats), 3) if c_lats else 0.0
-        c_stats = compute_latency_stats(c_lats)
-        entry = {
-            "name": name,
-            "avg_latency_ms": avg_lat,
-            "total_mutations": _progress_per_container_mutations.get(test_id, {}).get(name, 0),
-            "p50_latency_ms": c_stats["latency_p50"],
-            "p95_latency_ms": c_stats["latency_p95"],
-        }
-        entry.update(summarize_container_timing(
-            _progress_per_container_timing.get(test_id, {}).get(name, {})
-        ))
-        per_container.append(entry)
+    per_container = _per_container_breakdown(test_id, CONTAINERS)
 
     # Determine final state
     if _cancel_flags.get(test_id, False):
@@ -1509,7 +1540,7 @@ async def cancel_loadtest(request: Request) -> JSONResponse:
         latency_avg=0.0,
         latency_max=0.0,
         histogram={"lt_10ms": 0, "10_30ms": 0, "30_50ms": 0, "gt_50ms": 0},
-        per_container=[],
+        per_container=_per_container_breakdown(test_id),
         seed=status.seed,
         duration_s=status.duration_s,
         target_rps=status.target_rps,
@@ -1548,6 +1579,7 @@ def _live_progress(test_id: str) -> dict:
         "rps": rps,
         **stats,
         "histogram": compute_histogram(latencies),
+        "per_container": _per_container_breakdown(test_id),
     }
 
 
@@ -1592,6 +1624,7 @@ async def _sse_event_generator(test_id: str) -> AsyncGenerator[str, None]:
             "latency_p99": live["latency_p99"],
             "errors": live["errors"],
             "histogram": live["histogram"],
+            "per_container": live["per_container"],
         }
 
         yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"

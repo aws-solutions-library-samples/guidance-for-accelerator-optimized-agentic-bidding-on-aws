@@ -100,7 +100,8 @@ fi
 #   ./deploy.sh --start-at 3                   # force a starting phase, overriding the AWS check
 #   ./deploy.sh --verbose                      # print full detailed logs alongside phase output
 #   ./deploy.sh --destroy                      # tear down the entire stack
-#   AWS_REGION=us-west-2 ./deploy.sh           # different region
+#   ./deploy.sh --region us-west-2             # different region (default us-east-1;
+#                                              # remembered per prefix, AWS_REGION env also works)
 #   (every example above also needs --prefix <3-char>; omitted here for width)
 #
 # AWS PROFILE. Which credentials every aws/eksctl/kubectl/boto3 call uses:
@@ -278,6 +279,7 @@ _GIVEN_PROFILE=0
 # with a fallback.
 DEPLOY_PROFILE="${AWS_PROFILE:-}"
 DEPLOY_PROFILE_SOURCE="AWS_PROFILE environment variable"
+DEPLOY_REGION_SOURCE="AWS_REGION environment variable"
 if [[ -n "${AWS_REGION:-}" ]];      then _GIVEN_REGION=1; fi
 if [[ -n "${AWS_PROFILE:-}" ]];     then _GIVEN_PROFILE=1; fi
 if [[ -n "${MAX_GPUS:-}" ]];        then _GIVEN_MAXGPUS=1; fi
@@ -398,6 +400,8 @@ for arg in "$@"; do
     --artf-node-role=*) ARTF_NODE_ROLE="${arg#--artf-node-role=}"; _GIVEN_ARTF_NODE_ROLE=1 ;;
     --artf-node-role)   ;; # value comes in next arg, handled below
     --artf-on-gpu)      ARTF_NODE_ROLE="inference"; _GIVEN_ARTF_NODE_ROLE=1 ;;
+    --region=*)         AWS_REGION="${arg#--region=}"; _GIVEN_REGION=1; DEPLOY_REGION_SOURCE="--region" ;;
+    --region)           ;; # value comes in next arg, handled below
     --profile=*)        DEPLOY_PROFILE="${arg#--profile=}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1 ;;
     --profile)          ;; # value comes in next arg, handled below
     --start-at)         _GIVEN_START_AT=1 ;; # value comes in next arg, handled below
@@ -421,6 +425,8 @@ for arg in "$@"; do
         NGC_SECRET="${arg}"
       elif [[ "${_PREV_ARG:-}" == "--ngc-key" ]]; then
         NGC_KEY="${arg}"
+      elif [[ "${_PREV_ARG:-}" == "--region" ]]; then
+        AWS_REGION="${arg}"; _GIVEN_REGION=1; DEPLOY_REGION_SOURCE="--region"
       elif [[ "${_PREV_ARG:-}" == "--profile" ]]; then
         DEPLOY_PROFILE="${arg}"; DEPLOY_PROFILE_SOURCE="--profile"; _GIVEN_PROFILE=1
       else
@@ -444,11 +450,17 @@ done
 # records it in _PREV_ARG, no next arg ever arrives, and the run proceeds with the
 # default -- so `--profile` on its own deployed with whatever the shell had.
 case "${_PREV_ARG:-}" in
-  --prefix|--maxGPUs|--start-at|--model-id|--artf-node-role|--ngc-secret|--ngc-key|--profile)
+  --prefix|--maxGPUs|--start-at|--model-id|--artf-node-role|--ngc-secret|--ngc-key|--profile|--region)
     printf '\033[0;31m[fail]\033[0m %s\n' "${_PREV_ARG} needs a value (it was the last argument)" >&2
     exit 1 ;;
 esac
 unset _PREV_ARG
+# Checked before anything is created: the Region is spliced into resource names
+# (STACK_UID, bucket names) and every AWS call.
+if ! [[ "${AWS_REGION}" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+  printf '\033[0;31m[fail]\033[0m %s\n' "'${AWS_REGION}' (from ${DEPLOY_REGION_SOURCE}) is not an AWS Region name (expected something like us-west-2)" >&2
+  exit 1
+fi
 
 # --prefix is required, and its shape is fixed: exactly three characters, a letter
 # followed by letters or digits. It is spliced into S3 bucket names (lowercase
@@ -582,7 +594,7 @@ validate_learner_mode() {
 warn_part2_left_on_switch() {
   local prev_learner="$1" learner="$2" prev_retraining="$3"
   if [[ "${prev_learner}" == "0" && "${learner}" == "1" && "${prev_retraining}" != "0" ]]; then
-    printf '\033[0;33m[warn]\033[0m %s\n' "Prefix '${STACK_PREFIX}' had Part 2 deployed. Learner mode leaves its Part 2 resources in place, including the scheduled ml.g5.2xlarge retraining (${STACK_PREFIX}-governance-eventbridge) and the governance AgentCore runtime. To remove them, run ./deploy.sh --prefix ${STACK_PREFIX} --destroy, then deploy the prefix again with --learner-mode."
+    printf '\033[0;33m[warn]\033[0m %s\n' "Prefix '${STACK_PREFIX}' had Part 2 deployed. Learner mode leaves its Part 2 resources in place, including the scheduled ml.g6.2xlarge retraining (${STACK_PREFIX}-governance-eventbridge) and the governance AgentCore runtime. To remove them, run ./deploy.sh --prefix ${STACK_PREFIX} --destroy, then deploy the prefix again with --learner-mode."
   fi
   return 0
 }
@@ -917,6 +929,8 @@ deploy_ui_api_proxy() {
 # compatibility (macOS default) — see _source_hash()/display_name() above
 # for the same pattern already used elsewhere in this script.
 phase_hint() {
+  # A failure that knows its own remedy says it instead of the phase's generic one.
+  if [[ -n "${PHASE_HINT_OVERRIDE:-}" ]]; then printf '%s\n' "${PHASE_HINT_OVERRIDE}"; return 0; fi
   if [[ "${LEARNER_MODE:-0}" -eq 1 ]]; then
     case "$1" in
       2) echo "Learner mode: check your EC2 On-Demand Standard vCPU quota (L-1216C47A) for the cpu-services c5.2xlarge nodes. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)."; return 0 ;;
@@ -925,7 +939,7 @@ phase_hint() {
   fi
   case "$1" in
     1) echo "Check AWS credentials (aws sts get-caller-identity) and that boto3/torch/onnx/onnxscript are installed." ;;
-    2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild and your EC2 g5 GPU service quota for cluster creation. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)." ;;
+    2) echo "Check NVIDIA NGC credentials (--ngc-key/--ngc-secret) for CodeBuild and your EC2 G and VT (g6) GPU service quota for cluster creation. Nodes 'failed to join' usually means they cannot reach the EKS endpoint or ECR from their private subnets (NAT gateway / route table)." ;;
     3) echo "Check GPU node availability: kubectl get nodes -l nvidia.com/gpu=present ; kubectl get pods ; and the UI API proxy stack: aws cloudformation describe-stack-events --stack-name ${UI_API_PROXY_STACK:-<prefix>-ui-api-proxy}" ;;
     4) echo "Check the CloudFront/S3 frontend deploy output above and Cognito user pool creation." ;;
     5) echo "Check Bedrock model access (--model-id) and the AgentCore runtime IAM roles." ;;
@@ -1126,6 +1140,29 @@ else
 fi
 export AWS_PROFILE="${DEPLOY_PROFILE}"
 
+# =========================================================================
+# AWS Region -- resolved here too, for the same reason as the profile
+# =========================================================================
+# Order: --region, AWS_REGION env, the region remembered for this prefix, then
+# us-east-1. Every mode passes through here, so --status and --destroy find a
+# prefix in the Region it was deployed to without being told again. Exported
+# because deploy_closed_loop.sh reads AWS_REGION from the environment.
+_REMEMBERED_REGION="$(state_read "${STACK_PREFIX}" remembered.region)"
+if [[ "${_GIVEN_REGION}" -eq 1 ]]; then
+  # A prefix's resources live in one Region. Another Region under the same prefix
+  # would overwrite this prefix's record and orphan what is already deployed.
+  if [[ -n "${_REMEMBERED_REGION}" && "${_REMEMBERED_REGION}" != "${AWS_REGION}" ]]; then
+    fail "Region mismatch for prefix '${STACK_PREFIX}': this run asked for ${AWS_REGION} (from ${DEPLOY_REGION_SOURCE}) but the prefix is deployed in ${_REMEMBERED_REGION} (remembered in ${DEPLOY_STATE_FILE}). Use a new prefix for ${AWS_REGION}, or run ./deploy.sh --prefix ${STACK_PREFIX} --destroy first."
+  fi
+elif [[ -n "${_REMEMBERED_REGION}" ]]; then
+  AWS_REGION="${_REMEMBERED_REGION}"
+  DEPLOY_REGION_SOURCE="remembered for prefix '${STACK_PREFIX}'"
+else
+  DEPLOY_REGION_SOURCE="default"
+fi
+export AWS_REGION
+say "  AWS region:  ${AWS_REGION} (${DEPLOY_REGION_SOURCE})"
+
 # A NAMED profile that is not configured locally fails on the first SDK call with a
 # message that names the step, not the cause. Check it once here instead. "default"
 # is exempt: botocore tolerates its absence (environment-variable credentials still
@@ -1301,7 +1338,6 @@ if [[ "${DESTROY}" -eq 0 && "${UI_ONLY}" -eq 0 && "${EXPORT_ONLY}" -eq 0 ]]; the
   # below start from them.
   WITH_RETRAINING="${_WITH_RETRAINING_CHOICE}"
   WITH_PREBID="${_WITH_PREBID_CHOICE}"
-  _reuse AWS_REGION       region        "${_GIVEN_REGION}"           "AWS_REGION"
   _reuse MAX_GPUS         maxGPUs       "${_GIVEN_MAXGPUS}"          "--maxGPUs"
   _reuse ARTF_NODE_ROLE   artfNodeRole  "${_GIVEN_ARTF_NODE_ROLE}"   "--artf-node-role"
   _reuse BEDROCK_MODEL_ID modelId       "${_GIVEN_MODEL_ID}"         "--model-id"
@@ -2088,9 +2124,9 @@ fi
 # =========================================================================
 # Preflight: GPU capacity for Triton + (optional) Model Optimizer
 # =========================================================================
-# Triton and the Model Optimizer each require their own A10G GPU node (the
-# gpu-inference group uses the g5 family: g5.xlarge/2xlarge/4xlarge = 4/8/16 vCPU,
-# 1 A10G each). With Part 2 closed-loop enabled (default) BOTH must run, so the
+# Triton and the Model Optimizer each require their own L4 GPU node (the
+# gpu-inference group uses the g6 family: g6.xlarge/2xlarge/4xlarge = 4/8/16 vCPU,
+# 1 L4 each). With Part 2 closed-loop enabled (default) BOTH must run, so the
 # deploy needs room for 2 GPU nodes. Fail fast with a clear message instead of
 # letting the Model Optimizer sit Pending for hours (which leaves Triton unable to
 # load its tensorrt_plan engines and the GPU containers stuck "gpu offline").
@@ -2125,7 +2161,7 @@ if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then
   REQUIRED_GPUS=1
 
   if [[ "${MAX_GPUS}" -lt "${REQUIRED_GPUS}" ]]; then
-    fail "GPU capacity too low: --maxGPUs=${MAX_GPUS} but at least ${REQUIRED_GPUS} GPU node is needed for Triton (g5-family A10G). Re-run with --maxGPUs 1 (or 2+ to leave headroom for on-demand optimize / NeMo-RL retraining bursts)."
+    fail "GPU capacity too low: --maxGPUs=${MAX_GPUS} but at least ${REQUIRED_GPUS} GPU node is needed for Triton (g6-family L4). Re-run with --maxGPUs 1 (or 2+ to leave headroom for on-demand optimize / NeMo-RL retraining bursts)."
   fi
 
   # Retraining (NeMo-RL) spins up a GPU training job on top of the 2 steady-state
@@ -2135,20 +2171,20 @@ if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then
   fi
 
   # Soft check: the account's On-Demand G/VT vCPU service quota must fit the GPU
-  # nodes. This is a FLOOR based on the smallest g5 size (g5.xlarge = 4 vCPU); if
-  # EKS falls back to a larger A10G size (g5.2xlarge=8, g5.4xlarge=16 vCPU) it
-  # consumes more quota. This is the usual cause of a node that never launches.
+  # nodes. Sized on the first instance type in cluster-config.yaml's gpu-inference
+  # group (g6.2xlarge = 8 vCPU), which is the only type the ASG launches.
+  # This is the usual cause of a node that never launches.
   # Warn (don't hard-fail) if the quota can't be read.
-  NEEDED_VCPUS=$(( REQUIRED_GPUS * 4 ))
+  NEEDED_VCPUS=$(( REQUIRED_GPUS * 8 ))
   GVT_QUOTA="$(aws service-quotas get-service-quota \
     --service-code ec2 --quota-code L-DB2E81BA \
     --region "${AWS_REGION}" --query 'Quota.Value' --output text 2>/dev/null || echo '')"
   if [[ -n "${GVT_QUOTA}" && "${GVT_QUOTA}" != "None" ]]; then
     GVT_VCPUS="${GVT_QUOTA%.*}"   # strip any decimal
     if [[ "${GVT_VCPUS}" -lt "${NEEDED_VCPUS}" ]]; then
-      fail "AWS quota too low for GPU nodes: 'Running On-Demand G and VT instances' (L-DB2E81BA) is ${GVT_VCPUS} vCPUs in ${AWS_REGION}, but at least ${NEEDED_VCPUS} are needed for ${REQUIRED_GPUS}x g5-family A10G nodes. Request an increase (Service Quotas console -> EC2 -> L-DB2E81BA) or use --no-retraining."
+      fail "AWS quota too low for GPU nodes: 'Running On-Demand G and VT instances' (L-DB2E81BA) is ${GVT_VCPUS} vCPUs in ${AWS_REGION}, but at least ${NEEDED_VCPUS} are needed for ${REQUIRED_GPUS}x g6.2xlarge L4 nodes. Request an increase (Service Quotas console -> EC2 -> L-DB2E81BA) or use --no-retraining."
     fi
-    log "  GPU quota OK: ${GVT_VCPUS} G/VT vCPUs available, need >= ${NEEDED_VCPUS} (${REQUIRED_GPUS}x g5-family A10G, min 4 vCPU each)"
+    log "  GPU quota OK: ${GVT_VCPUS} G/VT vCPUs available, need >= ${NEEDED_VCPUS} (${REQUIRED_GPUS}x g6.2xlarge L4, 8 vCPU each)"
   else
     warn "  Could not read the G/VT vCPU service quota (needs service-quotas:GetServiceQuota)."
     warn "  Ensure 'Running On-Demand G and VT instances' >= ${NEEDED_VCPUS} vCPUs in ${AWS_REGION}, or the GPU node(s) may never launch."
@@ -2503,11 +2539,12 @@ print(v if isinstance(v, int) and not isinstance(v, bool) else '')
 #   learner: an existing gpu-inference group is scaled to 0 (never deleted, so a
 #            switch back needs no recreate), and cpu-services is raised to at
 #            least 4 nodes for Triton.
-#   standard after learner: gpu-inference is created from the standard cluster
-#            config when it is missing (a cluster that was created in learner mode).
-#   standard otherwise: nothing, which is the path every default deploy takes.
+#   standard after learner: gpu-inference is created when it is missing (a
+#            cluster that was created in learner mode), by ensure_gpu_nodegroup.
+#   standard (both cases): reconcile_gpu_instance_types, which warns when the
+#            live group's GPU family is not the one cluster-config.yaml lists.
 reconcile_nodegroups_for_mode() {
-  local cfg desired
+  local desired
   if [[ "${LEARNER_MODE}" -eq 1 ]]; then
     if aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
@@ -2533,17 +2570,374 @@ reconcile_nodegroups_for_mode() {
     if ! aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
       say "  Standard mode after learner mode: creating the gpu-inference node group"
-      cfg="$(mktemp)"
-      render_cluster_config "${cfg}"
-      if ! quiet "eksctl create nodegroup gpu-inference" \
-          eksctl create nodegroup --config-file "${cfg}" --include=gpu-inference; then
-        rm -f "${cfg}"
-        fail 3 "Could not create the gpu-inference node group for the switch back to standard mode."
-      fi
-      rm -f "${cfg}"
+      ensure_gpu_nodegroup || fail 3 "$(gpu_search_failure)"
+      return 0
     fi
   fi
+  reconcile_gpu_instance_types
   return 0
+}
+
+# gpu_launch_problem: prints gpu-inference's first health issue as
+# "<code>: <message>" (for example EC2 InsufficientInstanceCapacity naming the
+# instance type and AZ), or nothing when the group reports no issue.
+gpu_launch_problem() {
+  local issue
+  issue="$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+    --region "${AWS_REGION}" --query 'nodegroup.health.issues[0].[code,message]' --output text 2>/dev/null || true)"
+  [[ -n "${issue}" && "${issue}" != "None" ]] || return 0
+  issue="${issue//$'\t'/: }"
+  printf '%s\n' "${issue%% Our system will be working*}"
+}
+
+# gpu_launch_warning <problem> <gpu-nodes>: the operator-facing explanation of a
+# GPU node group that cannot launch, printed once where the deploy first sees it.
+gpu_launch_warning() {
+  local problem="$1" nodes="$2" first
+  first="$(awk '/^  - name: gpu-inference$/{g=1} g && /^    instanceTypes:/{print; exit}' \
+    "${SCRIPT_DIR}/eks/cluster-config.yaml" | sed -e 's/^ *instanceTypes: *//' | tr -d '[]",' | awk '{print $1}')"
+  warn "GPU node group gpu-inference cannot launch an instance."
+  warn "  EKS reports: ${problem}"
+  if [[ "${nodes}" -eq 0 ]]; then
+    warn "  There is no GPU node, so Triton stays Pending and the GPU-backed containers (bid pricer, deal scorer, yield optimizers) cannot serve. This deploy will finish as incomplete."
+  else
+    warn "  ${nodes} GPU node is running Triton; the extra node for the TensorRT bootstrap Job cannot launch, so the Job waits for it."
+  fi
+  warn "  The node group retries on its own about every 10 minutes, with the one size it was created with."
+  warn "  To recover: re-run ./deploy.sh --prefix ${STACK_PREFIX}. A group with no instance and launch failures is deleted, and each size in deployment/eks/cluster-config.yaml (${first:-unknown} first) is tried in turn."
+}
+
+# reconcile_gpu_instance_types: warn when the live gpu-inference group runs a GPU
+# family other than the one cluster-config.yaml lists. The group holds the one size
+# ensure_gpu_nodegroup found capacity for, so a different SIZE of the same family is
+# expected. A different family is a different GPU: the Model Optimizer bootstrap
+# keeps engines already in S3, and those would fail to load on the new GPU.
+reconcile_gpu_instance_types() {
+  local want have
+  want="$(gpu_candidate_types)"
+  have="$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+    --region "${AWS_REGION}" --query 'nodegroup.instanceTypes' --output text 2>/dev/null | xargs || true)"
+  [[ -n "${want}" && -n "${have}" && "${have}" != "None" ]] || return 0
+  local want_family="${want%%.*}" have_family="${have%%.*}"
+  if [[ "${want_family}" != "${have_family}" ]]; then
+    warn "  gpu-inference runs ${have_family} instances but cluster-config.yaml now lists ${want_family}. That is a different GPU, and the TensorRT engines in s3://${MODEL_BUCKET}/triton-models/ were built for the old one, so the node group was left unchanged. Deploy a new prefix (or --destroy this one and redeploy) to move to ${want_family}."
+  fi
+  return 0
+}
+
+# =========================================================================
+# GPU node group: find a size EC2 can launch
+# =========================================================================
+# The gpu-inference Auto Scaling group launches only the first instance type it
+# lists (On-Demand `prioritized`), and a node group that cannot launch stays
+# CREATING for about 30 minutes before EKS fails it. So the cluster is created
+# without it, and ensure_gpu_nodegroup creates it EMPTY (desired 0, ACTIVE within
+# minutes) with one size at a time from cluster-config.yaml's instanceTypes. Each
+# size is tried by scaling to 1 and reading the ASG's scaling activities. A size
+# that fails with InsufficientInstanceCapacity in every cluster AZ is given up: the
+# group is deleted and created empty with the next size. Any other launch failure
+# (quota, permissions) stops the search, because another size would fail the same way.
+GPU_PROBE_TIMEOUT="${GPU_PROBE_TIMEOUT:-900}"     # seconds per size
+GPU_PROBE_INTERVAL="${GPU_PROBE_INTERVAL:-20}"
+GPU_SEARCH_REPORT_FILE="${GPU_SEARCH_REPORT_FILE:-$(mktemp "${TMPDIR:-/tmp}/gpu-search.XXXXXX")}"
+GPU_PROBE_DETAIL=""
+
+# gpu_candidate_types: gpu-inference's instanceTypes from cluster-config.yaml, in order.
+gpu_candidate_types() {
+  awk '/^  - name: gpu-inference$/{g=1} g && /^    instanceTypes:/{print; exit}' \
+    "${SCRIPT_DIR}/eks/cluster-config.yaml" | sed -e 's/^ *instanceTypes: *//' | tr -d '[]",' | xargs
+}
+
+# cluster_azs: the availabilityZones the cluster's subnets are in, space-separated.
+cluster_azs() {
+  grep -E '^availabilityZones:' "${SCRIPT_DIR}/eks/cluster-config.yaml" \
+    | sed -e 's/^availabilityZones: *//' -e "s/__REGION__/${AWS_REGION}/g" | tr -d '[]",' | xargs
+}
+
+# render_cluster_config_without_gpu <out>: the cluster config with the
+# gpu-inference node group removed, for `eksctl create cluster`.
+render_cluster_config_without_gpu() {
+  local out="$1" tmp
+  tmp="$(mktemp)"
+  render_cluster_config "${tmp}"
+  awk '/^  - name: gpu-inference$/{skip=1; next} skip && /^  - name: /{skip=0} !skip' "${tmp}" > "${out}"
+  rm -f "${tmp}"
+}
+
+# render_gpu_nodegroup_config <out> <type>: the cluster config with gpu-inference
+# limited to <type> and created empty (desiredCapacity 0, minSize 0).
+render_gpu_nodegroup_config() {
+  local out="$1" type="$2" tmp
+  tmp="$(mktemp)"
+  render_cluster_config "${tmp}"
+  awk -v t="${type}" '
+    /^  - name: gpu-inference$/ { g=1; print; next }
+    g && /^  - name: / { g=0 }
+    g && /^    instanceTypes:/   { print "    instanceTypes: [\"" t "\"]"; next }
+    g && /^    desiredCapacity:/ { print "    desiredCapacity: 0"; next }
+    g && /^    minSize:/         { print "    minSize: 0"; next }
+    { print }' "${tmp}" > "${out}"
+  rm -f "${tmp}"
+}
+
+_gpu_ng() {  # _gpu_ng <query>: a describe-nodegroup field, or nothing when the group is absent
+  local v
+  v="$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+    --region "${AWS_REGION}" --query "$1" --output text 2>/dev/null || true)"
+  [[ "${v}" == "None" ]] && v=""
+  printf '%s' "${v}"
+}
+
+_gpu_stack() { printf 'eksctl-%s-nodegroup-gpu-inference' "${CLUSTER_NAME}"; }
+
+# eksctl turns termination protection on for every stack it creates, and
+# `eksctl delete nodegroup` does not turn it off, so the search would stall on its
+# own first delete.
+_gpu_unprotect_stack() {
+  aws cloudformation update-termination-protection --stack-name "$(_gpu_stack)" \
+    --no-enable-termination-protection --region "${AWS_REGION}" >/dev/null 2>&1 || true
+}
+
+# By name, so no --approve: eksctl accepts that flag only with --config-file.
+_gpu_delete_nodegroup() {
+  _gpu_unprotect_stack
+  quiet "eksctl delete nodegroup gpu-inference" \
+    eksctl delete nodegroup --cluster "${CLUSTER_NAME}" --name gpu-inference \
+      --region "${AWS_REGION}" --wait
+}
+
+# A failed create leaves the node group's stack in ROLLBACK_COMPLETE, and eksctl
+# will not create a node group whose stack name is taken.
+_gpu_clear_failed_stack() {
+  local st
+  st="$(aws cloudformation describe-stacks --stack-name "$(_gpu_stack)" --region "${AWS_REGION}" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)"
+  case "${st}" in
+    ""|None|DELETE_COMPLETE) return 0 ;;
+    *_IN_PROGRESS)
+      GPU_PROBE_DETAIL="its CloudFormation stack $(_gpu_stack) is ${st}; wait for it to finish, then re-run"
+      return 1 ;;
+  esac
+  say "  Removing the leftover gpu-inference stack ($(_gpu_stack), ${st})"
+  _gpu_unprotect_stack
+  aws cloudformation delete-stack --stack-name "$(_gpu_stack)" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+  if ! aws cloudformation wait stack-delete-complete --stack-name "$(_gpu_stack)" --region "${AWS_REGION}" 2>/dev/null; then
+    GPU_PROBE_DETAIL="could not delete the leftover stack $(_gpu_stack) (${st})"
+    return 1
+  fi
+  return 0
+}
+
+_gpu_create_empty() {  # _gpu_create_empty <type>
+  local cfg rc=0
+  cfg="$(mktemp)"
+  render_gpu_nodegroup_config "${cfg}" "$1"
+  quiet "eksctl create nodegroup gpu-inference (${1}, 0 nodes)" \
+    eksctl create nodegroup --config-file "${cfg}" --include=gpu-inference || rc=$?
+  rm -f "${cfg}"
+  _gpu_unprotect_stack
+  return "${rc}"
+}
+
+# gpu_probe_verdict <asg> <since-utc> <azs>: one reading of a launch in progress.
+# Prints `launched`, `no-capacity`, `error:<EC2 message>` or `waiting:<AZs that
+# reported InsufficientInstanceCapacity so far>`.
+gpu_probe_verdict() {
+  local asg="$1" since="$2" azs="$3" count acts
+  count="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "${asg}" \
+    --region "${AWS_REGION}" --query 'length(AutoScalingGroups[0].Instances)' --output text 2>/dev/null || true)"
+  if [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]]; then
+    echo "launched"; return 0
+  fi
+  acts="$(aws autoscaling describe-scaling-activities --auto-scaling-group-name "${asg}" \
+    --region "${AWS_REGION}" --max-items 50 --output json 2>/dev/null || echo '{}')"
+  "${PYTHON}" -c '
+import json, re, sys
+since, azs, raw = sys.argv[1], set(sys.argv[2].split()), sys.argv[3]
+try:
+    acts = json.loads(raw).get("Activities", [])
+except ValueError:
+    acts = []
+seen = set()
+for a in acts:
+    # ISO-8601 UTC on both sides, so the string order is the time order.
+    if str(a.get("StartTime", "")) < since or a.get("StatusCode") != "Failed":
+        continue
+    msg = a.get("StatusMessage") or ""
+    if "InsufficientInstanceCapacity" in msg:
+        m = re.search(r"Availability Zone you requested \(([a-z0-9-]+)\)", msg)
+        if m:
+            seen.add(m.group(1))
+        continue
+    print("error:" + msg.split(" Our system will be working")[0][:300])
+    sys.exit(0)
+print("no-capacity" if azs and azs <= seen else "waiting:" + " ".join(sorted(seen)))
+' "${since}" "${azs}" "${acts}"
+}
+
+# probe_gpu_type <type> <azs>: scale the empty group to 1 and watch. Returns 0 when
+# an instance launched, 1 when the size has no capacity, 2 on any other failure.
+# GPU_PROBE_DETAIL carries the reason.
+probe_gpu_type() {
+  local type="$1" azs="$2" asg since waited=0 verdict last="" seen
+  GPU_PROBE_DETAIL=""
+  asg="$(_gpu_ng 'nodegroup.resources.autoScalingGroups[0].name')"
+  if [[ -z "${asg}" ]]; then
+    GPU_PROBE_DETAIL="gpu-inference has no Auto Scaling group"; return 2
+  fi
+  since="$(date -u +%Y-%m-%dT%H:%M:%S)"
+  if ! aws eks update-nodegroup-config --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+      --scaling-config "minSize=1,maxSize=${MAX_GPUS},desiredSize=1" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    GPU_PROBE_DETAIL="could not scale gpu-inference to 1"; return 2
+  fi
+  while :; do
+    verdict="$(gpu_probe_verdict "${asg}" "${since}" "${azs}")"
+    case "${verdict}" in
+      launched)    return 0 ;;
+      no-capacity) GPU_PROBE_DETAIL="InsufficientInstanceCapacity in ${azs// /, }"; return 1 ;;
+      error:*)     GPU_PROBE_DETAIL="${verdict#error:}"; return 2 ;;
+    esac
+    seen="${verdict#waiting:}"
+    if [[ "${verdict}" != "${last}" && -n "${seen}" ]]; then
+      say "    ${type}: no capacity yet in ${seen// /, } ($(( waited / 60 ))m)"
+      last="${verdict}"
+    fi
+    if [[ "${waited}" -ge "${GPU_PROBE_TIMEOUT}" ]]; then
+      GPU_PROBE_DETAIL="no instance after $(( waited / 60 )) min"
+      [[ -n "${seen}" ]] && GPU_PROBE_DETAIL="${GPU_PROBE_DETAIL} (InsufficientInstanceCapacity in ${seen// /, })"
+      return 1
+    fi
+    sleep "${GPU_PROBE_INTERVAL}"
+    waited=$(( waited + GPU_PROBE_INTERVAL ))
+  done
+}
+
+# gpu_search_failure: the message for a failed search, read back from the report
+# file (the search runs in the backgrounded cluster subshell).
+gpu_search_failure() {
+  if [[ -n "${GPU_SEARCH_REPORT_FILE}" && -s "${GPU_SEARCH_REPORT_FILE}" ]]; then
+    cat "${GPU_SEARCH_REPORT_FILE}"
+  else
+    printf 'the gpu-inference node group could not be created (see %s)' "${DEPLOY_LOG:-the detail log}"
+  fi
+}
+
+_gpu_report() {  # _gpu_report <message>: record why the search stopped
+  if [[ -n "${GPU_SEARCH_REPORT_FILE}" ]]; then printf '%s' "$1" > "${GPU_SEARCH_REPORT_FILE}"; fi
+  return 0
+}
+
+# ensure_gpu_nodegroup: make sure gpu-inference exists and has a node, searching
+# the sizes in cluster-config.yaml when it is missing, stuck, or scaled to 0 (the
+# nightly shutdown, Stop GPUs) and its own size has no capacity. Standard mode
+# only. A group that is ACTIVE with an instance is left alone. Returns 1 with the
+# reason in GPU_SEARCH_REPORT_FILE.
+ensure_gpu_nodegroup() {
+  [[ "${LEARNER_MODE}" -eq 0 ]] || return 0
+  local types azs status desired asg count problem type rc tried="" current="" skip="" remaining
+  types="$(gpu_candidate_types)"
+  azs="$(cluster_azs)"
+  if [[ -z "${types}" ]]; then
+    _gpu_report "deployment/eks/cluster-config.yaml lists no instanceTypes for gpu-inference"; return 1
+  fi
+  status="$(_gpu_ng 'nodegroup.status')"
+  case "${status}" in
+    "")
+      if ! _gpu_clear_failed_stack; then
+        _gpu_report "gpu-inference cannot be created: ${GPU_PROBE_DETAIL}"; return 1
+      fi ;;
+    CREATING|UPDATING)
+      _gpu_report "gpu-inference is ${status} from an earlier run. Wait for it to finish (aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name gpu-inference --region ${AWS_REGION}), then re-run."
+      return 1 ;;
+    DELETING)
+      aws eks wait nodegroup-deleted --cluster-name "${CLUSTER_NAME}" --nodegroup-name gpu-inference \
+        --region "${AWS_REGION}" 2>/dev/null || true
+      if ! _gpu_clear_failed_stack; then
+        _gpu_report "gpu-inference cannot be created: ${GPU_PROBE_DETAIL}"; return 1
+      fi ;;
+    *)
+      desired="$(_gpu_ng 'nodegroup.scalingConfig.desiredSize')"
+      asg="$(_gpu_ng 'nodegroup.resources.autoScalingGroups[0].name')"
+      count="$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "${asg:-none}" \
+        --region "${AWS_REGION}" --query 'length(AutoScalingGroups[0].Instances)' --output text 2>/dev/null || true)"
+      # Running, or not countable: not this function's call.
+      if [[ ! "${count}" =~ ^[0-9]+$ || "${count}" -gt 0 ]]; then
+        return 0
+      fi
+      if [[ "${desired}" == "0" ]]; then
+        # Scaled down. Restart it with its own size first; a size outside the
+        # list (another GPU family) is left for reconcile_gpu_instance_types.
+        current="$(_gpu_ng 'nodegroup.instanceTypes[0]')"
+        [[ -n "${current}" && " ${types} " == *" ${current} "* ]] || return 0
+        say "  gpu-inference is at 0 nodes; asking for 1 ${current}"
+        rc=0; probe_gpu_type "${current}" "${azs}" || rc=$?
+        case "${rc}" in
+          0)
+            say "  GPU node group: ${current} launched"
+            return 0 ;;
+          1)
+            say "  ${current}: ${GPU_PROBE_DETAIL}; deleting the group to try the other sizes"
+            tried="${current}: ${GPU_PROBE_DETAIL}"
+            skip="${current}"
+            if ! _gpu_delete_nodegroup; then
+              _gpu_report "Could not delete gpu-inference after ${current} found no capacity. Check: eksctl get nodegroup --cluster ${CLUSTER_NAME} --region ${AWS_REGION}"
+              return 1
+            fi ;;
+          *)
+            _gpu_report "EC2 would not launch ${current} for gpu-inference: ${GPU_PROBE_DETAIL}. Another size would fail the same way, so the search stopped."
+            return 1 ;;
+        esac
+      else
+        # Wants a node and has none. EKS's health issue can lag the ASG by minutes,
+        # so the ASG's own failed launches count as well.
+        problem="$(gpu_launch_problem)"
+        if [[ -z "${problem}" ]]; then
+          local verdict
+          verdict="$(gpu_probe_verdict "${asg}" "" "${azs}")"
+          case "${verdict}" in
+            no-capacity) problem="InsufficientInstanceCapacity in ${azs// /, }" ;;
+            error:*)     problem="${verdict#error:}" ;;
+            waiting:?*)  problem="InsufficientInstanceCapacity in ${verdict#waiting:}" ;;
+          esac
+        fi
+        [[ -n "${problem}" ]] || return 0
+        say "  gpu-inference has no instance and cannot launch (${problem}); deleting it to try each size in turn"
+        if ! _gpu_delete_nodegroup; then
+          _gpu_report "Could not delete the stuck gpu-inference node group. Check: eksctl get nodegroup --cluster ${CLUSTER_NAME} --region ${AWS_REGION}"
+          return 1
+        fi
+      fi ;;
+  esac
+  remaining=""
+  for type in ${types}; do
+    [[ "${type}" == "${skip}" ]] || remaining="${remaining:+${remaining} }${type}"
+  done
+  say "  Finding a GPU size EC2 can launch in ${azs// /, } (tries ${remaining// /, } in order)"
+  for type in ${remaining}; do
+    say "  Trying ${type}: creating gpu-inference with 0 nodes, then asking for 1"
+    if ! _gpu_create_empty "${type}"; then
+      _gpu_report "Could not create the gpu-inference node group with ${type} (eksctl output in ${DEPLOY_LOG:-the detail log})"
+      return 1
+    fi
+    rc=0; probe_gpu_type "${type}" "${azs}" || rc=$?
+    case "${rc}" in
+      0)
+        say "  GPU node group: ${type} launched"
+        return 0 ;;
+      1)
+        say "  ${type}: ${GPU_PROBE_DETAIL}; deleting the group to try the next size"
+        tried="${tried:+${tried}; }${type}: ${GPU_PROBE_DETAIL}"
+        if ! _gpu_delete_nodegroup; then
+          _gpu_report "Could not delete gpu-inference after ${type} found no capacity. Check: eksctl get nodegroup --cluster ${CLUSTER_NAME} --region ${AWS_REGION}"
+          return 1
+        fi ;;
+      *)
+        _gpu_report "EC2 would not launch ${type} for gpu-inference: ${GPU_PROBE_DETAIL}. Another size would fail the same way, so the search stopped; the group is left with ${type}."
+        return 1 ;;
+    esac
+  done
+  _gpu_report "No On-Demand GPU capacity in ${AWS_REGION} (${azs// /, }) for any size in deployment/eks/cluster-config.yaml. ${tried}. EC2 capacity changes by the hour: re-run the same command to search again (the cluster is kept), or deploy a new prefix with --region <another Region>."
+  return 1
 }
 
 # =========================================================================
@@ -3630,10 +4024,10 @@ create_eks_cluster() {
   if [[ "${LEARNER_MODE}" -eq 1 ]]; then
     log "  Learner mode: no GPU node group; Triton runs on cpu-services (4 x c5.2xlarge)"
   else
-    log "  GPU node group: desired 1, max ${MAX_GPUS} (set via --maxGPUs)"
+    log "  GPU node group: created after the cluster, one size at a time until one launches (max ${MAX_GPUS} nodes, --maxGPUs)"
   fi
   local CLUSTER_CONFIG="/tmp/${CLUSTER_NAME}-config.yaml"
-  render_cluster_config "${CLUSTER_CONFIG}"
+  render_cluster_config_without_gpu "${CLUSTER_CONFIG}"
   # eksctl streams one line per CloudFormation waiter for 15-20 minutes, and it
   # runs CONCURRENTLY with the image build, so the two interleave. Captured to a
   # log file by default; the heartbeat in the orchestration block below is what
@@ -3657,6 +4051,7 @@ create_eks_cluster() {
 ensure_eks_cluster() {
   if eksctl get cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
     step "Step 5: EKS cluster ${CLUSTER_NAME} already exists"
+    ensure_gpu_nodegroup || return 1
     return 0
   fi
 
@@ -3704,7 +4099,18 @@ ensure_eks_cluster() {
         ;;
     esac
   fi
+  ensure_gpu_nodegroup || return 1
   ok "EKS cluster ready"
+}
+
+# The message for a failed Step 5: the GPU search's own reason when it stopped the
+# step, otherwise eksctl's log and the failed CloudFormation resource.
+phase2_cluster_failure() {
+  if [[ -n "${GPU_SEARCH_REPORT_FILE}" && -s "${GPU_SEARCH_REPORT_FILE}" ]]; then
+    cat "${GPU_SEARCH_REPORT_FILE}"
+    return 0
+  fi
+  printf '%s' "EKS cluster creation failed. eksctl output is in ${_EKSCTL_LOG}; the resource-level reason is in CloudFormation: aws cloudformation describe-stack-events --stack-name <the eksctl-${CLUSTER_NAME}-* stack that failed> --region ${AWS_REGION} --query \"StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]\""
 }
 
 # -------------------------------------------------------------------------
@@ -3729,7 +4135,7 @@ if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
       while kill -0 "${_cluster_pid}" 2>/dev/null; do
         sleep 60
         kill -0 "${_cluster_pid}" 2>/dev/null || break
-        printf '  … still creating the EKS cluster (%dm elapsed; eksctl output in %s)\n' \
+        printf '  … still on the EKS cluster and GPU node group (%dm elapsed; eksctl output in %s)\n' \
           "$(( ( $(date +%s) - _PHASE2_START ) / 60 ))" "${_EKSCTL_LOG}"
       done
     ) &
@@ -3738,14 +4144,27 @@ if [[ "${SKIP_IMAGES}" -eq 0 && "${SKIP_CLUSTER}" -eq 0 ]]; then
   build_images
   if ! wait "${_cluster_pid}"; then
     stop_bg "${_heartbeat_pid}"
-    fail 2 "EKS cluster creation failed. eksctl output is in ${_EKSCTL_LOG}; the resource-level reason is in CloudFormation: aws cloudformation describe-stack-events --stack-name <the eksctl-${CLUSTER_NAME}-* stack that failed> --region ${AWS_REGION} --query \"StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]\""
+    _p2_msg="$(phase2_cluster_failure)"
+    if [[ -n "${GPU_SEARCH_REPORT_FILE}" && -s "${GPU_SEARCH_REPORT_FILE}" ]]; then
+      PHASE_HINT_OVERRIDE="The cluster and cpu-services are kept, so a re-run goes straight to the GPU search."
+    fi
+    fail 2 "${_p2_msg}"
   fi
   stop_bg "${_heartbeat_pid}"
 elif [[ "${SKIP_IMAGES}" -eq 0 ]]; then
   build_images
   warn "Skipping EKS cluster creation (--skip-cluster)"
 elif [[ "${SKIP_CLUSTER}" -eq 0 ]]; then
-  ensure_eks_cluster
+  # A waited subshell, as in the branch above: called from an `if`, the function
+  # would run with set -e switched off.
+  ( ensure_eks_cluster ) &
+  if ! wait "$!"; then
+    _p2_msg="$(phase2_cluster_failure)"
+    if [[ -n "${GPU_SEARCH_REPORT_FILE}" && -s "${GPU_SEARCH_REPORT_FILE}" ]]; then
+      PHASE_HINT_OVERRIDE="The cluster and cpu-services are kept, so a re-run goes straight to the GPU search."
+    fi
+    fail 2 "${_p2_msg}"
+  fi
   warn "Skipping image build (--skip-images)"
 else
   warn "Skipping image build (--skip-images)"
@@ -4191,14 +4610,22 @@ log "  Checking for GPU node availability..."
 GPU_WAIT_TIMEOUT=420
 GPU_WAIT_INTERVAL=15
 GPU_ELAPSED=0
+GPU_PROBLEM=""
 while true; do
   GPU_NODES="$(kubectl get nodes -l nvidia.com/gpu=present --no-headers 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "${GPU_NODES}" -ge "${BOOTSTRAP_GPU_DESIRED}" ]]; then
     log "  GPU node(s) available (${GPU_NODES} found, need ${BOOTSTRAP_GPU_DESIRED})"
     break
   fi
+  # A reported launch failure (InsufficientInstanceCapacity, quota) will not clear
+  # inside this wait; say so now instead of after the timeout.
+  GPU_PROBLEM="$(gpu_launch_problem)"
+  if [[ -n "${GPU_PROBLEM}" ]]; then
+    gpu_launch_warning "${GPU_PROBLEM}" "${GPU_NODES}"
+    break
+  fi
   if [[ "${GPU_ELAPSED}" -ge "${GPU_WAIT_TIMEOUT}" ]]; then
-    warn "Only ${GPU_NODES}/${BOOTSTRAP_GPU_DESIRED} GPU nodes after ${GPU_WAIT_TIMEOUT}s — the bootstrap Job and/or Triton may stay pending."
+    warn "Only ${GPU_NODES}/${BOOTSTRAP_GPU_DESIRED} GPU nodes after ${GPU_WAIT_TIMEOUT}s, and the node group reports no launch failure yet. Triton and/or the bootstrap Job may stay Pending."
     warn "Check node group: eksctl get nodegroup --cluster ${CLUSTER_NAME} --region ${AWS_REGION}"
     break
   fi
@@ -4368,6 +4795,16 @@ wait_managed_rollouts() {
     kubectl get "deployment/${name}" >/dev/null 2>&1 || continue
     timeout=300
     [[ "${name}" == "triton-inference-server" ]] && timeout=900
+    # No GPU node and a launch failure on record: waiting 900 s cannot help.
+    if [[ "${name}" == "triton-inference-server" && "${LEARNER_MODE}" -eq 0 ]] \
+        && [[ "$(kubectl get nodes -l nvidia.com/gpu=present --no-headers 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]]; then
+      local problem; problem="$(gpu_launch_problem)"
+      if [[ -n "${problem}" ]]; then
+        warn "  Not waiting for deployment/triton-inference-server: no GPU node, and gpu-inference cannot launch one (${problem})."
+        failed+=("deployment/triton-inference-server: Pending, no GPU node (gpu-inference: ${problem})")
+        continue
+      fi
+    fi
     say "  Waiting for deployment/${name} to roll out (up to ${timeout}s)..."
     if ! wait_rollout "${name}" "" "${timeout}"; then
       failed+=("${ROLLOUT_FAILURE}")
@@ -4431,20 +4868,22 @@ GPU_ASG_NAME="$(aws eks describe-nodegroup \
   --output text 2>/dev/null || echo '')"
 
 if [[ -n "${GPU_ASG_NAME}" && "${GPU_ASG_NAME}" != "None" ]]; then
-  # Create/update scheduled action to scale GPU to 0 at 8pm ET (00:00 UTC next day for ET, but use America/New_York)
+  # Create/update the scheduled action that scales the GPU group to 0 at midnight
+  # America/New_York. It lives on the ASG, so a group the GPU search recreated
+  # gets it here on the same run.
   aws autoscaling put-scheduled-update-group-action \
     --auto-scaling-group-name "${GPU_ASG_NAME}" \
     --scheduled-action-name "${STACK_NAME}-gpu-nightly-shutdown" \
-    --recurrence "0 20 * * *" \
+    --recurrence "0 0 * * *" \
     --time-zone "America/New_York" \
     --desired-capacity 0 \
     --min-size 0 \
     --region "${AWS_REGION}" 2>/dev/null || true
 
-  # Note: Cron "0 20 * * *" = 8:00 PM in the specified timezone
+  # Note: Cron "0 0 * * *" = 12:00 AM (midnight) in the specified timezone
   # The --time-zone flag handles DST automatically
   log "  GPU ASG: ${GPU_ASG_NAME}"
-  log "  Scheduled shutdown: daily at 8:00 PM America/New_York"
+  log "  Scheduled shutdown: daily at 12:00 AM (midnight) America/New_York"
   log "  Users can restart GPUs via the UI 'Start GPU' button"
 else
   warn "Could not find GPU ASG — skipping scheduled shutdown setup"
@@ -4710,7 +5149,7 @@ if [[ "${WITH_RETRAINING}" -eq 1 || "${LEARNER_MODE}" -eq 1 ]]; then
     # vpc-proxy and governance-eventbridge stacks did not exist -- the failure was
     # visible only as two lines scrolled off the top of a 40-minute log.
     _DEPLOY_DEGRADED=1
-    _DEGRADED_DETAIL="the closed-loop stack (deploy_closed_loop.sh exited non-zero)"
+    _DEGRADED_DETAIL="${_DEGRADED_DETAIL:+${_DEGRADED_DETAIL}, and }the closed-loop stack (deploy_closed_loop.sh exited non-zero)"
     warn "Closed-loop deployment exited ${_CL_RC}."
     # The last lines are almost always the error, and they are what a reader wants
     # without opening a file. The full log is named right after.
@@ -5023,7 +5462,7 @@ else
 say "  NVIDIA Triton Inference Server:"
 say "    EKS Cluster:   ${CLUSTER_NAME}"
 say "    Triton Image:  nvcr.io/nvidia/tritonserver:24.08-py3"
-say "    GPU:           NVIDIA A10G (g5.xlarge)"
+say "    GPU:           NVIDIA L4 (g6.2xlarge)"
 say "    Models:        s3://${MODEL_BUCKET}/triton-models/"
 say "    Backend:       ONNX Runtime + CUDA Execution Provider, and FIL on GPU"
 say ""

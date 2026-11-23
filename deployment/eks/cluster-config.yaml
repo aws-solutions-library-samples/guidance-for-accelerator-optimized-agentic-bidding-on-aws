@@ -1,5 +1,5 @@
 # EKS cluster configuration for Accelerator-optimized Agentic Bidding with Triton Inference Server.
-# The GPU node group uses the g5 family (all 1x NVIDIA A10G GPU) for cost-effective
+# The GPU node group uses the g6 family (all 1x NVIDIA L4 GPU) for cost-effective
 # GPU inference of recommendation models (DLRM, Wide & Deep, NCF).
 #
 # For production with larger models, upgrade to:
@@ -25,10 +25,10 @@ metadata:
     description: "S7734 Guidance for Accelerator-Optimized Agentic Bidding on AWS"
 
 # Three AZs, not eksctl's default of two picked at random. The GPU nodegroup is
-# On-Demand g5, and On-Demand capacity for a GPU family comes and goes per AZ: a
-# two-AZ VPC is one capacity event away from a nodegroup that cannot launch at
-# all: g5.xlarge can have no capacity in the two AZs eksctl chose while other AZs
-# in the region have it, and a two-AZ VPC has no subnets there to use.
+# On-Demand g6, and On-Demand capacity for a GPU instance type comes and goes per
+# AZ: a two-AZ VPC is one capacity event away from a nodegroup that cannot launch
+# at all, because the type can have no capacity in the two AZs eksctl chose while
+# other AZs in the region have it, and a two-AZ VPC has no subnets there to use.
 # Spreading the VPC across AZs is the lever that buys
 # capacity resilience; see the note on instanceTypes below for what does not.
 availabilityZones: ["__REGION__a", "__REGION__b", "__REGION__c"]
@@ -47,23 +47,29 @@ vpc:
 managedNodeGroups:
   # GPU node group for Triton Inference Server.
   #
-  # All three types carry a SINGLE NVIDIA A10G GPU (4 / 8 / 16 vCPU). The list is
-  # a PREFERENCE ORDER, not a capacity fallback. EKS backs a managed nodegroup with
-  # an Auto Scaling group whose On-Demand allocation strategy is `prioritized`,
-  # which fulfils capacity from the first type in the list, then the second, then
-  # the third — and on InsufficientInstanceCapacity it retries the first type, it
-  # does not descend: every launch attempt is g5.xlarge and the larger types are
-  # never tried. Keeping the
-  # larger types listed costs nothing and lets an operator reorder them, but do not
-  # expect them to rescue a stuck nodegroup. AZ spread (above) is what does that.
-  # Reference: EC2 Auto Scaling "Allocation strategies for multiple instance types",
-  # On-Demand `prioritized`.
+  # All three types carry a SINGLE NVIDIA L4 GPU (24 GB; 8 / 16 / 4 vCPU). The
+  # list is the ORDER deploy.sh tries them in. EKS backs a managed nodegroup with
+  # an Auto Scaling group whose On-Demand allocation strategy is `prioritized`: on
+  # InsufficientInstanceCapacity it retries the first type and never the others
+  # (EC2 Auto Scaling "Allocation strategies for multiple instance types"). So
+  # eksctl create cluster gets this config WITHOUT this group, and deploy.sh's
+  # ensure_gpu_nodegroup creates it with one type at a time and 0 nodes, scales it
+  # to 1, and moves to the next type when the launch fails for capacity in every
+  # AZ. desiredCapacity / minSize below apply once a type has launched.
   #
-  # IMPORTANT — keep every type in this list on the A10G (Ampere, sm_86)
-  # architecture. Triton serves pre-built TensorRT engines (platform:
-  # tensorrt_plan) compiled by the Model Optimizer for A10G; a plan built for one
-  # GPU arch will NOT load on another. Do NOT add g4dn (T4, sm_75) or g6 (L4,
-  # sm_89) here — it would silently break Triton engine loading.
+  # g6 (L4) replaced g5 (A10G): in us-east-1, g5.xlarge On-Demand capacity was
+  # exhausted in all three of the cluster's AZs for 19+ hours (zero launches), and
+  # g5.2xlarge scored as low. g6.2xlarge is $0.9776/h; g5.2xlarge was $1.212/h.
+  # A family change on an existing cluster is refused (see
+  # reconcile_gpu_instance_types), because engines built for the old GPU would
+  # stay in S3 and fail to load on the new one.
+  #
+  # IMPORTANT: keep every type in this list on the SAME GPU model (L4, Ada,
+  # sm_89). Triton serves TensorRT engines (platform: tensorrt_plan) that the
+  # Model Optimizer compiles on this nodegroup, and trtexec builds without a
+  # hardware-compatibility level, so an engine loads only on the GPU it was built
+  # for. Do NOT add g5 (A10G, sm_86), g4dn (T4, sm_75) or g6e (L40S, a different
+  # sm_89 GPU) here; it would silently break Triton engine loading.
   #
   # privateNetworking: true -- nodes launch in the private subnets with no public IP.
   # eksctl's default places managed nodes in the PUBLIC subnets, which does not
@@ -77,7 +83,7 @@ managedNodeGroups:
   # an internal NLB, Prebid Server is in-cluster over service DNS, and the VPC
   # proxy Lambda sits inside the VPC.
   - name: gpu-inference
-    instanceTypes: ["g5.xlarge", "g5.2xlarge", "g5.4xlarge"]
+    instanceTypes: ["g6.2xlarge", "g6.4xlarge", "g6.xlarge"]
     privateNetworking: true
     desiredCapacity: 1
     minSize: 1
