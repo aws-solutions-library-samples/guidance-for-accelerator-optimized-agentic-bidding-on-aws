@@ -26,9 +26,10 @@ Edit `app.py`. There is one marked block:
 # =======================================================================
 ```
 
-It carries a worked example, the mapping from intent to payload field, and
-pointers to the two containers worth copying. `shared/artf_types.py` has the
-types.
+It carries a worked example and the mapping from intent to path and payload
+field; the module docstring points to the two containers worth copying.
+`shared/artf_types.py` has the types and `shared/artf_applier.py` the paths
+each intent may write to.
 
 ### 2. Rebuild this one image
 
