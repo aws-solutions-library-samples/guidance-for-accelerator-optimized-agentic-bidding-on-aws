@@ -292,6 +292,27 @@ the previous one finishing, so the order matters:
    turns "no conversion reported, and its attribution window has closed" into a real
    negative. See [where the bid shader's labels come
    from](CLOSED_LOOP.md#bid-pricer-where-the-bid-shaders-labels-come-from).
+
+   **Optional: include a demo dataset.** The **Demo dataset** card above the Train
+   controls generates a synthetic, labelled dataset for the selected model and
+   stores it in the training bucket under its own prefix (`demo-training-data/`
+   for the Bid Pricer, `demo-training-data-deal-yield-floor/` and
+   `-margin/` for the yield models), one dataset per model, each generation
+   replacing the last. You set the rates it is drawn from: win rate, click rate
+   given a win and conversion rate given a click for the Bid Pricer (defaults 90%,
+   2%, 5%), or the share of deals that clear for a yield model (default 60%). The
+   card shows the row count and expected positives before you confirm, and the
+   generator runs the trainer's own dataset checks before writing. Tick **Include
+   demo dataset** to add it to the next training job; the job's input becomes a
+   manifest of the demo dataset plus everything already in the model's
+   `training-data/` prefix, and with it included you can train before any load
+   test run has been swept. This is the practical way to get a Bid Pricer job past
+   the single-class refusal above without enabling the outcome simulator: the demo
+   rows carry conversions and non-conversions. The option is off by default, is
+   disabled while no demo dataset exists for the model, and every version trained
+   with it carries `includes_demo_dataset=true` and the dataset's generation time
+   in its Model Registry metadata, so the registry view labels it as trained with
+   demo data. Its accuracy says nothing about real traffic.
 4. **Let governance run.** When training completes, the new version registers in
    its SageMaker Model Package Group automatically, which triggers the Model
    Promotion Governance Agent. For a Bid Pricer version trained from a load test,
