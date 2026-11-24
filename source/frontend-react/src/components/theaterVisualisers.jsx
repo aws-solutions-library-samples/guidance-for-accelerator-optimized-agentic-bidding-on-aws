@@ -182,7 +182,8 @@ export function ValueVisual({ value, landing, taxonomyNames }) {
       return (
         <DealTokenRow
           label={value.role === "segments" ? "audience segments"
-            : value.role === "deals-activated" ? "deals activated" : "deals suppressed"}
+            : value.role === "content-ids" ? "content identifiers"
+              : value.role === "deals-activated" ? "deals activated" : "deals suppressed"}
           ids={value.ids}
           role={value.role}
           taxonomyNames={taxonomyNames}

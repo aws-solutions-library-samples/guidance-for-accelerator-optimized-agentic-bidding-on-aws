@@ -106,6 +106,17 @@ export function mutationToValues(mutation, submittedPayload) {
       .filter((m) => typeof m?.type === "string" && isFiniteNumber(m?.value))
       .map((m) => ({ kind: "metric", type: m.type, value: m.value }));
   }
+  if (intent === "ADD_CIDS") {
+    // Content identifiers travel as imp.metric entries (the appliers accept
+    // ADD_CIDS only on /imp/{imp}/metric), so the payload has the ADD_METRICS
+    // shape. They are identifiers, not scores, so they render as tokens.
+    const metrics = Array.isArray(payload.metric) ? payload.metric : [];
+    const ids = metrics
+      .filter((m) => typeof m?.type === "string" && m.type.trim())
+      .map((m) => m.type);
+    if (ids.length === 0) return [];
+    return [{ kind: "ids", role: "content-ids", ids }];
+  }
 
   if (intent === "ACTIVATE_SEGMENTS" || intent === "ACTIVATE_DEALS" || intent === "SUPPRESS_DEALS") {
     const ids = Array.isArray(payload.id) ? payload.id : [];

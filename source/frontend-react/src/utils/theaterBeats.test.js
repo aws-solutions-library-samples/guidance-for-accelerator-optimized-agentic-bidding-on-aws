@@ -263,6 +263,21 @@ describe("mutationToValues", () => {
     expect(values).toHaveLength(1);
     expect(values[0].type).toBe("brand_safety");
   });
+  it("renders ADD_CIDS metric entries as one content-identifier token row, not as gauges", () => {
+    const cids = {
+      intent: "ADD_CIDS", op: "ADD", path: "/imp/imp-1/metric",
+      payload: { metric: [
+        { type: "cid:iris_8a92b23a77", value: 1.0, vendor: "iris.tv" },
+        { type: "cid:premium-drama-finale", value: 1.0, vendor: "iris.tv" },
+      ] },
+    };
+    const values = mutationToValues(cids, payloadWithDeal);
+    expect(values).toEqual([{ kind: "ids", role: "content-ids", ids: ["cid:iris_8a92b23a77", "cid:premium-drama-finale"] }]);
+  });
+  it("yields nothing for an ADD_CIDS payload with no usable metric types", () => {
+    const empty = { intent: "ADD_CIDS", op: "ADD", path: "/imp/imp-1/metric", payload: { metric: [{ type: "  ", value: 1 }] } };
+    expect(mutationToValues(empty, payloadWithDeal)).toEqual([]);
+  });
 });
 
 /* ---------------------------------------------------------- explore, BR-12 */
