@@ -4,7 +4,7 @@
 #
 # Uploads the source/ directory to CodeBuild and runs the buildspec to build
 # and push all container images to ECR. This avoids the need for local Docker
-# disk space (especially for the ~20 GB NeMo-RL image).
+# disk space (especially for the ~20 GB training image).
 #
 # Usage:
 #   ./remote_build.sh --stack-name stg-nvidia-artf-recommenders

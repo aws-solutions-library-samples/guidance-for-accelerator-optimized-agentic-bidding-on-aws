@@ -1,14 +1,14 @@
 """XGBoost Training Pipeline for the Yield Optimizer (deal floor/margin) model.
 
 Standalone, NOT a subclass of training.pipeline.TrainingPipeline -- that
-class is architecturally NeMo-RL-specific (RL-shaped hyperparameters,
-NeMo-RL training image), which has nothing to do with an XGBoost tree model.
+class is specific to the PyTorch trainer (RL-shaped hyperparameters, the
+custom training image), which has nothing to do with an XGBoost tree model.
 Reuses TrainingPipeline's TrainingResult dataclass (generic enough to
 describe any completed training job) but nothing else.
 
 Key differences from TrainingPipeline:
 - Training image: SageMaker's first-party built-in XGBoost algorithm
-  container (sagemaker.image_uris.retrieve), not the custom NeMo-RL image.
+  container (sagemaker.image_uris.retrieve), not the custom PyTorch training image.
 - Hyperparameters: tree-model hyperparameters (max_depth, num_round, eta,
   objective), not RL-shaped ones (reward_function, rl_learning_rate).
 - Concurrency: a live sagemaker.list_training_jobs() check, matching the
@@ -65,7 +65,7 @@ MODEL_PACKAGE_GROUP_BY_TARGET: dict[str, str] = {
 
 # SageMaker's TrainingJobName/ListTrainingJobs NameContains only accept
 # [a-zA-Z0-9\-]+ -- same constraint training_trigger.py's _job_name_prefix()
-# documents for the NeMo-RL model types.
+# documents for the PyTorch-trained model types.
 _JOB_NAME_PREFIX_BY_TARGET: dict[str, str] = {
     TARGET_FLOOR: "deal-yield-manager-floor",
     TARGET_MARGIN: "deal-yield-manager-margin",

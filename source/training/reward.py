@@ -1,7 +1,7 @@
-"""NeMo-RL reward function for bid outcome reinforcement learning.
+"""ROI reward function for bid outcomes.
 
 Computes a scalar reward in [-1.0, 1.0] for each bid outcome, used by the
-SageMaker training pipeline (NeMo-RL integration) to optimize ROI:
+SageMaker trainer's shading-policy search to optimize ROI:
 maximize revenue while minimizing cost.
 
 Reward signal semantics:
@@ -57,7 +57,7 @@ def _estimate_ctr(outcome: BidShadingOutcomeRecord) -> float:
 def compute_rl_reward(outcome: BidShadingOutcomeRecord) -> float:
     """Compute reinforcement learning reward for a bid outcome.
 
-    Used by NeMo-RL during SageMaker training to shape the policy towards
+    Used by the SageMaker trainer's policy search to shape the policy towards
     profitable bidding: maximizing revenue while minimizing cost.
 
     Args:

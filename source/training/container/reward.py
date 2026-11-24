@@ -1,7 +1,7 @@
-"""NeMo-RL reward function for bid outcome reinforcement learning (tensor version).
+"""ROI reward function for bid outcomes (tensor version).
 
 Computes vectorized rewards from bid outcomes for REINFORCE policy gradient.
-Used inside the SageMaker training container alongside NeMo Framework.
+Used inside the SageMaker training container, which runs on the NeMo Framework base image.
 
 Reward types:
 - "roi": Optimizes return on investment (revenue - cost) / cost

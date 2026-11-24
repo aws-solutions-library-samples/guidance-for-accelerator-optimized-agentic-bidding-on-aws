@@ -71,7 +71,7 @@ _PARKED_MODEL_TYPES: frozenset[str] = frozenset({"ncf_deal_manager"})
 # Two distinct CreateTrainingJob shapes exist in this repo (matching
 # governance_eventbridge_cfn.yaml's RetrainingTriggerFunction, which this
 # on-demand trigger mirrors):
-# - "nemo-rl": custom NeMo-RL training image, model_type/window_days/
+# - "nemo-rl": the custom PyTorch training image (NeMo Framework base), model_type/window_days/
 #   cadence_hours hyperparameters (dlrm_bid_shader, ncf_deal_manager).
 # - "xgboost": SageMaker's built-in XGBoost algorithm container, tree
 #   hyperparameters (deal_yield_manager_floor/margin -- see
@@ -475,7 +475,7 @@ def _build_training_job_params(
     container validates every hyperparameter against XGBoost's own list and
     fails the job with "Extraneous hyperparameter found" for anything else
     (sagemaker_algorithm_toolkit/hyperparameter_validation.py), so they cannot
-    ride as hyperparameters there. The NeMo-RL shape additionally keeps them as
+    ride as hyperparameters there. The "nemo-rl" shape additionally keeps them as
     hyperparameters because the custom container reads them.
 
     ``load_test_run_id`` does NOT scope the training input. Both shapes read an
@@ -487,7 +487,7 @@ def _build_training_job_params(
     ``include_demo_dataset`` (FR2.2, FR2.3) switches the channel to the
     ManifestFile in ``demo_input`` and adds the ``includes_demo_dataset`` and
     ``demo_dataset_generated_at`` tags, plus the same two hyperparameters on the
-    NeMo-RL shape. With it off the channel is the ``S3Prefix`` one, unchanged.
+    "nemo-rl" shape. With it off the channel is the ``S3Prefix`` one, unchanged.
     """
     if include_demo_dataset and demo_input is None:
         raise ValueError("include_demo_dataset requires demo_input (the uploaded ManifestFile)")

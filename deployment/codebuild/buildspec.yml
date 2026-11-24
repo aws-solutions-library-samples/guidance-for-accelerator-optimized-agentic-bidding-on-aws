@@ -3,7 +3,7 @@
 #
 # This buildspec handles building and pushing all container images for the
 # ARTF Recommenders solution. It runs remotely on CodeBuild to avoid large
-# image builds (especially NeMo-RL at ~20 GB) overwhelming local machines.
+# image builds (especially the training image at ~20 GB) overwhelming local machines.
 #
 # Environment variables (passed via CodeBuild project or overrides):
 #   STACK_NAME        — Resource prefix (e.g., "stg-nvidia-artf-recommenders")
@@ -13,7 +13,7 @@
 #   BUILD_TARGET      — Which images to build:
 #                        "all"       — All images (Part 1 + Part 2)
 #                        "part1"     — Part 1 only (Triton, orchestrator, AgentCore)
-#                        "nemo"      — NeMo-RL training container only
+#                        "nemo"      — SageMaker training container only (NeMo Framework base)
 #                        "agents"    — Adaptive Bidding + Model Promotion Governance agent containers
 #                        "optimizer" — TensorRT optimization service (NIM-optimization role)
 #   NGC_API_KEY_SECRET — Secrets Manager secret name/ARN for NGC API key
@@ -307,7 +307,7 @@ phases:
         fi
 
       # -----------------------------------------------------------------------
-      # NeMo-RL training container (amd64, ~20 GB base image)
+      # SageMaker training container (amd64, ~20 GB NeMo Framework base image)
       # -----------------------------------------------------------------------
       - |
         BUILD=0
@@ -315,7 +315,7 @@ phases:
           case " ${BUILD_ONLY} " in *" nemo "*|*" nemo-rl-training "*) BUILD=1 ;; esac
         elif [ "${BUILD_TARGET}" = "all" ] || [ "${BUILD_TARGET}" = "nemo" ]; then BUILD=1; fi
         if [ "${BUILD}" = "1" ]; then
-          echo "--- Building NeMo-RL training container (amd64) ---"
+          echo "--- Building the SageMaker training container (amd64) ---"
           TRAINING_REPO="artf-nemo-rl-training"
 
           # Ensure ECR repo exists

@@ -247,7 +247,7 @@ class TestTriggerTrainingXGBoostShape:
     """deal_yield_manager_floor/margin use the xgboost training shape (see
     _TRAINING_SHAPE) -- SageMaker's built-in XGBoost container, tree
     hyperparameters, and a per-target training-data S3 prefix, rather than
-    the NeMo-RL shape dlrm_bid_shader/ncf_deal_manager use."""
+    the "nemo-rl" shape dlrm_bid_shader/ncf_deal_manager use."""
 
     _COMMON_KWARGS = dict(
         sagemaker_role_arn="arn:aws:iam::123456789012:role/sagemaker-training",
@@ -296,7 +296,7 @@ class TestTriggerTrainingXGBoostShape:
         )
         s3_uri = call_kwargs["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"]
         assert s3_uri == "s3://artf-training-data-bucket/training-data-deal-yield-floor/"
-        # Tree hyperparameters, not the NeMo-RL shape.
+        # Tree hyperparameters, not the "nemo-rl" shape.
         hp = call_kwargs["HyperParameters"]
         assert hp["max_depth"] == "6"
         assert hp["objective"] == "reg:squarederror"

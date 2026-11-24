@@ -22,7 +22,7 @@ API's naming conventions):
 - ``SAGEMAKER_TRAINING_ROLE_ARN`` — IAM role SageMaker assumes for the job.
 - ``MODEL_BUCKET`` — S3 bucket for training output artifacts / Triton model repo.
 - ``TRAINING_DATA_BUCKET`` — S3 bucket containing labeled training data.
-- ``TRAINING_IMAGE_REGISTRY`` — ECR registry hosting the NeMo-RL training image.
+- ``TRAINING_IMAGE_REGISTRY``: ECR registry hosting the SageMaker training image.
 - ``TRITON_URL`` — cluster-internal Triton endpoint (already used elsewhere
   in the orchestrator, e.g. app.py's health-check routes).
 - ``AUDIT_TRAIL_TABLE`` — the real audit-trail DynamoDB table (already used

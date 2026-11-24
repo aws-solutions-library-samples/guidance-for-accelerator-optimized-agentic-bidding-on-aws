@@ -2144,13 +2144,13 @@ test_learner_mode_flags() {
   local cl_src; cl_src="$(cat "${D}/deploy_closed_loop.sh")"
   assert_contains "${cl_src}" '--adaptive-only)   ADAPTIVE_ONLY=1 ;;' "deploy_closed_loop.sh accepts --adaptive-only"
   assert_contains "${cl_src}" 'if [[ "${START_AT}" -le 2 && "${ADAPTIVE_ONLY}" -eq 0 ]]; then' "--adaptive-only skips Glue ETL"
-  assert_contains "${cl_src}" 'log "  Step 4b (NeMo-RL training container) skipped: --adaptive-only' "--adaptive-only skips the NeMo-RL build"
+  assert_contains "${cl_src}" 'log "  Step 4b (SageMaker training container) skipped: --adaptive-only' "--adaptive-only skips the training image build"
   assert_contains "${cl_src}" 'log "  Step 5b (Model Promotion Governance agent) skipped: --adaptive-only."' "--adaptive-only skips the Governance agent"
   assert_contains "${cl_src}" '_AGENT_BUILD_SELECT=(--only adaptive-bidding-agent)' "--adaptive-only builds only the Adaptive Bidding image in CodeBuild"
   # The NeMo outputs are read by the final check, so they are set before the Step 4b gate.
   _lm_order "NEMO_BUILD_ID is set before the Step 4b gate" \
     "$(grep -n '^NEMO_BUILD_ID=""$' "${D}/deploy_closed_loop.sh" | cut -d: -f1)" \
-    "$(grep -n 'Step 4b (NeMo-RL training container) skipped' "${D}/deploy_closed_loop.sh" | cut -d: -f1)" \
+    "$(grep -n 'Step 4b (SageMaker training container) skipped' "${D}/deploy_closed_loop.sh" | cut -d: -f1)" \
     "$(grep -n '^if \[\[ -n "${NEMO_BUILD_ID}" && ! -f "${NEMO_OUTPUTS}" \]\]; then$' "${D}/deploy_closed_loop.sh" | cut -d: -f1)"
   assert_eq "$(grep -c 'NGC_KEY\|NGC_SECRET' "${D}/deploy_prebid.sh")" "0" "deploy_prebid.sh reads no NGC variable"
   assert_eq "$(grep -c '^NGC_SECRET=""$' "${D}/codebuild/remote_build.sh")" "1" "remote_build.sh resets NGC_SECRET instead of reading the environment"

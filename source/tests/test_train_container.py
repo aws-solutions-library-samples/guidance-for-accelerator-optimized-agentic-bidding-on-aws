@@ -1,4 +1,4 @@
-"""Unit tests for the NeMo-RL training container entrypoint (train.py).
+"""Unit tests for the SageMaker training container entrypoint (train.py).
 
 Covers failure modes of live SageMaker training jobs:
 

@@ -71,7 +71,7 @@ _LOG = logging.getLogger("register_genesis_models")
 #
 # deal_yield_manager_floor / deal_yield_manager_margin are trained via a
 # SEPARATE path (XGBoost via source/training/xgboost_pipeline.py, not
-# NeMo-RL) but their genesis artifacts are registered through this SAME
+# the PyTorch trainer) but their genesis artifacts are registered through this SAME
 # script/convention -- each genesis seed is converted to ONNX at export time
 # (onnx-source/deal_yield_manager_floor/model.onnx,
 # onnx-source/deal_yield_manager_margin/model.onnx) purely for Model
@@ -91,7 +91,7 @@ _MODEL_TYPES: list[tuple[str, str]] = [
 ]
 
 # model_type values that use SageMaker's built-in XGBoost algorithm image
-# (not this project's own NeMo-RL ECR image).
+# (not this project's own training image in ECR).
 _XGBOOST_MODEL_TYPES = frozenset({"deal_yield_manager_floor", "deal_yield_manager_margin"})
 
 # SageMaker's CustomerMetadataProperties values must match
@@ -225,7 +225,7 @@ def _onnx_artifact_exists(s3_client, bucket: str, key: str) -> bool:
 
 def _training_image_exists(ecr_client, repository: str, tag: str) -> bool:
     """Verify the training image tag this registration will reference is
-    actually present in ECR. The NeMo-RL training image builds asynchronously
+    actually present in ECR. The SageMaker training image builds asynchronously
     (CodeBuild, 15-50 min) and deploy_closed_loop.sh does not block on it, so
     on a fresh deploy this image usually does not exist yet when genesis
     registration first runs. CreateModelPackage validates the referenced
@@ -250,7 +250,7 @@ def _resolve_inference_image_uri(
 
     deal_yield_manager_floor / deal_yield_manager_margin are trained via a
     separate path (XGBoost, see source/training/xgboost_pipeline.py) that
-    does NOT build a custom image into this project's own NeMo-RL ECR repo
+    does NOT build a custom image into this project's own training image repo
     -- they use SageMaker's first-party built-in XGBoost algorithm
     container instead, which always exists and is never subject to the "is
     our own async CodeBuild image ready yet" check that applies to
@@ -396,13 +396,13 @@ def register_genesis_models(
 
         # deal_yield_manager_floor/margin use SageMaker's first-party
         # built-in XGBoost image (always exists) rather than this project's
-        # own async-built NeMo-RL ECR image -- the "is our CodeBuild image
-        # ready yet" check only applies to the NeMo-RL-trained model types.
+        # own async-built training image -- the "is our CodeBuild image
+        # ready yet" check only applies to the PyTorch-trained model types.
         if model_type not in _XGBOOST_MODEL_TYPES and not _training_image_exists(
             ecr_client, training_image_repository, image_tag
         ):
             _LOG.warning(
-                "  %s: training image %s:%s not found in ECR yet - the NeMo-RL "
+                "  %s: training image %s:%s not found in ECR yet - the SageMaker "
                 "training container builds asynchronously (15-50 min) and this "
                 "registration references it as the InferenceSpecification "
                 "container. Skipping honestly (not attempting a call that would "
@@ -562,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     _LOG.info("Genesis registration complete: %s", results)
     if not_ready:
         _LOG.warning(
-            "%d model type(s) are waiting on the NeMo-RL training image to finish "
+            "%d model type(s) are waiting on the SageMaker training image to finish "
             "building: %s. Re-run this script (or ./check_builds.sh) once it is ready.",
             len(not_ready),
             not_ready,

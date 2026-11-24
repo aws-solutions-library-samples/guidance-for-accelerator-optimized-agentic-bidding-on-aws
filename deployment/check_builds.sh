@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# check_builds.sh — Check if the NeMo-RL container image build is complete
+# check_builds.sh: check if the SageMaker training image build is complete
 #
-# The NeMo-RL training container (~20 GB) is the only image that builds
+# The SageMaker training container (~20 GB) is the only image that builds
 # asynchronously. This script checks its status and writes .nemo-outputs.json
 # when ready, so deploy.sh can resume without re-checking.
 #
@@ -126,7 +126,7 @@ display_status() {
   done
 
   echo ""
-  echo "  NeMo-RL Training Image (needed for: SageMaker retraining):"
+  echo "  SageMaker training image (needed for: SageMaker retraining):"
   echo "  ───────────────────────────────────────────────────────────"
 
   case "${cb_status}" in
@@ -154,7 +154,7 @@ display_status() {
   if [[ "${part1_ok}" == "true" ]] && check_nemo_ecr; then
     echo "  ✓ ALL IMAGES READY"
     echo ""
-    echo "  The NeMo-RL training container is in ECR. SageMaker retraining"
+    echo "  The SageMaker training container is in ECR. SageMaker retraining"
     echo "  jobs will use it automatically when triggered by EventBridge."
     echo "  No further action needed."
     echo ""

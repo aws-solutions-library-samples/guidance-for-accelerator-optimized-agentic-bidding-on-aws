@@ -140,6 +140,10 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 | NVIDIA Triton canary router | Python backend, in cluster | Splits inference traffic between stable and canary TensorRT versions |
 | NVIDIA Triton FIL backend | Triton 24.08 | Serves the floor and margin XGBoost models from native `xgboost.json` |
 
+### Future Design: NeMo-RL for Audience Activation
+
+NeMo-RL is not a component of this guidance today. The training image uses the NeMo Framework base image for its CUDA and PyTorch runtime; the trainer is plain PyTorch. The planned use is off the bid path: a build step reasons over the demo's known inventory to produce a segment map baked into the Audience Activator image, outcomes record which segments were activated, and a NeMo-RL GRPO job post-trains a small open model against the measured clearing-price lift to re-reason that map. The Governance agent then compares the new map against the serving one before it rolls out. The README's [Future design](README.md#future-design-a-nemo-rl-trained-reasoner-for-audience-activation) section describes the design in full.
+
 ## Well-Architected Pillars
 
 ### Operational Excellence
@@ -174,7 +178,7 @@ While a canary serves traffic, a guardrail monitor polls CloudWatch every 10 sec
 - **No always-on optimizer GPU:** Optimization runs only when a version is promoted or bootstrapped
 - **Consumption-billed agents:** Both AgentCore runtimes and the Lambda shims incur cost only when invoked
 - **Pausable schedules:** The agent and retraining schedules can be disabled without a teardown (see [Pausing scheduled components](#pausing-scheduled-components))
-- **Early exit on unfit data:** A training job with missing or unfit data ends at the dataset gate. A NeMo-RL job still bills about 8 minutes, mostly downloading its training image; an XGBoost job about 80 seconds
+- **Early exit on unfit data:** A training job with missing or unfit data ends at the dataset gate. A bid pricer job still bills about 8 minutes, mostly downloading its training image; an XGBoost job about 80 seconds
 
 ### Sustainability
 

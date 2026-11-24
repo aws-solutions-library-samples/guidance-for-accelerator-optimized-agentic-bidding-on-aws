@@ -80,7 +80,7 @@ fi
 #   ./deploy.sh --prefix dv1 --with-prebid --no-control-plane
 #                                               # Prebid without the campaign/deals MCP control plane
 #   ./deploy.sh --prefix dv1                   # FULL stack incl. Part 2 closed-loop (default)
-#   ./deploy.sh --no-retraining                # Part 1 only (skip NeMo-RL, Model Registry, Glue ETL, agents)
+#   ./deploy.sh --no-retraining                # Part 1 only (skip the training image, Model Registry, Glue ETL, agents)
 #   ./deploy.sh --model-id global.anthropic.claude-opus-5-5  # override the agents' Bedrock model
 #   ./deploy.sh --local-build                  # build images locally with Docker (requires ~30 GB free disk)
 #   ./deploy.sh --ngc-key KEY                  # NGC key stored automatically (for NeMo builds)
@@ -317,7 +317,7 @@ EXPORT_ONLY=0
 # addition to the default phase headers + checkmarked summaries. Default (0)
 # shows only the phase-level output.
 VERBOSE=0
-# Part 2 closed-loop (NeMo-RL training, Model Registry, Glue ETL, the Adaptive
+# Part 2 closed-loop (SageMaker training, Model Registry, Glue ETL, the Adaptive
 # Bidding + Governance agents) is ON by default. Disable with --no-retraining.
 WITH_RETRAINING=1
 # Prebid Server as a second, sell-side ARTF host is OFF by default. Unlike
@@ -523,7 +523,7 @@ fi
 # values are restored (a restored value has not been checked yet).
 #
 # Learner mode deploys Part 1 plus the Adaptive Bidding agent. Every other Part 2
-# component trains or promotes on GPUs (NeMo-RL on NGC images, scheduled retraining
+# component trains or promotes on GPUs (the NGC-based training image, scheduled retraining
 # on GPU training instances, TensorRT promotion Jobs). So WITH_RETRAINING is forced
 # to 0, and Step 11 runs deploy_closed_loop.sh --adaptive-only instead of the full
 # closed loop. _WITH_RETRAINING_CHOICE keeps the operator's own value, which is
@@ -2161,13 +2161,13 @@ if [[ "${EXPORT_ONLY}" -eq 0 && "${LEARNER_MODE}" -eq 0 ]]; then
   REQUIRED_GPUS=1
 
   if [[ "${MAX_GPUS}" -lt "${REQUIRED_GPUS}" ]]; then
-    fail "GPU capacity too low: --maxGPUs=${MAX_GPUS} but at least ${REQUIRED_GPUS} GPU node is needed for Triton (g6-family L4). Re-run with --maxGPUs 1 (or 2+ to leave headroom for on-demand optimize / NeMo-RL retraining bursts)."
+    fail "GPU capacity too low: --maxGPUs=${MAX_GPUS} but at least ${REQUIRED_GPUS} GPU node is needed for Triton (g6-family L4). Re-run with --maxGPUs 1 (or 2+ to leave headroom for on-demand optimize / SageMaker retraining bursts)."
   fi
 
-  # Retraining (NeMo-RL) spins up a GPU training job on top of the 2 steady-state
+  # Retraining spins up a GPU training job on top of the 2 steady-state
   # nodes; recommend headroom so it doesn't fight Triton/optimizer for a node.
   if [[ "${WITH_RETRAINING}" -eq 1 && "${MAX_GPUS}" -lt 3 ]]; then
-    warn "  --with-retraining is on (default) but --maxGPUs=${MAX_GPUS}. NeMo-RL retraining jobs may wait for a GPU. Consider --maxGPUs 3 (or --no-retraining)."
+    warn "  --with-retraining is on (default) but --maxGPUs=${MAX_GPUS}. Retraining jobs may wait for a GPU. Consider --maxGPUs 3 (or --no-retraining)."
   fi
 
   # Soft check: the account's On-Demand G/VT vCPU service quota must fit the GPU
@@ -5176,7 +5176,7 @@ if [[ "${WITH_RETRAINING}" -eq 1 || "${LEARNER_MODE}" -eq 1 ]]; then
 else
   log ""
   log "  Skipping closed-loop retraining (pass --with-retraining to enable)."
-  log "  This includes: NeMo-RL training container, SageMaker Model Registry,"
+  log "  This includes: the SageMaker training container, SageMaker Model Registry,"
   log "  Glue ETL, EventBridge scheduled retraining, and AgentCore agents."
 fi
 # Phase 5 is the one phase whose ok() can be reached after a failure: the

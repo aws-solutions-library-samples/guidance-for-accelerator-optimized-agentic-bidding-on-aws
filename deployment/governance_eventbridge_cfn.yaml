@@ -69,7 +69,7 @@ Parameters:
     Default: ''
     Description: >-
       ECR registry host (<account>.dkr.ecr.<region>.amazonaws.com) for the
-      NeMo-RL training container. Leave empty to skip scheduled retraining.
+      SageMaker training container. Leave empty to skip scheduled retraining.
 
   DLRMModelPackageGroupName:
     Type: String
@@ -120,7 +120,7 @@ Parameters:
 Conditions:
   # Base retraining/registration infrastructure. The single retraining-trigger
   # Lambda, the registration Lambda, and the job-completion rule all handle
-  # EVERY model type, so they require only the NeMo-RL essentials: the training
+  # EVERY model type, so they require only the training essentials: the training
   # role, the buckets, the training image registry, and the DLRM/NCF model
   # package groups. They are deliberately NOT gated on the Yield Optimizer's
   # XGBoost config. Previously they were, which meant a missing
@@ -780,7 +780,7 @@ Resources:
                   if 'MetricName' in m and 'Value' in m
               }
               hyperparams = job.get('HyperParameters', {})
-              # Provenance lives in hyperparameters for the NeMo-RL shape and
+              # Provenance lives in hyperparameters for the "nemo-rl" shape and
               # ONLY in Tags for the built-in XGBoost shape (that container
               # rejects hyperparameters outside XGBoost's own list). Read
               # hyperparameters first, then the job's tags.
@@ -949,7 +949,7 @@ Resources:
         #
         # Same action set and GetAuthorizationToken-on-* split that
         # closed_loop_cfn.yaml's training role already uses. Scoped to
-        # repositories in this account, which covers the NeMo-RL training image
+        # repositories in this account, which covers the SageMaker training image
         # the DLRM/NCF model packages reference. Yield packages reference the
         # AWS-owned sagemaker-xgboost image, whose account varies by region.
         - PolicyName: ReadTrainingImageForRegistration

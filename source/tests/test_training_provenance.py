@@ -71,7 +71,7 @@ def test_run_id_and_base_version_are_recorded_as_tags(model_type):
 
 @pytest.mark.parametrize("model_type", NEMO_RL)
 def test_nemo_rl_also_keeps_them_as_hyperparameters(model_type):
-    """The custom NeMo-RL container reads them from its hyperparameters."""
+    """The custom PyTorch training container reads them from its hyperparameters."""
     hp = _params(model_type, run_id="lt-abc123")["HyperParameters"]
     assert hp["load_test_run_id"] == "lt-abc123"
     assert hp["base_model_version"] == "arn:base"
@@ -225,7 +225,7 @@ def test_demo_dataset_provenance_defaults_to_false_and_none():
 
 def test_registration_lambda_copies_the_run_id_onto_the_model_package():
     """Provenance nothing reads back is not provenance. The Lambda that registers
-    the version has to carry it across, from hyperparameters (NeMo-RL) or Tags
+    the version has to carry it across, from hyperparameters ("nemo-rl" shape) or Tags
     (XGBoost, where hyperparameters cannot hold it)."""
     text = GOVERNANCE_CFN.read_text(encoding="utf-8")
     assert re.search(r"sm\.list_tags\(ResourceArn=job\['TrainingJobArn'\]\)", text), (

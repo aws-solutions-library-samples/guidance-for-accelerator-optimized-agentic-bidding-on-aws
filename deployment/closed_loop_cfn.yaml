@@ -47,7 +47,7 @@ Parameters:
     Type: String
     Default: 'artf-nemo-rl-training'
     Description: >-
-      ECR repository name for the NeMo-RL training container
+      ECR repository name for the SageMaker training container
       (deploy_closed_loop.sh Step 4b). Used to scope the training role's ECR pull.
 
 Conditions:
@@ -161,7 +161,7 @@ Resources:
         - !Sub '${StackPrefix}-artf-dlrm-bid-shader'
         - 'artf-dlrm-bid-shader'
       ModelPackageGroupDescription: >-
-        Model versions for the DLRM Bid Shader - trained via NeMo-RL on bid outcomes.
+        Model versions for the DLRM Bid Shader - trained with PyTorch on SageMaker from bid outcomes.
         Each version goes through A/B testing via the Governance Agent before promotion.
 
   # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ Resources:
   # 3c. Deal Yield Manager (Yield Optimizer) Model Package Groups
   #
   # Trained via a SEPARATE path (XGBoost, source/training/xgboost_pipeline.py)
-  # from DLRM/NCF's NeMo-RL path. Registered through the same
+  # from DLRM/NCF's PyTorch path. Registered through the same
   # genesis-registration script/convention for cross-model-type consistency.
   #
   # CORRECTION (found during Unit 3 implementation): Triton's FIL backend
@@ -238,7 +238,7 @@ Resources:
   # Lambda in governance_eventbridge_cfn.yaml). Scoped per the SageMaker
   # CreateTrainingJob execution-role docs: S3 read on the training-data bucket,
   # S3 read/write on the model bucket (job output + genesis onnx-source read),
-  # ECR pull on the NeMo-RL training repo, CloudWatch metrics, and Logs.
+  # ECR pull on the training image repo, CloudWatch metrics, and Logs.
   # ---------------------------------------------------------------------------
   SageMakerTrainingExecutionRole:
     Type: AWS::IAM::Role
@@ -256,7 +256,7 @@ Resources:
         - !Sub '${StackPrefix}-sagemaker-training-execution-role'
         - 'sagemaker-training-execution-role'
       Description: >-
-        Execution role SageMaker assumes to run NeMo-RL retraining jobs
+        Execution role SageMaker assumes to run the retraining jobs
         (CreateTrainingJob RoleArn).
       AssumeRolePolicyDocument:
         Version: '2012-10-17'

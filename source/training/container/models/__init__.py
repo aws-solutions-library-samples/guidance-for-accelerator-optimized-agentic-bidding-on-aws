@@ -1,4 +1,4 @@
-"""DLRM model architecture for NeMo-RL training.
+"""DLRM model architecture for the SageMaker trainer.
 
 Based on NVIDIA DeepLearningExamples DLRM:
 https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/Recommendation/DLRM

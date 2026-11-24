@@ -1,6 +1,6 @@
 """Unit tests for training.reward — compute_rl_reward function.
 
-Validates the NeMo-RL reward function returns correct signals for various
+Validates the ROI reward function returns correct signals for various
 bid outcomes and always stays bounded in [-1.0, 1.0].
 
 **Validates: Requirements 3.3**

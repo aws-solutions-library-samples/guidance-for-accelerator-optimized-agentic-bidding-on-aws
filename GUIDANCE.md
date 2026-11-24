@@ -384,7 +384,7 @@ Part 2 extends the NVIDIA software stack with components that build on the Trito
 - Python 3.11+ with boto3, torch, onnx, onnxscript (and sagemaker, which `deploy.sh` installs itself when Part 2 is enabled)
 - jq, eksctl, kubectl
 - Docker with buildx only if you pass `--local-build`; images build on AWS CodeBuild by default
-- An NVIDIA NGC API key (`--ngc-key`) for the gated NeMo-RL training base image, unless you pass `--no-retraining`. The Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is public and needs no key
+- An NVIDIA NGC API key (`--ngc-key`) for the gated NVIDIA NeMo Framework base image of the training container, unless you pass `--no-retraining`. The Triton Inference Server image (`nvcr.io/nvidia/tritonserver:24.08-py3`) is public and needs no key
 - Service quota for at least one g6.2xlarge instance (8 vCPU of 'Running On-Demand G and VT instances') in the target region
 
 ### Supported Regions

@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   CodeBuild project for building ARTF Recommenders container images remotely.
-  Avoids local disk/resource requirements for large images (NeMo-RL ~20 GB).
+  Avoids local disk/resource requirements for large images (the training image is ~20 GB).
 
 Parameters:
   StackName:
@@ -12,7 +12,7 @@ Parameters:
     Default: ''
     Description: >-
       (Optional) Secrets Manager secret name or ARN containing the NVIDIA NGC
-      API key. Required for building the NeMo-RL training container. Create with:
+      API key. Required for building the SageMaker training container. Create with:
       aws secretsmanager create-secret --name artf-ngc-api-key --secret-string "YOUR_NGC_KEY"
   ExternalArtfSourceRepositoryArn:
     Type: String
@@ -190,7 +190,7 @@ Resources:
       Name: !Sub '${StackName}-image-builder'
       Description: >-
         Builds ARTF container images (amd64): Triton ARTF containers,
-        orchestrator, metrics enricher, and NeMo-RL training container.
+        orchestrator, metrics enricher, and the SageMaker training container.
         Also cross-compiles ARM64 images via buildx.
       ServiceRole: !GetAtt CodeBuildRole.Arn
       # 120 min: the newer model's build (larger export/compile step) runs past

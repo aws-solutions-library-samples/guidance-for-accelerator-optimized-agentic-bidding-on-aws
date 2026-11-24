@@ -1,11 +1,11 @@
 """Training Pipeline for the closed-loop learning system.
 
-Orchestrates SageMaker training jobs with NeMo-RL and registers versioned
+Orchestrates SageMaker training jobs for the PyTorch trainer and registers versioned
 model artifacts in the SageMaker Model Registry.
 
 Key behaviors:
 - Configurable retraining cadence (default 6h) and data window (default 7d)
-- Combined supervised + RL loss via NeMo-RL
+- Supervised fit, then a shading-policy search against the ROI reward
 - At-most-one concurrent training job per ModelType
 - Full lineage metadata on model registration
 
@@ -56,7 +56,7 @@ class TrainingJobConfig:
         base_model_version: Checkpoint URI/version to fine-tune from.
         training_data_uri: S3 URI to labeled Parquet training data.
         validation_split: Fraction of data reserved for validation (0.0-1.0).
-        use_reinforcement_learning: Whether to include NeMo-RL loss.
+        use_reinforcement_learning: Whether to run the policy phase after the supervised fit.
         reward_function: Reward signal type - "roi", "ctr", or "revenue".
         rl_learning_rate: Learning rate for the RL optimizer.
         rl_epochs: Number of RL training epochs.
@@ -148,8 +148,9 @@ class TrainingJobFailedError(Exception):
 # In production these would come from a configuration store; here they serve as
 # the default mapping.
 # Training container image — built from source/training/container/Dockerfile
-# and pushed to ECR during deployment. Uses NVIDIA NeMo Framework (nvcr.io/nvidia/nemo:24.07)
-# with PyTorch, NeMo-RL, and ONNX export capabilities.
+# and pushed to ECR during deployment. Built on the NVIDIA NeMo Framework image
+# (nvcr.io/nvidia/nemo:24.07) for its CUDA and PyTorch runtime; the trainer itself is
+# plain PyTorch with ONNX export.
 _TRAINING_IMAGE_MAP: dict[ModelType, str] = {
     ModelType.DLRM_BID_SHADER: "{account}.dkr.ecr.{region}.amazonaws.com/artf-nemo-rl-training:dlrm",
     ModelType.NCF_DEAL_MANAGER: "{account}.dkr.ecr.{region}.amazonaws.com/artf-nemo-rl-training:ncf",
@@ -168,7 +169,7 @@ _MODEL_PACKAGE_GROUP_MAP: dict[ModelType, str] = {
 
 
 class TrainingPipeline:
-    """Orchestrates model retraining via SageMaker + NeMo-RL.
+    """Orchestrates model retraining on SageMaker with the PyTorch training image.
 
     Manages the lifecycle of training jobs: launching, polling for completion,
     and registering trained models in the SageMaker Model Registry.

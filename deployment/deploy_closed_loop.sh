@@ -37,7 +37,7 @@ fi
 # --adaptive-only deploys what the Adaptive Bidding agent needs and nothing that
 # trains or promotes: Step 1 (KMS key), Step 3 without genesis registration (the
 # parameter-store and audit tables), Step 4 (roles, parameter seed), Step 5a and
-# Step 7. Glue ETL, the NeMo-RL image, the Governance agent and the invocation
+# Step 7. Glue ETL, the training image, the Governance agent and the invocation
 # stack (Step 6) are skipped. deploy.sh passes it in learner mode.
 #
 # --profile is exported as AWS_PROFILE and passed on explicitly to remote_build.sh,
@@ -670,7 +670,7 @@ log "  Adaptive Bidding execution role: ${ADAPTIVE_BIDDING_ROLE_ARN}"
 log "  Governance execution role: ${GOVERNANCE_ROLE_ARN}"
 
 # =========================================================================
-# Step 4b: Build and push NeMo-RL training container
+# Step 4b: Build and push the SageMaker training container
 # =========================================================================
 TRAINING_REPO="artf-nemo-rl-training"
 fi # step 4
@@ -681,9 +681,9 @@ NEMO_OUTPUTS="${SCRIPT_DIR}/.nemo-outputs.json"
 NEMO_BUILD_ID=""
 
 if [[ "${ADAPTIVE_ONLY}" -eq 1 ]]; then
-  log "  Step 4b (NeMo-RL training container) skipped: --adaptive-only builds nothing NGC-based."
+  log "  Step 4b (SageMaker training container) skipped: --adaptive-only builds nothing NGC-based."
 else
-step "Step 4b: Building NeMo-RL training container"
+step "Step 4b: Building the SageMaker training container"
 
 # Create ECR repo if needed
 aws ecr describe-repositories --repository-names "${TRAINING_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
@@ -787,12 +787,12 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
     # Local build (synchronous — requires ~25 GB free disk)
     # shellcheck source=lib/deploy_docker.sh
     source "${SCRIPT_DIR}/lib/deploy_docker.sh"
-    docker_ensure_running "build the NeMo-RL training image locally"
+    docker_ensure_running "build the SageMaker training image locally"
     _training_ecr_login() {
       aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${TRAINING_REGISTRY}"
     }
     quiet "ECR login (${TRAINING_REGISTRY})" _training_ecr_login
-    run_step "Building the NeMo-RL training image (amd64)" \
+    run_step "Building the SageMaker training image (amd64)" \
       docker build --platform linux/amd64 -t "${TRAINING_REPO}:latest" "${SCRIPT_DIR}/../source/training/container/"
     # src-<hash> is pushed alongside dlrm/ncf so the next run can tell this
     # image was built from the current source (see the hash note above).
@@ -811,10 +811,10 @@ if [[ ! -f "${NEMO_OUTPUTS}" ]]; then
   "BuiltAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-    log "  NeMo-RL training container pushed (${NEMO_PUSH_TAGS[*]})"
+    log "  SageMaker training container pushed (${NEMO_PUSH_TAGS[*]})"
   else
     # Remote build via CodeBuild — fire async, continue deploying
-    log "  Starting NeMo-RL build on CodeBuild (async — takes 15-50 min)"
+    log "  Starting the training image build on CodeBuild (async, takes 15-50 min)"
     log "  Deployment will continue. The NeMo image is only needed for"
     log "  SageMaker training jobs, not for the runtime to function."
     STACK_NAME_CL="${STACK_PREFIX:+${STACK_PREFIX}-}nvidia-artf-recommenders"
@@ -1405,7 +1405,7 @@ EOF
   else
     echo ""
     warn "═══════════════════════════════════════════════════════════════════"
-    warn "  The NeMo-RL training container is still building on CodeBuild."
+    warn "  The SageMaker training container is still building on CodeBuild."
     warn "  Everything else is deployed and functional."
     warn ""
     warn "  The NeMo image is only needed for SageMaker retraining jobs —"

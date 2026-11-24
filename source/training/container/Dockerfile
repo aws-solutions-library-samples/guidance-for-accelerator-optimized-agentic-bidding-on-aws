@@ -1,18 +1,18 @@
-# NeMo-RL Training Container for ARTF Recommender Models
-# ======================================================
+# SageMaker Training Container for ARTF Recommender Models
+# ========================================================
 #
-# This container runs SageMaker training jobs that fine-tune the DLRM, NCF,
-# and Wide&Deep models using NVIDIA NeMo Framework with reinforcement learning
-# from bid outcome signals (CTR, win rate, ROI).
+# This container runs SageMaker training jobs that fit the DLRM and NCF models
+# with a plain PyTorch trainer, then (for the DLRM) search the shading-policy
+# coefficients against an ROI reward computed from bid outcomes.
 #
-# Base image: NVIDIA NeMo Framework (includes PyTorch, Megatron-Core,
-# NeMo-RL, CUDA toolkit, NCCL for multi-GPU training).
+# Base image: NVIDIA NeMo Framework, used for its CUDA, PyTorch and NCCL
+# runtime. The trainer imports nothing from NeMo itself.
 #
 # Training loop:
 #   1. Load base model checkpoint (ONNX → PyTorch weights)
 #   2. Load labeled training data (Parquet from S3, prepared by Glue ETL)
 #   3. Supervised pre-training pass on labeled click/conversion data
-#   4. RL fine-tuning pass using NeMo-RL with custom reward (ROI-based)
+#   4. Shading-policy search against the ROI reward (reward.py)
 #   5. Export trained model to ONNX
 #   6. Upload artifact to S3 output path (SageMaker convention)
 #
@@ -30,7 +30,7 @@
 FROM nvcr.io/nvidia/nemo:24.07
 
 LABEL maintainer="ARTF Bidding Platform"
-LABEL description="NeMo-RL training container for recommender model retraining"
+LABEL description="SageMaker training container for recommender model retraining"
 LABEL nvidia.nemo.version="24.07"
 
 # Install additional dependencies for ONNX export and data loading

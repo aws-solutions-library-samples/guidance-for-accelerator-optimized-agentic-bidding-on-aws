@@ -571,7 +571,7 @@ export const ARTF_MUTATION_INFO = {
       canary:
         "The dlrm_bid_shader Triton router forwards each request to _stable or _canary based on an in-memory traffic-percentage parameter (control-plane only \u2014 no ARTF container change).",
       training:
-        "SageMaker NeMo-RL retraining; reward = ROI (revenue \u2212 cost), computed per bid outcome (source/training/reward.py).",
+        "SageMaker PyTorch retraining (NeMo Framework image): supervised fit, then a shading-policy search against reward = ROI (revenue \u2212 cost), computed per bid outcome (source/training/reward.py).",
     },
   },
   ncf_deal_manager: {
@@ -590,7 +590,7 @@ export const ARTF_MUTATION_INFO = {
       canary:
         "The ncf_deal_manager Triton router forwards each request to _stable or _canary based on an in-memory traffic-percentage parameter.",
       training:
-        "SageMaker NeMo-RL retraining; reward = deal_relevance \u00d7 conversion_probability.",
+        "SageMaker PyTorch retraining (NeMo Framework image) on implicit deal engagement; the deployed version is trained on sample interactions from the deal book.",
       businessMetric:
         "Per-variant revenue attribution requires the ADOT/CloudWatch integration (ARTF/ABTest Variant dimension). Serving guardrails (latency, error rate) come from Triton metrics directly.",
     },

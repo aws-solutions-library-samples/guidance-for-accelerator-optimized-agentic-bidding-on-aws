@@ -43,7 +43,7 @@ const MODEL_TYPES = COMPARABLE_MODEL_TYPES;
 // decoupled from MODEL_TYPES above (which drives the scenario testing
 // harness — that works fine for NCF). Three real trainable model types
 // exist today (matches orchestrator.training_trigger.TRAINABLE_MODEL_TYPES,
-// the authoritative backend enforcement): dlrm_bid_shader (NeMo-RL) and
+// the authoritative backend enforcement): dlrm_bid_shader (PyTorch trainer) and
 // the Yield Optimizer's two independently-trained sub-models,
 // deal_yield_manager_floor/margin (SageMaker built-in XGBoost — see
 // training/xgboost_pipeline.py's module docstring on why Triton's FIL

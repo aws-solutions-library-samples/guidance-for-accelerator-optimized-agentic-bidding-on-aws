@@ -1,8 +1,10 @@
-"""NeMo-RL Training Entrypoint for ARTF Recommender Models.
+"""SageMaker training entrypoint for the ARTF recommender models.
 
 Runs inside a SageMaker training job. Performs:
 1. Supervised warm-up on labeled bid outcome data
-2. RL fine-tuning using NeMo-RL with a custom reward function
+2. For the bid shader, a direct search over the three shading-policy coefficients
+   against the ROI reward in reward.py (the REINFORCE phase below is skipped for
+   models that expose no policy parameters)
 3. ONNX export of the trained model
 
 Environment (SageMaker convention):
@@ -678,7 +680,7 @@ def rl_finetune(
     train_loader: DataLoader,
     hp: dict,
 ) -> dict[str, float]:
-    """Phase 2: Reinforcement learning fine-tuning using NeMo-RL reward shaping.
+    """Phase 2: REINFORCE fine-tuning of a model's policy parameters.
 
     Uses the custom bid outcome reward function to optimize model parameters
     for downstream business metrics (ROI, revenue) rather than just CTR accuracy.
@@ -747,7 +749,7 @@ def rl_finetune(
             # Forward pass — model predicts score used for bid pricing
             scores = model(features).squeeze()
 
-            # Compute reward from outcomes using the NeMo-RL reward function
+            # Compute reward from outcomes with reward.compute_reward
             rewards = compute_reward(
                 scores=scores.detach(),
                 outcomes=outcomes,
@@ -1098,7 +1100,7 @@ def main():
     """Main training entrypoint, SageMaker compatible."""
     start_time = time.time()
     logger.info("=" * 60)
-    logger.info("NeMo-RL Training Job Starting")
+    logger.info("Training job starting")
     logger.info("=" * 60)
 
     hp = load_hyperparameters()
